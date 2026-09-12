@@ -1,6 +1,6 @@
 ---
 name: coworker
-description: Transport for one cowork.py command against the Codex coworker in this checkout. Sends one task to a read-only lane with an explicit model and effort, or runs status, read, watch, kill or reset, and returns the script's output unchanged. Never edits, never judges the reply.
+description: Run one cowork.py operation against Codex in this checkout and return its output unchanged.
 tools: Bash
 model: sonnet
 effort: low
@@ -18,7 +18,7 @@ python3 ~/.claude/skills/cowork/scripts/cowork.py send --lane <lane> --read-only
 <DELIM>
 ```
 
-- These flags and no others; the script has no timeout flag. Use the longest tool timeout you can. The request id is printed first; if the call times out, return that id, since the request keeps running detached and the caller can `read` it later.
+- These flags and no others; the script has no timeout flag. Set the Bash tool's timeout to its maximum (600000 ms), never the default. If the tool backgrounds the command anyway, return `pending` with the Bash task id and the request id (printed first): the sender is alive and will deliver, so the caller reads that task's output with `TaskOutput`; `cowork.py read <id>` is only for a request whose sender died without delivering.
 - `--read-only` always: it makes a new lane read-only, is harmless on one that already is, and the script refuses it on `main`, so this transport cannot create a writable lane.
 - `--model` and `--effort` always; `gpt-6-astra` and `high` when the prompt names none.
 - Pick a delimiter that occurs nowhere in the task text, for instance `COWORK_TASK_` followed by random hex, and check that before running: a task line equal to the delimiter would end the input and run the rest as shell.
