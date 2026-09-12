@@ -82,6 +82,18 @@ stores overrides in the marker, the defaults are the constants at the top of
 `simplify_gate.py`. Per-session state lives under
 `~/.cache/agentrc/simplify-gate/`.
 
+## Chief session
+
+`agents/chief.md` is a dispatch-only main session: no file or shell tools, so every
+read, edit, build and review is delegated to the repository's agents, skills and
+workflows, and Codex is reached through `agents/coworker.md`, the one `cowork.py`
+transport. The task worktree exists first; the session starts inside it:
+
+```sh
+~/code/agentrc/install.py install --agent chief --agent coworker
+git worktree add .worktrees/<branch> -b <branch> <base> && cd .worktrees/<branch> && claude --agent chief
+```
+
 ## Tests
 
 ```sh
