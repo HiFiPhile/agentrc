@@ -39,7 +39,7 @@ class InstallTest(unittest.TestCase):
 
     def test_nothing_is_selected_by_default_and_bad_selections_are_usage_errors(self):
         for argv in (['install'], ['install', '--skill', 'all', '--skill', SKILL], ['install', '--agent', 'nope'],
-                     ['remove'], ['frob', '--skill', 'all']):
+                     ['install', '--workflow', 'nope'], ['remove'], ['frob', '--skill', 'all']):
             done = self.run_cli(*argv)
             self.assertEqual(done.returncode, 2, argv)
         self.assertIn('pvs-studio', self.run_cli('install', '--agent', 'nope').stderr, 'lists what exists')
@@ -57,14 +57,16 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.claude / 'agents').exists())
         self.assertEqual(self.ok('install', '--skill', SKILL), '', 'a rerun is silent')
 
-    def test_all_covers_every_skill_agent_and_hook(self):
-        self.ok('install', '--skill', 'all', '--agent', 'all', '--hook', 'all', '--claude-md')
+    def test_all_covers_every_skill_agent_hook_and_workflow(self):
+        self.ok('install', '--skill', 'all', '--agent', 'all', '--hook', 'all', '--workflow', 'all', '--claude-md')
         skills = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
         self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), skills)
         self.assertEqual(os.readlink(self.claude / 'agents' / 'pvs-studio.md'), str(ROOT / 'agents' / 'pvs-studio.md'))
         self.assertEqual(sorted(p.name for p in (self.codex / 'agents').iterdir()),
                          sorted(p.name for p in (ROOT / 'agents').iterdir()), 'every agent md and toml')
         self.assertEqual(os.readlink(self.claude / 'hooks' / 'simplify-gate'), str(ROOT / 'hooks' / 'simplify-gate'))
+        self.assertEqual(os.readlink(self.claude / 'workflows' / 'fix-issue.js'), str(ROOT / 'workflows' / 'fix-issue.js'))
+        self.assertFalse((self.codex / 'workflows').exists(), 'workflows are Claude only')
         self.assertEqual(os.readlink(self.claude / 'CLAUDE.md'), str(ROOT / 'CLAUDE.md'))
         self.assertEqual(os.readlink(self.codex / 'AGENTS.md'), '../.claude/CLAUDE.md')
         self.assertEqual((self.codex / 'AGENTS.md').read_text(), (ROOT / 'CLAUDE.md').read_text())
@@ -169,7 +171,7 @@ class InstallTest(unittest.TestCase):
                 self.setUp()
                 arrange()
                 before = sorted(str(p) for p in self.home.rglob('*'))
-                done = self.run_cli('install', '--skill', 'all', '--agent', 'all', '--hook', 'all', '--claude-md')
+                done = self.run_cli('install', '--skill', 'all', '--agent', 'all', '--hook', 'all', '--workflow', 'all', '--claude-md')
                 self.assertEqual(done.returncode, 1, case)
                 self.assertIn('move it aside first', done.stderr)
                 self.assertEqual(sorted(str(p) for p in self.home.rglob('*')), before, 'nothing changed')
@@ -177,13 +179,14 @@ class InstallTest(unittest.TestCase):
     # --- remove -----------------------------------------------------------------
 
     def test_remove_unlinks_whatever_the_link_points_to_but_never_content(self):
-        self.ok('install', '--skill', SKILL, '--hook', 'simplify-gate', '--agent', 'pvs-studio')
+        self.ok('install', '--skill', SKILL, '--hook', 'simplify-gate', '--agent', 'pvs-studio', '--workflow', 'fix-issue')
         os.remove(self.codex / 'skills' / SKILL)
         os.symlink('/somewhere/else', self.codex / 'skills' / SKILL)
         (self.claude / 'agents' / 'pvs-studio.md').unlink()
         (self.claude / 'agents' / 'pvs-studio.md').write_text('my own copy')
-        out = self.ok('remove', '--skill', SKILL, '--hook', 'simplify-gate', '--agent', 'pvs-studio')
+        out = self.ok('remove', '--skill', SKILL, '--hook', 'simplify-gate', '--agent', 'pvs-studio', '--workflow', 'fix-issue')
         self.assertFalse((self.claude / 'skills' / SKILL).exists())
+        self.assertFalse((self.claude / 'workflows' / 'fix-issue.js').exists())
         self.assertFalse((self.codex / 'skills' / SKILL).is_symlink(), 'a foreign link is removed too')
         self.assertEqual((self.claude / 'agents' / 'pvs-studio.md').read_text(), 'my own copy')
         self.assertIn('left alone', out)

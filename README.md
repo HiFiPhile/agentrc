@@ -9,6 +9,7 @@ CLAUDE.md         user-wide instructions (~/.codex/AGENTS.md symlinks here too)
 skills/           ~/.claude/skills and ~/.codex/skills
 agents/           <name>.md for Claude, plus <name>.toml for Codex, into ~/.claude/agents and ~/.codex/agents
 hooks/            Claude Code hooks, one folder each with a hooks.json; switched on per repository (see below)
+workflows/        <name>.js saved workflows, into ~/.claude/workflows (Claude only)
 tests/            unit tests for skill scripts, hooks and the installer
 .claude-plugin/   plugin and marketplace manifests
 ```
@@ -20,7 +21,7 @@ Nothing is installed by default: name what you want, or `all` per category.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
-~/code/agentrc/install.py install --skill all --agent all --hook all --claude-md
+~/code/agentrc/install.py install --skill all --agent all --hook all --workflow all --claude-md
 ~/code/agentrc/install.py install --skill read-doc --skill cowork   # cherry-pick
 ~/code/agentrc/install.py remove --hook simplify-gate
 ```

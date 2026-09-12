@@ -8,9 +8,10 @@
 Skills link into ~/.claude/skills and ~/.codex/skills; agents into
 ~/.claude/agents (the .md) and ~/.codex/agents (the .md and its .toml);
 hooks into ~/.claude/hooks, with their hooks.json merged into
-~/.claude/settings.json; --claude-md links ~/.claude/CLAUDE.md and
-~/.codex/AGENTS.md. Nothing is selected by default. Everything is a symlink,
-so edits are live and a rerun after a change is a no-op.
+~/.claude/settings.json; workflows into ~/.claude/workflows (Claude only);
+--claude-md links ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md. Nothing is
+selected by default. Everything is a symlink, so edits are live and a rerun
+after a change is a no-op.
 
 Refuses before touching anything when a destination holds something that is
 not a link, or a directory to link into is a file or a dangling link. `remove`
@@ -27,7 +28,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
-KINDS = ('skill', 'agent', 'hook')
+KINDS = ('skill', 'agent', 'hook', 'workflow')
 
 
 def available(kind):
@@ -35,6 +36,8 @@ def available(kind):
         return sorted(p.name for p in (REPO / 'skills').iterdir() if p.is_dir())
     if kind == 'agent':
         return sorted(p.stem for p in (REPO / 'agents').glob('*.md'))
+    if kind == 'workflow':
+        return sorted(p.stem for p in (REPO / 'workflows').glob('*.js'))
     return sorted(p.name for p in (REPO / 'hooks').iterdir() if (p / 'hooks.json').exists())
 
 
@@ -42,7 +45,7 @@ def dirs(kind):
     """Where entries of a kind are linked to."""
     claude, codex = Path.home() / '.claude', Path.home() / '.codex'
     return {'skill': [claude / 'skills', codex / 'skills'], 'agent': [claude / 'agents', codex / 'agents'],
-            'hook': [claude / 'hooks']}[kind]
+            'hook': [claude / 'hooks'], 'workflow': [claude / 'workflows']}[kind]
 
 
 def links(kind, name):
@@ -56,6 +59,8 @@ def links(kind, name):
         return pairs + ([(toml, dirs(kind)[1] / toml.name)] if toml.exists() else [])
     if kind == 'hook':
         return [(REPO / 'hooks' / name, dirs(kind)[0] / name)]
+    if kind == 'workflow':
+        return [(REPO / 'workflows' / f'{name}.js', dirs(kind)[0] / f'{name}.js')]
     return [(REPO / 'CLAUDE.md', Path.home() / '.claude' / 'CLAUDE.md'),
             (Path('../.claude/CLAUDE.md'), Path.home() / '.codex' / 'AGENTS.md')]
 
@@ -119,7 +124,7 @@ def unlink(dst):
 
 def prune(kind):
     """Drop our links whose source left the repo; leave every other link alone."""
-    source = REPO / {'skill': 'skills', 'agent': 'agents', 'hook': 'hooks'}[kind]
+    source = REPO / {'skill': 'skills', 'agent': 'agents', 'hook': 'hooks', 'workflow': 'workflows'}[kind]
     for parent in dirs(kind):
         for path in parent.iterdir() if parent.is_dir() else ():
             if not path.is_symlink() or path.exists():

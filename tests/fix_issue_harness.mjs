@@ -1,0 +1,170 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { test } from 'node:test'
+
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+// The body runs as the runtime runs it; `meta` is exposed so its value, not its spelling, is checked.
+const body = readFileSync(new URL('../workflows/fix-issue.js', import.meta.url), 'utf8')
+  .replace(/^export const meta = /m, 'const meta = globalThis.__meta = ')
+
+const TRIAGE = {
+  target: '28', kind: 'issue', issue: 28, repo: 'hathach/tinyusb', title: 'Port CMSIS-RTOS',
+  summary: 'Add a CMSIS-RTOS2 OSAL backend', criteria: 'a CMSIS-RTOS2 OSAL, tested with CMSIS-RTOS over FreeRTOS',
+  disposition: 'implement',
+  scope: ['src/osal/', 'src/tusb_option.h', 'examples/device/cdc_msc_cmsis_rtos2/'],
+  verify: 'cmake -S examples/device/cdc_msc -B <BUILD> -DBOARD=stm32f407disco && cmake --build <BUILD>',
+  validate: { name: 'validate', args: { boards: ['stm32f407disco'], base: 'abc1234', maxCycles: 1, skip: ['review', 'codex'] }, limitation: null },
+  draftReply: null, needsUser: null, branch: 'issue-28', head: 'abc1234',
+}
+const DEV = { item: 'src/osal/', diffstat: '3 files changed', buildOk: true, board: 'stm32f407disco', notes: '' }
+const VERIFIED = { pass: true, detail: 'ok', branch: 'issue-28', commits: ['1111111 Add CMSIS-RTOS2 OSAL backend', '2222222 Add cdc_msc_cmsis_rtos2 example'], dirty: [], outOfScope: [] }
+
+// Drive the workflow against stub agents keyed by label; `opts.<label>` merges
+// over the default reply, `null` is a dead agent.
+async function run(opts = {}) {
+  const calls = []
+  const logs = []
+  const reply = (label, base) => opts[label] === null ? null : { ...base, ...(opts[label] || {}) }
+  const agent = async (prompt, options) => {
+    calls.push({ label: options.label, agentType: options.agentType, prompt: String(prompt) })
+    if (options.label === 'triage') return reply('triage', TRIAGE)
+    if (options.label === 'implement') return reply('implement', DEV)
+    if (options.label === 'verify') return reply('verify', VERIFIED)
+    throw new Error(`unstubbed agent label ${options.label}`)
+  }
+  const workflow = async () => { throw new Error('nesting is forbidden') }
+  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', body)
+  const result = await fn('args' in opts ? opts.args : '28', agent, null, null, () => {}, m => logs.push(String(m)), workflow, null)
+  return { result, calls, logs, labels: calls.map(c => c.label) }
+}
+
+test('meta names the slash command and four phases', async () => {
+  await run()
+  assert.equal(globalThis.__meta.name, 'fix-issue')
+  assert.deepEqual(globalThis.__meta.phases.map(p => p.title), ['Triage', 'Implement', 'Verify', 'Report'])
+})
+
+test('an empty target is rejected before any agent runs', async () => {
+  for (const args of ['', '   ', {}, { target: '' }, null]) {
+    await assert.rejects(run({ args }), /args must be/)
+  }
+})
+
+test('a slash-form number reaches triage verbatim, not as JSON', async () => {
+  const { result, calls } = await run({ args: '28' })
+  assert.match(calls[0].prompt, /"28"/)
+  assert.equal(calls[0].agentType, 'Explore')
+  assert.equal(result.target, '28')
+  const url = await run({ args: 'https://github.com/hathach/tinyusb/issues/28' })
+  assert.match(url.calls[0].prompt, /issues\/28/)
+})
+
+test('reply, unclear or needsUser stop before Implement', async () => {
+  for (const triage of [{ disposition: 'reply', draftReply: 'Which board?' }, { disposition: 'unclear', needsUser: 'no repro' }, { needsUser: 'which kernel?' }]) {
+    const { result, labels } = await run({ triage })
+    assert.equal(result.reason, 'not-actionable')
+    assert.equal(result.pass, false)
+    assert.deepEqual(labels, ['triage'])
+    assert.equal(result.triage.draftReply, triage.draftReply ?? null)
+  }
+})
+
+test('a missing or malformed verify command or scope stops before Implement; valid args override', async () => {
+  for (const [triage, missing] of [
+    [{ verify: null }, ['verify']], [{ verify: '   ' }, ['verify']], [{ scope: [] }, ['scope']],
+    [{ scope: ['src/', ''] }, ['scope']], [{ verify: null, scope: [] }, ['verify', 'scope']],
+  ]) {
+    const { result, labels } = await run({ triage })
+    assert.equal(result.reason, 'triage-incomplete', JSON.stringify(triage))
+    assert.deepEqual(result.missing, missing)
+    assert.deepEqual(labels, ['triage'])
+  }
+  for (const verify of [{ cmd: 'make check' }, 42, '   ']) {
+    const bad = await run({ args: { target: '28', verify, scope: ['src/', 42] } })
+    assert.deepEqual(bad.result.missing, ['verify', 'scope'], 'a malformed override fails even when triage has a valid command')
+    assert.deepEqual(bad.labels, ['triage'])
+  }
+  const overridden = await run({ args: { target: '28', verify: ' make check ', scope: ['src/'] }, triage: { verify: null, scope: [] } })
+  assert.equal(overridden.result.pass, true)
+  assert.match(overridden.calls[1].prompt, /Verify with: make check\n/)
+  assert.match(overridden.calls[2].prompt, /run exactly: make check /)
+})
+
+test('a dead triage, writer or verifier never passes', async () => {
+  assert.deepEqual((await run({ triage: null })).result, { pass: false, reason: 'triage-died', target: '28' })
+  const dead = await run({ implement: null })
+  assert.equal(dead.result.reason, 'implement-died')
+  assert.deepEqual(dead.labels, ['triage', 'implement'])
+  const verifier = await run({ verify: null })
+  assert.equal(verifier.result.pass, false)
+  assert.equal(verifier.result.reason, 'verify-failed')
+  assert.equal(verifier.result.verify.detail, 'verify agent died')
+})
+
+test('a failed build stops before Verify and keeps the partial report', async () => {
+  const { result, labels } = await run({ implement: { buildOk: false, notes: 'undefined reference' } })
+  assert.equal(result.reason, 'build-failed')
+  assert.equal(result.implement.notes, 'undefined reference')
+  assert.deepEqual(labels, ['triage', 'implement'])
+})
+
+test('a writer that would substitute the acceptance criteria stops as needs-user', async () => {
+  const { result, calls, labels } = await run({ implement: { buildOk: false, notes: 'needs-user: RTX5 is vendored, CMSIS-FreeRTOS is not; which kernel?' } })
+  assert.equal(result.reason, 'needs-user')
+  assert.deepEqual(labels, ['triage', 'implement'])
+  assert.match(calls[1].prompt, /Acceptance criteria, the target's own: a CMSIS-RTOS2 OSAL, tested with CMSIS-RTOS over FreeRTOS/)
+  assert.match(calls[1].prompt, /do not implement the substitute/)
+  assert.match(calls[1].prompt, /never force a board lock/)
+})
+
+test('verify gates on command, branch, commits, clean tree and every commit\'s paths', async () => {
+  const cases = {
+    'verify-failed': { pass: false, detail: 'error: x' },
+    'wrong-branch': { branch: 'master' },
+    'no-commits': { commits: [] },
+    'dirty-tree': { dirty: [' M src/osal/osal.h'] },
+    'out-of-scope': { outOfScope: ['test/hil/tinyusb.json'] },
+  }
+  for (const [reason, verify] of Object.entries(cases)) {
+    const { result } = await run({ verify })
+    assert.equal(result.pass, false, reason)
+    assert.equal(result.reason, reason)
+    assert.match(result.next, new RegExp(`^recover: ${reason} `), reason)
+    assert.doesNotMatch(result.next, /Workflow \/validate|opens the PR/, reason)
+  }
+  const { calls } = await run()
+  assert.match(calls[2].prompt, /git log --name-only --no-renames --format= abc1234\.\.HEAD/)
+  assert.match(calls[2].prompt, /test\/hil\/\*\.json \(direct children only\)/)
+  assert.match(calls[2].prompt, /git rev-parse --abbrev-ref HEAD/)
+})
+
+test('the happy path passes with the branch commits and a safe next step', async () => {
+  const { result, calls } = await run()
+  assert.equal(result.pass, true)
+  assert.equal(result.reason, null)
+  assert.deepEqual(result.commits, VERIFIED.commits)
+  assert.equal(result.issue, 28)
+  assert.equal(result.disposition, 'implement')
+  assert.match(result.next, /^Workflow \/validate \{"boards":\["stm32f407disco"\],"base":"abc1234","maxCycles":1,"skip":\["review","codex"\]\}; clean its artifacts/)
+  assert.match(result.next, /review rounds via coworker read-only lanes/)
+  assert.equal(calls[1].agentType, 'code-writer')
+  assert.match(calls[1].prompt, /Never push, never open a PR/)
+  assert.match(calls[1].prompt, /git add <paths>/)
+  assert.match(calls[0].prompt, /read its source, not only its meta/)
+  assert.match(calls[0].prompt, /disable its internal repairs and its own review stages/)
+  const bare = await run({ triage: { validate: null } })
+  assert.equal(bare.result.validate, null)
+  assert.match(bare.result.next, /^no validation workflow named/)
+  assert.match(bare.result.next, /is the only check; review rounds .*; that check again if HEAD moved; then the human opens the PR$/)
+  const unsupported = await run({ triage: { validate: { name: 'full-check', args: null, limitation: 'does not forward maxCycles' } } })
+  assert.match(unsupported.result.next, /^workflow \/full-check cannot run with repairs and its own reviews disabled \(does not forward maxCycles\) — launch its component stages/)
+  assert.match(unsupported.result.next, /; those stages again if HEAD moved; then the human opens the PR$/)
+  assert.doesNotMatch(unsupported.result.next, /only check|Workflow \/full-check/)
+})
+
+test('nothing is ever dispatched to push, comment or nest a workflow', async () => {
+  const runs = [await run(), await run({ implement: { buildOk: false } }), await run({ triage: { disposition: 'reply' } }), await run({ verify: { pass: false } })]
+  for (const { labels } of runs) {
+    assert.ok(labels.every(l => !/^(push|comment|post)/.test(l)), labels.join(','))
+  }
+})
