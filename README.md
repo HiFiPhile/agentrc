@@ -94,6 +94,9 @@ transport. The task worktree exists first; the session starts inside it:
 git worktree add .worktrees/<branch> -b <branch> <base> && cd .worktrees/<branch> && claude --agent chief
 ```
 
+Headless (`claude -p --agent chief`), set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`:
+by default `-p` kills units still running ten minutes after the chief's turn ends.
+
 ## Tests
 
 ```sh

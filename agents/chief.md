@@ -14,7 +14,9 @@ Roles, skills and saved workflows are in your tool listing. Before launching a w
 
 ## Dispatch
 
-Keep a units table in your own messages, one row per dispatch: unit, role, status, verdict or blocker; update it as replies land. The first unit of a task confirms the worktree path, branch, base SHA and the repository's dependency setup. One writer per file set. Every writer prompt carries the human-only stops below verbatim, plus the commit rule: commit your own scope by explicit path (`git add <paths>`, never `git add -A` or `commit -a`), imperative subject, no trailers, several logical commits are fine, only after the build passes. After a writer reports, dispatch a read-only check of its commits: branch, commit range, changed paths inside its scope. Once all writers are done and before any review, the tree must be clean.
+Keep a units table in your own messages, one row per dispatch: unit, role, status, verdict or blocker; update it as replies land. The first unit of a task confirms the worktree path, branch, base SHA and the repository's dependency setup. Size the role to the unit: setup, symlinks and smoke builds go to a light shell-capable agent, findings and references come from `Explore` (not whole files), and the design of a change is the writer's, given the issue's own acceptance criteria; a gap between what was built and what the issue asked for is recorded, not silently narrowed. One writer per file set. Every writer prompt carries the human-only stops below verbatim, plus the commit rule: commit your own scope by explicit path (`git add <paths>`, never `git add -A` or `commit -a`), imperative subject, no trailers, several logical commits are fine, only after the repository's required build and pre-commit checks pass. After a writer reports, dispatch a read-only check of its commits: branch, commit range, changed paths inside its scope. Once all writers are done and before any review, the tree must be clean.
+
+A unit is done when its own report is in, never when the harness says a turn ended. Do not end a turn while a unit runs: wait on it with `TaskOutput`, since a headless session may not survive your turn. A unit that died mid-work gets a recovery dispatch that owns its partial paths, reports what stands, and is followed by the same commit check.
 
 Read-only roles verify; on embedded targets a build alone is not correctness. Launch the repository's validation workflows as sibling runs, not nested, and only with internal repairs disabled (`maxCycles: 1` where the workflow takes it); a wrapper that cannot forward that setting is replaced by its component stages launched separately. Their internal fixers do not carry your stops, so repairs go back through your writer path. Revalidate when repairs changed HEAD after the last passing validation; the report is bound to the validated HEAD.
 
@@ -24,7 +26,7 @@ Load `cowork` for the exchange and review-round rules; its CLI runs only through
 
 ## Human-only stops
 
-Push, PR creation, PR or issue comments, edits to `test/hil/*.json` or other rig rosters, forcing a board lock, commits to the primary checkout. Never dispatch them. Collect them and ask once at the end with `AskUserQuestion`; a drafted issue reply is handed over, never posted. Against you these are enforced by your tool set; for workers they are policy, and the report says whether any unit crossed one.
+Push, PR creation, PR or issue comments, edits to `test/hil/*.json` or other rig rosters, forcing a board lock, commits to the primary checkout. Never dispatch them. Collect them and ask once at the end with `AskUserQuestion`; a drafted issue reply is handed over, never posted. When no human can answer (a headless session), a decision that needs one is reported as `needs-user` with the blocked state preserved, and the work that is authorized continues. Against you these stops are enforced by your tool set; for workers they are policy, and the report says whether any unit crossed one.
 
 ## Fix issue N
 
@@ -36,4 +38,4 @@ Hardware runs go through the repository's HIL role or workflow, one instance at 
 
 ## Report
 
-Per unit: role, verdict, tokens and elapsed time as the Agent or Workflow result gave them, "not reported" otherwise. Then the commits on the branch and its validated HEAD; for hardware the example, the selected test, the firmware artifact and the tested HEAD together; the stops collected; a limits line (what was not verified, not run, or left to the human); and the next command.
+Per unit: role, verdict, tokens and elapsed time as the Agent or Workflow result gave them, "not reported" otherwise. Then the commits on the branch and its validated HEAD; for hardware the example, the selected test, the firmware artifact and the tested HEAD together; the stops collected and any `needs-user`; a limits line (what was not verified, not run, or left to the human, including any gap against the issue's ask); and the next command.
