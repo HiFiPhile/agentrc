@@ -1,6 +1,6 @@
 ---
 name: cowork
-description: Cowork with the other coding agent headless, in this worktree, through its own CLI - Claude drives `codex exec`, Codex drives `claude -p` - with resumed sessions, lanes, so context carries across requests. Hand it a bounded task, ask a question or a review, one request in flight per lane and lanes in parallel, and let a human follow its reasoning with `tail`. The coworker edits and commits locally; push, PRs and comments stay with the human.
+description: Cowork with the other coding agent headless, in this worktree, through its own CLI - Claude drives `codex exec`, Codex drives `claude -p` - with resumed sessions, lanes, so context carries across requests. Hand it a bounded task, ask a question or a review, one request in flight per lane and lanes in parallel. The coworker edits and commits locally; push, PRs and comments stay with the human.
 ---
 
 # Coworking with the other agent's CLI
@@ -18,41 +18,38 @@ same commands; the checkout is shared.
 ```bash
 S=<skill dir>/scripts/cowork.py
 
-python3 $S send (--task "..." | --task-file F | --task -) [--lane L] [--read-only] [--no-edit] [--model M] [--effort E]
+python3 $S send (--task "..." | --task -) [--lane L] [--read-only] [--no-edit] [--model M] [--effort E]
 python3 $S kill <id>             # the running request, with all it spawned
-python3 $S read <id>             # deliver the reply of a request whose send died
-python3 $S watch [<id>...]       # one line per undelivered request as it settles; exits once the named ones are done
+python3 $S read [--wait] <id>    # recover a dead sender's reply; --wait blocks until ready
 python3 $S status                # lanes and undelivered requests
-python3 $S tail [<id>]           # follow the event stream while the turn runs
 python3 $S reset codex|claude <lane>|all   # forget the lane and its requests; a worktree lane's tree goes once merged
 ```
 
 `send` prints the request id, then blocks until the reply is in and prints
-it. Run it in your harness's background: its exit is the notification, and
-you keep working meanwhile. One request per lane is in flight: a `send`
-while one runs is refused with exit 3 naming it, so wait for the reply, or
-`kill` it, or use another lane. There is no timeout: a turn runs until the CLI ends or you `kill` it. The
-turn runs in a detached runner, so a `send` that dies loses nothing: `status`
-shows the request and `read <id>` delivers the reply.
+it. In an ordinary Claude session, run `send` in a background Bash and arm
+Monitor on `python3 $S read --wait <id>`, using the id printed by `send`:
+a background shell may be reaped, while the runner is detached and Monitor
+is not reaped. If the send shell died before delivery, Monitor delivers the reply; if
+`send` delivered first, Monitor exits 3 with an already-delivered diagnostic
+and the send's output holds the reply. Monitor can also win while the send
+is alive: use the output that delivered the reply, and expect exit 3 from
+the other consumer. For fan-out, use one send and one Monitor per lane.
+The `coworker` agent from agentrc is the transport for sessions without
+Bash, such as `chief`, on read-only lanes only. In Codex, run
+`send` in the foreground, or check `status` between your own steps.
+
+One request per lane is in flight: a `send` while one runs is refused with
+exit 3 naming it, so wait for the reply, or `kill` it, or use another lane.
+There is no timeout: a turn runs until the CLI ends or you `kill` it.
+Plain `read <id>` refuses a request that is still running.
+Before finishing, run `status` and use `read --wait <id>` only for undelivered
+requests you sent, never the request you are answering (`COWORK_TURN`) or
+another caller's request.
 
 Delivery by `send` or `read` removes the request's files; `reset` also
 removes undelivered requests with the lane's session. The coworker's
 own store keeps the whole session, prompts included: `~/.codex/sessions` and
 `~/.claude/projects`, where `codex resume` / `claude --resume` find it.
-
-A background shell is not a safe place for the ping in Claude Code: under
-memory pressure in a long session it reaps idle background shells, and a
-`send` killed that way has no exit to notify you. Its Monitor tool is exempt,
-so there arm `watch <id>...` with the requests in flight; each line it prints
-(`<id>  replied`, `was killed`, `exited 2`, ...) arrives as a notification,
-and you `read <id>` for the reply. Passing the ids means a request that
-settled before the watch started is still reported. A request its own
-`send` delivered is not reported, since that `send`'s exit was the ping;
-the watch covers the ones whose `send` died. A watch given ids exits by
-itself once each of them is reported or delivered, so the monitor ends
-with the work; only the id-less form runs until stopped. Codex has no such
-tool: run `send` in the foreground, or check `status` between your own
-steps.
 
 The coworker defaults to the other CLI: Codex from Claude Code, Claude from
 Codex; `--to` overrides. `--no-edit` puts Claude in plan mode; Codex is asked

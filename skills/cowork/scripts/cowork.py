@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Run coworker turns in a detached process, resuming one session per lane, one turn at a time per lane.
 
-  cowork.py send [--to codex|claude] [--lane L] [--read-only] [--no-edit] [--model M] [--effort E] (--task TEXT | --task-file F | --task -)
+  cowork.py send [--to codex|claude] [--lane L] [--read-only] [--no-edit] [--model M] [--effort E] (--task TEXT | --task -)
   cowork.py kill <id>
-  cowork.py read <id>
-  cowork.py watch [<id>...]
+  cowork.py read [--wait] <id>
   cowork.py status
-  cowork.py tail [<id>]
   cowork.py reset <side> <lane>|all
 
 A lane is one resumed session of a side, with files under
@@ -31,11 +29,11 @@ inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
 while one is refused.
 
 send waits for the reply, prints it and removes the request; read does the
-same for a reply whose send died; watch reports settled requests still
-undelivered; reset removes everything of a lane, its worktree included once
-its branch is merged. Exit codes: 1 failed, 3 unknown or delivered request,
-a lane busy, not ready or of the wrong kind, or reset refused, 4 missing
-"Files touched" line or a changed tree during --no-edit.
+same for a reply whose send died, waiting for release with --wait and
+refusing a running request otherwise; reset removes everything of a lane, its
+worktree included once its branch is merged. Exit codes: 1 failed, 3 unknown
+or delivered request, a lane busy, not ready or of the wrong kind, or reset
+refused, 4 missing "Files touched" line or a changed tree during --no-edit.
 """
 
 import argparse
@@ -66,7 +64,6 @@ HEADER = ('cowork request {id} from {me} on lane {lane}, answered by {model} at 
           '{where}End your reply with a line "Files touched: <paths>" or "Files touched: none".\n---\n')
 WHERE = 'Your checkout is the worktree {root} on branch {branch}, based on {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
-STORE = {'codex': '~/.codex/sessions', 'claude': '~/.claude/projects'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # Claude's names; Codex has minimal..xhigh
 TIERS = {  # the same token cost on the other side, by the family word in the model name (2026-09 list prices)
     'fable': 'gpt-6-astra', 'opus': 'gpt-5.6-sol', 'sonnet': 'gpt-5.6-terra', 'haiku': 'gpt-5.6-luna',
@@ -568,54 +565,11 @@ def deliver(box, request):
     return code
 
 
-def settled(gitdir):
-    """{request: what happened} for every request in this worktree whose
-    runner has let go and whose reply is still here. Read under admission,
-    so a request being created or delivered is never seen half-made."""
-    done = {}
-    for box in boxes(gitdir):
-        with admission(box):
-            for request in requests(box):
-                if not held(box / f'{request}.lock'):
-                    done[request] = verdict(box, request)[0]
-    return done
-
-
-def locate(gitdir, request):
-    return next((box for box in boxes(gitdir) if (box / f'{request}.lock').exists()), None)
-
-
 def find(gitdir, request):
-    box = locate(gitdir, request)
+    box = next((box for box in boxes(gitdir) if (box / f'{request}.lock').exists()), None)
     if box is None:
         die(f'no request {request} in this worktree: delivered already, or never sent', BUSY)
     return box
-
-
-def follow(box, request):
-    """Print the event stream as it grows, until the runner lets go."""
-    stream, lock = box / f'{request}.jsonl', box / f'{request}.lock'
-    try:
-        handle = stream.open('rb')  # not exists() first: a delivery may remove it in between
-    except FileNotFoundError:
-        die(f'{request} has no stream here: delivered already, or never sent; its turn is in the '
-            f'coworker\'s own session store ({STORE[box.parent.name]})', BUSY)
-    try:
-        with handle:
-            done = False
-            while True:
-                chunk = handle.read()
-                if chunk:
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.flush()
-                elif done:
-                    return
-                elif not held(lock):
-                    done = True  # one more read: the runner may have appended and let go since the last one
-                else:
-                    time.sleep(0.2)
-    except BrokenPipeError:  # the reader left, e.g. `tail | head`
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
 def start(box, root, side, task, no_edit, read_only, model, effort):
@@ -643,7 +597,7 @@ def start(box, root, side, task, no_edit, read_only, model, effort):
         settle_pair(box, model, effort)
         request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
         (box / f'{request}.task').write_text(task)
-        (box / f'{request}.jsonl').touch()  # so `tail` has a file the instant the id is printed
+        (box / f'{request}.jsonl').touch()
         with (box / f'{request}.lock').open('w') as lock, (box / f'{request}.err').open('ab') as err:
             fcntl.flock(lock, fcntl.LOCK_EX)
             argv = [sys.executable, __file__, '_run', side, lane, request, str(int(no_edit)), str(lock.fileno())]
@@ -693,20 +647,15 @@ def main(argv=None):
                                                     'any other lane works in its own worktree unless created --read-only')
     send.add_argument('--read-only', action='store_true',
                       help='on a lane\'s first send: it works in this checkout and every send to it is --no-edit')
-    task = send.add_mutually_exclusive_group(required=True)
-    task.add_argument('--task', help='literal text, or - for stdin')
-    task.add_argument('--task-file', type=Path)
+    send.add_argument('--task', required=True, help='literal text, or - for stdin')
     send.add_argument('--no-edit', action='store_true', help='a question or review: the coworker must not edit')
     send.add_argument('--model', help='the coworker\'s model from now on; first send defaults to your own tier')
     send.add_argument('--effort', choices=EFFORTS, help='its reasoning effort from now on; first send defaults to yours')
     sub.add_parser('kill', help='stop a running request and everything its coworker spawned').add_argument('request')
-    sub.add_parser('read', help='print the reply of a settled request whose send died, and remove it').add_argument('request')
-    watch = sub.add_parser('watch', help='print "<id>  <what happened>" for each request as it settles; '
-                                        'with ids, exit once each is reported or delivered, else run forever')
-    watch.add_argument('request', nargs='*', help='requests to wait for, reported even if already settled')
+    read = sub.add_parser('read', help='print the reply of a request whose send died, and remove it')
+    read.add_argument('request')
+    read.add_argument('--wait', action='store_true', help='wait until the runner and its descendants release the request')
     sub.add_parser('status', help='lanes and undelivered requests in this worktree')
-    tail = sub.add_parser('tail', help='follow the event stream of a request (default: the latest) until it settles')
-    tail.add_argument('request', nargs='?')
     reset_ = sub.add_parser('reset', help='forget a lane\'s session and its requests, remove its worktree once merged; '
                                           'the next send starts anew')
     reset_.add_argument('side', choices=SIDES)
@@ -727,10 +676,7 @@ def main(argv=None):
             die(f'lane names are [a-z0-9-], up to 40, and not "all": {a.lane!r}')
         box = box_of(gitdir, side, a.lane)
         box.mkdir(parents=True, exist_ok=True)
-        if a.task_file:
-            task = a.task_file.read_text()
-        else:
-            task = sys.stdin.read() if a.task == '-' else a.task
+        task = sys.stdin.read() if a.task == '-' else a.task
         if not task.strip():
             die('the task resolved to nothing')
         request = start(box, root, side, task, a.no_edit, a.read_only, a.model, a.effort)
@@ -739,7 +685,10 @@ def main(argv=None):
         return deliver(box, request)
 
     if a.cmd == 'read':
-        return deliver(find(gitdir, a.request), a.request)
+        box = find(gitdir, a.request)
+        if a.wait:
+            held(box / f'{a.request}.lock', wait=True)
+        return deliver(box, a.request)
 
     if a.cmd == 'kill':
         box = find(gitdir, a.request)
@@ -752,20 +701,6 @@ def main(argv=None):
                 kill_tree(int(pid))  # our CLI, orphaned or not; a runner still there also sees the verdict
             print(f'{a.request}: {exit_file.read_text().strip()}')
         return 0
-
-    if a.cmd == 'watch':
-        for request in a.request:
-            find(gitdir, request)
-        seen = set(settled(gitdir)) - set(a.request)  # the past is reported only where asked
-        while True:
-            for request, what in sorted(settled(gitdir).items()):
-                if request not in seen:
-                    seen.add(request)
-                    print(request, ' ', what, flush=True)
-            if a.request and all(r in seen or locate(gitdir, r) is None
-                                 for r in a.request):  # each named request reported, or delivered by its own send
-                return 0
-            time.sleep(0.5)
 
     if a.cmd == 'status':
         for side in SIDES:
@@ -783,26 +718,6 @@ def main(argv=None):
                         print(f'  {request}  {state(box, request)}')
             if not shown:
                 print(f'{side}: no lane')
-        return 0
-
-    if a.cmd == 'tail':
-        if a.request:
-            box = locate(gitdir, a.request)
-            if box is None:
-                side = a.request.split('-')[0]
-                die(f'{a.request} has no stream here: delivered already, or never sent; its turn is in the '
-                    f'coworker\'s own session store ({STORE.get(side, "?")})', BUSY)
-            follow(box, a.request)
-            return 0
-        streams = []
-        for box in boxes(gitdir):
-            for stream in box.glob('*.jsonl'):
-                with contextlib.suppress(FileNotFoundError):  # delivered between glob and stat
-                    streams.append((stream.stat().st_mtime, stream))
-        if not streams:
-            die('no undelivered request in this worktree', BUSY)
-        latest = max(streams)[1]
-        follow(latest.parent, latest.stem)
         return 0
 
     if a.cmd == 'reset':

@@ -165,6 +165,14 @@ class CoworkTest(unittest.TestCase):
         self.gate.touch()
         until(lambda: not cowork.held(self.box() / f'{request}.lock'))
 
+    def read_wait(self, request):
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), 'read', '--wait', request], cwd=self.root,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.background.append(proc)
+        until(lambda: proc.poll() is not None or cowork.holds(proc.pid, self.box() / f'{request}.lock'))
+        self.assertIsNone(proc.poll())
+        return proc
+
     def leftovers(self, request):
         return sorted(p.suffix for p in self.box().glob(f'{request}.*'))
 
@@ -399,20 +407,15 @@ class CoworkTest(unittest.TestCase):
     def test_task_sources(self):
         task = self.root / 'task.md'
         task.write_text('from file')
-        code, _, _, _ = self.send('--task-file', str(task))
-        self.assertEqual(code, 0)
         code, _, _, _ = self.send('--task', '-', stdin='from stdin')
         self.assertEqual(code, 0)
-        self.assertTrue(self.calls()[0]['stdin'].endswith('from file'))
-        self.assertTrue(self.calls()[1]['stdin'].endswith('from stdin'))
+        self.assertTrue(self.calls()[0]['stdin'].endswith('from stdin'))
         code, _, _, _ = self.send('--task', 'task.md')
         self.assertEqual(code, 0, 'a literal is a literal, even one that names a file')
-        self.assertTrue(self.calls()[2]['stdin'].endswith('task.md'))
+        self.assertTrue(self.calls()[1]['stdin'].endswith('task.md'))
 
     def test_an_empty_task_never_reaches_the_coworker(self):
-        task = self.root / 'empty.md'
-        task.write_text('  \n')
-        for argv in (('--task', ''), ('--task', '-'), ('--task-file', str(task))):
+        for argv in (('--task', ''), ('--task', '-')):
             code, _, _, err = self.send(*argv)
             self.assertEqual(code, 1, argv)
             self.assertIn('resolved to nothing', err)
@@ -741,72 +744,67 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('codex-x died without recording a verdict', out)
         self.assertEqual(self.leftovers('codex-x'), [])
 
-    def test_watch_reports_each_undelivered_request_once_and_replays_only_what_was_asked(self):
-        earlier = self.reaped('--task', 'before')
-        self.settled(earlier)
-        self.gate.unlink()
-        unasked = self.reaped('--task', 'not replayed', FAKE_REPLY='no footer\n')
-        self.settled(unasked)
-        self.gate.unlink()
-        first_id = self.reaped('--task', 'one', FAKE_EXIT='2')  # reaped before delivery, so the watch is the only ping
-        watch = subprocess.Popen([sys.executable, str(SCRIPT), 'watch', earlier, first_id],
-                                 cwd=self.root, stdout=subprocess.PIPE, text=True)
-        self.background.append(watch)
-        self.assertEqual(watch.stdout.readline(), f'{earlier}   replied\n')
-        self.gate.touch()
-        self.assertEqual(watch.wait(timeout=30), 0, 'exits once every named request is reported')
-        self.assertEqual(watch.stdout.read(), f'{first_id}   exited 2\n')
-        self.run_cli('read', first_id)
-        self.assertEqual(self.leftovers(first_id), [])
-        code, _, _ = self.run_cli('watch', 'codex-nope')
-        self.assertEqual(code, cowork.BUSY)
-
-    def test_a_watch_ends_with_a_delivery_it_never_saw_and_an_unnamed_watch_never_ends(self):
+    def test_read_wait_recovers_a_dead_sender_and_binds_the_session(self):
         request = self.reaped('--task', 'x')
-        scans, sleep = [], time.sleep
-
-        def deliver_between_scans(_):  # the watch saw the request live; settle and read it before its next scan
-            time.sleep = sleep  # once: the waits below sleep for real
-            self.settled(request)
-            scans.append(self.run_cli('read', request)[0])
-
-        with mock.patch('time.sleep', deliver_between_scans):
-            code, out, _ = self.run_cli('watch', request)
-        self.assertEqual((code, out, scans), (0, '', [0]), 'the read was the ping, the watch just ends')
-        forever = subprocess.Popen([sys.executable, str(SCRIPT), 'watch'], cwd=self.root, stdout=subprocess.PIPE, text=True)
-        self.background.append(forever)
-        time.sleep(1)
-        self.assertIsNone(forever.poll())
-
-    def test_tail_follows_until_the_turn_settles_and_refuses_a_delivered_request(self):
-        proc, request = self.send_gated('--task', 'x')
-        self.started(request)
-        tail = subprocess.Popen([sys.executable, str(SCRIPT), 'tail', request], cwd=self.root, stdout=subprocess.PIPE, text=True)
-        self.background.append(tail)
-        time.sleep(0.5)
-        self.assertIsNone(tail.poll(), 'follows while the turn runs')
+        reader = self.read_wait(request)
+        self.assertIsNone(cowork.session_of(self.box()))
         self.gate.touch()
-        self.assertEqual(tail.wait(timeout=10), 0, 'exits by itself once the lock is released')
-        out = tail.stdout.read()
-        self.assertIn('thread.started', out)
-        self.assertIn('agent_message', out)
-        proc.wait(timeout=30)
-        code, _, err = self.run_cli('tail', request)
-        self.assertEqual(code, cowork.BUSY)
-        self.assertIn('delivered already', err)
-        self.assertIn('~/.codex/sessions', err)
+        out, err = reader.communicate(timeout=10)
+        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', ''))
+        self.assertEqual(cowork.session_of(self.box()), 'thread-42')
+        self.assertEqual(self.leftovers(request), [])
 
-    def test_tail_exits_quietly_when_its_reader_leaves(self):
-        proc, request = self.send_gated('--task', 'x')
-        self.started(request)
-        tail = subprocess.Popen([sys.executable, str(SCRIPT), 'tail', request], cwd=self.root,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.background.append(tail)
-        tail.stdout.close()  # like `tail | head`
+    def test_read_wait_waits_for_lock_release_even_with_a_verdict(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.exit').write_text('0\n')
+        (box / 'codex-x.reply').write_text('done\nFiles touched: none\n')
+        with (box / 'codex-x.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            reader = self.read_wait('codex-x')
+            self.assertTrue((box / 'codex-x.reply').exists())
+        out, err = reader.communicate(timeout=10)
+        self.assertEqual((reader.returncode, out, err), (0, 'done\nFiles touched: none\n', ''))
+
+    def test_read_wait_leaves_status_and_kill_responsive(self):
+        request = self.reaped('--task', 'x')
+        reader = self.read_wait(request)
+        status = subprocess.run([sys.executable, str(SCRIPT), 'status'], capture_output=True, text=True, timeout=5)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn(f'{request}  running', status.stdout)
+        killed = subprocess.run([sys.executable, str(SCRIPT), 'kill', request],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(killed.returncode, 0, killed.stderr)
+        out, err = reader.communicate(timeout=10)
+        self.assertEqual(reader.returncode, cowork.FAILED)
+        self.assertIn('was killed', out)
+        self.assertEqual(err, '')
+
+    def test_read_wait_competing_consumers_deliver_once(self):
+        request = self.reaped('--task', 'x')
+        readers = [self.read_wait(request), self.read_wait(request)]
         self.gate.touch()
-        self.assertEqual(tail.wait(timeout=10), 0)
-        self.assertEqual(tail.stderr.read(), '')
-        proc.wait(timeout=30)
+        results = []
+        for reader in readers:
+            out, err = reader.communicate(timeout=10)
+            results.append((reader.returncode, out, err))
+        results.sort()
+        self.assertEqual(results[0], (0, 'codex reply\nFiles touched: none\n', ''))
+        self.assertEqual(results[1][:2], (cowork.BUSY, ''))
+        self.assertIn('delivered already', results[1][2])
+        self.assertEqual(self.leftovers(request), [])
+
+    def test_a_killed_read_wait_leaves_the_request_recoverable(self):
+        request = self.reaped('--task', 'x')
+        reader = self.read_wait(request)
+        reader.kill()
+        reader.wait(timeout=5)
+        self.assertTrue(cowork.held(self.box() / f'{request}.lock'))
+        replacement = self.read_wait(request)
+        self.gate.touch()
+        out, err = replacement.communicate(timeout=10)
+        self.assertEqual((replacement.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', ''))
+        self.assertEqual(self.leftovers(request), [])
 
     def test_the_jsonl_exists_the_instant_the_id_is_printed(self):
         proc, request = self.send_gated('--task', 'x')
@@ -1024,16 +1022,6 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, cowork.BUSY)
         self.assertIn(f"{tree} is not lane impl's worktree", err)
         self.assertEqual(self.calls(), [])
-
-    def test_tail_of_a_vanished_stream_names_the_sides_store(self):
-        code, _, err = self.run_cli('tail', 'codex-main-20260911-000000-000000')
-        self.assertEqual(code, cowork.BUSY)
-        self.assertIn('~/.codex/sessions', err)
-        box = self.box()
-        box.mkdir(parents=True)
-        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
-            cowork.follow(box, 'codex-main-x')  # located, then its stream was delivered away
-        self.assertIn('~/.codex/sessions', err.getvalue())
 
     def test_lane_names_are_restricted_and_a_detached_host_gets_no_worktree_lane(self):
         self.commit('a.txt', 'a')
