@@ -60,12 +60,19 @@ test('a slash-form number reaches triage verbatim, not as JSON', async () => {
 })
 
 test('reply, unclear or needsUser stop before Implement', async () => {
-  for (const triage of [{ disposition: 'reply', draftReply: 'Which board?' }, { disposition: 'unclear', needsUser: 'no repro' }, { needsUser: 'which kernel?' }]) {
-    const { result, labels } = await run({ triage })
-    assert.equal(result.reason, 'not-actionable')
+  for (const [triage, reason] of [
+    [{ disposition: 'reply', draftReply: 'Which board?' }, 'not-actionable'],
+    [{ disposition: 'unclear', needsUser: 'no repro' }, 'needs-user'],
+    [{ needsUser: 'which kernel?' }, 'needs-user'],
+    [{ disposition: 'unclear', needsUser: 'CMSIS-FreeRTOS not vendored; accept RTX5 or add the dep?' }, 'needs-user'],
+  ]) {
+    const { result, labels, calls } = await run({ triage })
+    assert.equal(result.reason, reason, JSON.stringify(triage))
     assert.equal(result.pass, false)
     assert.deepEqual(labels, ['triage'])
     assert.equal(result.triage.draftReply, triage.draftReply ?? null)
+    assert.equal(result.triage.needsUser, triage.needsUser ?? null)
+    assert.match(calls[0].prompt, /cannot meet as written/)
   }
 })
 
