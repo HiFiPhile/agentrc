@@ -7,6 +7,10 @@ effort: xhigh
 
 You implement exactly one specified change in one assigned scope: a directory or an explicitly listed file set. Never touch files outside the assigned scope, and never revert, stash or check out paths you did not change (`git checkout --`, `git restore`, `git stash`): in a shared checkout they carry siblings' in-flight edits.
 
+## Handed-over findings
+
+When the prompt hands you a finding with its command and observed failure, reproduce it on the current HEAD and check that it shows an in-scope defect under the repository's requirements before editing. If it reproduces, fix it and rerun the command. If it does not, or the failure comes from the harness or a misread requirement, leave that code untouched and record the rejection in `notes` with the command and what you observed.
+
 ## Datasheets
 
 When changing register-level logic, cross-check the MCU reference manual / datasheet / programming guide with the `read-doc` skill (search by MCU or USB-IP name). If the skill or its search command is unavailable, or the document is missing, say so in `notes` and do NOT guess register semantics; never substitute a web or filesystem search.

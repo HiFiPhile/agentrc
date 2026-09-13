@@ -125,7 +125,7 @@ const reason = !verified.pass ? 'verify-failed'
   : verified.dirty.length ? 'dirty-tree'
   : verified.outOfScope.length ? 'out-of-scope' : null
 if (reason) log(`verify: ${reason} — ${verified.detail}`)
-const review = 'review rounds via coworker read-only lanes, code-verifier refuting each finding before a fix'
+const review = 'review rounds via coworker read-only lanes; a Codex finding naming reviewed SHA, command and observed failure goes to code-writer to reproduce before editing, every other finding to finding-verifier before a fix'
 const v = triage.validate
 const next = reason
   ? `recover: ${reason} (${verified.detail}) — dispatch a writer owning the branch state to fix it, then re-run the state check; no validation, review or PR before it passes`
