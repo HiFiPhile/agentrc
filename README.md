@@ -87,8 +87,11 @@ stores overrides in the marker, the defaults are the constants at the top of
 
 `agents/chief.md` is a dispatch-only main session: no file or shell tools, so every
 read, edit, build and review is delegated to the repository's agents, skills and
-workflows, and Codex is reached through `agents/coworker.md`, the one `cowork.py`
-transport. The task worktree exists first; the session starts inside it:
+workflows. The chief's own Codex exchanges (review rounds, second opinions) go
+through `agents/coworker.md`, the one `cowork.py` transport; a repository
+workflow it launches may carry its own schema-bound Codex bridge, and its
+results come back through the workflow. The task worktree exists first; the
+session starts inside it:
 
 ```sh
 ~/code/agentrc/install.py install --agent chief --agent coworker
