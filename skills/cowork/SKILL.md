@@ -134,9 +134,10 @@ For each finding, say whether you reproduced it or only read the code.
 
 - **No shared history.** The session remembers its own turns, not yours;
   every request carries what it needs.
-- **Not a batch transport.** Schema'd, unattended jobs go through the
-  project's one-shot runner if it has one, which has real completion and
-  failure boundaries.
+- **Not a batch transport.** Schema'd, unattended verification uses a saved
+  workflow's `agent()` call on a review role (`code-verifier`,
+  `finding-verifier`) for completion and failure boundaries; request a Codex
+  second opinion here.
 - **The simplify gate stays out** of a coworker turn (`COWORK_TURN` in its
   environment). Edits you commissioned are challenged at your own Stop and
   are yours to defend, not to reject as a peer's.
