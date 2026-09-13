@@ -90,8 +90,10 @@ read, edit, build and review is delegated to the repository's agents, skills and
 workflows. The chief's own Codex exchanges (review rounds, second opinions) go
 through `agents/coworker.md`, the one `cowork.py` transport; a repository
 workflow it launches may carry its own schema-bound Codex bridge, and its
-results come back through the workflow. The task worktree exists first; the
-session starts inside it:
+results come back through the workflow. `workflows/code-audit.js` is the saved
+review it launches: one `code-verifier` per directory x dimension, then
+`finding-verifier` refutes every finding (`args: { dirs, dimensions }`, both
+required). The task worktree exists first; the session starts inside it:
 
 ```sh
 ~/code/agentrc/install.py install --agent chief --agent coworker

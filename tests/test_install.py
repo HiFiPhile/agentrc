@@ -66,6 +66,7 @@ class InstallTest(unittest.TestCase):
                          sorted(p.name for p in (ROOT / 'agents').iterdir()), 'every agent md and toml')
         self.assertEqual(os.readlink(self.claude / 'hooks' / 'simplify-gate'), str(ROOT / 'hooks' / 'simplify-gate'))
         self.assertEqual(os.readlink(self.claude / 'workflows' / 'fix-issue.js'), str(ROOT / 'workflows' / 'fix-issue.js'))
+        self.assertEqual(os.readlink(self.claude / 'workflows' / 'code-audit.js'), str(ROOT / 'workflows' / 'code-audit.js'))
         self.assertFalse((self.codex / 'workflows').exists(), 'workflows are Claude only')
         self.assertEqual(os.readlink(self.claude / 'CLAUDE.md'), str(ROOT / 'CLAUDE.md'))
         self.assertEqual(os.readlink(self.codex / 'AGENTS.md'), '../.claude/CLAUDE.md')
