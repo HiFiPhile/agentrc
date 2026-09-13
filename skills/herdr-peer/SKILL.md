@@ -1,6 +1,6 @@
 ---
 name: herdr-peer
-description: Cowork with the coding-agent session in the neighbouring Herdr pane, in either direction between Claude and Codex, sharing one checkout. Hand a bounded task to the peer and take the result back, ask it a question or for a review, or tell it what you are doing while you both work in parallel. The peer edits and commits locally; push, PRs and comments stay with the human. Interactive only; schema'd, unattended jobs belong in a project's one-shot runner, if it has one. Requires HERDR_ENV=1.
+description: Cowork with the coding-agent session in the neighbouring Herdr pane, in either direction between Claude and Codex, sharing one checkout. Hand a bounded task to the peer and take the result back, ask it a question or for a review, or tell it what you are doing while you both work in parallel. The peer edits and commits locally; push, PRs and comments stay with the human. Interactive only; schema'd, unattended verification is a saved workflow's job. Requires HERDR_ENV=1.
 ---
 
 # Coworking with the peer session in the neighbouring Herdr pane
@@ -81,9 +81,10 @@ failure; a silent `DONE` over unfinished work is.
   normal input channel, which is why both envelopes declare themselves.
 - **Alternate-screen truncation.** When `read` reports it, ask the peer to write
   its full answer to a scratch file and reply with the path. Fallback only.
-- **Not a batch transport.** Schema'd, unattended jobs go through the
-  project's one-shot runner if it has one (tinyusb: `.claude/codex-agent.py`),
-  which has real completion and failure boundaries.
+- **Not a batch transport.** Schema'd, unattended verification uses a saved
+  workflow's `agent()` call on a review role (`code-verifier`,
+  `finding-verifier`) for completion and failure boundaries; ask the peer for
+  a second opinion, not a schema'd job.
 
 ## Review rounds
 
