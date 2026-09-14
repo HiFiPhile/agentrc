@@ -6,6 +6,10 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const body = readFileSync(new URL('../workflows/code-audit.js', import.meta.url), 'utf8')
   .replace(/^export const meta = /m, 'const meta = globalThis.__meta = ')
 
+// The runtime sandbox lacks these; Node has them, so a body tested only here can
+// depend on one and still refuse every real run (see pr-babysit's hostOf).
+const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
+
 const finding = (line, why) =>
   ({ file: 'src/a.c', line, snippet: 'x = y;', why, severity: 'high', confidence: 'medium' })
 
@@ -48,8 +52,10 @@ async function run(args, { scans = {}, verdicts = {}, reverse = false } = {}) {
     return v
   }))
   const workflow = async () => { throw new Error('nesting is forbidden') }
-  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', body)
-  const result = await fn(args, agent, pipeline, parallel, () => {}, m => logs.push(String(m)), workflow, null)
+  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget',
+    ...ABSENT, body)
+  const result = await fn(args, agent, pipeline, parallel, () => {}, m => logs.push(String(m)), workflow, null,
+    ...ABSENT.map(() => undefined))
   return { result, calls, logs, finished, labels: calls.map(c => c.label) }
 }
 

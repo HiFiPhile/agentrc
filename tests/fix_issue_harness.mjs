@@ -7,6 +7,11 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const body = readFileSync(new URL('../workflows/fix-issue.js', import.meta.url), 'utf8')
   .replace(/^export const meta = /m, 'const meta = globalThis.__meta = ')
 
+// The runtime sandbox lacks these; Node has them, so a workflow body tested
+// only here can depend on one and still refuse every real run. See pr-babysit's
+// hostOf, which used `new URL` and died at preflight on every production run.
+const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
+
 const TRIAGE = {
   target: '28', kind: 'issue', issue: 28, repo: 'hathach/tinyusb', title: 'Port CMSIS-RTOS',
   summary: 'Add a CMSIS-RTOS2 OSAL backend', criteria: 'a CMSIS-RTOS2 OSAL, tested with CMSIS-RTOS over FreeRTOS',
@@ -27,14 +32,17 @@ async function run(opts = {}) {
   const reply = (label, base) => opts[label] === null ? null : { ...base, ...(opts[label] || {}) }
   const agent = async (prompt, options) => {
     calls.push({ label: options.label, agentType: options.agentType, prompt: String(prompt) })
+    if (options.label === opts.throwOn) throw new Error(`${options.label} exploded`)
     if (options.label === 'triage') return reply('triage', TRIAGE)
     if (options.label === 'implement') return reply('implement', DEV)
     if (options.label === 'verify') return reply('verify', VERIFIED)
     throw new Error(`unstubbed agent label ${options.label}`)
   }
   const workflow = async () => { throw new Error('nesting is forbidden') }
-  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', body)
-  const result = await fn('args' in opts ? opts.args : '28', agent, null, null, () => {}, m => logs.push(String(m)), workflow, null)
+  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget',
+    ...ABSENT, body)
+  const result = await fn('args' in opts ? opts.args : '28', agent, null, null, () => {}, m => logs.push(String(m)), workflow, null,
+    ...ABSENT.map(() => undefined))
   return { result, calls, logs, labels: calls.map(c => c.label) }
 }
 
@@ -175,4 +183,18 @@ test('nothing is ever dispatched to push, comment or nest a workflow', async () 
   for (const { labels } of runs) {
     assert.ok(labels.every(l => !/^(push|comment|post)/.test(l)), labels.join(','))
   }
+})
+
+test('an agent that throws is a dead agent, not a dead workflow', async () => {
+  // Each stage records or reports what came before it; a rejection that escapes
+  // loses that, and `implement` has already committed to the branch by then.
+  for (const [throwOn, reason] of [['triage', 'triage-died'], ['implement', 'implement-died']]) {
+    const { result, logs } = await run({ throwOn })
+    assert.equal(result.pass, false, throwOn)
+    assert.equal(result.reason, reason, throwOn)
+    assert.ok(logs.some(l => l.includes(`${throwOn} errored — ${throwOn} exploded`)), logs.join('\n'))
+  }
+  const { result } = await run({ throwOn: 'verify' })
+  assert.equal(result.reason, 'verify-failed')
+  assert.equal(result.verify.detail, 'verify agent died')
 })

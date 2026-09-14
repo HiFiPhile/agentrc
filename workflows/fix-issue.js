@@ -78,7 +78,7 @@ const triage = await agent(
   'when no such workflow exists. ' +
   'branch: `git rev-parse --abbrev-ref HEAD`; head: `git rev-parse HEAD`. Read only. Return ONLY JSON matching the schema.',
   { label: 'triage', phase: 'Triage', agentType: 'Explore', schema: TRIAGE },
-)
+).catch(e => { log(`triage errored — ${e && e.message}`); return null })
 if (!triage) return { pass: false, reason: 'triage-died', target }
 log(`triage: ${triage.kind} ${triage.issue ?? ''} ${triage.disposition} — ${triage.title}`)
 if (triage.disposition === 'reply' || triage.disposition === 'unclear' || triage.needsUser) {
@@ -105,7 +105,7 @@ const dev = await agent(
   "subject, no trailers, several logical commits are fine, only after the build and the repository's required pre-commit " +
   'checks pass; a hook failing on a partial change means regrouping paths, not bypassing it.',
   { label: 'implement', phase: 'Implement', agentType: 'code-writer', schema: DEV },
-)
+).catch(e => { log(`implement errored — ${e && e.message}`); return null })
 if (!dev) return { pass: false, reason: 'implement-died', target, triage }
 if (dev.buildOk === false) {
   const needsUser = /^needs-user:/i.test(dev.notes.trim())
@@ -122,7 +122,7 @@ const verified = await agent(
   `later reverted still counts) outside ${JSON.stringify(scope)} or matching test/hil/*.json (direct children only). ` +
   'Return ONLY JSON matching the schema.',
   { label: 'verify', phase: 'Verify', model: 'haiku', effort: 'low', schema: VERIFY },
-) ?? { pass: false, detail: 'verify agent died', branch: '', commits: [], dirty: [], outOfScope: [] }
+).catch(e => { log(`verify errored — ${e && e.message}`); return null }) ?? { pass: false, detail: 'verify agent died', branch: '', commits: [], dirty: [], outOfScope: [] }
 
 const reason = !verified.pass ? 'verify-failed'
   : verified.branch !== triage.branch ? 'wrong-branch'
