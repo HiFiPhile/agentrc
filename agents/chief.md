@@ -22,6 +22,8 @@ Record each writer batch's pre-dispatch SHA; after it completes, dispatch a read
 Require that batch's hook/pre-commit evidence from the writer's report or an independent run of the repository's required checks; git history cannot prove hooks ran.
 Check failures go to a recovery writer owning the batch, never repairs by the check unit; the final check before validation uses the task base.
 
+An authorized `pr-babysit` owns its internal fix, verification, commit-audit and publishing sequence. Its scoped fix verification may inspect uncommitted changes, and its own commit audit replaces your per-batch one. Run it with no concurrent checkout writer and no coworker review, wait for it, then inspect the branch, HEAD and worktree it leaves.
+
 Only a unit's own terminal result completes it — never a harness turn ending. Do not end a turn while a unit runs: wait on its Agent or Workflow with `TaskOutput`, since a headless session may not survive your turn. Ask for the terminal result in the dispatch itself rather than nudging a running unit. A unit that died mid-work gets a recovery dispatch that owns its partial paths, reports what stands, and is followed by the same commit check.
 
 Read-only roles verify; on embedded targets a build alone is not correctness. Launch the repository's validation workflows as sibling runs, not nested, and only with internal repairs disabled (`maxCycles: 1` where the workflow takes it) and, when a coworker lane reviews, with the workflow's own review stages skipped; a wrapper that cannot forward those settings is replaced by its component stages launched separately. Their internal fixers do not carry your stops, so repairs go back through your writer path.
