@@ -152,9 +152,13 @@ class Find(unittest.TestCase):
 
     def test_a_table_of_contents_line_is_demoted_below_the_section_it_points_at(self):
         term = 'USB_CHEPnR'
-        toc = '40.6.7      USB endpoint/channel n register (USB_CHEPnR) . . . . . . . . 1652'
         heading = '40.6.7      USB endpoint/channel n register (USB_CHEPnR)'
-        self.assertLess(locate.score(toc, term), locate.score(heading, term))
+        for toc in (heading + ' . . . . . . . . 1652',          # ST spaces its leaders
+                    heading + ' ....................... 1652'):  # Renesas does not
+            self.assertLess(locate.score(toc, term), locate.score(heading, term), toc)
+        prose = 'the GRSTCTL field is set... then cleared by hardware'
+        self.assertEqual(locate.score(prose, 'GRSTCTL'), locate.score(prose.replace('...', ''), 'GRSTCTL'),
+                         'a bare ellipsis is prose, not a leader')
 
     def test_hits_within_one_context_window_are_reported_once(self):
         pages = ['SIE_CTRL here\nand SIE_CTRL again\n\n\n\nfar below SIE_CTRL']
@@ -453,6 +457,7 @@ class Search(unittest.TestCase):
             (2, 'RM0468 STM32H7 reference manual', ['reference-manual'], True),
             (3, 'ES0392 STM32H7 device errata', ['errata'], True),
             (4, 'DS12110 STM32F4 datasheet', ['datasheet'], True),
+            (5, 'ES0182 STM32F4 device errata', ['errata'], True),
         ]).close()
 
     def run_search(self, *args):
@@ -465,10 +470,16 @@ class Search(unittest.TestCase):
         """Book ids of the result rows; the count header also opens with a digit."""
         return [l.split()[0] for l in out.splitlines() if '  [' in l]
 
-    def test_the_reference_manual_and_errata_come_before_the_application_note(self):
+    def test_the_reference_manual_comes_first_and_the_errata_after_the_datasheet(self):
         code, out = self.run_search('stm32h7')
         self.assertEqual(code, 0)
         self.assertEqual(self.ids(out), ['2', '3', '1'])
+
+    def test_a_part_whose_registers_live_in_its_datasheet_ranks_that_before_its_errata(self):
+        # SAM D21 and nRF52840 have no separate reference manual, so the two
+        # errata used to bury the document that answers a register question.
+        _, out = self.run_search('stm32f4')
+        self.assertEqual(self.ids(out), ['4', '5'])
 
     def test_the_header_counts_every_kind_that_matched_not_only_those_shown(self):
         _, out = self.run_search('stm32h7', '--limit', '1')
@@ -507,6 +518,32 @@ class Kinds(unittest.TestCase):
     def test_several_kind_tags_classify_the_same_way_whatever_their_order(self):
         self.assertEqual(search.kind_of('x', 'datasheet, errata'), 'errata')
         self.assertEqual(search.kind_of('x', 'errata, datasheet'), 'errata')
+
+    def test_a_product_or_protocol_specification_is_its_own_kind(self):
+        for title in ('nRF52840 Product Specification v1.7',
+                      'Enhanced Host Controller Interface Specification for Universal Serial Bus (EHCI)',
+                      'Open Host Controller Interface Specification (OHCI)',
+                      'Complete MIDI 1.0 Detailed Specification v. 96.1 3rd Ed.',
+                      # An API specification is one too; the kind is the document
+                      # type, not a claim that the subject is hardware.
+                      'flexistack USBD API Specification'):
+            self.assertEqual(search.kind_of(title, None), 'specification', title)
+
+    def test_a_more_specific_kind_still_wins_over_the_word_specification(self):
+        self.assertEqual(search.kind_of('AN3796 LCD Driver Specification - Application Notes Rev 4', None),
+                         'application-note')
+        self.assertEqual(search.kind_of('Changes Specification Electrical Characteristics Rx111 Group',
+                                        'errata, renesas'), 'errata')
+        self.assertEqual(search.kind_of('DS60001364 PIC32MM Flash Programming Specification', None),
+                         'datasheet', 'the vendor prefix is read before the words')
+
+    def test_display_order_puts_base_documentation_first_but_tag_precedence_is_separate(self):
+        self.assertLess(search.KINDS.index('datasheet'), search.KINDS.index('errata'),
+                        'a register question is answered from the datasheet')
+        self.assertLess(search.TAG_PRECEDENCE.index('errata'), search.TAG_PRECEDENCE.index('datasheet'),
+                        'but a book tagged both is still an erratum')
+        self.assertEqual(search.kind_of('x', 'datasheet, errata'), 'errata')
+        self.assertEqual(sorted(search.KINDS), sorted(search.TAG_PRECEDENCE), 'same kinds, two orders')
 
     def test_an_untagged_book_falls_back_to_its_title_prefix(self):
         for title, kind in (('RM0492 STM32H503 line', 'reference-manual'),

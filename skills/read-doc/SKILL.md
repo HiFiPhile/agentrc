@@ -43,9 +43,9 @@ Not for general concepts, repo/code questions, or when no such doc is likely.
 Keywords supplied as skill arguments, else derived from the question (part
 number, peripheral, spec name). `scripts/search.py` sits under this skill; run
 it from wherever the skill was loaded. It ANDs the keywords across every
-metadata field and prints the book id, a count per document kind, and the most
-authoritative kinds first — reference manuals and errata before application
-notes, because a register question is answered by the former:
+metadata field and prints the book id, a count per document kind, and the base
+documentation first — the manual, specification or datasheet a register question
+is answered from, ahead of the errata and application notes:
 
 ```bash
 python3 <skill dir>/scripts/search.py errata RT1064            # AND (default)
@@ -58,8 +58,13 @@ search never ran, so fix the invocation instead of broadening.
 
 One match → use it. Several → the kind counts say whether the right kind is
 even present; narrow with `--kind` or another keyword rather than reading the
-wrong document. Genuinely ambiguous → ask the user which to read. Nothing
-(exit 1) → retry with fewer keywords; the part number alone often works where
+wrong document. The base document is ranked first but an erratum overrides it,
+so a register claim is checked against both: the count line says whether one
+exists. Vendors name the base document differently — a reference manual, a
+family data sheet, a product specification or an IP core's databook — so the
+kind that carries the registers varies by vendor, not the question you asked.
+Genuinely ambiguous → ask the user which to read. Nothing (exit 1) → retry with
+fewer keywords; the part number alone often works where
 `<part> datasheet` does not, because words like "datasheet" and "manual" are
 rarely in the metadata. `--any` only changes anything with two or more
 keywords. Still nothing → say the document is missing rather than answering

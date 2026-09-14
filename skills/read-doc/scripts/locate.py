@@ -228,7 +228,9 @@ def score(line, term):
         points += 1
     if heading:
         points += 1
-    if re.search(r"\.\s\.\s\.", low):  # a table-of-contents leader, not the section itself
+    # A contents entry, not the section: ST spaces its leaders, Renesas does not.
+    # Four, not three: a bare "..." is prose, on 8k lines of a 250-book sample.
+    if re.search(r"(?:\.\s*){4,}", low):
         points -= 4
     return points
 

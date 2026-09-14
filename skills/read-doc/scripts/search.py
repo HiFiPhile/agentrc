@@ -7,8 +7,9 @@ Usage: search.py KEYWORD [KEYWORD...]        all keywords must match (AND)
 
 Matches title, authors, tags, series, publisher, description and stored
 filename. Prints the book id to pass to locate.py, a count per document kind,
-and the best matches first: reference manuals and errata before application
-notes, since a register question is answered by the former.
+and the base documentation first: the manual, specification or datasheet a
+register question is answered from, before the errata that amend it and the
+application notes that use it.
 
 Exit 0 matched, 1 nothing matched, 2 bad usage or no library.
 """
@@ -26,9 +27,15 @@ LIB = os.path.realpath(os.path.expanduser(os.environ.get("CALIBRE_LIBRARY") or "
 DB = os.path.join(LIB, "metadata.db")
 LIMIT = 10
 
-# Document kinds, most authoritative for a register/erratum question first.
-KINDS = ("reference-manual", "errata", "datasheet", "programming-manual",
-         "user-manual", "application-note", "schematic", "other")
+# Display order: the document a register question is answered from comes first.
+# Errata sit below the base documentation they amend, not because they matter
+# less — they override it — but because they are read in addition to it.
+KINDS = ("reference-manual", "specification", "datasheet", "errata",
+         "programming-manual", "user-manual", "application-note", "schematic", "other")
+# Which kind wins when a book carries several kind tags. A different question
+# from display order: a book tagged both errata and datasheet is still errata.
+TAG_PRECEDENCE = ("reference-manual", "errata", "datasheet", "specification",
+                  "programming-manual", "user-manual", "application-note", "schematic", "other")
 # Whole tag (normalized) -> kind. Never a substring test: many books carry a
 # whole abstract as one tag, and "this application note..." is not a kind.
 TAG_KINDS = {
@@ -39,6 +46,7 @@ TAG_KINDS = {
     "user manual": "user-manual", "user guide": "user-manual", "user's guide": "user-manual",
     "application note": "application-note",
     "technical reference": "reference-manual",
+    "specification": "specification",
     "schematic": "schematic", "schematics": "schematic",
 }
 # Fallback for untagged books: the vendor prefix that opens the title, then the
@@ -52,6 +60,10 @@ TITLE_KINDS = (
     (r"\bprogramming guide\b", "programming-manual"),
     (r"\buser'?s? manual\b", "user-manual"),
     (r"\bdatasheet\b", "datasheet"), (r"\bapplication note\b", "application-note"),
+    # Last, so "Specification ... Errata" and "AN.... Specification" keep their
+    # kind. A product or protocol specification is a document type, not a claim
+    # about hardware: an API specification is one too.
+    (r"\bspecifications?\b", "specification"),
 )
 
 # A USB controller core's own documentation is the register reference for every
@@ -96,7 +108,7 @@ def kind_of(title, tags):
     named = tag_list(tags)
     kinds = {TAG_KINDS[t] for t in named if t in TAG_KINDS}
     if kinds:
-        return min(kinds, key=KINDS.index)
+        return min(kinds, key=TAG_PRECEDENCE.index)
     t = norm(title)
     for pattern, kind in TITLE_KINDS:
         if re.search(pattern, t):
