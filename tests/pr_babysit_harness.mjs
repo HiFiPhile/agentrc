@@ -519,7 +519,7 @@ test('a path whose name has a leading or trailing space is rejected, not trimmed
     scope: [' src/lead.c', 'src/trail.c ', 'src/keep me.c'],
   })
   const ls = calls.find(c => c.label === 'scope:verify')
-  assert.match(ls.prompt, /git ls-files -- 'src\/keep me\.c'\n/, 'an interior space is still a legal path')
+  assert.match(ls.prompt, /git -c core\.quotePath=false ls-files -- 'src\/keep me\.c'\n/, 'an interior space is still a legal path')
   assert.equal(ls.prompt.includes('lead.c'), false)
   assert.equal(ls.prompt.includes('trail.c'), false)
 })
@@ -539,7 +539,7 @@ test('the scoper offers every candidate to git, and keeps only the paths it know
   })
   const ls = calls.find(c => c.label === 'scope:verify')
   // Offered: both spellings of plus+@~[1].c collapsed to one, and the invented path too.
-  assert.match(ls.prompt, /git ls-files -- 'src\/my file \(v2\)\.c' 'src\/plus\+@~\[1\]\.c' 'src\/invented\.c'\n/)
+  assert.match(ls.prompt, /git -c core\.quotePath=false ls-files -- 'src\/my file \(v2\)\.c' 'src\/plus\+@~\[1\]\.c' 'src\/invented\.c'\n/)
   const fix = calls.find(c => c.label.startsWith('fix:'))
   assert.match(fix.prompt, /Scope: src\/my file \(v2\)\.c, src\/plus\+@~\[1\]\.c/)
   assert.equal(fix.prompt.includes('invented'), false, 'a path git did not confirm never reaches the fixer')
@@ -765,14 +765,17 @@ test('a commit carrying a path the run did not own is never pushed', async () =>
   assert.ok(logs.some(l => /committed but NOT pushed — commit carries unowned path/.test(l)))
 })
 
-test('a worker rejection outside the guarded lanes still reports the cycle', async () => {
-  // The publisher's three turns are each guarded now, so the fix-note poster is
-  // the unguarded worker that proves the scoreboard survives a rejection.
+test('a reply poster that throws leaves the debt owed, not the cycle dead', async () => {
+  // The comments it posts are public and it records what went out AFTER it
+  // returns, so a rejection there must not take the cycle with it: the run has
+  // to end saying the replies are still owed, not that something exploded.
   const { result, logs } = await run({ reviews: oneValid, throwOn: 'resolve#' })
   assert.equal(result.pass, false)
-  assert.equal(result.reason, 'cycle-threw')
+  assert.equal(result.reason, 'deferred-replies-unresolved', 'the debt is what is unresolved')
   assert.equal(result.history.length, 1, 'the verdict keeps the history it was built from')
-  assert.match(result.history[0].error, /cycle threw: resolve#1 exploded/)
+  assert.deepEqual(result.history[0].fixNotePosts, { pass: false, detail: 'agent died', doneIds: [] },
+    'the receipt exists even though the poster died')
+  assert.ok(logs.some(l => /resolve#1 errored — resolve#1 exploded/.test(l)), logs.join('\n'))
   assert.equal(summaries(logs).length, 1, 'the scoreboard survives an agent-failure cycle')
   const row = rowsOf(summaries(logs)[0])[0]
   assert.match(row[3], /fixed \+ pushed/, 'the push did land before the throw — the row must say so')

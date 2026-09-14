@@ -323,9 +323,9 @@ const fixAndVerify = async (workIn) => {
   const candidates = [...new Set(fileless.flatMap(w => [...w.files]))]
   if (candidates.length > 0) {
     const v = await agent(
-      `${IN_CHECKOUT}Run exactly: git ls-files -- ${candidates.map(c => `'${c}'`).join(' ')}\nReturn files = the paths that command printed, verbatim — no additions, no substitutions.`,
+      `${IN_CHECKOUT}Run exactly: git -c core.quotePath=false ls-files -- ${candidates.map(c => `'${c}'`).join(' ')}\nReturn files = the paths that command printed, verbatim — no additions, no substitutions.`,
       { label: 'scope:verify', phase: 'Fix', model: 'haiku', schema: SCOPE },
-    )
+    ).catch(e => { log(`scope:verify errored — ${e && e.message}`); return null })
     const exists = new Set((v ? v.files : []).map(canon))
     for (const w of fileless) for (const f of [...w.files])
       if (!exists.has(f)) { w.files.delete(f); log(`scope:${w.key}: dropped ${f} — not confirmed as a repo file`) }
@@ -550,7 +550,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
     `${IN_CHECKOUT}Editing and committing nothing, report the commit at HEAD: ` +
     'sha = `git rev-parse HEAD`; parents = the space-separated output of `git show -s --format=%P HEAD` ' +
     'split into a list — every parent, not only the first; ' +
-    'paths = the lines of `git show --name-only --no-renames --format= HEAD`. ' +
+    'paths = the lines of `git -c core.quotePath=false show --name-only --no-renames --format= HEAD`. ' +
     'Return ONLY JSON matching the schema.',
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
@@ -778,7 +778,7 @@ const runCycle = async (cycle, entry) => {
         `Replies: ${JSON.stringify(freshReplies)}. pass=true only if every reply was posted and every inline thread resolved; detail = what went where. ` +
         'doneIds = the commentIds fully handled: reply posted (or already present) AND (thread resolved, or an issue comment with no thread to resolve).',
         { label: `replies#${cycle}`, phase: 'Push', model: 'sonnet', schema: OPIDS },
-      )
+      ).catch(e => { log(`replies#${cycle} errored — ${e && e.message}`); return null })
       const offered = new Set(freshReplies.map(x => x.commentId))
       // Keep the receipt before anything later can fail: a cycle that dies after
       // posting must still be able to say what went out.
@@ -839,7 +839,7 @@ const runCycle = async (cycle, entry) => {
           'pass=true only if every reply was posted and every thread resolved; detail = what went where. ' +
           'doneIds = the commentIds fully handled: reply posted AND (thread resolved, or an issue comment with no thread to resolve).',
           { label: `resolve#${cycle}`, phase: 'Push', model: 'sonnet', schema: OPIDS },
-        )
+        ).catch(e => { log(`resolve#${cycle} errored — ${e && e.message}`); return null })
         entry.fixNotePosts = resolved || { pass: false, detail: 'agent died', doneIds: [] }
         for (const id of (resolved && resolved.doneIds) || []) {
           if (answerable.has(id)) pay(id, 'fixNote')
