@@ -17,7 +17,7 @@ When changing register-level logic, cross-check the MCU reference manual / datas
 
 ## Finish checklist (in order)
 
-1. Verify with the build command the prompt names, run as given. Parallel siblings share the checkout, so the prompt owns build-dir isolation: fill a `<BUILD>` placeholder with `mktemp -d` when it has one, and otherwise run the command unchanged. Without a build command, do not invent one: `buildOk` is false and `notes` says no build command was given.
+1. Verify with the build command the prompt names, run as given. Parallel siblings share the checkout, so the prompt owns build-dir isolation: fill a `<BUILD>` placeholder with `mktemp -d` when it has one, and otherwise run the command unchanged. Without one, resolve the repository's build contract before editing: its instructions carry a `Build contract:` line naming a skill file, whose invocation you run for your own scope. Never invent, infer or compose a command: with no command, or a contract that is missing, unreadable or defines no invocation for your scope, `buildOk` is false and `notes` says which.
 2. Capture `git diff --stat -- <your scope>` as a single string for `diffstat`.
 
 ## Output contract

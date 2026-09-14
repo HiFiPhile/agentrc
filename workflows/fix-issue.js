@@ -68,7 +68,10 @@ const triage = await agent(
   'blocker and the decision the human must take in one line; documented dependency setup is not a blocker. ' +
   'scope: the directories or files the change touches, new ones included.\n' +
   "verify: the build or test command the repository's instructions (CLAUDE.md, AGENTS.md) name for a change of this kind, " +
-  'one board where boards exist, `<BUILD>` allowed for a private build dir; null when none is named. ' +
+  'one board where boards exist, `<BUILD>` allowed for a private build dir. When those instructions name a build contract ' +
+  'instead of a command (a `Build contract:` line pointing at a skill file), read that file and return the concrete ' +
+  'invocation it defines for this scope, not the pointer. null when the repository names neither, and null too when a ' +
+  'named contract is missing, unreadable, or defines no invocation for this scope: never infer or compose a substitute. ' +
   'validate: the saved validation workflow those instructions name; read its source, not only its meta, and choose args that ' +
   'disable its internal repairs and its own review stages (a coworker lane reviews later) and set its base to the current HEAD ' +
   'SHA: { name, args, limitation: null }. When it cannot be run that way, { name, args: null, limitation: <why> }; null only ' +
