@@ -38,15 +38,26 @@ TAG_KINDS = {
     "datasheet": "datasheet", "data sheet": "datasheet",
     "user manual": "user-manual", "user guide": "user-manual", "user's guide": "user-manual",
     "application note": "application-note",
+    "technical reference": "reference-manual",
     "schematic": "schematic", "schematics": "schematic",
 }
-# Fallback for untagged books: the vendor prefix that opens the title.
+# Fallback for untagged books: the vendor prefix that opens the title, then the
+# document word. A databook is an IP core's reference manual by another name.
 TITLE_KINDS = (
     (r"^rm\d", "reference-manual"), (r"^es\d", "errata"), (r"^ds\d", "datasheet"),
     (r"^um\d", "user-manual"), (r"^pm\d", "programming-manual"), (r"^an\d", "application-note"),
     (r"\berrata\b", "errata"), (r"\breference manual\b", "reference-manual"),
+    (r"\bdatabook\b", "reference-manual"), (r"\btechnical reference\b", "reference-manual"),
+    (r"\bcore reference\b", "reference-manual"),
+    (r"\bprogramming guide\b", "programming-manual"),
+    (r"\buser'?s? manual\b", "user-manual"),
     (r"\bdatasheet\b", "datasheet"), (r"\bapplication note\b", "application-note"),
 )
+
+# A USB controller core's own documentation is the register reference for every
+# MCU that licensed it, and some of it is titled with no document word at all
+# ("Mentor MUSBMHDRC USB 2.0 Multi-Point Dual-Role Controller").
+CORE_TAGS = ("dwc2", "dwc3", "chipidea", "musb")
 
 QUERY = """
 SELECT b.id, b.title, b.path,
@@ -82,14 +93,15 @@ def kind_of(title, tags):
     Kinds are tried in KINDS order so a book tagged both "errata" and
     "datasheet" classifies the same way whatever order Calibre returns.
     """
-    kinds = {TAG_KINDS[t] for t in tag_list(tags) if t in TAG_KINDS}
+    named = tag_list(tags)
+    kinds = {TAG_KINDS[t] for t in named if t in TAG_KINDS}
     if kinds:
         return min(kinds, key=KINDS.index)
     t = norm(title)
     for pattern, kind in TITLE_KINDS:
         if re.search(pattern, t):
             return kind
-    return "other"
+    return "reference-manual" if set(CORE_TAGS) & set(named) else "other"
 
 
 def resolve(bid, path, fmt, name):

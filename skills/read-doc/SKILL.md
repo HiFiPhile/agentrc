@@ -65,6 +65,15 @@ rarely in the metadata. `--any` only changes anything with two or more
 keywords. Still nothing → say the document is missing rather than answering
 from memory.
 
+A peripheral is often a licensed IP core whose own databook is the register
+authority the MCU manual abbreviates. Those documents carry no part number, so a
+search for the MCU alone never returns them: search the core name too. Get the
+core from the MCU manual's own USB chapter, or in a tinyusb checkout from the
+supported-device table in `README.rst`, whose driver column names it per part,
+rather than assuming: neighbouring parts from one vendor do not always share
+one. Read the integration chapter as well as the core document: wiring, clocks
+and errata are the MCU's, and only the MCU's manual is authoritative for them.
+
 Set `CALIBRE_LIBRARY` to search a library elsewhere.
 
 ## Find the page

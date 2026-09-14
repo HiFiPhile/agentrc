@@ -513,6 +513,12 @@ class Kinds(unittest.TestCase):
                             ('ES0392 device errata', 'errata'),
                             ('DS12110 STM32H743VI', 'datasheet'),
                             ('AN4839 Level 1 cache', 'application-note'),
+                            # An IP core's databook is its reference manual.
+                            ('DesignWare Cores USB 2.0 Hi-Speed On-The-Go (OTG) Databook, Version 4.20a',
+                             'reference-manual'),
+                            ('DesignWare Cores USB 2.0 OTG Programming Guide, Version 4.20a',
+                             'programming-manual'),
+                            ("RX651 Group User's Manual: Hardware", 'user-manual'),
                             ('USB 2.0 specs', 'other')):
             self.assertEqual(search.kind_of(title, None), kind, title)
 
