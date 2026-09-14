@@ -229,9 +229,8 @@ const dismissalKey = (f) => f.findingId
 const unresolvedVerdict = (cycles, deferred, dryRun = false) =>
   ({ pass: false, cycles, history, reason: 'deferred-replies-unresolved', deferred, dryRun })
 
-// Backoff between cycles that have nothing to do but wait. Degrades to a no-op
-// rather than throwing if the workflow host has no timer.
-const nap = (ms) => new Promise(res => { if (typeof setTimeout === 'function') setTimeout(res, ms); else res() })
+// Backoff between cycles that have nothing to do but wait.
+const nap = (ms) => new Promise(res => setTimeout(res, ms))
 
 // Canonicalize a repo-relative path for set/collision comparison: resolve ./..
 // segments, unify separators; '' for a path that escapes the repo or whose
