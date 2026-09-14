@@ -35,7 +35,7 @@ from search import DB, LIB, norm, resolve, tag_list  # noqa: E402
 INDEX = os.path.join(LIB, ".read-doc")
 # pdftotext's output changes with its options; bump VERSION when either changes.
 EXTRACTOR = ["pdftotext", "-layout"]
-VERSION = 1
+VERSION = 2
 JOBS, MAX_JOBS = 4, 32
 CONTEXT, LIMIT, MAX_CHARS, MIN_CHARS = 2, 5, 4000, 80
 # Not technical documentation. Matched as whole tags, never a substring of one.
@@ -109,7 +109,9 @@ def read_index(bid):
     if not isinstance(meta, dict):
         return None, None
     pages = split_pages(body)
-    return (meta, pages) if meta.get("pages") == len(pages) else (None, None)
+    # Page count alone misses a body truncated inside its last page.
+    intact = meta.get("pages") == len(pages) and meta.get("chars") == len(body)
+    return (meta, pages) if intact else (None, None)
 
 
 def is_current(meta, bid, src):
@@ -153,10 +155,14 @@ def extract(bid, src):
         pages = len(split_pages(body))
         if pages != expected:
             raise Unavailable(f"{bid}: extracted {pages} pages, pdfinfo says {expected}")
+        if not body.strip():
+            raise Unavailable(f"{bid}: {expected} page(s) with no text layer (scanned or drawn);"
+                              " read the pages themselves, `find` cannot search it")
         if stat_of(src) != before:
             raise Unavailable(f"{bid}: the source changed while it was being extracted")
         meta = {"id": bid, "path": os.path.relpath(src, LIB), "size": before[0],
-                "mtime_ns": before[1], "pages": pages, "extractor": EXTRACTOR, "version": VERSION}
+                "mtime_ns": before[1], "pages": pages, "chars": len(body),
+                "extractor": EXTRACTOR, "version": VERSION}
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(meta) + "\n" + body)
         os.replace(tmp, text_path(bid))
@@ -201,7 +207,11 @@ def ensure(bid):
     return read_index(bid)
 
 
-def score(line, term):
+# The rows that follow a register's name where the whole definition is a block.
+DEFINITION_ROWS = re.compile(r"^(offset|address offset|reset( value)?|name|access|bits?)\b\s*[:\s]", re.I)
+
+
+def score(line, term, following=()):
     """Rank a definition above a mention: the register's own section, not a cross-reference.
 
     Every shape below is a real heading in this library, and each rule matches
@@ -232,6 +242,8 @@ def score(line, term):
     # Four, not three: a bare "..." is prose, on 8k lines of a 250-book sample.
     if re.search(r"(?:\.\s*){4,}", low):
         points -= 4
+    if sum(bool(DEFINITION_ROWS.match(f.strip())) for f in following) >= 2:
+        points += 3
     return points
 
 
@@ -246,16 +258,19 @@ def find(pages, term, context, limit, offset, max_chars):
         lines = page.split("\n")
         for i, line in enumerate(lines):
             if norm(term) in norm(line):
-                hits.append((-score(line, term), pno, i, lines))
+                hits.append((-score(line, term, lines[i + 1:i + 4]), pno, i, lines))
     if not hits:
         return 0, []
     hits.sort(key=lambda h: h[:3])
-    # Two hits a line apart would print nearly the same window twice.
-    merged, taken = [], []
+    # Two hits a line apart would print nearly the same window twice. Checking
+    # only the lines already taken on that page keeps a common term like "EN"
+    # from turning this into a scan of every hit so far.
+    merged, taken = [], {}
     for hit in hits:
-        if not any(p == hit[1] and abs(i - hit[2]) <= context for p, i in taken):
+        lines_taken = taken.setdefault(hit[1], set())
+        if not any(i in lines_taken for i in range(hit[2] - context, hit[2] + context + 1)):
             merged.append(hit)
-            taken.append((hit[1], hit[2]))
+            lines_taken.add(hit[2])
     blocks, used = [], 0
     for _, pno, i, lines in merged[offset:offset + limit]:
         window = [l.rstrip() for l in lines[max(0, i - context):i + context + 1] if l.strip()]
@@ -325,7 +340,7 @@ def build(args):
             return "indexed", None
         except Unavailable as e:
             return "unavailable", str(e)
-        except OSError as e:
+        except (OSError, sqlite3.Error) as e:
             return "failed", f"{bid}: {e}"
 
     started = time.time()
@@ -367,7 +382,8 @@ def find_cmd(args):
         raise Unavailable(f"{args.book}: the index file is unreadable; delete it and retry")
     total, blocks = find(pages, args.term, args.context, args.limit, args.offset, args.max_chars)
     if not total:
-        print(f"{args.book}: no page contains {args.term!r} ({meta['pages']} pages searched)")
+        print(f"{args.book}: {args.term!r} is not in the extracted text of any page "
+              f"({meta['pages']} pages searched); a figure or scan holds none")
         return 1
     print(f"{args.book}: {total} line(s) contain {args.term!r} in {meta['pages']} pages;"
           f" showing {len(blocks)}" + (f" from {args.offset}" if args.offset else "")
@@ -414,7 +430,7 @@ def main(argv):
     except Unavailable as e:
         print(e, file=sys.stderr)
         return 3
-    except OSError as e:
+    except (OSError, sqlite3.Error) as e:
         print(f"{type(e).__name__}: {e}", file=sys.stderr)
         return 3
 

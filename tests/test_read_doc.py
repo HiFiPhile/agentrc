@@ -172,8 +172,9 @@ class Find(unittest.TestCase):
 
 
 class Manifest(unittest.TestCase):
-    META = {'id': 7, 'path': 'Vendor/x.pdf', 'size': 10, 'mtime_ns': 99,
-            'pages': 2, 'extractor': locate.EXTRACTOR, 'version': locate.VERSION}
+    BODY = 'one\ftwo\f'
+    META = {'id': 7, 'path': 'Vendor/x.pdf', 'size': 10, 'mtime_ns': 99, 'pages': 2,
+            'chars': len(BODY), 'extractor': locate.EXTRACTOR, 'version': locate.VERSION}
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -201,8 +202,11 @@ class Manifest(unittest.TestCase):
         self.assertFalse(locate.is_current(None, 7, self.src))
 
     def test_a_body_that_lost_pages_is_rejected_rather_than_renumbered(self):
-        (self.index / '7.txt').write_text(json.dumps({**self.META, 'pages': 5}) + '\none\ftwo\f')
+        (self.index / '7.txt').write_text(json.dumps({**self.META, 'pages': 5}) + '\n' + self.BODY)
         self.assertEqual(locate.read_index(7), (None, None))
+        truncated = self.BODY[:-3]
+        (self.index / '7.txt').write_text(json.dumps(self.META) + '\n' + truncated)
+        self.assertEqual(locate.read_index(7), (None, None), 'a body cut inside its last page')
         self.assertIsNotNone(locate.read_header(7), 'the header alone still reads, for the bulk check')
 
     def test_the_bulk_check_reads_only_the_header_not_the_pages(self):
@@ -233,7 +237,7 @@ class Manifest(unittest.TestCase):
             self.assertIsNone(locate.read_header(7), repr(bad))
 
     def test_the_manifest_is_read_from_the_same_file_as_its_pages(self):
-        (self.index / '7.txt').write_text(json.dumps(self.META) + '\none\ftwo\f')
+        (self.index / '7.txt').write_text(json.dumps(self.META) + '\n' + self.BODY)
         meta, pages = locate.read_index(7)
         self.assertEqual(meta['id'], 7)
         self.assertEqual(pages, ['one', 'two'])
@@ -289,6 +293,17 @@ class Extract(unittest.TestCase):
         fresh = locate.extract(4, str(self.src))
         self.assertEqual(fresh['mtime_ns'], locate.stat_of(self.src)[1])
         self.assertTrue(locate.is_current(locate.read_header(4), 4, str(self.src)), 're-extraction heals it')
+
+    def test_a_pdf_with_no_text_layer_is_unavailable_not_an_empty_document(self):
+        """A scan extracts to blank pages; calling that "indexed" would turn
+        every later lookup into a false claim that the term is absent."""
+        self.addCleanup(setattr, locate, 'EXTRACTOR', locate.EXTRACTOR)
+        # three blank pages, the shape pdftotext gives for a scan
+        locate.EXTRACTOR = ['sh', '-c', 'printf "\\f\\f\\f" > "$2"', '_']
+        with self.assertRaises(locate.Unavailable) as e:
+            locate.extract(4, str(self.src))
+        self.assertIn('text layer', str(e.exception))
+        self.assertEqual(os.listdir(locate.INDEX), [], 'nothing cached for an unusable book')
 
     def test_a_pdftotext_failure_is_unavailable_and_leaves_nothing_behind(self):
         self.addCleanup(setattr, locate, 'EXTRACTOR', locate.EXTRACTOR)
@@ -586,6 +601,28 @@ class Usage(unittest.TestCase):
     def test_a_term_that_looks_like_an_option_is_still_a_term(self):
         code, out = self.run_script('locate.py', 'find', '--book', '1', '--term=--book')
         self.assertNotEqual(code, 2, out)
+
+    def unavailable(self, library, script, *args):
+        env = dict(os.environ, CALIBRE_LIBRARY=str(library))
+        done = subprocess.run([sys.executable, str(SCRIPTS / script), *args],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(done.returncode, 3, f'{script} {args}: {done.stdout}{done.stderr}')
+
+    def test_a_missing_library_is_unavailable_in_both_scripts_not_a_miss(self):
+        """Exit 1 is evidence a caller acts on; an absent library must never
+        produce it."""
+        self.unavailable('/nonexistent/calibre-library', 'search.py', 'stm32')
+        self.unavailable('/nonexistent/calibre-library', 'locate.py', 'build', '--all')
+
+    def test_a_corrupt_database_is_unavailable_not_a_miss(self):
+        """A present but unreadable metadata.db reaches sqlite, which the
+        missing-library case never does: `build` stops at its writability check
+        and search never opens the file."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        (Path(tmp.name) / 'metadata.db').write_text('this is not a database')
+        self.unavailable(tmp.name, 'search.py', 'stm32')
+        self.unavailable(tmp.name, 'locate.py', 'find', '--book', '1', '--term', 'x')
 
     def test_search_with_no_keyword_prints_usage(self):
         code, out = self.run_script('search.py')

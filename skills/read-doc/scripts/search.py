@@ -11,7 +11,7 @@ and the base documentation first: the manual, specification or datasheet a
 register question is answered from, before the errata that amend it and the
 application notes that use it.
 
-Exit 0 matched, 1 nothing matched, 2 bad usage or no library.
+Exit 0 matched, 1 nothing matched, 2 bad usage, 3 the library is unavailable.
 """
 import argparse
 import contextlib
@@ -32,38 +32,45 @@ LIMIT = 10
 # less — they override it — but because they are read in addition to it.
 KINDS = ("reference-manual", "specification", "datasheet", "errata",
          "programming-manual", "user-manual", "application-note", "schematic", "other")
-# Which kind wins when a book carries several kind tags. A different question
-# from display order: a book tagged both errata and datasheet is still errata.
-TAG_PRECEDENCE = ("reference-manual", "errata", "datasheet", "specification",
+# Which kind wins when a book carries several kind tags, or its title several
+# document words. A different question from display order: an errata amending a
+# reference manual names both, and is errata.
+TAG_PRECEDENCE = ("errata", "reference-manual", "datasheet", "specification",
                   "programming-manual", "user-manual", "application-note", "schematic", "other")
-# Whole tag (normalized) -> kind. Never a substring test: many books carry a
-# whole abstract as one tag, and "this application note..." is not a kind.
-TAG_KINDS = {
+# One vocabulary for the document words, read from a book's tags and from its
+# title. Never a substring of a tag: many books carry a whole abstract as one,
+# and "this application note..." is not a kind.
+ALIASES = {
     "errata": "errata", "board errata": "errata",
-    "reference manual": "reference-manual",
-    "programming manual": "programming-manual",
+    "reference manual": "reference-manual", "technical reference": "reference-manual",
+    "databook": "reference-manual", "core reference": "reference-manual",
+    "programming manual": "programming-manual", "programming guide": "programming-manual",
     "datasheet": "datasheet", "data sheet": "datasheet",
-    "user manual": "user-manual", "user guide": "user-manual", "user's guide": "user-manual",
+    # Every spelling below is one the library actually uses.
+    "user manual": "user-manual", "users manual": "user-manual",
+    "user's manual": "user-manual",
+    "user guide": "user-manual", "users guide": "user-manual",
+    "user's guide": "user-manual",
     "application note": "application-note",
-    "technical reference": "reference-manual",
+    "schematic": "schematic",
+    # A product or protocol specification is a document type, not a claim about
+    # hardware: an API specification is one too.
     "specification": "specification",
-    "schematic": "schematic", "schematics": "schematic",
 }
-# Fallback for untagged books: the vendor prefix that opens the title, then the
-# document word. A databook is an IP core's reference manual by another name.
-TITLE_KINDS = (
+# The vendor prefix that opens a title, read before any document word.
+TITLE_PREFIXES = (
     (r"^rm\d", "reference-manual"), (r"^es\d", "errata"), (r"^ds\d", "datasheet"),
     (r"^um\d", "user-manual"), (r"^pm\d", "programming-manual"), (r"^an\d", "application-note"),
-    (r"\berrata\b", "errata"), (r"\breference manual\b", "reference-manual"),
-    (r"\bdatabook\b", "reference-manual"), (r"\btechnical reference\b", "reference-manual"),
-    (r"\bcore reference\b", "reference-manual"),
-    (r"\bprogramming guide\b", "programming-manual"),
-    (r"\buser'?s? manual\b", "user-manual"),
-    (r"\bdatasheet\b", "datasheet"), (r"\bapplication note\b", "application-note"),
-    # Last, so "Specification ... Errata" and "AN.... Specification" keep their
-    # kind. A product or protocol specification is a document type, not a claim
-    # about hardware: an API specification is one too.
-    (r"\bspecifications?\b", "specification"),
+)
+# One compiled table, used two ways: fullmatch against a whole tag, search
+# inside a title. Ordered by TAG_PRECEDENCE, so a title carrying two document
+# words resolves the same way a book carrying two kind tags does: "Reference
+# Manual Errata" is errata. Length breaks ties within one kind. Trailing s? for
+# the plural in a title ("...User Guides"); no other inflection is accepted.
+DOC_WORDS = tuple(
+    (re.compile(r"\b" + r"\s+".join(map(re.escape, a.split())) + r"s?\b"), kind)
+    for a, kind in sorted(ALIASES.items(),
+                          key=lambda kv: (TAG_PRECEDENCE.index(kv[1]), -len(kv[0])))
 )
 
 # A USB controller core's own documentation is the register reference for every
@@ -90,8 +97,10 @@ _authors = None
 
 
 def norm(s):
-    # NFKC + casefold so MICRO SIGN/GREEK MU, curly quotes and dashes compare equal.
-    return unicodedata.normalize("NFKC", s).casefold()
+    # NFKC + casefold so MICRO SIGN/GREEK MU and dashes compare equal. NFKC
+    # leaves the curly apostrophe alone, so fold it too: the library spells
+    # "User's Manual" both ways.
+    return unicodedata.normalize("NFKC", s).casefold().replace("\u2019", "'")
 
 
 def tag_list(tags):
@@ -100,18 +109,21 @@ def tag_list(tags):
 
 
 def kind_of(title, tags):
-    """The document kind, from an exact tag, else the title, else "other".
+    """The document kind, from a whole tag, else the title, else "other".
 
-    Kinds are tried in KINDS order so a book tagged both "errata" and
-    "datasheet" classifies the same way whatever order Calibre returns.
+    A book tagged both "errata" and "datasheet" classifies by TAG_PRECEDENCE,
+    so the answer does not depend on the order Calibre returns the tags in.
     """
     named = tag_list(tags)
-    kinds = {TAG_KINDS[t] for t in named if t in TAG_KINDS}
+    kinds = {kind for pattern, kind in DOC_WORDS for tag in named if pattern.fullmatch(tag)}
     if kinds:
         return min(kinds, key=TAG_PRECEDENCE.index)
     t = norm(title)
-    for pattern, kind in TITLE_KINDS:
-        if re.search(pattern, t):
+    for pattern, kind in TITLE_PREFIXES:
+        if re.match(pattern, t):
+            return kind
+    for pattern, kind in DOC_WORDS:
+        if pattern.search(t):
             return kind
     return "reference-manual" if set(CORE_TAGS) & set(named) else "other"
 
@@ -149,8 +161,7 @@ def parser():
     return p
 
 
-def main(argv):
-    args = parser().parse_args(argv)
+def run(args):
     keywords = [norm(k) for k in args.keyword]
     if not keywords:
         parser().print_help(sys.stderr)
@@ -158,10 +169,6 @@ def main(argv):
     if args.limit < 0:
         print("--limit cannot be negative", file=sys.stderr)
         return 2
-    if not os.path.exists(DB):
-        print(f"no Calibre database at {DB}", file=sys.stderr)
-        return 2
-
     with contextlib.closing(sqlite3.connect("file:" + urllib.parse.quote(DB) + "?mode=ro",
                                             uri=True)) as db:
         rows = db.execute(QUERY).fetchall()
@@ -202,6 +209,17 @@ def main(argv):
             p = resolve(bid, path, fmt, name)
             print(f"  {fmt} {p}" if p else f"  {fmt} MISSING (library mid-sync or file deleted)")
     return 0
+
+
+def main(argv):
+    """Exit 3 covers the whole run, not just the query: --path walks the
+    library tree, and a half-synced one must not read as "nothing matched"."""
+    args = parser().parse_args(argv)
+    try:
+        return run(args)
+    except (OSError, sqlite3.Error) as e:
+        print(f"the Calibre library at {LIB} is unavailable: {e}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

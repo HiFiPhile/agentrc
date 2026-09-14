@@ -53,8 +53,11 @@ python3 <skill dir>/scripts/search.py RT1060 RT1064 --any
 python3 <skill dir>/scripts/search.py --kind reference-manual stm32h7
 ```
 
-Exit 0 matched, 1 nothing matched, 2 bad usage or no library — 2 means the
-search never ran, so fix the invocation instead of broadening.
+Both scripts use one exit-code contract: 0 a result, 1 searched and found
+nothing, 2 bad usage, 3 the library, a PDF or the index was unavailable. Only 1
+is evidence; 2 and 3 mean the search never ran, so fix the invocation, or
+report the component the message names as unavailable, instead of broadening
+the keywords. An unsearchable PDF is not an unreachable library.
 
 One match → use it. Several → the kind counts say whether the right kind is
 even present; narrow with `--kind` or another keyword rather than reading the
@@ -90,10 +93,16 @@ searches the document's text and answers with the physical PDF pages to open:
 python3 <skill dir>/scripts/locate.py find --book 2125 --term SIE_CTRL
 ```
 
-It ranks a register's own definition above passing mentions, prints a few
+It prefers a register's own definition to a passing mention, prints a few
 context lines per hit, and pages with `--offset`. `--context`, `--limit` and
-`--max-chars` bound the output. Exit 1 means the term is absent from the whole
-document, which is evidence: say so rather than assuming the wrong document.
+`--max-chars` bound the output. The ranking is a heuristic over the page text,
+not a guarantee: when the first excerpts are cross-references, keep going with
+`--offset` rather than concluding the document does not define the term.
+
+Exit 1 means the term is in no page's *extracted text*. That is evidence about
+the text layer, not about the document: a drawn schematic, a scanned page or a
+figure carries none. On a document you expect to be graphical, open the PDF
+pages directly before reporting the register as undocumented.
 
 The first lookup of a book extracts it (one to three seconds for a large
 manual); later ones are immediate. The text lives in `<library>/.read-doc/`,
@@ -107,10 +116,14 @@ python3 <skill dir>/scripts/locate.py build --book 2125    # one book
 ```
 
 It re-extracts only what changed, so a run over an unchanged library costs a
-stat per book (0.2 s for 4800), and it prunes books that lost their PDF. It
+stat per book, and it prunes books that lost their PDF. It does retry the books
+with no text layer, cheaply and in case one was replaced by a better scan: 3 s
+for 4800 books, of which 4750 are only stat'ed. It
 compares against the source, not the extracted text, so it reindexes a replaced
-revision but does not scrub a damaged one; a damaged extraction is caught and
-redone by the `find` that needs it. Run it after importing documents, or
+revision without re-reading the index. A `find` checks the page count and
+length its index file claims, so an extraction cut short is caught and redone;
+content corrupted in place at the same length is not, which is why extraction
+writes a temporary file and renames it. Run it after importing documents, or
 nightly:
 
 ```cron
@@ -119,8 +132,8 @@ nightly:
 
 Photography books are skipped by tag (`--skip-tag` replaces that list); a
 `find` on one still indexes it, since skipping is a build cost, not a reading
-policy. Exit 3 means the library, a PDF or the index was unavailable — the
-message names which, and the build did not silently do less than it claims.
+policy. Exit 3 names what was unavailable — including a PDF with no text layer
+at all — and the build did not silently do less than it claims.
 
 Calibre's Check Library lists `.read-doc` as an invalid author directory. Add
 it to that dialog's ignore-names field once per library; nothing else in
@@ -160,4 +173,4 @@ the next reader can reopen it.
   would have named the page for.
 - Quoting a bitfield table from a text excerpt. Open the page.
 - Requiring all keywords to match — broaden, or use `--any`, on zero hits.
-- Treating a `MISSING` file, or an exit 2, as proof the document is absent.
+- Treating a `MISSING` file, or an exit 2 or 3, as proof the document is absent.
