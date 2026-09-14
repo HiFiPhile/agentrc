@@ -17,7 +17,17 @@ When changing register-level logic, cross-check the MCU reference manual / datas
 
 ## Finish checklist (in order)
 
-1. Verify with the build command the prompt names, run as given. Parallel siblings share the checkout, so the prompt owns build-dir isolation: fill a `<BUILD>` placeholder with `mktemp -d` when it has one, and otherwise run the command unchanged. Without one, resolve the repository's build contract before editing: its instructions carry a `Build contract:` line naming a skill file, whose invocation you run for your own scope. Never invent, infer or compose a command: with no command, or a contract that is missing, unreadable or defines no invocation for your scope, `buildOk` is false and `notes` says which.
+1. Build. Which command you run depends on what the prompt gave you.
+
+   **The prompt names a command** — run it exactly as given. Fill a `<BUILD>` placeholder with `mktemp -d` first; parallel siblings share the checkout, so the prompt owns build-dir isolation.
+
+   **The prompt names none** — resolve the repository's build contract, before editing, in this order:
+
+   1. Read the repository's instruction file and find its `Build contract:` line. It names a skill file.
+   2. Read that skill file.
+   3. Run the invocation it defines, for your own scope, as it defines it.
+
+   Writing your own build command is a failure of this step, not a fallback from it. A `cmake`, `make`, `ninja` or `tools/build.py` line you assembled yourself is not evidence, however cleanly it builds and however obvious it looks — the contract exists because the project's real build has flags, directories and targets your line will not have. If there is no `Build contract:` line, or the file it names is missing or unreadable, or it defines no invocation for your scope, stop there: `buildOk` is false and `notes` says which of those it was. Reporting that is a correct outcome; inventing a command to avoid it is not.
 2. Capture `git diff --stat -- <your scope>` as a single string for `diffstat`.
 
 ## Output contract
