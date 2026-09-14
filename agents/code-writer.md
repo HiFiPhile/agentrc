@@ -26,7 +26,7 @@ When changing register-level logic, cross-check the MCU reference manual / datas
    1. Read the repository's instruction file and find its `Build contract:` line. It names a skill file.
    2. Read that skill file.
    3. Run the invocation it defines, for your own scope, as it defines it.
-   4. Report the result the way the contract says to. A contract may define an outcome that is neither a pass nor a failure — that nothing in your scope is a thing a build can verify — and it says which of those its outcome is and what `buildOk` should then be. Take that from the contract and put its stated reason in `notes`; never decide for yourself that a scope did not need building.
+   4. Report `buildOk` and `notes` exactly as the build contract specifies, including when the scope has no build-verifiable work.
 
    Writing your own build command is a failure of this step, not a fallback from it. A `cmake`, `make`, `ninja` or `tools/build.py` line you assembled yourself is not evidence, however cleanly it builds and however obvious it looks — the contract exists because the project's real build has flags, directories and targets your line will not have. If there is no `Build contract:` line, or the file it names is missing or unreadable, or it defines no invocation for your scope, stop there: `buildOk` is false and `notes` says which of those it was. Reporting that is a correct outcome; inventing a command to avoid it is not.
 2. Capture `git diff --stat -- <your scope>` as a single string for `diffstat`.
