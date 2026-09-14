@@ -380,7 +380,7 @@ const fixAndVerify = async (workIn) => {
         `${IN_CHECKOUT}Verify the uncommitted changes for ${scopeOf(w)} (use git diff -- <the files above>, and read any newly created untracked files directly) address these issues:\n- ${textOf(w)}\n` +
         'Return {"addresses": bool, "reason": string}.',
         { label: `check:${w.key}`, phase: 'Fix', agentType: 'finding-verifier', schema: CHECK },
-      ).catch(() => null)
+      ).catch(e => { log(`check:${w.key} errored — ${e && e.message}`); return null })
         .then(v => verdictOf(fix, w, !!(v && v.addresses), v ? v.reason : 'verifier died'))
     },
   )
