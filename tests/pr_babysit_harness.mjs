@@ -86,7 +86,7 @@ async function run(opts = {}) {
       if (opts.fix === null) return null // a dead code-writer
       return {
         item: label.slice(4), diffstat: `stat:${label.slice(4)}`,
-        buildOk: true, notes: '', ...opts.fix,
+        buildOk: true, board: '', notes: '', ...opts.fix,
       }
     }
     if (label.startsWith('replies#') || label.startsWith('resolve#')) {
@@ -490,7 +490,12 @@ test('the fixer is told to stage nothing, and how to verify', async () => {
   assert.match(fix.prompt, /Do not stage or commit: leave your changes in the working tree for this workflow to publish\./)
   assert.match(fix.prompt, /Verify with the repository's build contract, resolved for your scope; do not invent a command\./)
   assert.doesNotMatch(fix.prompt, /cmake|get_deps|BOARD=/, 'no repository-specific recipe is baked in')
-  assert.deepEqual(fix.schema.required.slice().sort(), ['buildOk', 'diffstat', 'item', 'notes'])
+  // Read the expected keys from code-writer's own output contract. A list
+  // hardcoded here pins whatever the schema happens to say, which is how `board`
+  // came to be rejected: the role always returns it, and this schema forbade it.
+  const roleKeys = [...readFileSync(new URL('../agents/code-writer.md', import.meta.url), 'utf8')
+    .match(/^\{"item".*\}$/m)[0].matchAll(/"(\w+)":/g)].map(m => m[1]).sort()
+  assert.deepEqual(fix.schema.required.slice().sort(), roleKeys)
   const built = await run({ reviews: oneValid, args: { build: '  make check  ' } })
   const fix2 = built.calls.find(c => c.label.startsWith('fix:'))
   assert.match(fix2.prompt, /Verify with: make check \(a `<BUILD>` placeholder becomes a fresh `mktemp -d`\)\./)

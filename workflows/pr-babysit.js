@@ -132,12 +132,15 @@ const REVIEWS = {
     done: { type: 'boolean' },
   },
 }
+// code-writer's output contract, verbatim: a schema that omits a key the role
+// always returns rejects a role-conformant reply. `board` is unused here and
+// still declared for that reason.
 const DEV = {
   type: 'object', additionalProperties: false,
-  required: ['item', 'diffstat', 'buildOk', 'notes'],
+  required: ['item', 'diffstat', 'buildOk', 'board', 'notes'],
   properties: {
     item: { type: 'string' }, diffstat: { type: 'string' }, buildOk: { type: 'boolean' },
-    notes: { type: 'string' },
+    board: { type: 'string' }, notes: { type: 'string' },
   },
 }
 const CHECK = {
