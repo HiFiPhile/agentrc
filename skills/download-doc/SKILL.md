@@ -95,6 +95,14 @@ python3 <skill dir>/scripts/sync.py st --family STM32H7 --types datasheet,errata
 python3 <skill dir>/scripts/sync.py nxp --types errata --device "i.MX RT" --apply
 ```
 
+After an `--apply` run, reindex so `read-doc` can find pages in the revisions it
+replaced. The command reconciles the whole library but extracts only the PDFs
+that are missing or whose source changed:
+
+```bash
+python3 ~/.claude/skills/read-doc/scripts/locate.py build --all
+```
+
 `--apply` refuses to run while something else holds the library:
 
 - **The Calibre GUI holds an exclusive write lock.** Ask the user to close it; don't
