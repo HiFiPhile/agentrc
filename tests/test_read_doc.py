@@ -5,6 +5,7 @@ every refusal is explicit rather than a silent default."""
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -106,6 +107,54 @@ class Find(unittest.TestCase):
             self.assertLessEqual(len(blocks[0]), cap, f'cap {cap} exceeded')
             self.assertTrue(blocks[0].startswith('p1'), f'cap {cap} lost the page number')
             self.assertTrue(blocks[0].endswith(locate.TRUNCATED), f'cap {cap} hid the truncation')
+
+    def test_a_definition_line_outranks_prose_that_merely_names_the_register(self):
+        # Every shape here is a real line from the library; the prose lines are
+        # what used to win, sending the reader to a cross-reference.
+        definitions = ['Bit 15 VTRX: USB valid transaction received',
+                       '40.6.7      USB endpoint/channel n register (USB_CHEPnR)',
+                       'USB: SIE_CTRL Register',
+                       'ERR006223: Failure to resume from WAIT/STOP mode with power gating']
+        prose = ['USB_CHEPnR register) for reception double-buffered bulk endpoints or DTOGTX (bit 6 of',
+                 'controls for EP0 come from SIE_CTRL. The VTRX bit is set by hardware when a transfer',
+                 'see ERR006223 for the workaround that applies to this configuration of the part']
+        for definition in definitions:
+            term = re.search(r'VTRX|USB_CHEPnR|SIE_CTRL|ERR006223', definition).group()
+            for mention in prose:
+                if term.lower() not in mention.lower():
+                    continue
+                self.assertGreater(locate.score(definition, term), locate.score(mention, term),
+                                   f'{term}: {definition!r} must outrank {mention!r}')
+
+    def test_a_register_heading_outranks_an_interrupt_bit_of_the_same_name(self):
+        # Both are definitions; the register's own page is the one a register
+        # question wants. This pair is RP2040 p405 against p414.
+        heading = 'USB: BUFF_STATUS Register'
+        bit_row = '4           BUFF_STATUS: Raised when any bit in BUFF_STATUS is set. Clear by clearing      RO     0x0'
+        self.assertGreater(locate.score(heading, 'BUFF_STATUS'), locate.score(bit_row, 'BUFF_STATUS'))
+        pages = ['x', 'y', bit_row, 'z', heading]
+        _, blocks = locate.find(pages, 'BUFF_STATUS', 0, 2, 0, 4000)
+        self.assertTrue(blocks[0].startswith('p5'), blocks[0])
+
+    def test_short_prose_does_not_collect_the_heading_bonus(self):
+        # Real pairs from RM0492: the prose is shorter than the heading, so
+        # length alone once ranked it first.
+        for term, prose, heading in (
+            ('USB_CNTR', '2. Clear SUSPEN bit of USB_CNTR register.', '40.6.1          USB control register (USB_CNTR)'),
+            ('USB_FNR', 'bits in the USB_FNR register.', '40.6.3          USB frame number register (USB_FNR)'),
+            # A sentence that wrapped leaves a line identical to a bare heading.
+            ('FLASH_NSSR', 'FLASH_NSSR register', '7.10.6          FLASH status register (FLASH_NSSR)'),
+            ('FLASH_NSSR', 'the FLASH_NSSR register', '7.10.6          FLASH status register (FLASH_NSSR)'),
+        ):
+            self.assertGreater(locate.score(heading, term), locate.score(prose, term), term)
+            _, blocks = locate.find([prose, 'x', heading], term, 0, 2, 0, 4000)
+            self.assertTrue(blocks[0].startswith('p3'), f'{term}: {blocks[0]}')
+
+    def test_a_table_of_contents_line_is_demoted_below_the_section_it_points_at(self):
+        term = 'USB_CHEPnR'
+        toc = '40.6.7      USB endpoint/channel n register (USB_CHEPnR) . . . . . . . . 1652'
+        heading = '40.6.7      USB endpoint/channel n register (USB_CHEPnR)'
+        self.assertLess(locate.score(toc, term), locate.score(heading, term))
 
     def test_hits_within_one_context_window_are_reported_once(self):
         pages = ['SIE_CTRL here\nand SIE_CTRL again\n\n\n\nfar below SIE_CTRL']

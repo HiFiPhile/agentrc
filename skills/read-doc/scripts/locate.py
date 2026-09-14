@@ -202,16 +202,34 @@ def ensure(bid):
 
 
 def score(line, term):
-    """Rank a definition above a mention: the register's own section, not a cross-reference."""
+    """Rank a definition above a mention: the register's own section, not a cross-reference.
+
+    Every shape below is a real heading in this library, and each rule matches
+    the structure of one: prose that merely contains the name cannot collect
+    them by accident. A table-of-contents entry is demoted, though one whose
+    dot leaders fall on the following line still reads as a heading here.
+    """
     stripped = line.strip()
-    low, t = norm(stripped), norm(term)
+    low, t = norm(stripped), re.escape(norm(term))
+    heading = len(stripped) < 60
     points = 0
-    if low.startswith(t):
-        points += 2
-    if re.search(re.escape(t) + r"\b.{0,20}\b(register|bit|field|erratum)\b", low):
-        points += 2
-    if len(stripped) < 60:
+    # Only the peripheral-prefixed heading, "USB: SIE_CTRL Register". A bare
+    # "SIE_CTRL register" line is just as often prose that wrapped, and ST's
+    # numbered headings are carried by the section rule below instead.
+    if re.match(r"\S{1,12}:\s+" + t + r"\s+register\s*$", low):
+        points += 4
+    if re.match(r"bits?\s+[\d:\[\]\s]*" + t + r"\b", low):  # "Bit 15 VTRX: ..."
+        points += 3
+    if re.match(r"\d+(\.\d+)+\s.*" + t, low):                # "40.6.7 ... (USB_CHEPnR)"
+        points += 3
+    if re.search(t + r"\s*[:\u2013-]", low):                  # "ERR006223: ..."
         points += 1
+    if re.search(t + r"\b.{0,20}\b(register|bit|field|erratum)\b", low):
+        points += 1
+    if heading:
+        points += 1
+    if re.search(r"\.\s\.\s\.", low):  # a table-of-contents leader, not the section itself
+        points -= 4
     return points
 
 
