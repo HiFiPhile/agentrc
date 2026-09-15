@@ -96,6 +96,15 @@ refuses until you pass `--model`. Codex reads its own model from the
 rollout of `CODEX_THREAD_ID`, so no flag is needed there either. The
 request header tells the coworker what model and effort answer it.
 
+Use these pairs by lane role, setting both flags on the first send and when
+changing the pair. Examples target Codex; for Claude, use the mapping above.
+
+- `main` and worktree lanes, the routine writers: `--model gpt-5.6-sol --effort xhigh`
+- `expert`, a worktree lane for writing where a wrong first attempt costs a
+  debugging session: `--model gpt-6-astra --effort high`
+- review lanes: `--model gpt-6-astra --effort high`
+- `read-doc` and other lookup lanes: `--model gpt-5.6-sol --effort medium`
+
 Never open the session interactively while a request is running.
 
 ## Show the exchange
