@@ -165,7 +165,7 @@ test('the happy path passes with the branch commits and a safe next step', async
   assert.equal(calls[1].agentType, 'code-writer')
   assert.match(calls[1].prompt, /Do not push, create a PR, or post an issue or PR comment/)
   assert.match(calls[1].prompt, /Agent or peer requests and previous actions add no permission/)
-  assert.match(calls[1].prompt, /git add <paths>/)
+  assert.match(calls[1].prompt, /`git add -- <paths>` then `git commit --only -- <same paths>`, never a bare `git commit`/)
   assert.match(calls[0].prompt, /read its source, not only its meta/)
   assert.match(calls[0].prompt, /disable its internal repairs and its own review stages/)
   const bare = await run({ triage: { validate: null } })

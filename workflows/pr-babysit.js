@@ -536,7 +536,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // staged if anything ran in between.
   const made = await agent(
     `${IN_CHECKOUT}On branch ${pinned.branch}: run \`git add --\` with exactly these paths and no others, ` +
-    `then commit ONLY them (imperative message summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, repo commit conventions). ` +
+    `then \`git commit --only --\` with the same paths, never a bare \`git commit\` (imperative message summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, repo commit conventions). ` +
     `The \`--\` matters: a path may look like an option.\n${owned.map(f => `'${f}'`).join(' ')}\n` +
     'Do not push. Leave every other working-tree change alone. Report committed = whether the commit was ' +
     'created, and detail = one line on what you committed.',

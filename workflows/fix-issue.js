@@ -101,7 +101,7 @@ const dev = await agent(
   'Meet them as written. If meeting them needs a substitution (another kernel, a dropped requirement, a different platform), ' +
   'do not implement the substitute: report buildOk false with notes starting `needs-user:` and the decision the human must take.\n' +
   `Repository: ${triage.repo}. Scope, touch nothing outside it: ${scope.join(', ')}. Verify with: ${verify}\n` +
-  `${STOPS} Commit your own scope by explicit path (\`git add <paths>\`, never \`git add -A\` or \`commit -a\`), imperative ` +
+  `${STOPS} Stage and commit only your own scope: \`git add -- <paths>\` then \`git commit --only -- <same paths>\`, never a bare \`git commit\`, \`git add -A\` or \`commit -a\`; imperative ` +
   "subject, no trailers, several logical commits are fine, only after the build and the repository's required pre-commit " +
   'checks pass; a hook failing on a partial change means regrouping paths, not bypassing it.',
   { label: 'implement', phase: 'Implement', agentType: 'code-writer', schema: DEV },

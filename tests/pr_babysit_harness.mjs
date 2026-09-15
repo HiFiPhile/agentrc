@@ -470,6 +470,7 @@ test('the publisher stages exactly the owned paths, never a protected one', asyn
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.ok(commit)
   assert.match(commit.prompt, /run `git add --` with exactly these paths and no others/)
+  assert.match(commit.prompt, /`git commit --only --` with the same paths, never a bare `git commit`/)
   assert.match(commit.prompt, /The `--` matters: a path may look like an option\./)
   assert.match(commit.prompt, /'hw\/bsp\/stm32f4\/family\.c'/)
   assert.doesNotMatch(commit.prompt, /rig\.json/, 'a protected path must never reach the index')
