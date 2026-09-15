@@ -246,6 +246,8 @@ test('args validation', async () => {
   await assert.rejects(run({ args: { reviewers: undefined } }), /reviewers must be an array/)
   await assert.rejects(run({ args: { ciWait: 0 } }), /ciWait must be a positive integer/)
   await assert.rejects(run({ args: { ciWait: 1.5 } }), /ciWait must be a positive integer/)
+  await assert.rejects(run({ args: { lane: 'review' } }), /lane must be 'both', 'ci' or 'reviews'/)
+  await assert.rejects(run({ args: { lane: 'ci' } }), /needs yieldAfterCycle/)
 })
 
 test('an unknown reviewer or a malformed protected pattern throws before any agent runs', async () => {
@@ -1683,6 +1685,94 @@ test('a rejected receipt that names a reply still blocks a repost', async () => 
   })
   assert.equal(calls.filter(c => c.label.startsWith('replies#')).length, 1, 'a second reply went over the untrusted one')
   assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'receipt for a different body' })
+})
+
+test('a ci launch watches CI and never runs the validator', async () => {
+  // Chief saw only a check conclude: this launch spends no opus on a harvest.
+  const { result, labels, logs } = await run({
+    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
+    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build', firstError: 'boom', files: ['src/a.c'], rigSide: false }] },
+  })
+  assert.equal(labels.some(l => l.startsWith('reviews#') || l.startsWith('challenge#') || l.startsWith('replies#')), false)
+  assert.ok(labels.some(l => l === 'ci#1'))
+  assert.ok(labels.some(l => l.startsWith('fix:')), 'the CI fix still runs')
+  assert.equal(result.status, 'paused')
+  assert.equal(result.observation.lane, 'ci')
+  assert.equal(result.observation.reviews, null, 'nobody looked at reviews')
+  assert.equal(result.history[0].reviews, null)
+  assert.match(summaries(logs)[0], /reviews not observed this launch/)
+})
+
+test('a ci launch cannot declare the PR done, even green', async () => {
+  const { result, logs } = await run({
+    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
+    ci: { status: 'green', infraRerun: [], realFailures: [] },
+  })
+  assert.equal(result.status, 'paused')
+  assert.equal(result.pass, false)
+  assert.ok(logs.some(l => /ci lane only — reviews not observed, no verdict this launch/.test(l)), logs.join('\n'))
+})
+
+test('a reviews launch runs no CI watcher and still fixes and pushes', async () => {
+  const { result, labels, logs } = await run({
+    args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3 },
+    reviews: oneValid,
+  })
+  assert.equal(labels.some(l => l.startsWith('ci#')), false)
+  assert.ok(labels.some(l => l.startsWith('push#')), 'the review push went out')
+  assert.equal(result.status, 'paused')
+  assert.equal(result.observation.lane, 'reviews')
+  assert.equal(result.observation.ci, null)
+  assert.match(summaries(logs)[0], /CI not observed this launch/)
+  assert.equal(result.state.expectedHead, shaFor(1), 'the pushed head is the next expectation')
+})
+
+test('a reviews launch with settled bots still declares nothing', async () => {
+  const { result, logs } = await run({
+    args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3 },
+    reviews: { findings: [], replies: [], done: true },
+  })
+  assert.equal(result.status, 'paused')
+  assert.ok(logs.some(l => /reviews lane only — CI not observed, no verdict this launch/.test(l)), logs.join('\n'))
+})
+
+test('the lane is not part of the state a launch must match', async () => {
+  const first = await run({ args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } })
+  assert.equal(first.result.state.config.lane, undefined)
+  const second = await run({ args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3, state: first.result.state }, reviews: { findings: [], replies: [], done: true } })
+  assert.equal(second.result.state.cyclesUsed, 2, 'the budget is shared across lanes')
+  const third = await run({ args: { yieldAfterCycle: true, maxCycles: 3, state: second.result.state }, reviews: { findings: [], replies: [], done: true } })
+  assert.equal(third.result.status, 'complete', `only the both launch completes (got ${third.result.reason})`)
+  assert.deepEqual(third.result.history.map(e => e.lane), ['ci', 'reviews', 'both'])
+})
+
+test('debt and the pushed head carry across a lane switch', async () => {
+  // A reviews launch pushes a fix and leaves a refutation owed; the ci launch
+  // after it must start at the pushed head and keep the debt; the both launch
+  // then pays it and completes.
+  const reviews1 = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], done: true }
+  const first = await run({
+    args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 4 },
+    reviews: reviews1, dropDoneIds: (label) => label.startsWith('replies#'),
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.equal(first.result.state.expectedHead, shaFor(1))
+  assert.deepEqual(first.result.deferred, [2])
+  const second = await run({
+    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 4, state: first.result.state },
+    preflight: { head: shaFor(1), prHead: shaFor(1) },
+  })
+  assert.equal(second.result.status, 'paused')
+  assert.deepEqual(second.result.deferred, [2], 'the ci launch keeps the reply owed')
+  assert.equal(second.result.state.expectedHead, shaFor(1))
+  const third = await run({
+    args: { yieldAfterCycle: true, maxCycles: 4, state: second.result.state },
+    preflight: { head: shaFor(1), prHead: shaFor(1) },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], done: true },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.equal(third.result.status, 'complete', `the both launch pays and completes (got ${third.result.reason})`)
+  assert.equal(third.result.state.debt.length, 0)
 })
 
 test('a dry run still runs the fixers it is allowed to run', async () => {

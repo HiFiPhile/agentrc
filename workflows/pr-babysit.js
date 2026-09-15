@@ -14,10 +14,12 @@ export const meta = {
 //          ciWait?: number (minutes to wait on pending checks, default 30),
 //          build?: string (verify command; default: the project's build contract),
 //          yieldAfterCycle?: boolean (run one cycle and return, with `state` for the next launch),
+//          lane?: 'both' | 'ci' | 'reviews' (which lane this launch runs, default both; a single lane
+//            needs yieldAfterCycle and never declares the PR done),
 //          state?: object (a previous launch's returned state, handed back unchanged) }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, ciWait?, build?, yieldAfterCycle?, state? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, ciWait?, build?, yieldAfterCycle?, lane?, state? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -73,6 +75,15 @@ const buildCmd = typeof args.build === 'string' && args.build.trim() ? args.buil
 // numbering and the budget. It never carries autoPush: permission is given to
 // every launch afresh.
 const yieldAfterCycle = args.yieldAfterCycle === true
+// Which lane this launch runs: scheduling input from the caller's own
+// observation (only CI moved, only a bot spoke), so it is not part of the
+// config a restored state must match. A single lane observes half the PR and
+// cannot declare it done; only a `both` launch can.
+const lane = args.lane === undefined ? 'both' : args.lane
+if (!['both', 'ci', 'reviews'].includes(lane)) throw new Error("lane must be 'both', 'ci' or 'reviews'")
+if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs one lane for one cycle: it needs yieldAfterCycle`)
+const ciLane = lane !== 'reviews'
+const reviewLane = lane !== 'ci'
 const STATE_VERSION = 1
 const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, build: buildCmd }
 let restored = null
@@ -324,7 +335,8 @@ const stateOut = () => ({
 const finish = (verdict, status) => {
   const last = history[history.length - 1] || null
   const observation = {
-    reviewedHead: last ? last.head : expectedHead, reviews: last ? last.reviews || null : null, ci: last ? last.ci || null : null,
+    reviewedHead: last ? last.head : expectedHead, lane: last ? last.lane || lane : lane,
+    reviews: last ? last.reviews || null : null, ci: last ? last.ci || null : null,
     actions: last ? {
       reviewFixes: last.reviewFixes || null, ciFixes: last.ciFixes || null,
       reviewPush: last.reviewPush || last.reviewPushFailed || null, ciPush: last.ciPush || last.ciPushFailed || null,
@@ -597,12 +609,12 @@ const cycleSummary = (entry) => {
       rf.rigSide ? '-' : shaOf(entry.ciPush),
     ])
   }
-  const head = `cycle ${entry.cycle} summary — CI ${entry.ci ? entry.ci.status : 'unknown'}, ` +
-    `${reviewers.length === 0 ? 'no reviewers requested'
+  const head = `cycle ${entry.cycle} summary — CI ${entry.ci ? entry.ci.status : entry.lane === 'reviews' ? 'not observed this launch' : 'unknown'}, ` +
+    `${entry.lane === 'ci' ? 'reviews not observed this launch' : reviewers.length === 0 ? 'no reviewers requested'
       : entry.reviews ? (entry.reviews.done ? 'all bots settled' : 'bots still pending') : 'no review data'}` +
     `${entry.error ? `, ERROR: ${entry.error}` : ''}`
   return rows.length === 0
-    ? `${head}\n(no bot findings, no real CI failures)`
+    ? `${head}\n(no bot findings or real CI failures reported this launch)`
     : `${head}\n${mdTable(['Bot', 'Finding', 'Verdict', 'Outcome', 'Commit'], rows)}`
 }
 
@@ -787,10 +799,13 @@ const runCycle = async (cycle, entry) => {
   try {
     // Two independent lanes, launched together. The review lane never waits on
     // CI: it validates, fixes, and pushes while the CI lane is still watching.
-    ciPromise = agent(
-      `${IN_CHECKOUT}Watch CI for PR #${args.pr} per your procedure; wait budget for pending checks: ${ciWait} minutes.`,
-      { label: `ci#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: CI },
-    ).catch(e => { log(`cycle ${cycle}: pr-ci-watcher errored — ${e && e.message}`); return null })
+    entry.lane = lane
+    if (ciLane) {
+      ciPromise = agent(
+        `${IN_CHECKOUT}Watch CI for PR #${args.pr} per your procedure; wait budget for pending checks: ${ciWait} minutes.`,
+        { label: `ci#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: CI },
+      ).catch(e => { log(`cycle ${cycle}: pr-ci-watcher errored — ${e && e.message}`); return null })
+    }
 
     const owedLastCycle = [...debt.keys()]
     const reviewPrompt =
@@ -801,18 +816,21 @@ const runCycle = async (cycle, entry) => {
         ? 'These comments still owe an answer from an earlier cycle; report their findings again ' +
           `so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '')
     // reviewers: [] is a CI-only run: there is nobody to harvest, so the lane is
-    // skipped rather than asked to validate nothing.
-    const r = reviewers.length === 0
-      ? { findings: [], replies: [], done: true } // the REVIEWS shape, harvested from nobody
-      : await agent(reviewPrompt, {
-        label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
-      }).catch(e => { log(`cycle ${cycle}: review validator errored — ${e && e.message}`); return null })
+    // skipped rather than asked to validate nothing. A `ci` launch skips it too,
+    // with the empty shape but no done: nobody looked, so nothing settled.
+    const r = !reviewLane
+      ? { findings: [], replies: [], done: false }
+      : reviewers.length === 0
+        ? { findings: [], replies: [], done: true } // the REVIEWS shape, harvested from nobody
+        : await agent(reviewPrompt, {
+          label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
+        }).catch(e => { log(`cycle ${cycle}: review validator errored — ${e && e.message}`); return null })
     if (!r) {
       entry.error = 'pr-review-validator died'
       return { pass: false, cycles: cycle, history, reason: 'review-validator-died' }
     }
-    if (reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
-    entry.reviews = r
+    if (reviewLane && reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
+    entry.reviews = reviewLane ? r : null
 
     // findingId is the only thing telling one dismissal on a comment from
     // another. Two findings sharing one would silently collapse into a single
@@ -1084,6 +1102,10 @@ const runCycle = async (cycle, entry) => {
     }
 
     // ---- CI lane result ----
+    if (!ciLane) {
+      log(`cycle ${cycle}: reviews lane only — CI not observed, no verdict this launch`)
+      return null
+    }
     const c = await ciPromise
     if (!c) {
       log(`cycle ${cycle}: pr-ci-watcher died — re-arming`)
@@ -1122,6 +1144,10 @@ const runCycle = async (cycle, entry) => {
       }
       entry.ciPush = ciPush
       return null // pushed: fresh CI run next cycle
+    }
+    if (!reviewLane) {
+      log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
+      return null
     }
     if (r.done && c.status === 'green') {
       const outstanding = [...debt.keys()]
