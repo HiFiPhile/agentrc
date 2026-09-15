@@ -8,7 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'install.py'
-SKILL = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())[0]
+SKILLS = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
+SKILL = SKILLS[0]
 
 
 class InstallTest(unittest.TestCase):
@@ -38,29 +39,27 @@ class InstallTest(unittest.TestCase):
     # --- selection ------------------------------------------------------------
 
     def test_nothing_is_selected_by_default_and_bad_selections_are_usage_errors(self):
-        for argv in (['install'], ['install', '--skill', 'all', '--skill', SKILL], ['install', '--agent', 'nope'],
-                     ['install', '--workflow', 'nope'], ['remove'], ['frob', '--skill', 'all']):
+        for argv in (['install'], ['install', '--skill', SKILL], ['install', '--agent', 'all'],
+                     ['install', '--hook'], ['remove'], ['frob', '--skill']):
             done = self.run_cli(*argv)
             self.assertEqual(done.returncode, 2, argv)
-        self.assertIn('pvs-studio', self.run_cli('install', '--agent', 'nope').stderr, 'lists what exists')
         self.assertFalse(self.claude.exists(), 'nothing was created')
 
     # --- install --------------------------------------------------------------
 
-    def test_a_named_skill_links_into_both_cli_dirs_and_nothing_else(self):
-        out = self.ok('install', '--skill', SKILL)
+    def test_skills_link_into_both_cli_dirs_and_nothing_else(self):
+        out = self.ok('install', '--skill')
         for d in (self.claude / 'skills', self.codex / 'skills'):
             self.assertEqual(os.readlink(d / SKILL), str(ROOT / 'skills' / SKILL))
-            self.assertEqual(sorted(p.name for p in d.iterdir()), [SKILL])
-        self.assertEqual(out.count('->'), 2)
+            self.assertEqual(sorted(p.name for p in d.iterdir()), SKILLS)
+        self.assertEqual(out.count('->'), 2 * len(SKILLS) + 1, 'and the one hook')
         self.assertFalse((self.claude / 'CLAUDE.md').exists())
         self.assertFalse((self.claude / 'agents').exists())
-        self.assertEqual(self.ok('install', '--skill', SKILL), '', 'a rerun is silent')
+        self.assertEqual(self.ok('install', '--skill'), '', 'a rerun is silent')
 
-    def test_all_covers_every_skill_agent_hook_and_workflow(self):
-        self.ok('install', '--skill', 'all', '--agent', 'all', '--hook', 'all', '--workflow', 'all', '--claude-md')
-        skills = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
-        self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), skills)
+    def test_each_flag_covers_its_kind_and_a_skill_brings_its_hook(self):
+        self.ok('install', '--skill', '--agent', '--workflow', '--claude-md')
+        self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), SKILLS)
         self.assertEqual(os.readlink(self.claude / 'agents' / 'pvs-studio.md'), str(ROOT / 'agents' / 'pvs-studio.md'))
         self.assertEqual(sorted(p.name for p in (self.codex / 'agents').iterdir()),
                          sorted(p.name for p in (ROOT / 'agents').iterdir()), 'every agent md and toml')
@@ -72,14 +71,14 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(os.readlink(self.codex / 'AGENTS.md'), '../.claude/CLAUDE.md')
         self.assertEqual((self.codex / 'AGENTS.md').read_text(), (ROOT / 'CLAUDE.md').read_text())
 
-    def test_a_hook_is_registered_once_with_absolute_quoted_commands_and_older_entries_replaced(self):
+    def test_a_skill_hook_is_registered_once_with_absolute_quoted_commands_and_older_entries_replaced(self):
         old = str(ROOT / 'hooks' / 'simplify-gate')  # the pre-folder install pointed straight into the repo
         (self.claude).mkdir()
         (self.claude / 'settings.json').write_text(json.dumps({'model': 'x', 'hooks': {
             'SessionStart': [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'other'}]}],
             'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': old}]}],
             'Stop': [{'hooks': [{'type': 'command', 'command': 'other-stop'}, {'type': 'command', 'command': old}]}]}}))
-        self.ok('install', '--hook', 'simplify-gate')
+        self.ok('install', '--skill')
         launcher = f"{self.claude}/hooks/simplify-gate/simplify-gate"
         data = self.settings()
         self.assertEqual(data['model'], 'x')
@@ -89,13 +88,13 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(stop['timeout'], 650)
         self.assertNotIn('matcher', data['hooks']['Stop'][-1])
         self.assertEqual(json.loads((self.claude / 'settings.json.before-agentrc').read_text())['hooks']['PreToolUse'][0]['hooks'][0]['command'], old)
-        self.assertEqual(self.ok('install', '--hook', 'simplify-gate'), '', 'idempotent')
+        self.assertEqual(self.ok('install', '--skill'), '', 'idempotent')
         self.assertEqual(self.settings(), data)
 
     def test_a_hook_path_with_a_space_is_quoted(self):
         home = self.home / 'my home'
         home.mkdir()
-        done = subprocess.run([sys.executable, str(SCRIPT), 'install', '--hook', 'simplify-gate'],
+        done = subprocess.run([sys.executable, str(SCRIPT), 'install', '--skill'],
                               capture_output=True, text=True, env={**os.environ, 'HOME': str(home)})
         self.assertEqual(done.returncode, 0, done.stderr)
         data = json.loads((home / '.claude' / 'settings.json').read_text())
@@ -107,16 +106,16 @@ class InstallTest(unittest.TestCase):
         os.symlink('/nonexistent/elsewhere', self.claude / 'skills' / 'foreign')
         (self.claude / 'skills' / 'mine').mkdir()
         (self.claude / 'skills' / 'mine' / 'SKILL.md').write_text('x')
-        self.ok('install', '--skill', SKILL)
+        self.ok('install', '--skill')
         names = sorted(p.name for p in (self.claude / 'skills').iterdir())
-        self.assertEqual(names, [SKILL, 'foreign', 'mine'])
+        self.assertEqual(names, sorted(SKILLS + ['foreign', 'mine']))
 
     def test_the_whole_dir_link_of_an_earlier_installer_is_replaced_only_when_skills_are_selected(self):
         self.claude.mkdir()
         os.symlink(ROOT / 'skills', self.claude / 'skills')
-        self.ok('install', '--agent', 'pvs-studio')
+        self.ok('install', '--agent')
         self.assertTrue((self.claude / 'skills').is_symlink(), 'an agent install leaves the skills alone')
-        self.ok('install', '--skill', SKILL)
+        self.ok('install', '--skill')
         self.assertFalse((self.claude / 'skills').is_symlink())
         self.assertTrue((self.claude / 'skills' / SKILL).is_symlink())
 
@@ -124,35 +123,35 @@ class InstallTest(unittest.TestCase):
         (self.claude / 'skills').mkdir(parents=True)
         os.symlink('/old/target', self.claude / 'skills' / SKILL)
         (self.claude / 'skills' / f'{SKILL}.agentrc-old').write_text('precious')
-        self.ok('install', '--skill', SKILL)
+        self.ok('install', '--skill')
         self.assertEqual((self.claude / 'skills' / f'{SKILL}.agentrc-old').read_text(), 'precious')
-        self.assertEqual(sorted(p.name for p in (self.claude / 'skills').iterdir()), [SKILL, f'{SKILL}.agentrc-old'],
+        self.assertEqual(sorted(p.name for p in (self.claude / 'skills').iterdir()), sorted(SKILLS + [f'{SKILL}.agentrc-old']),
                          'no staging dir left behind')
 
     def test_prune_resolves_dot_dot_before_deciding_a_link_is_ours(self):
         (self.claude / 'skills').mkdir(parents=True)
         os.symlink(ROOT / 'skills' / '..' / '..' / 'elsewhere' / 'missing', self.claude / 'skills' / 'tricky')
         os.symlink(Path(os.path.relpath(ROOT / 'skills' / 'gone', self.claude / 'skills')), self.claude / 'skills' / 'gone')
-        self.ok('install', '--skill', SKILL)
+        self.ok('install', '--skill')
         names = sorted(p.name for p in (self.claude / 'skills').iterdir())
-        self.assertEqual(names, [SKILL, 'tricky'], 'a relative dead link of ours goes, a dotted foreign one stays')
+        self.assertEqual(names, sorted(SKILLS + ['tricky']), 'a relative dead link of ours goes, a dotted foreign one stays')
 
     def test_unusable_settings_refuse_before_any_link_or_unlink(self):
         self.claude.mkdir()
         for bad in ('{not json', '{"hooks": []}', '{"hooks": {"Stop": [{"hooks": "x"}]}}'):
             (self.claude / 'settings.json').write_text(bad)
-            done = self.run_cli('install', '--skill', SKILL, '--hook', 'simplify-gate')
+            done = self.run_cli('install', '--skill')
             self.assertEqual(done.returncode, 1, bad)
             self.assertIn('fix it first', done.stderr)
             self.assertFalse((self.claude / 'skills').exists(), bad)
-        self.ok('install', '--skill', SKILL)  # a skill alone never reads settings
+        self.ok('install', '--agent')  # no hook, settings never read
         (self.claude / 'settings.json').unlink()
-        self.ok('install', '--hook', 'simplify-gate')
+        self.ok('install', '--skill')
         (self.claude / 'settings.json').write_text('{not json')
-        self.assertEqual(self.run_cli('remove', '--hook', 'simplify-gate').returncode, 1)
+        self.assertEqual(self.run_cli('remove', '--skill').returncode, 1)
         self.assertTrue((self.claude / 'hooks' / 'simplify-gate').is_symlink(), 'still linked')
         (self.claude / 'settings.json').write_text('{"model": "x"}')
-        self.assertNotIn('updated', self.ok('remove', '--skill', SKILL, '--hook', 'simplify-gate'))
+        self.assertNotIn('updated', self.ok('remove', '--skill'))
         self.assertEqual((self.claude / 'settings.json').read_text(), '{"model": "x"}', 'a no-op keeps the file byte for byte')
         self.assertFalse((self.claude / 'settings.json.before-agentrc').exists())
 
@@ -172,7 +171,7 @@ class InstallTest(unittest.TestCase):
                 self.setUp()
                 arrange()
                 before = sorted(str(p) for p in self.home.rglob('*'))
-                done = self.run_cli('install', '--skill', 'all', '--agent', 'all', '--hook', 'all', '--workflow', 'all', '--claude-md')
+                done = self.run_cli('install', '--skill', '--agent', '--workflow', '--claude-md')
                 self.assertEqual(done.returncode, 1, case)
                 self.assertIn('move it aside first', done.stderr)
                 self.assertEqual(sorted(str(p) for p in self.home.rglob('*')), before, 'nothing changed')
@@ -180,12 +179,12 @@ class InstallTest(unittest.TestCase):
     # --- remove -----------------------------------------------------------------
 
     def test_remove_unlinks_whatever_the_link_points_to_but_never_content(self):
-        self.ok('install', '--skill', SKILL, '--hook', 'simplify-gate', '--agent', 'pvs-studio', '--workflow', 'fix-issue')
+        self.ok('install', '--skill', '--agent', '--workflow')
         os.remove(self.codex / 'skills' / SKILL)
         os.symlink('/somewhere/else', self.codex / 'skills' / SKILL)
         (self.claude / 'agents' / 'pvs-studio.md').unlink()
         (self.claude / 'agents' / 'pvs-studio.md').write_text('my own copy')
-        out = self.ok('remove', '--skill', SKILL, '--hook', 'simplify-gate', '--agent', 'pvs-studio', '--workflow', 'fix-issue')
+        out = self.ok('remove', '--skill', '--agent', '--workflow')
         self.assertFalse((self.claude / 'skills' / SKILL).exists())
         self.assertFalse((self.claude / 'workflows' / 'fix-issue.js').exists())
         self.assertFalse((self.codex / 'skills' / SKILL).is_symlink(), 'a foreign link is removed too')
@@ -195,7 +194,7 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.claude / 'hooks' / 'simplify-gate').exists())
         self.assertNotIn('hooks', self.settings())
         (self.claude / 'settings.json').unlink()
-        self.assertEqual(self.ok('remove', '--hook', 'simplify-gate'), '', 'no settings file, nothing to say')
+        self.assertEqual(self.ok('remove', '--skill'), '', 'no settings file, nothing to say')
         self.assertFalse((self.claude / 'settings.json').exists())
 
     def test_remove_claude_md_only_when_it_links_into_this_checkout(self):

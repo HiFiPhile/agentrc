@@ -2,7 +2,7 @@
 """Claude Code hooks: snapshot the checkout at each user prompt and at Stop,
 and run a bounded read-only Codex YAGNI challenge over what changed in between.
 
-`install.py install --hook simplify-gate` registers the two events (see
+`install.py install --skill` registers the two events (see
 hooks.json beside this file); they call `simplify-gate`, which runs this script
 only where the marker file `<git common dir>/simplify-gate` exists. The
 `simplify-gate` skill owns that marker, per repository and all of its

@@ -17,13 +17,12 @@ tests/            unit tests for skill scripts, hooks and the installer
 ## Install by symlink (preferred)
 
 Skills are invoked by bare name and edits are live with no reinstall step.
-Nothing is installed by default: name what you want, or `all` per category.
+Nothing is installed by default: each flag takes every entry of its kind.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
-~/code/agentrc/install.py install --skill all --agent all --hook all --workflow all --claude-md
-~/code/agentrc/install.py install --skill read-doc --skill cowork   # cherry-pick
-~/code/agentrc/install.py remove --hook simplify-gate
+~/code/agentrc/install.py install --skill --agent --workflow --claude-md
+~/code/agentrc/install.py remove --skill
 ```
 
 `--claude-md` links `~/.claude/CLAUDE.md` and points `~/.codex/AGENTS.md` at
@@ -67,10 +66,10 @@ running, stay queued for the next turn. A peer sharing the checkout
 may have made some of the diff; the challenge says so, and Claude rejects
 findings on files it neither wrote nor commissioned. Codex never edits.
 
-Install the hooks once per machine, then switch the gate on per repository:
+Installing the skill registers its hooks once per machine; then switch the gate on per repository:
 
 ```sh
-~/code/agentrc/install.py install --hook simplify-gate     # remove undoes it
+~/code/agentrc/install.py install --skill                  # remove undoes it
 cd ~/code/tinyusb && /simplify-gate on                     # or: skills/simplify-gate/scripts/gate.py on
 ```
 

@@ -21,6 +21,6 @@ marker. A change takes effect at the next tool call, no session restart.
 
 Status shows `on`/`off`, then the model and effort with their source: `(repo)`
 from the marker, `(default)` from `hooks/simplify-gate/simplify_gate.py`. The
-hooks themselves are installed once per machine with
-`~/code/agentrc/install.py install --hook simplify-gate`; if status says on
+hooks are registered once per machine when the skill is installed
+(`~/code/agentrc/install.py install --skill`); if status says on
 but no challenge ever runs, check that first.

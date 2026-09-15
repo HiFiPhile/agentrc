@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Link parts of this checkout into ~/.claude and ~/.codex, by explicit choice.
 
-    install.py install --skill cowork --skill read-doc     # named skills
-    install.py install --skill all --agent all --hook all --claude-md
-    install.py remove --hook simplify-gate
+    install.py install --skill --agent --workflow --claude-md
+    install.py remove --skill
 
 Skills link into ~/.claude/skills and ~/.codex/skills; agents into
 ~/.claude/agents (the .md) and ~/.codex/agents (the .md and its .toml);
-hooks into ~/.claude/hooks, with their hooks.json merged into
-~/.claude/settings.json; workflows into ~/.claude/workflows (Claude only);
---claude-md links ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md. Nothing is
-selected by default. Everything is a symlink, so edits are live and a rerun
-after a change is a no-op.
+a skill's hooks of the same name into ~/.claude/hooks, with their hooks.json
+merged into ~/.claude/settings.json; workflows into ~/.claude/workflows
+(Claude only);
+--claude-md links ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md. Each flag
+takes every entry of its kind; nothing is selected by default. Everything is
+a symlink, so edits are live and a rerun after a change is a no-op.
 
 Refuses before touching anything when a destination holds something that is
 not a link, or a directory to link into is a file or a dangling link. `remove`
@@ -29,6 +29,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 KINDS = ('skill', 'agent', 'hook', 'workflow')
+FLAGS = ('skill', 'agent', 'workflow')  # hooks come with the skill of the same name
 
 
 def available(kind):
@@ -199,20 +200,8 @@ def write_settings(before, after):
 # --- command line -------------------------------------------------------------
 
 def selection(parser, args):
-    chosen = []
-    for kind in KINDS:
-        names = getattr(args, kind)
-        if not names:
-            continue
-        have = available(kind)
-        if 'all' in names:
-            if names != ['all']:
-                parser.error(f'--{kind} all cannot be combined with names')
-            names = have
-        for name in names:
-            if name not in have:
-                parser.error(f'no {kind} named {name}; available: {", ".join(have) or "none"}')
-        chosen += [(kind, name) for name in names]
+    chosen = [(kind, name) for kind in FLAGS if getattr(args, kind) for name in available(kind)]
+    chosen += [('hook', name) for kind, name in chosen if kind == 'skill' and name in available('hook')]
     if args.claude_md:
         chosen.append(('claude-md', None))
     if not chosen:
@@ -223,8 +212,8 @@ def selection(parser, args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('action', choices=('install', 'remove'))
-    for kind in KINDS:
-        parser.add_argument(f'--{kind}', action='append', metavar='NAME|all', default=[])
+    for kind in FLAGS:
+        parser.add_argument(f'--{kind}', action='store_true', help=f'every {kind}')
     parser.add_argument('--claude-md', action='store_true', help='CLAUDE.md, also as ~/.codex/AGENTS.md')
     args = parser.parse_args(argv)
     chosen = selection(parser, args)
