@@ -209,6 +209,8 @@ test('an unknown reviewer or a malformed protected pattern throws before any age
     [{ reviewers: ['codex', 'gpt'] }, /unknown reviewer\(s\) \["gpt"\]/],
     [{ reviewers: 'codex' }, /reviewers must be an array of codex, copilot, coderabbit, claude/],
     [{ reviewers: [4] }, /unknown reviewer/],
+    [{ reviewers: ['codex'], autoRun: ['copilot'] }, /autoRun must be a subset of reviewers \["codex"\]/],
+    [{ reviewers: ['codex'], autoRun: 'codex' }, /autoRun must be a subset/],
     [{ protected: '^test/hil/(' }, /protected is not a valid regex/],
     [{ protected: '   ' }, /non-empty regex string/],
     [{ protected: 7 }, /non-empty regex string/],
@@ -229,6 +231,18 @@ test('the requested reviewers, normalized, are the ones the validator is asked f
   const reviews = calls.find(c => c.label.startsWith('reviews#'))
   assert.match(reviews.prompt, /the reviewers to harvest on this PR are codex, copilot, and no others/)
   assert.doesNotMatch(reviews.prompt, /coderabbit/i, 'an unrequested bot must not be harvested')
+})
+
+test('the auto-running reviewers are named apart from the harvest list', async () => {
+  // Harvest-only Copilot must never become a settlement requirement.
+  const split = await run({ args: { reviewers: ['codex', 'copilot'], autoRun: [' Codex '] } })
+  const prompt = split.calls.find(c => c.label.startsWith('reviews#')).prompt
+  assert.match(prompt, /harvest on this PR are codex, copilot, and no others; of those, codex auto-run on every push and gate done/)
+  // Default: everybody harvested is also waited for, as before the split.
+  const same = await run({ args: { reviewers: ['codex', 'copilot'] } })
+  assert.match(same.calls.find(c => c.label.startsWith('reviews#')).prompt, /of those, codex, copilot auto-run/)
+  const nobody = await run({ args: { reviewers: ['copilot'], autoRun: [] } })
+  assert.match(nobody.calls.find(c => c.label.startsWith('reviews#')).prompt, /none of them auto-run, so done waits on nobody/)
 })
 
 test('reviewers: [] runs no review lane at all and still completes', async () => {

@@ -6,6 +6,7 @@ export const meta = {
 }
 
 // args: { pr: number, reviewers: string[] (required; [] runs no review lane),
+//          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default: reviewers),
 //          maxCycles?: number, autoPush?: boolean (default false = dry run),
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
 //          protected?: string (regex over canonical repo-relative paths; matches are
@@ -14,7 +15,7 @@ export const meta = {
 //          build?: string (verify command; default: the project's build contract) }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers: string[], maxCycles?, autoPush?, checkoutDir?, protected?, ciWait?, build? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, ciWait?, build? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -40,6 +41,13 @@ const reviewers = args.reviewers.map(r => typeof r === 'string' ? r.trim().toLow
 const unknown = reviewers.filter(r => !KNOWN_REVIEWERS.includes(r))
 if (unknown.length) {
   throw new Error(`unknown reviewer(s) ${JSON.stringify(unknown)}; the validator knows only ${KNOWN_REVIEWERS.join(', ')}`)
+}
+// Harvesting and settling are different lists: a bot that only reviews on
+// demand (Copilot here) is harvested when it has spoken but never waited for.
+const autoRun = Array.isArray(args.autoRun ?? args.reviewers)
+  ? (args.autoRun ?? args.reviewers).map(r => typeof r === 'string' ? r.trim().toLowerCase() : r) : null
+if (!autoRun || autoRun.some(r => !reviewers.includes(r))) {
+  throw new Error(`autoRun must be a subset of reviewers ${JSON.stringify(reviewers)}; got ${JSON.stringify(args.autoRun)}`)
 }
 const ciWait = args.ciWait ?? 30
 if (!Number.isInteger(ciWait) || ciWait < 1) {
@@ -615,7 +623,8 @@ const runCycle = async (cycle, entry) => {
     const owedLastCycle = [...debt.keys()]
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
-      `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others. ${IN_CHECKOUT}` +
+      `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others; ` +
+      `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push and gate done` : 'none of them auto-run, so done waits on nobody'}. ${IN_CHECKOUT}` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report their findings again ' +
           `so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '')
