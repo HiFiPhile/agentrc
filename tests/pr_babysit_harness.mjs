@@ -1583,3 +1583,163 @@ test('a commit that leaves an owned change behind is not pushed', async () => {
   assert.match(result.history[0].reviewPushFailed.detail, /commit left owned change\(s\) behind:  M src\/a\.c/)
   assert.ok(logs.some(l => /committed but NOT pushed — commit left owned change/.test(l)))
 })
+
+// --- yielding launches: one cycle per launch, the ledger carried in `state` ---
+
+// A debt-bearing first launch: one dismissal the validator drafted no reply for,
+// so the cycle re-arms instead of passing. Yielding turns that re-arm into a pause.
+const owing = { findings: [invalidFinding({ commentId: 5 })], replies: [], done: true }
+const upheld = { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] }
+
+test('a yielding launch runs one cycle, pauses with its state, and takes no backoff', async () => {
+  const { result, labels, napPoints } = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true },
+    reviews: { findings: [], replies: [], done: false },
+  })
+  assert.equal(result.status, 'paused')
+  assert.equal(result.reason, 'yielded')
+  assert.equal(labels.filter(l => l.startsWith('reviews#')).length, 1, 'exactly one validator dispatch')
+  assert.equal(napPoints.length, 0, 'the caller decides how long to wait')
+  assert.equal(result.state.cyclesUsed, 1)
+  assert.equal(result.state.maxCycles, 3)
+  assert.equal(result.state.expectedHead, HEAD)
+  assert.equal(result.observation.reviews.done, false)
+  assert.equal(result.observation.ci.status, 'green')
+})
+
+test('state carries the ledger to the next launch, which re-reports what is owed', async () => {
+  const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
+  assert.equal(first.result.status, 'paused')
+  assert.deepEqual(first.result.deferred, [5])
+  assert.deepEqual(first.result.state.debt, [[5, { dismissals: ['5#1'], note: false, renumbered: false, digest: 'd5' }]])
+  const second = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state },
+    reviews: owing, challenge: upheld,
+  })
+  const prompt = second.calls.find(c => c.label === 'reviews#2').prompt
+  assert.ok(prompt.includes('[5]'), 'the validator is told which comment still owes an answer')
+  assert.equal(second.result.state.cyclesUsed, 2)
+  assert.deepEqual(second.result.deferred, [5], 'an obligation survives the launch boundary')
+})
+
+test('a resumed launch still catches an edited comment through the carried digest', async () => {
+  const first = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true },
+    reviews: { findings: [invalidFinding({ commentId: 7, findingId: '7#1', commentDigest: 'before' })], replies: [], done: true },
+    challenge: upheld,
+  })
+  const second = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state },
+    reviews: { findings: [invalidFinding({ commentId: 7, findingId: '7#1', commentDigest: 'after' })], replies: [], done: true },
+    challenge: { verdicts: [{ id: 0, upheld: false, reason: 'real' }] },
+  })
+  assert.ok(second.logs.some(l => l.includes('comment 7 was edited')), 'the edit is seen across launches')
+  // The same body must not read as an edit, or every resumed comment would.
+  const same = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state },
+    reviews: { findings: [invalidFinding({ commentId: 7, findingId: '7#1', commentDigest: 'before' })], replies: [], done: true },
+    challenge: upheld,
+  })
+  assert.ok(!same.logs.some(l => l.includes('was edited')), 'an unchanged comment is not an edit')
+  assert.deepEqual(first.result.state.debt[0][1].digest, 'before', 'the digest travels in the state')
+})
+
+test('a resumed launch refuses a checkout that is another PR, even at the expected head', async () => {
+  const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
+  const second = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state },
+    preflight: { prRepo: 'someone/tinyusb', prUrl: 'https://github.com/someone/tinyusb/pull/3888', pushUrls: ['git@github.com:someone/tinyusb.git'] },
+    reviews: owing,
+  })
+  assert.equal(second.result.reason, 'state-mismatch')
+  assert.deepEqual(second.labels, ['preflight'])
+})
+
+test('the observation names the head the cycle reviewed, not the one it pushed', async () => {
+  const { result } = await run({ reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 1, yieldAfterCycle: true } })
+  assert.equal(result.observation.reviewedHead, HEAD)
+  assert.equal(result.state.expectedHead, shaFor(1), 'the continuation SHA is the pushed commit')
+})
+
+test('a state from a failed preflight resumes once the checkout is fixed', async () => {
+  const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, preflight: { dirty: ['x'] } })
+  assert.equal(first.result.reason, 'dirty-start')
+  const second = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: JSON.parse(JSON.stringify(first.result.state)) },
+    reviews: { findings: [], replies: [], done: false },
+  })
+  assert.equal(second.result.status, 'paused')
+  assert.equal(second.result.state.cyclesUsed, 1)
+})
+
+test('the cycle budget is cumulative across launches and refuses before any agent runs', async () => {
+  const first = await run({ args: { autoPush: true, maxCycles: 1, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
+  assert.equal(first.result.status, 'blocked', 'the last cycle of the budget does not pause')
+  assert.equal(first.result.reason, 'deferred-replies-unresolved')
+  const second = await run({ args: { autoPush: true, maxCycles: 1, yieldAfterCycle: true, state: first.result.state }, reviews: owing })
+  assert.equal(second.result.status, 'blocked')
+  assert.equal(second.result.reason, 'budget-exhausted')
+  assert.deepEqual(second.labels, [], 'not even the preflight')
+})
+
+test('a resumed launch refuses a head the previous launch did not leave', async () => {
+  const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
+  const moved = { ...first.result.state, expectedHead: FOREIGN }
+  const second = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: moved }, reviews: owing })
+  assert.equal(second.result.reason, 'stale-head')
+  assert.equal(second.result.expected, FOREIGN)
+  assert.deepEqual(second.labels, ['preflight'])
+})
+
+test('state never carries autoPush, and a resumed dry run publishes nothing', async () => {
+  const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
+  assert.ok(!JSON.stringify(first.result.state).includes('autoPush'))
+  const second = await run({
+    args: { autoPush: false, maxCycles: 3, yieldAfterCycle: true, state: first.result.state },
+    reviews: oneValid, scope: ['src/a.c'],
+  })
+  assert.equal(second.result.dryRun, true)
+  assert.ok(!second.labels.some(l => /^(commit|push|replies|resolve)#/.test(l)), 'the earlier grant does not carry over')
+})
+
+test('a rig-side pause keeps the reply debt', async () => {
+  const { result } = await run({
+    args: { autoPush: true, maxCycles: 3 },
+    reviews: owing, challenge: upheld,
+    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'hil / pico', firstError: 'board did not enumerate', files: [], rigSide: true }] },
+  })
+  assert.equal(result.reason, 'ci-red-rig-side')
+  assert.deepEqual(result.deferred, [5], 'the caller sees what is still owed when it decides to stop')
+  assert.deepEqual(result.state.debt.map(([id]) => id), [5])
+})
+
+test('N cycles over N launches dispatch the validator N times, no more', async () => {
+  const pending = { findings: [], replies: [], done: false }
+  const one = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: pending })
+  const a = await run({ args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true }, reviews: pending })
+  const b = await run({ args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true, state: a.result.state }, reviews: pending })
+  const validators = (labels) => labels.filter(l => l.startsWith('reviews#')).length
+  assert.equal(validators(one.labels), 2)
+  assert.equal(validators(a.labels) + validators(b.labels), 2)
+  assert.equal(b.result.reason, 'maxCycles reached')
+  assert.equal(b.result.status, 'blocked')
+})
+
+test('a state from a run with other arguments, or of another shape, is refused', async () => {
+  const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
+  await assert.rejects(run({ args: { maxCycles: 3, reviewers: ['codex', 'copilot'], state: first.result.state } }),
+    /different arguments/)
+  await assert.rejects(run({ args: { maxCycles: 3, state: { version: 0 } } }), /not a pr-babysit state/)
+})
+
+test('every result carries a status, an observation and the state', async () => {
+  for (const [opts, status] of [
+    [{}, 'complete'],
+    [{ preflight: { dirty: ['x'] } }, 'blocked'],
+    [{ reviews: oneValid, scope: ['src/a.c'], args: { autoPush: false } }, 'blocked'],
+  ]) {
+    const { result } = await run(opts)
+    assert.equal(result.status, status, JSON.stringify(opts))
+    assert.ok('observation' in result && 'state' in result)
+  }
+})

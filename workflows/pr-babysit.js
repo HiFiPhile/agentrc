@@ -7,15 +7,17 @@ export const meta = {
 
 // args: { pr: number, reviewers: string[] (required; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default: reviewers),
-//          maxCycles?: number, autoPush?: boolean (default false = dry run),
+//          maxCycles?: number (ceiling on review/fix/CI cycles, default 5), autoPush?: boolean (default false = dry run),
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
 //          protected?: string (regex over canonical repo-relative paths; matches are
 //            dropped from a fix scope and never committed),
 //          ciWait?: number (minutes to wait on pending checks, default 30),
-//          build?: string (verify command; default: the project's build contract) }
+//          build?: string (verify command; default: the project's build contract),
+//          yieldAfterCycle?: boolean (run one cycle and return, with `state` for the next launch),
+//          state?: object (a previous launch's returned state, handed back unchanged) }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, ciWait?, build? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, ciWait?, build?, yieldAfterCycle?, state? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -27,7 +29,7 @@ if (typeof checkoutDir !== 'string') {
 }
 const IN_CHECKOUT = checkoutDir === '.' ? 'The working tree IS the PR checkout. '
   : `The PR branch checkout is at ${checkoutDir} - run every git/build/file command there, not in the session directory. `
-const maxCycles = args.maxCycles ?? 3
+const maxCycles = args.maxCycles ?? 5
 if (!Number.isInteger(maxCycles) || maxCycles < 1) {
   throw new Error('maxCycles must be an integer >= 1')
 }
@@ -64,6 +66,28 @@ if (args.protected !== undefined && args.protected !== null) {
   }
 }
 const buildCmd = typeof args.build === 'string' && args.build.trim() ? args.build.trim() : null
+
+// A launch that yields runs exactly one cycle and returns its state, so a caller
+// with judgment decides whether the next cycle is worth its cost. The state is
+// this run's ledger, serialized: the next launch restores it and continues the
+// numbering and the budget. It never carries autoPush: permission is given to
+// every launch afresh.
+const yieldAfterCycle = args.yieldAfterCycle === true
+const STATE_VERSION = 1
+const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, build: buildCmd }
+let restored = null
+if (args.state !== undefined && args.state !== null) {
+  const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
+  const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
+    st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
+    typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) && Array.isArray(st.history)
+  if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
+  if (JSON.stringify(st.config) !== JSON.stringify(config)) {
+    throw new Error(`state was made by a run with different arguments: ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
+  }
+  restored = st
+}
+let cyclesUsed = restored ? restored.cyclesUsed : 0
 
 // Writers are asked not to publish or commit: this workflow's own publisher
 // commits the paths it audited, so a writer that staged its work would put
@@ -216,18 +240,45 @@ const postReplyRecipe = (noun) =>
   `(gh pr comment ${args.pr} --body <quote the original point, then the ${noun}>) and skip resolving. ` +
   `After replying to an inline comment, mark its thread resolved. ${RESOLVE_RECIPE} `
 
-const history = []
+const history = restored ? restored.history : []
 // commentId -> { how, digest }: how the comment has been answered so far
 // ('refutation' or 'fixNote') and the body that answer addressed. Either answer
 // resolved its thread, so the comment accrues no further debt from a later
 // harvest - until the reviewer edits the body, which the digest catches: our
 // answer then stands against points that are no longer the ones being made.
-const answeredWith = new Map()
+const answeredWith = new Map(restored ? restored.answeredWith : [])
 // commentId -> { dismissals, note }: which dismissals we have relied on without
 // telling the reviewer, and whether a landed fix still owes its note. Standing
 // debt, not a snapshot: a harvest that drops a finding does not settle it. The
 // next validator is asked to re-report these, and the final verdict names them.
-const debt = new Map()
+const debt = new Map(restored
+  ? restored.debt.map(([id, d]) => [id, { dismissals: new Set(d.dismissals), note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}) }])
+  : [])
+// What HEAD must still be at the next publish: the PR head at preflight, each
+// pushed SHA after, and across launches the SHA the previous one left.
+let expectedHead = restored ? restored.expectedHead : ''
+let pin = restored ? restored.pin : null
+const stateOut = () => ({
+  version: STATE_VERSION, pin, expectedHead, config, cyclesUsed, maxCycles,
+  answeredWith: [...answeredWith],
+  debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}) }]),
+  history,
+})
+// Every result carries a status the caller can act on without reading the reason
+// (complete: passed; paused: a whole cycle ran and another may follow; blocked:
+// something needs attention first), what the last cycle observed, and the state.
+const finish = (verdict, status) => {
+  const last = history[history.length - 1] || null
+  const observation = {
+    reviewedHead: last ? last.head : expectedHead, reviews: last ? last.reviews || null : null, ci: last ? last.ci || null : null,
+    actions: last ? {
+      reviewFixes: last.reviewFixes || null, ciFixes: last.ciFixes || null,
+      reviewPush: last.reviewPush || last.reviewPushFailed || null, ciPush: last.ciPush || last.ciPushFailed || null,
+      refutedPosts: last.refutedPosts || null, fixNotePosts: last.fixNotePosts || null, error: last.error || null,
+    } : null,
+  }
+  return { ...verdict, status: status || (verdict.pass ? 'complete' : 'blocked'), observation, state: stateOut() }
+}
 const owesDismissal = (commentId) => {
   const d = debt.get(commentId)
   return !!d && d.dismissals.size > 0
@@ -926,7 +977,7 @@ const runCycle = async (cycle, entry) => {
     }
     if (r.done && rigSide.length > 0 && fixable.length === 0 && c.infraRerun.length === 0 && c.status !== 'running') {
       log(`cycle ${cycle}: CI red only from rig-side failures — human/rig attention needed, nothing to fix in the PR`)
-      return { pass: false, cycles: cycle, history, reason: 'ci-red-rig-side' }
+      return { pass: false, cycles: cycle, history, reason: 'ci-red-rig-side', deferred: [...debt.keys()] }
     }
     if (c.status === 'running' || c.infraRerun.length > 0) {
       log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming`)
@@ -965,6 +1016,10 @@ const PIN = {
     dirty: { type: 'array', items: { type: 'string' } },
   },
 }
+if (cyclesUsed >= maxCycles) {
+  log(`state: ${cyclesUsed} of ${maxCycles} cycles already used — nothing left to run`)
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'budget-exhausted' })
+}
 const pinned = await agent(
   `${IN_CHECKOUT}Editing and committing nothing, report this checkout: ` +
   'branch = `git rev-parse --abbrev-ref HEAD`; ' +
@@ -976,20 +1031,31 @@ const pinned = await agent(
   'head = `git rev-parse HEAD`; dirty = the lines of `git status --porcelain`. Return ONLY JSON matching the schema.',
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 ).catch(e => { log(`preflight errored — ${e && e.message}`); return null })
-if (!pinned) return { pass: false, cycles: 0, history, reason: 'preflight-died' }
+if (!pinned) return finish({ pass: false, cycles: cyclesUsed, history, reason: 'preflight-died' })
 if (pinned.dirty.length) {
   log(`preflight: the checkout is dirty — ${pinned.dirty.length} path(s); commit or stash before babysitting`)
-  return { pass: false, cycles: 0, history, reason: 'dirty-start', dirty: pinned.dirty }
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'dirty-start', dirty: pinned.dirty })
 }
 if (pinned.prBranch.trim() !== pinned.branch.trim()) {
   log(`preflight: checked out ${pinned.branch}, but PR #${args.pr} heads ${pinned.prBranch}`)
-  return { pass: false, cycles: 0, history, reason: 'wrong-branch', branch: pinned.branch, expected: pinned.prBranch.trim() }
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-branch', branch: pinned.branch, expected: pinned.prBranch.trim() })
 }
 // A branch name is not an identity: the same name can be stale, ahead, or from
 // another fork entirely, and its commits would then become the trusted baseline.
 if (pinned.head.trim() !== pinned.prHead.trim()) {
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but PR #${args.pr} heads ${pinned.prHead.slice(0, 7)}`)
-  return { pass: false, cycles: 0, history, reason: 'wrong-head', head: pinned.head.trim(), expected: pinned.prHead.trim() }
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-head', head: pinned.head.trim(), expected: pinned.prHead.trim() })
+}
+// A resumed launch continues from the SHA the previous one left; a PR head that
+// moved since is somebody else's work, not this run's baseline.
+const currentPin = { prRepo: pinned.prRepo.trim(), prBranch: pinned.prBranch.trim(), prUrl: pinned.prUrl, remote: pinned.remote, pushUrls: pinned.pushUrls }
+if (restored && restored.pin && JSON.stringify(currentPin) !== JSON.stringify(restored.pin)) {
+  log(`preflight: this is not the PR the state belongs to — ${JSON.stringify(currentPin)} vs ${JSON.stringify(restored.pin)}`)
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'state-mismatch', pin: currentPin, expected: restored.pin })
+}
+if (restored && restored.pin && pinned.head.trim() !== restored.expectedHead) {
+  log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but the previous launch left ${restored.expectedHead.slice(0, 7)}`)
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'stale-head', head: pinned.head.trim(), expected: restored.expectedHead })
 }
 // The PR's URL carries the host; the HEAD repository carries owner/repo, and on
 // a fork PR that is not the base repository the URL names. Together they are the
@@ -1005,15 +1071,17 @@ if (!expectedOrigin || badPush !== undefined) {
   log(`preflight: ${pinned.remote} pushes to ${originOf(badPush) || badPush}, not PR #${args.pr}'s head repository ${expectedOrigin || `${HOST}/${pinned.prRepo}`} (only ${HOST} over https or ssh)`)
   // With an off-host PR URL there is no derivable expectation, so report the
   // only one this workflow supports rather than a bare repo name.
-  return { pass: false, cycles: 0, history, reason: 'wrong-remote', remoteUrl: badPush, expected: expectedOrigin || `${HOST}/${pinned.prRepo.trim().toLowerCase()}` }
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-remote', remoteUrl: badPush, expected: expectedOrigin || `${HOST}/${pinned.prRepo.trim().toLowerCase()}` })
 }
-// What HEAD must still be at the next publish: the PR head now, each pushed SHA after.
-let expectedHead = pinned.prHead.trim()
+expectedHead = pinned.prHead.trim()
+pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
 
-for (let cycle = 1; cycle <= maxCycles; cycle++) {
+const firstCycle = cyclesUsed + 1
+const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
+for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
-  const entry = { cycle }
+  const entry = { cycle, head: expectedHead }
   history.push(entry)
   // A rejection from any worker not individually guarded (replies/resolve/scope/
   // fixer/push) must not skip the scoreboard — that is exactly the cycle worth
@@ -1028,9 +1096,14 @@ for (let cycle = 1; cycle <= maxCycles; cycle++) {
   } finally {
     entry.summary = cycleSummary(entry)
     log(entry.summary)
+    cyclesUsed = cycle
   }
-  if (verdict) return verdict
+  if (verdict) return finish(verdict)
 }
-return debt.size > 0
+if (yieldAfterCycle && cyclesUsed < maxCycles) {
+  // The cycle would have re-armed; the caller decides whether, and when, it does.
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'yielded', deferred: [...debt.keys()] }, 'paused')
+}
+return finish(debt.size > 0
   ? unresolvedVerdict(maxCycles, [...debt.keys()], args.autoPush !== true)
-  : { pass: false, cycles: maxCycles, history, reason: 'maxCycles reached' }
+  : { pass: false, cycles: maxCycles, history, reason: 'maxCycles reached' })
