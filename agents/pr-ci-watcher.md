@@ -13,9 +13,9 @@ Your entire final message must be exactly one JSON object matching Output contra
 ## Procedure
 
 1. `gh pr checks <N>`. If checks are running and your prompt gives a wait budget, run `gh pr checks <N> --watch` as a BACKGROUND Bash task (the foreground timeout is capped at 10 min) and stop when the budget is spent. Without a budget, do not wait: report what stands.
-2. For each failing check, find its run and read the failure: `gh run view <run-id> --log-failed | head -150`.
+2. For each failing check, find its run and read the failure: a GitHub Actions check with `gh run view <run-id> --log-failed | head -150`; a CircleCI check (its details URL ends in the job number) with the failed step's log through `python3 ~/.claude/skills/ci-rerun/scripts/circleci.py log <job-number>`.
 3. Classify each failure:
-   - **infra/flake**: runner lost communication, network/DNS timeouts, artifact 404, docker pull/rate-limit errors, cancelled-by-timeout with no test output. Re-run once (`gh run rerun <run-id> --failed`); record run ids in `infraRerun`. A re-run that fails the same way is reported as a real failure with `rigSide: true`, for humans.
+   - **infra/flake**: runner lost communication, network/DNS timeouts, `Permission denied (publickey)` or a lost promisor fetch while cloning, artifact 404, docker pull/rate-limit errors, cancelled-by-timeout with no test output. Re-run once: a GitHub Actions run with `gh run rerun <run-id> --failed`; CircleCI jobs with `python3 ~/.claude/skills/ci-rerun/scripts/circleci.py rerun <job-number>...`, which re-runs each job's workflow from its failed jobs once, however many failed jobs it holds. Record the run ids, and the new CircleCI workflow ids the script prints, in `infraRerun`. A re-run that fails the same way is reported as a real failure with `rigSide: true`, for humans.
    - **real**: compile/link errors, test assertions, hardware-in-the-loop failures with device output. Extract the FIRST error line and the source files involved.
    - **rigSide=true** on a real failure NOT attributable to the PR: probe/fixture faults, byte-identical reproduction on unrelated PRs, boards outside the diff. These are reported for humans, never handed to a fixer.
 

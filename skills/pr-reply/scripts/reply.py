@@ -5,17 +5,20 @@
 
 FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>"}, ...]},
 digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
-which the body must match before anything is posted. Each commentId
-is a review comment (an inline thread) or, failing that, an issue comment on the
-PR. A reply of ours with the identical body already under the comment is reused,
-never posted twice. A review reply is read back and must match the body, the
-parent, our login and the PR before its thread is resolved; an issue comment has
-no thread, its body is the original comment's URL as a quote line plus the text.
-Nothing is ever edited or deleted.
+which the body must match before anything is posted. Each commentId names one
+of three things on the PR: a review comment (an inline thread), an issue comment,
+or a review whose body carries the finding (a bot's summary, or a point GitHub
+would not anchor inline). A reply of ours with the identical body already under
+the comment is reused, never posted twice. A review reply is read back and must
+match the body, the parent, our login and the PR before its thread is resolved;
+the other two have no thread: the reply is an issue comment whose body is the
+original's URL as a quote line plus the text. Nothing is ever edited or deleted.
 
-stdout ends with one JSON line {"receipts": [{"commentId", "kind": "review"|"issue",
-"replyId", "digest", "sent", "posted", "verified", "resolved", "error"}]}: sent
-says a POST was issued (a lost response leaves sent true and replyId null: the
+stdout ends with one JSON line {"receipts": [{"commentId", "kind", "replyId",
+"digest", "sent", "posted", "verified", "resolved", "error"}]}: kind is
+"review", "issue" or "review-body", "none" when all three were searched and the
+id is on none of them (the caller owes it nothing), null when a lookup failed
+before that was known; sent says a POST was issued (a lost response leaves sent true and replyId null: the
 reply may exist), posted that GitHub answered it, verified is true on a
 matching read-back, false on a mismatch and null when the read-back could not
 be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
@@ -89,6 +92,7 @@ class Poster:
         self.me = api('GET', 'user')['login']
         self._review = None
         self._issue = None
+        self._reviews = None
 
     def review_comments(self):
         if self._review is None:
@@ -100,23 +104,29 @@ class Poster:
             self._issue = api('GET', f'repos/{self.repo}/issues/{self.pr}/comments?per_page=100', paginate=True)
         return self._issue
 
+    def reviews(self):
+        if self._reviews is None:
+            self._reviews = api('GET', f'repos/{self.repo}/pulls/{self.pr}/reviews?per_page=100', paginate=True)
+        return self._reviews
+
     def kind_of(self, comment_id):
-        """('review', comment) for an inline review comment on this PR,
-        ('issue', comment) for an issue comment on it; ApiError otherwise."""
-        for c in self.review_comments():
-            if c['id'] == comment_id:
-                return 'review', c
-        for c in self.issue_comments():
-            if c['id'] == comment_id:
-                return 'issue', c
-        raise ApiError(f'comment {comment_id} is not on PR #{self.pr}')
+        """('review', comment) for an inline review comment on this PR, ('issue',
+        comment) for an issue comment on it, ('review-body', review) for a review
+        whose body is the target, ('none', None) when all three were searched and
+        none has the id; ApiError when a lookup failed or the id is ambiguous."""
+        found = [(kind, c) for kind, pool in (('review', self.review_comments()), ('issue', self.issue_comments()),
+                                              ('review-body', self.reviews()))
+                 for c in pool if c['id'] == comment_id]
+        if len(found) > 1:
+            raise ApiError(f'id {comment_id} is ambiguous on PR #{self.pr}: {", ".join(k for k, _ in found)}')
+        return found[0] if found else ('none', None)
 
     def existing(self, kind, comment_id, body):
         pool = self.review_comments() if kind == 'review' else self.issue_comments()
         for c in pool:
             if c['user']['login'] != self.me or c['body'] != body:
                 continue
-            if kind == 'issue' or c.get('in_reply_to_id') == comment_id:
+            if kind != 'review' or c.get('in_reply_to_id') == comment_id:
                 return c['id']
         return None
 
@@ -177,6 +187,9 @@ def handle(poster, item):
     try:
         kind, original = poster.kind_of(item['commentId'])
         rc['kind'] = kind
+        if kind == 'none':
+            rc['error'] = f'comment {item["commentId"]} is not on PR #{poster.pr}'
+            return rc
         body = item['body'] if kind == 'review' else issue_body(original, item['body'])
         reply_id = poster.existing(kind, item['commentId'], body)
         if reply_id is None:
@@ -242,7 +255,7 @@ def main(argv=None):
         return 2
     receipts = [handle(poster, item) for item in replies]
     print(json.dumps({'receipts': receipts}))
-    ok = all(r['verified'] is True and (r['kind'] == 'issue' or r['resolved']) for r in receipts)
+    ok = all(r['verified'] is True and (r['kind'] != 'review' or r['resolved']) for r in receipts)
     return 0 if ok else 1
 
 

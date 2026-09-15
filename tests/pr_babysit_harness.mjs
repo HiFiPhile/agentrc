@@ -114,12 +114,17 @@ async function run(opts = {}) {
       // digest: posted, read back and resolved unless a case says the batch
       // failed (dropDoneIds), a reply landed with the wrong body (wrongBody),
       // its read-back was unavailable (unreadable), the POST's response was
-      // lost (lost), the agent invented an id (strayDoneIds) or the receipts
-      // are reshaped (receipts).
+      // lost (lost), the agent invented an id (strayDoneIds), the id is on
+      // none of the PR's id spaces (noTarget), it names a review body
+      // (reviewBody) or the receipts are reshaped (receipts).
       const entries = JSON.parse(String(prompt).match(/Manifest: (\{.*\})$/)[1]).replies
       const failed = opts.dropDoneIds && opts.dropDoneIds(label)
       const receipt = ({ commentId, digest }) => failed
         ? { commentId, kind: 'review', replyId: null, digest, sent: false, posted: false, verified: false, resolved: null, error: 'posting failed' }
+        : opts.noTarget && opts.noTarget(commentId)
+          ? { commentId, kind: 'none', replyId: null, digest, sent: false, posted: false, verified: false, resolved: null, error: `comment ${commentId} is not on PR #7` }
+        : opts.reviewBody && opts.reviewBody(commentId)
+          ? { commentId, kind: 'review-body', replyId: 500 + commentId, digest, sent: true, posted: true, verified: true, resolved: null, error: null }
         : opts.lost && opts.lost(commentId)
           ? { commentId, kind: 'review', replyId: null, digest, sent: true, posted: false, verified: false, resolved: null, error: 'connection reset' }
           : opts.wrongBody && opts.wrongBody(commentId)
@@ -433,8 +438,8 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
   assert.deepEqual(rows.map(r => r[2]), ['valid', 'stale', 'invalid'], 'valid first, then stale, then invalid')
   assert.match(rows[0][3], /^fixed \+ pushed/)
   assert.equal(rows[0][4], shaFor(1).slice(0, 8))
-  assert.match(rows[1][3], /already fixed, replied \+ resolved/)
-  assert.match(rows[2][3], /refuted, replied \+ resolved/)
+  assert.match(rows[1][3], /already fixed, replied/)
+  assert.match(rows[2][3], /refuted, replied/)
   assert.deepEqual([rows[1][4], rows[2][4]], ['-', '-'], 'only fixed findings carry a commit')
   assert.match(rows[2][1], /refuted \\\| with a pipe/, 'a pipe in a claim is escaped, not table-breaking')
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
@@ -925,7 +930,7 @@ test('the cycle records what each posting lane reported', async () => {
     },
   })
   const entry = result.history[0]
-  assert.deepEqual(entry.refutedPosts, { pass: true, detail: 'posted, read back, resolved', receipts: [receiptFor(2, 'no')] })
+  assert.deepEqual(entry.refutedPosts, { pass: true, detail: 'posted and read back', receipts: [receiptFor(2, 'no')] })
   assert.equal(entry.fixNotePosts.pass, true)
   assert.equal(entry.fixNotePosts.receipts[0].digest, fnv1a(manifestOf(calls, 'resolve#1')[0].body))
   const dead = await run({ reviews: oneValid, posting: null })
@@ -1560,6 +1565,78 @@ test('two receipts for one comment, or success without a reply id, settle nothin
     receipts: (rs) => rs.map(r => ({ ...r, kind: 'issue', replyId: null, resolved: null })),
   })
   assert.deepEqual(noId.result.deferred, [2], 'verified with no reply id is impossible')
+})
+
+test('a comment on none of the PR\'s id spaces owes nothing', async () => {
+  // Every space searched, nothing found: no reply can ever pay it, so the
+  // debt is dropped, not carried through every later cycle. No reply exists,
+  // so answeredWith stays empty and the summary says so.
+  let cycle = 0
+  const validOnce = () => (++cycle === 1 ? oneValid : { findings: [], replies: [], done: true })
+  const { result } = await run({ args: { autoPush: true, maxCycles: 2 }, reviewsPerCycle: validOnce, noTarget: (id) => id === 1 })
+  assert.equal(result.pass, true, `nothing is owed (got ${result.reason})`)
+  assert.deepEqual(result.state.debt, [])
+  assert.deepEqual(result.state.answeredWith, [])
+  assert.equal(result.history[0].fixNotePosts.detail, 'not on the PR, nothing owed: 1')
+  const refuted = await run({
+    args: { autoPush: true },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], done: true },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+    noTarget: (id) => id === 2,
+  })
+  assert.equal(refuted.result.pass, true, 'a refutation with no target owes nothing either')
+  assert.deepEqual(refuted.result.state.debt, [])
+  assert.match(rowsOf(summaries(refuted.logs)[0])[0].join('|'), /refuted, no reply: comment is not on the PR/)
+})
+
+test('only an explicit none receipt retires a debt', async () => {
+  // A lookup that failed (kind null) or a receipt for another body proves
+  // nothing about whether the comment exists; the debt stays.
+  for (const [name, reshape] of [
+    ['lookup failed', (r) => ({ ...r, kind: null, sent: false, replyId: null, verified: false, error: 'HTTP 502' })],
+    ['wrong digest', (r) => ({ ...r, kind: 'none', sent: false, replyId: null, verified: false, digest: 'deadbeef', error: 'not on PR' })],
+    ['two receipts', (r) => [r, r].map(x => ({ ...x, kind: 'none', sent: false, replyId: null, verified: false }))],
+  ]) {
+    const { result } = await run({
+      args: { autoPush: true },
+      reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], done: true },
+      challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+      receipts: (rs) => rs.flatMap(reshape),
+    })
+    assert.deepEqual(result.deferred, [2], name)
+    assert.ok(result.state.debt.some(([id]) => id === 2), `${name}: the debt is kept`)
+  }
+})
+
+test('a none receipt that also names a reply is contradictory, not a retirement', async () => {
+  // The script's absence shape is exact: kind none with no POST and no reply.
+  // A receipt that says none and still carries a reply id can only be a
+  // transcription error, so the debt is kept and the reply it names is the repair.
+  for (const [name, reshape] of [
+    ['mismatch', (r) => ({ ...r, kind: 'none', verified: false, resolved: null, error: 'read-back mismatch on body' })],
+    ['success-shaped', (r) => ({ ...r, kind: 'none' })],
+    ['sent, no reply', (r) => ({ ...r, kind: 'none', replyId: null, posted: false, verified: false, resolved: null })],
+  ]) {
+    const { result } = await run({
+      args: { autoPush: true },
+      reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], done: true },
+      challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+      receipts: (rs) => rs.map(reshape),
+    })
+    assert.deepEqual(result.deferred, [2], name)
+    assert.deepEqual(result.state.answeredWith, [], `${name}: nothing was paid`)
+    const [, d] = result.state.debt.find(([id]) => id === 2)
+    assert.deepEqual(d.repair, name === 'sent, no reply' ? undefined : { replyId: 502, error: 'contradictory receipt' }, name)
+  }
+})
+
+test('a verified review-body receipt pays like an issue comment', async () => {
+  let cycle = 0
+  const validOnce = () => (++cycle === 1 ? oneValid : { findings: [], replies: [], done: true })
+  const { result } = await run({ args: { autoPush: true, maxCycles: 2 }, reviewsPerCycle: validOnce, reviewBody: (id) => id === 1 })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual(result.state.answeredWith.map(([id, a]) => [id, a.how]), [[1, 'fixNote']])
+  assert.equal(result.history[0].fixNotePosts.detail, 'posted and read back')
 })
 
 test('an unavailable read-back is retried, not repaired', async () => {

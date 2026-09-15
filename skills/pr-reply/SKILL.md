@@ -6,11 +6,14 @@ description: Post replies to PR review comments from a manifest and prove they l
 # Replying to PR review comments
 
 `scripts/reply.py` is the only way a reply reaches a PR. It takes a manifest
-of `{commentId, body, digest}` entries and, for each: finds whether the id is an inline
-review comment or an issue comment on the PR, reuses an identical reply of
-ours if one is already there, otherwise posts the body once, reads the posted
-comment back, and resolves the review thread only when body, parent, author
-and PR all match. Its receipts are the evidence; a `201` from GitHub is not.
+of `{commentId, body, digest}` entries and, for each: finds which of three
+things on the PR the id names (an inline review comment, an issue comment, or
+a review whose body carries the finding), reuses an identical reply of ours if
+one is already there, otherwise posts the body once, reads the posted comment
+back, and resolves the review thread only when body, parent, author and PR all
+match. An issue comment and a review body have no thread: the reply is a PR
+comment quoting the original's URL, and nothing is resolved. Its receipts are
+the evidence; a `201` from GitHub is not.
 
 ```bash
 R=~/.claude/skills/pr-reply/scripts/reply.py
@@ -25,19 +28,21 @@ never reaches the PR. A workflow computes the digests itself; by hand, use
 `--digest`.
 
 The last stdout line is `{"receipts": [...]}`, one per manifest entry:
-`kind` (`review` or `issue`), `replyId`, `digest`, `sent` (a POST was issued;
+`kind` (`review`, `issue` or `review-body`; `none` when all three were searched
+and the id is on none of them, so the caller owes it nothing; `null` when a
+lookup failed before that was known), `replyId`, `digest`, `sent` (a POST was issued;
 with `replyId` null the response was lost and the reply may exist), `posted`
 (false when an identical reply was reused), `verified` (true, false on a
 mismatch, null when the read-back could not be fetched), `resolved` (null for
-an issue comment, which has no thread), `error`. Exit 0 when every reply is
-verified and every review thread resolved, 1 otherwise, 2 for a bad manifest or
-an unreachable repo.
+the two kinds without a thread), `error`. Exit 0 when every reply is verified
+and every review thread resolved, 1 otherwise, 2 for a bad manifest or an
+unreachable repo.
 
 ## Judgment
 
 - **The body is the caller's.** Write the manifest with the exact text you
-  were given; do not paraphrase, shorten, quote or annotate it. An issue
-  comment gets the original comment's URL as a quote line above the text, so
+  were given; do not paraphrase, shorten, quote or annotate it. A reply that
+  is a PR comment gets the original's URL as a quote line above the text, so
   the reader can find what it answers; the script adds that itself.
 - **Once.** Never post by hand with `gh api`, never a trial or placeholder
   comment, never an edit, never a delete. If a run's outcome is unknown, run

@@ -23,6 +23,8 @@ class FakeGitHub:
     def __init__(self):
         self.review = {}   # id -> comment
         self.issue = {}    # id -> comment
+        self.reviews = {}  # id -> review
+        self.down = set()  # collection paths answering 404, as gh reports a failed GET
         self.threads = {}  # thread node id -> {ids: [...], resolved: bool}
         self.next_id = 900
         self.mutations = []
@@ -34,6 +36,10 @@ class FakeGitHub:
                             'html_url': f'https://github.com/{REPO}/pull/{PR}#discussion_r{cid}'}
         t = thread or f'T{cid}'
         self.threads.setdefault(t, {'ids': [], 'resolved': False})['ids'].append(cid)
+
+    def add_review(self, rid, body='bot review body', login='bot'):
+        self.reviews[rid] = {'id': rid, 'body': body, 'user': {'login': login},
+                             'html_url': f'https://github.com/{REPO}/pull/{PR}#pullrequestreview-{rid}'}
 
     def issue_comment(self, cid, body='bot summary', login='bot'):
         self.issue[cid] = {'id': cid, 'body': body, 'user': {'login': login},
@@ -55,6 +61,8 @@ class FakeGitHub:
 
     def rest(self, method, path, body, paginate):
         path = path.split('?')[0]
+        if path in self.down:
+            raise KeyError(path)
         pages = (lambda xs: [list(xs)]) if paginate else (lambda xs: list(xs))
         if path == 'user':
             return {'login': ME}
@@ -69,6 +77,9 @@ class FakeGitHub:
             cid = self.next_id = self.next_id + 1
             self.issue_comment(cid, body['body'], ME)
             return self.issue[cid]
+        m = re.fullmatch(rf'repos/{REPO}/pulls/{PR}/reviews', path)
+        if m and method == 'GET':
+            return pages(self.reviews.values())
         m = re.fullmatch(rf'repos/{REPO}/pulls/{PR}/comments/(\d+)/replies', path)
         if m and method == 'POST':
             parent = int(m.group(1))
@@ -165,7 +176,38 @@ class ReplyTest(unittest.TestCase):
     def test_unknown_comment_posts_nothing(self):
         rc, receipts = self.run_script([{'commentId': 99, 'body': 'x'}])
         self.assertEqual(rc, 1)
-        self.assertIn('not on PR', receipts[0]['error'])
+        self.assertEqual((receipts[0]['kind'], receipts[0]['sent'], receipts[0]['error']),
+                         ('none', False, f'comment 99 is not on PR #{PR}'))
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_failed_lookup_is_not_none(self):
+        self.gh.down.add(f'repos/{REPO}/pulls/{PR}/reviews')
+        rc, receipts = self.run_script([{'commentId': 99, 'body': 'x'}])
+        self.assertEqual(rc, 1)
+        self.assertEqual((receipts[0]['kind'], receipts[0]['sent']), (None, False))
+        self.assertIn('404', receipts[0]['error'])
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_review_body_reply_is_an_issue_comment_quoting_the_review(self):
+        self.gh.add_review(30, 'Actionable comments posted: 1\n\nOutside the diff: x')
+        body = 'Fixed in abc1234.\n\n- a.c:3: x'
+        rc, receipts = self.run_script([{'commentId': 30, 'body': body}])
+        self.assertEqual(rc, 0)
+        r = receipts[0]
+        self.assertEqual((r['kind'], r['replyId'], r['posted'], r['verified'], r['resolved']), ('review-body', 901, True, True, None))
+        quoted = f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\n{body}'
+        self.assertEqual(self.gh.mutations, [('post-issue', quoted)])
+        rc, receipts = self.run_script([{'commentId': 30, 'body': body}])
+        self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['posted']), (0, 901, False), 'the retry reuses the reply')
+        self.assertEqual(len(self.gh.mutations), 1)
+
+    def test_an_id_in_two_spaces_is_refused(self):
+        self.gh.review_comment(40)
+        self.gh.add_review(40)
+        rc, receipts = self.run_script([{'commentId': 40, 'body': 'x'}])
+        self.assertEqual(rc, 1)
+        self.assertEqual(receipts[0]['kind'], None)
+        self.assertIn('ambiguous', receipts[0]['error'])
         self.assertEqual(self.gh.mutations, [])
 
     def test_one_failure_does_not_stop_the_others(self):

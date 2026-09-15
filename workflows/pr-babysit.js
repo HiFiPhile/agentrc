@@ -577,10 +577,15 @@ const fixCell = (fixes, id, push, pushFailed) => {
   return `${push ? 'fixed + pushed' : 'fixed, uncommitted'}${hook}${stat}`
 }
 const VERDICT_ORDER = { valid: 0, stale: 1, invalid: 2 }
+// Comments the script found on none of the PR's three id spaces this cycle:
+// they owe nothing and no reply was posted, so the summary must not read
+// "pending". Per cycle, since a later harvest of the same id owes anew.
+const retired = new Set()
 const answerState = (commentId) => (debt.get(commentId) || {}).repair
   ? `NEEDS REPAIR: ${debt.get(commentId).repair.replyId ? `reply ${debt.get(commentId).repair.replyId} has the wrong body` : debt.get(commentId).repair.error}`
+  : retired.has(commentId) ? 'no reply: comment is not on the PR'
   : !answeredWith.has(commentId) ? 'reply pending'
-  : answeredWith.get(commentId).how === 'refutation' ? 'replied + resolved'
+  : answeredWith.get(commentId).how === 'refutation' ? 'replied'
     : owesDismissal(commentId) ? 'deferred to next cycle' : 'answered by fix note'
 
 const cycleSummary = (entry) => {
@@ -1019,14 +1024,30 @@ const runCycle = async (cycle, entry) => {
           if (sideEffect) repair(commentId, sideEffect.replyId, 'receipt for a different body')
           continue
         }
-        if (r.verified === true && r.replyId !== null && (r.kind === 'issue' || r.resolved === true)) { pay(commentId, how); settled.add(commentId) }
+        if (r.kind === 'none') {
+          // Every id space was searched and none has it: nothing can ever pay
+          // this, so it is dropped rather than carried. answeredWith is left
+          // alone, since no reply exists. Only the script's exact absence
+          // shape says so; a "none" that also claims a POST or a reply is
+          // contradictory and can neither retire nor pay.
+          if (r.replyId === null && !r.sent && !r.posted && r.verified === false && r.resolved === null) {
+            log(`cycle ${cycle}: comment ${commentId} is not on PR #${args.pr} — owes nothing`)
+            debt.delete(commentId); retired.add(commentId); settled.add(commentId)
+          } else if (r.replyId !== null) repair(commentId, r.replyId, 'contradictory receipt')
+          else log(`cycle ${cycle}: ${label} receipt for comment ${commentId} says none and a POST — not trusted`)
+          continue
+        }
+        if (r.verified === true && r.replyId !== null && (r.kind === 'issue' || r.kind === 'review-body' || r.resolved === true)) { pay(commentId, how); settled.add(commentId) }
         else if (r.verified === false && r.replyId !== null) repair(commentId, r.replyId, r.error || 'read-back mismatch')
         else if (r.verified === null && r.replyId !== null) log(`cycle ${cycle}: reply ${r.replyId} to comment ${commentId} could not be read back (${r.error}) — retried next cycle`)
       }
       const missing = [...expected.keys()].filter(id => !settled.has(id))
+      const gone = [...expected.keys()].filter(id => retired.has(id))
       const receipt = {
         pass: missing.length === 0,
-        detail: !out ? 'agent died' : missing.length === 0 ? 'posted, read back, resolved' : `unsettled: ${missing.join(', ')}`,
+        detail: !out ? 'agent died'
+          : [missing.length ? `unsettled: ${missing.join(', ')}` : gone.length < expected.size ? 'posted and read back' : '',
+            gone.length ? `not on the PR, nothing owed: ${gone.join(', ')}` : ''].filter(Boolean).join('; '),
         receipts,
       }
       if (!receipt.pass) log(`cycle ${cycle}: ${label} incomplete — ${receipt.detail}`)
@@ -1276,6 +1297,7 @@ const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
 for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
   const entry = { cycle, head: expectedHead }
+  retired.clear()
   history.push(entry)
   // A rejection from any worker not individually guarded (replies/resolve/scope/
   // fixer/push) must not skip the scoreboard — that is exactly the cycle worth
