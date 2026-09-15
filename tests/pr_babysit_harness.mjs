@@ -1630,6 +1630,42 @@ test('a none receipt that also names a reply is contradictory, not a retirement'
   }
 })
 
+test('a refutation paid before a later worker threw stays paid in the failed cycle', async () => {
+  // The refutation is posted before the fixer runs. When the fixer then throws,
+  // the cycle is reported as thrown, but the ledger already moved: the comment
+  // is answered and its receipt is in the cycle's history.
+  const { result } = await run({
+    args: { autoPush: true },
+    reviews: { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], done: true },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+    throwOn: 'fix:',
+  })
+  assert.equal(result.reason, 'cycle-threw')
+  assert.equal(result.history[0].refutedPosts.pass, true)
+  assert.deepEqual(result.state.answeredWith.map(([id, a]) => [id, a.how]), [[2, 'refutation']])
+  assert.equal(result.state.debt.some(([id]) => id === 2), false)
+})
+
+test('a retired comment harvested again owes again', async () => {
+  // Retirement is per cycle: the id was on no space this cycle. A later harvest
+  // that reports it anew, without a draft, opens a fresh obligation, and the
+  // summary calls it pending rather than retired.
+  let cycle = 0
+  const { result, logs } = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ({
+      findings: [invalidFinding({ commentId: 2, line: 4 })],
+      replies: ++cycle === 1 ? [{ commentId: 2, body: 'not so' }] : [], done: cycle > 1,
+    }),
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+    noTarget: (id) => cycle === 1 && id === 2,
+  })
+  assert.equal(result.reason, 'deferred-replies-unresolved')
+  assert.deepEqual(result.deferred, [2])
+  assert.match(rowsOf(summaries(logs)[0])[0].join('|'), /no reply: comment is not on the PR/)
+  assert.match(rowsOf(summaries(logs)[1])[0].join('|'), /refuted, reply pending/)
+})
+
 test('a verified review-body receipt pays like an issue comment', async () => {
   let cycle = 0
   const validOnce = () => (++cycle === 1 ? oneValid : { findings: [], replies: [], done: true })

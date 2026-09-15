@@ -69,16 +69,12 @@ if (args.protected !== undefined && args.protected !== null) {
 }
 const buildCmd = typeof args.build === 'string' && args.build.trim() ? args.build.trim() : null
 
-// A launch that yields runs exactly one cycle and returns its state, so a caller
-// with judgment decides whether the next cycle is worth its cost. The state is
-// this run's ledger, serialized: the next launch restores it and continues the
-// numbering and the budget. It never carries autoPush: permission is given to
-// every launch afresh.
+// A yielding launch runs one cycle and returns its state, the ledger and the
+// budget, which the next launch restores. It never carries autoPush: permission
+// is given to every launch afresh.
 const yieldAfterCycle = args.yieldAfterCycle === true
-// Which lane this launch runs: scheduling input from the caller's own
-// observation (only CI moved, only a bot spoke), so it is not part of the
-// config a restored state must match. A single lane observes half the PR and
-// cannot declare it done; only a `both` launch can.
+// The lane is the caller's scheduling input, not part of the config a restored
+// state must match. A single lane observes half the PR and cannot declare it done.
 const lane = args.lane === undefined ? 'both' : args.lane
 if (!['both', 'ci', 'reviews'].includes(lane)) throw new Error("lane must be 'both', 'ci' or 'reviews'")
 if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs one lane for one cycle: it needs yieldAfterCycle`)
@@ -191,9 +187,6 @@ const CHECK = {
   required: ['addresses', 'reason'],
   properties: { addresses: { type: 'boolean' }, reason: { type: 'string' } },
 }
-// `committed` separates the two ways pass=false happens: the commit exists and
-// only the push was rejected, or no commit was ever created (hook rejection,
-// missing git identity) and the work is still only in the working tree.
 // The push stage may not commit, and the SHA it sends is already known, so it
 // reports only whether the send succeeded.
 const PUSH = {
@@ -291,16 +284,14 @@ const RECEIPTS = {
 }
 
 const history = restored ? restored.history : []
-// commentId -> { how, digest }: how the comment has been answered so far
-// ('refutation' or 'fixNote') and the body that answer addressed. Either answer
-// resolved its thread, so the comment accrues no further debt from a later
-// harvest - until the reviewer edits the body, which the digest catches: our
-// answer then stands against points that are no longer the ones being made.
+// commentId -> { how, digest }: how the comment was answered ('refutation' or
+// 'fixNote') and the digest of the body that answer addressed. An answered
+// comment accrues no further debt until the reviewer edits it, which the
+// digest catches.
 const answeredWith = new Map(restored ? restored.answeredWith : [])
-// commentId -> { dismissals, note }: which dismissals we have relied on without
-// telling the reviewer, and whether a landed fix still owes its note. Standing
-// debt, not a snapshot: a harvest that drops a finding does not settle it. The
-// next validator is asked to re-report these, and the final verdict names them.
+// commentId -> { dismissals, note }: dismissals relied on without telling the
+// reviewer, and whether a landed fix still owes its note. Standing debt, not a
+// snapshot: a harvest that drops a finding does not settle it.
 const debt = new Map(restored
   ? restored.debt.map(([id, d]) => [id, { dismissals: new Set(d.dismissals), note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }])
   : [])
@@ -361,20 +352,15 @@ const unresolvedVerdict = (cycles, deferred, dryRun = false) =>
 // Backoff between cycles that have nothing to do but wait.
 const nap = (ms) => new Promise(res => setTimeout(res, ms))
 
-// Canonicalize a repo-relative path for set/collision comparison: resolve ./..
-// segments, unify separators; '' for a path that escapes the repo or whose
-// spelling would name a different file.
 // The only host this workflow will ask a publisher to push to. Widening it is
 // one constant and the two tests that name it.
 const HOST = 'github.com'
-// host/owner/repo out of a git remote URL, in the two secure forms a GitHub
-// remote takes: `user@host:owner/repo` and https/ssh URLs. Plain http and git://
-// are not accepted — both are unauthenticated and neither should carry a push.
-// The host is half the identity, and the path must be exactly owner/repo, so a
-// local path or a deeper prefix is not silently read as one.
-// The delimiter is mandatory and differs per form: a URL separates host from
-// path with `/`, the scp-like form with `:`. Accepting either for both makes
-// `git@github.com/owner/repo` look right, while git reads it as a local path.
+// host/owner/repo out of a git remote URL: `user@host:owner/repo` or an
+// https/ssh URL. Plain http and git:// are unauthenticated and carry no push.
+// The path must be exactly owner/repo, and the delimiter after the host is
+// mandatory and per form (`/` for a URL, `:` for scp-like): accepting either
+// for both makes `git@github.com/owner/repo` look right while git reads it as
+// a local path.
 const ORIGIN = /^(?:(?:https|ssh):\/\/(?:[^@/]*@)?([^/:]+)(?::\d+)?\/|(?:[^@/\s]+@)([^/:]+):)([^/]+)\/([^/]+?)(?:\.git)?$/
 const originOf = (url) => {
   const m = ORIGIN.exec(String(url).trim().replace(/\/+$/, ''))
@@ -392,6 +378,9 @@ const hostOf = (url) => {
   return m && m[1].toLowerCase() === HOST ? HOST : ''
 }
 
+// Canonicalize a repo-relative path for set/collision comparison: resolve ./..
+// segments, unify separators; '' for a path that escapes the repo or whose
+// spelling would name a different file.
 const canon = (p) => {
   const s = String(p).replace(/\\/g, '/')
   // Git allows a name that starts or ends with a space. Trimming would silently
@@ -624,9 +613,7 @@ const cycleSummary = (entry) => {
 }
 
 // The publisher is dispatched only after verification, so an unverified or
-// partial edit is never what this workflow asks to be pushed.
-// Returns the agent's verdict as-is (pass=false and all) so the caller can tell
-// the summary whether the fix is sitting committed-but-unpushed; a dead agent
+// partial edit is never what this workflow asks to be pushed. A dead agent
 // becomes a pass=false verdict of its own.
 const commitAndPush = async (cycle, what, owned = []) => {
   // Commit by explicit path, never `git add -A`: a stray edit on a path this
@@ -794,6 +781,103 @@ const commitAndPush = async (cycle, what, owned = []) => {
 
 let napMs = 0 // backoff owed from the previous cycle, taken after its summary
 
+// Posting is the script's; the workflow settles each comment by its receipt
+// alone, and a receipt can only pay, repair or retire a comment.
+const publishReplies = async (label, drafts, how, cycle, digestOf) => {
+  // A refutation settles the comment outright; a fix note ("fixed in X") is
+  // not the answer a dismissal owes, so it settles only the note.
+  const pay = (commentId, how) => {
+    answeredWith.set(commentId, { how, digest: digestOf.get(commentId) })
+    const d = debt.get(commentId)
+    if (!d) return
+    d.note = false
+    delete d.attempt
+    if (how === 'refutation') { d.dismissals.clear(); d.renumbered = false }
+    if (d.dismissals.size === 0 && !d.renumbered) debt.delete(commentId)
+  }
+  // A reply that exists with the wrong content is a repair for a human: the
+  // comment keeps its debt, and the next cycle must not answer it again on
+  // top of the wrong one.
+  const repair = (commentId, replyId, error) => {
+    const d = debt.get(commentId) || (debt.set(commentId, { dismissals: new Set(), note: false }), debt.get(commentId))
+    d.repair = { replyId, error }
+    log(`cycle ${cycle}: reply ${replyId} to comment ${commentId} exists with the wrong content (${error}) — needs a human repair, not another reply`)
+  }
+  // The body first offered is kept in the debt as an attempt (body, digest,
+  // answer type) until the comment is paid: no receipt proves an earlier
+  // POST never landed, and the script reuses only an identical body. A
+  // reviewer's edit or a verdict flip since makes it stale: neither reused
+  // nor reposted; a human reconciles.
+  const replies = []
+  for (const { commentId, body } of drafts) {
+    const d = debt.get(commentId)
+    const a = d && d.attempt
+    if (a && (a.how !== how || a.digest !== digestOf.get(commentId))) {
+      repair(commentId, null, `offered ${a.how} is stale (${a.how !== how ? `now owes a ${how}` : 'comment edited'})`)
+      continue
+    }
+    if (a && a.body !== body) log(`cycle ${cycle}: comment ${commentId} keeps the body already offered, not this cycle's redraft`)
+    const out = a ? a.body : body
+    if (d) d.attempt = { body: out, how, digest: digestOf.get(commentId) }
+    replies.push({ commentId, body: out, digest: fnv1a(out) })
+  }
+  if (replies.length === 0) return { pass: false, detail: 'nothing publishable', receipts: [] }
+  const out = await agent(
+    `${IN_CHECKOUT}Publish these replies on PR #${args.pr}: write exactly this JSON to a new temporary file and run ` +
+    `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --manifest <that file>\`, then return the receipts from its last stdout line unchanged. ` +
+    'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ' +
+    `Manifest: ${JSON.stringify({ replies })}`,
+    { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
+  ).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  const expected = new Map(replies.map(r => [r.commentId, r.digest]))
+  const receipts = out ? out.receipts.filter(r => expected.has(r.commentId)) : [] // a stray id answers nothing
+  const settled = new Set()
+  for (const [commentId, digest] of expected) {
+    const mine = receipts.filter(r => r.commentId === commentId)
+    // A receipt that is not trusted may still name a reply that exists:
+    // that id is kept as the repair, so nothing is posted over it.
+    const sideEffect = mine.find(r => r.replyId !== null)
+    if (mine.length !== 1) {
+      if (mine.length > 1) log(`cycle ${cycle}: ${label} returned ${mine.length} receipts for comment ${commentId} — none trusted`)
+      if (sideEffect) repair(commentId, sideEffect.replyId, 'contradictory receipts')
+      continue
+    }
+    const [r] = mine
+    if (r.digest !== digest) {
+      log(`cycle ${cycle}: ${label} receipt for comment ${commentId} is for a different body — not trusted`)
+      if (sideEffect) repair(commentId, sideEffect.replyId, 'receipt for a different body')
+      continue
+    }
+    if (r.kind === 'none') {
+      // Every id space was searched and none has it: nothing can ever pay
+      // this, so it is dropped rather than carried. answeredWith is left
+      // alone, since no reply exists. Only the script's exact absence
+      // shape says so; a "none" that also claims a POST or a reply is
+      // contradictory and can neither retire nor pay.
+      if (r.replyId === null && !r.sent && !r.posted && r.verified === false && r.resolved === null) {
+        log(`cycle ${cycle}: comment ${commentId} is not on PR #${args.pr} — owes nothing`)
+        debt.delete(commentId); retired.add(commentId); settled.add(commentId)
+      } else if (r.replyId !== null) repair(commentId, r.replyId, 'contradictory receipt')
+      else log(`cycle ${cycle}: ${label} receipt for comment ${commentId} says none and a POST — not trusted`)
+      continue
+    }
+    if (r.verified === true && r.replyId !== null && (r.kind === 'issue' || r.kind === 'review-body' || r.resolved === true)) { pay(commentId, how); settled.add(commentId) }
+    else if (r.verified === false && r.replyId !== null) repair(commentId, r.replyId, r.error || 'read-back mismatch')
+    else if (r.verified === null && r.replyId !== null) log(`cycle ${cycle}: reply ${r.replyId} to comment ${commentId} could not be read back (${r.error}) — retried next cycle`)
+  }
+  const missing = [...expected.keys()].filter(id => !settled.has(id))
+  const gone = [...expected.keys()].filter(id => retired.has(id))
+  const receipt = {
+    pass: missing.length === 0,
+    detail: !out ? 'agent died'
+      : [missing.length ? `unsettled: ${missing.join(', ')}` : gone.length < expected.size ? 'posted and read back' : '',
+        gone.length ? `not on the PR, nothing owed: ${gone.join(', ')}` : ''].filter(Boolean).join('; '),
+    receipts,
+  }
+  if (!receipt.pass) log(`cycle ${cycle}: ${label} incomplete — ${receipt.detail}`)
+  return receipt
+}
+
 // One cycle: returns null to re-arm, or the workflow's final result to stop.
 // Records what happened on `entry` as it goes, so the caller can report a cycle
 // that ended early.
@@ -891,14 +975,11 @@ const runCycle = async (cycle, entry) => {
       }
     }
 
-    // One derived answer to "what does this comment still owe us", replacing
-    // the rules that used to be spread across the reply, fix-note and summary
-    // stages. Derived, not stored: an obligation cannot outlive its cause.
-    //   wait      - carries both a valid and a refuted finding. Refuting it now
-    //               resolves the thread over a fix that has not landed, and the
-    //               drafted body would deny a finding we may have just accepted.
-    //   refutation- refuted findings only; the drafted reply answers it.
-    //   fixNote   - valid findings only; the post-fix note answers it.
+    // What a comment still owes, derived from this harvest, never stored:
+    //   wait       - both a valid and a refuted finding: refuting now would
+    //                resolve the thread over a fix that has not landed.
+    //   refutation - refuted findings only; the drafted reply answers it.
+    //   fixNote    - valid findings only; the post-fix note answers it.
     const ledger = new Map()
     const digestOf = new Map()
     for (const f of r.findings) {
@@ -913,15 +994,10 @@ const runCycle = async (cycle, entry) => {
       if (e.valid && e.refuted) return 'wait'
       return e.refuted ? 'refutation' : e.valid ? 'fixNote' : 'none'
     }
-    // Accrue this harvest. A comment already answered accrues nothing further:
-    // answering resolved its thread, so a later stale re-report of the finding
-    // we fixed is a consequence of our own fix, not a new dismissal owed to the
-    // reviewer.
-    //
-    // Dismissals are held by identity, not counted. Overturning one retires
-    // that one - re-reporting a finding the challenge already overturned must
-    // not retire a different dismissal still outstanding - and a comment the
-    // validator stopped reporting keeps everything it owed.
+    // Accrue this harvest. An answered comment accrues nothing: a stale
+    // re-report of a fixed finding is our own fix's consequence. Dismissals are
+    // held by identity, not counted: overturning one retires that one, and a
+    // comment the validator stopped reporting keeps everything it owed.
     for (const f of r.findings) {
       const prior = answeredWith.get(f.commentId)
       // Edited after we answered it: the reply that resolved the thread spoke to
@@ -953,113 +1029,11 @@ const runCycle = async (cycle, entry) => {
       if (!answered) { const e = open(); e.note = true; if (e.digest === undefined) e.digest = f.commentDigest }
       if (d && d.dismissals.size === 0 && !d.note && !d.renumbered) debt.delete(f.commentId)
     }
-    // A refutation resolves the thread, so it settles the comment outright. A
-    // fix note does not: it says "fixed in commit X", which is not the answer a
-    // dismissal owes, and letting it stand in for one closes the thread with
-    // the wrong content.
-    const pay = (commentId, how) => {
-      answeredWith.set(commentId, { how, digest: digestOf.get(commentId) })
-      const d = debt.get(commentId)
-      if (!d) return
-      d.note = false
-      delete d.attempt
-      if (how === 'refutation') { d.dismissals.clear(); d.renumbered = false }
-      if (d.dismissals.size === 0 && !d.renumbered) debt.delete(commentId)
-    }
-    // A reply that exists with the wrong content is a repair for a human: the
-    // comment keeps its debt, and the next cycle must not answer it again on
-    // top of the wrong one.
-    const repair = (commentId, replyId, error) => {
-      const d = debt.get(commentId) || (debt.set(commentId, { dismissals: new Set(), note: false }), debt.get(commentId))
-      d.repair = { replyId, error }
-      log(`cycle ${cycle}: reply ${replyId} to comment ${commentId} exists with the wrong content (${error}) — needs a human repair, not another reply`)
-    }
-    const publishReplies = async (label, drafts, how) => {
-      // The body that goes out is the one a comment was first offered, kept in
-      // its debt until it is paid: a retry after a lost receipt or a failed
-      // resolve must find the reply that exists, and the script reuses only an
-      // identical body. A redrafted text would post a second reply.
-      // An attempt is the body plus what it answered (the comment's digest and
-      // the answer type), kept until the comment is paid: no receipt can prove
-      // an earlier POST never landed. A reviewer's edit or a verdict flip since
-      // makes it a stale answer that may already be on the thread, so it is
-      // neither reused nor replaced by a repost; a human reconciles.
-      const replies = []
-      for (const { commentId, body } of drafts) {
-        const d = debt.get(commentId)
-        const a = d && d.attempt
-        if (a && (a.how !== how || a.digest !== digestOf.get(commentId))) {
-          repair(commentId, null, `offered ${a.how} is stale (${a.how !== how ? `now owes a ${how}` : 'comment edited'})`)
-          continue
-        }
-        if (a && a.body !== body) log(`cycle ${cycle}: comment ${commentId} keeps the body already offered, not this cycle's redraft`)
-        const out = a ? a.body : body
-        if (d) d.attempt = { body: out, how, digest: digestOf.get(commentId) }
-        replies.push({ commentId, body: out, digest: fnv1a(out) })
-      }
-      if (replies.length === 0) return { pass: false, detail: 'nothing publishable', receipts: [] }
-      const out = await agent(
-        `${IN_CHECKOUT}Publish these replies on PR #${args.pr}: write exactly this JSON to a new temporary file and run ` +
-        `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --manifest <that file>\`, then return the receipts from its last stdout line unchanged. ` +
-        'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ' +
-        `Manifest: ${JSON.stringify({ replies })}`,
-        { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
-      ).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
-      const expected = new Map(replies.map(r => [r.commentId, r.digest]))
-      const receipts = out ? out.receipts.filter(r => expected.has(r.commentId)) : [] // a stray id answers nothing
-      const settled = new Set()
-      for (const [commentId, digest] of expected) {
-        const mine = receipts.filter(r => r.commentId === commentId)
-        // A receipt that is not trusted may still name a reply that exists:
-        // that id is kept as the repair, so nothing is posted over it.
-        const sideEffect = mine.find(r => r.replyId !== null)
-        if (mine.length !== 1) {
-          if (mine.length > 1) log(`cycle ${cycle}: ${label} returned ${mine.length} receipts for comment ${commentId} — none trusted`)
-          if (sideEffect) repair(commentId, sideEffect.replyId, 'contradictory receipts')
-          continue
-        }
-        const [r] = mine
-        if (r.digest !== digest) {
-          log(`cycle ${cycle}: ${label} receipt for comment ${commentId} is for a different body — not trusted`)
-          if (sideEffect) repair(commentId, sideEffect.replyId, 'receipt for a different body')
-          continue
-        }
-        if (r.kind === 'none') {
-          // Every id space was searched and none has it: nothing can ever pay
-          // this, so it is dropped rather than carried. answeredWith is left
-          // alone, since no reply exists. Only the script's exact absence
-          // shape says so; a "none" that also claims a POST or a reply is
-          // contradictory and can neither retire nor pay.
-          if (r.replyId === null && !r.sent && !r.posted && r.verified === false && r.resolved === null) {
-            log(`cycle ${cycle}: comment ${commentId} is not on PR #${args.pr} — owes nothing`)
-            debt.delete(commentId); retired.add(commentId); settled.add(commentId)
-          } else if (r.replyId !== null) repair(commentId, r.replyId, 'contradictory receipt')
-          else log(`cycle ${cycle}: ${label} receipt for comment ${commentId} says none and a POST — not trusted`)
-          continue
-        }
-        if (r.verified === true && r.replyId !== null && (r.kind === 'issue' || r.kind === 'review-body' || r.resolved === true)) { pay(commentId, how); settled.add(commentId) }
-        else if (r.verified === false && r.replyId !== null) repair(commentId, r.replyId, r.error || 'read-back mismatch')
-        else if (r.verified === null && r.replyId !== null) log(`cycle ${cycle}: reply ${r.replyId} to comment ${commentId} could not be read back (${r.error}) — retried next cycle`)
-      }
-      const missing = [...expected.keys()].filter(id => !settled.has(id))
-      const gone = [...expected.keys()].filter(id => retired.has(id))
-      const receipt = {
-        pass: missing.length === 0,
-        detail: !out ? 'agent died'
-          : [missing.length ? `unsettled: ${missing.join(', ')}` : gone.length < expected.size ? 'posted and read back' : '',
-            gone.length ? `not on the PR, nothing owed: ${gone.join(', ')}` : ''].filter(Boolean).join('; '),
-        receipts,
-      }
-      if (!receipt.pass) log(`cycle ${cycle}: ${label} incomplete — ${receipt.detail}`)
-      return receipt
-    }
 
-    // REVIEWS does not tie replies to findings, so a validator can draft a
-    // reply for a comment that owes no refutation; posting it would refute a
-    // reviewer on no one's authority. One per comment, too: the script posts
-    // a single threaded reply and resolves the thread - so sibling drafts
-    // are merged into that body rather than dropped, since pay() then retires
-    // every dismissal on the comment, including the ones they answer.
+    // A draft for a comment that owes no refutation would refute a reviewer on
+    // no one's authority. One body per comment: the script posts one reply and
+    // resolves the thread, and pay() retires every dismissal on it, so sibling
+    // drafts merge into that body.
     let withheld = 0
     const replyFor = new Map()
     for (const x of r.replies) {
@@ -1073,7 +1047,7 @@ const runCycle = async (cycle, entry) => {
     if (freshReplies.length > 0 && args.autoPush === true) {
       // Keep the receipt before anything later can fail: a cycle that dies after
       // posting must still be able to say what went out.
-      entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation')
+      entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation', cycle, digestOf)
     }
 
     // ---- review lane: fix + push without waiting for CI ----
@@ -1103,12 +1077,9 @@ const runCycle = async (cycle, entry) => {
       entry.reviewPush = push
       reviewPushed = true
       // A comment still waiting on a sibling refutation is not answered by a
-      // fix note: that note resolves the thread over the unanswered half.
-      // One entry per comment, for the reason the refutations are merged: the
-      // note is posted once and resolves the thread, and pay() then settles the
-      // whole comment - so every finding on it must be named in that one note.
-      // The note's body is built here, not by the poster: the read-back can
-      // only prove a text the workflow decided on.
+      // fix note. One note per comment, naming every finding on it, for the
+      // reason refutations are merged; built here, since the read-back proves
+      // only a text the workflow decided on.
       const answerable = new Map()
       for (const f of validFindings) {
         if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair) continue
@@ -1118,7 +1089,7 @@ const runCycle = async (cycle, entry) => {
         else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}` })
       }
       if (answerable.size > 0) {
-        entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote')
+        entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
       }
     }
 
@@ -1299,10 +1270,8 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   const entry = { cycle, head: expectedHead }
   retired.clear()
   history.push(entry)
-  // A rejection from any worker not individually guarded (replies/resolve/scope/
-  // fixer/push) must not skip the scoreboard — that is exactly the cycle worth
-  // reporting. Converting it to a failure verdict instead of rethrowing keeps
-  // `history`, as the dead-validator path does.
+  // A worker's rejection must still reach the scoreboard: a failure verdict
+  // keeps `history`, a rethrow would drop it.
   let verdict
   try {
     verdict = await runCycle(cycle, entry)
