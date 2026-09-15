@@ -443,6 +443,7 @@ const fixCell = (fixes, id, push, pushFailed) => {
   // working tree with nothing in git to recover.
   if (pushFailed) {
     const detail = pushFailed.detail || 'no detail'
+    if (pushFailed.committed === null) return `fixed, COMMIT OUTCOME UNKNOWN: ${detail} — inspect HEAD and the worktree${stat}`
     return pushFailed.committed
       ? `fixed + committed, PUSH FAILED: ${detail}${stat}`
       : `fixed, COMMIT FAILED: ${detail}${stat}`
@@ -541,7 +542,8 @@ const commitAndPush = async (cycle, what, owned = []) => {
     'created, and detail = one line on what you committed.',
     { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'sonnet', schema: COMMIT },
   ).catch(e => { log(`commit#${cycle}-${what} errored — ${e && e.message}`); return null })
-  if (!made) return { pass: false, committed: false, detail: 'commit agent died', sha: '' }
+  // A dead commit agent leaves no receipt either way: null, never a guess.
+  if (!made) return { pass: false, committed: null, detail: 'commit agent died', sha: '' }
   if (!made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
 
   // Read the commit back in a separate turn: a committer reporting on its own

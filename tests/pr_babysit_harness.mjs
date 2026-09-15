@@ -787,7 +787,7 @@ test('a publisher agent that throws is a failed push, not a crash', async () => 
   // the summary can report rather than an unexplained dead cycle.
   for (const [throwOn, detail, committed] of [
     ['recheck#', 'recheck agent died', false],
-    ['commit#', 'commit agent died', false],
+    ['commit#', 'commit agent died', null], // no receipt either way: neither true nor false is earned
     ['push#', 'push agent died after the commit landed', true],
   ]) {
     const { result, logs } = await run({ reviews: oneValid, throwOn })
@@ -795,7 +795,8 @@ test('a publisher agent that throws is a failed push, not a crash', async () => 
     assert.equal(result.history[0].reviewPushFailed.detail, detail)
     assert.equal(result.history[0].reviewPushFailed.committed, committed)
     assert.match(rowsOf(summaries(logs)[0])[0][3],
-      committed ? /fixed \+ committed, PUSH FAILED/ : /fixed, COMMIT FAILED/, throwOn)
+      committed === null ? /fixed, COMMIT OUTCOME UNKNOWN: commit agent died/
+        : committed ? /fixed \+ committed, PUSH FAILED/ : /fixed, COMMIT FAILED/, throwOn)
   }
 })
 
