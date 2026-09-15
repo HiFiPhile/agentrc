@@ -11,7 +11,7 @@ const body = readFileSync(new URL('../workflows/pr-babysit.js', import.meta.url)
 // run here is more forgiving than production: `new URL` cost this workflow every
 // run, refusing each one at preflight, while the suite stayed green. Shadowing
 // them as parameters makes the body fail here the way it fails there.
-const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch']
+const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
 
 const GREEN = { status: 'green', infraRerun: [], realFailures: [] }
 const finding = (over = {}) => {
@@ -109,7 +109,7 @@ async function run(opts = {}) {
     }
     if (label.startsWith('audit#')) {
       if (opts.audit === null) return null // a dead read-back agent
-      return { sha: made, parents: [head], paths: staged, ...opts.audit }
+      return { sha: made, parents: [head], paths: staged, leftover: [], ...opts.audit }
     }
     if (label.startsWith('push#')) {
       // This stage may not commit and is handed the SHA, so it reports only
@@ -716,7 +716,7 @@ test('the commit is read back by an agent that did not write it', async () => {
   const audit = calls.find(c => c.label === 'audit#1-review')
   // A committer reporting on its own commit is the one witness not to rely on.
   assert.match(audit.prompt, /Editing and committing nothing/)
-  assert.deepEqual(audit.schema.required, ['sha', 'parents', 'paths'])
+  assert.deepEqual(audit.schema.required, ['sha', 'parents', 'paths', 'leftover'])
   assert.match(audit.prompt, /every parent, not only the first/)
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.deepEqual(commit.schema.required, ['committed', 'detail'],
@@ -1531,4 +1531,35 @@ test('a harvest that reuses a findingId is rejected', async () => {
     },
   })
   assert.equal(result.reason, 'duplicate-finding-ids')
+})
+
+test('every agent that acts on GitHub is told which checkout the PR lives in', async () => {
+  // The CI watcher and both comment posters infer the repository from their
+  // working directory; pointed at another checkout by checkoutDir, they were
+  // acting on the launching repository's same-numbered PR.
+  const { calls } = await run({
+    reviews: {
+      findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })],
+      replies: [{ commentId: 2, body: 'no' }], done: true,
+    },
+    args: { checkoutDir: '/srv/other/repo' },
+  })
+  for (const label of ['ci#1', 'reviews#1', 'replies#1', 'resolve#1']) {
+    const c = calls.find(c => c.label === label)
+    assert.ok(c, `${label} ran in this scenario`)
+    assert.match(c.prompt, /\/srv\/other\/repo/, `${label} must name the checkout`)
+  }
+})
+
+test('a commit that leaves an owned change behind is not pushed', async () => {
+  // Subset was the whole audit: committed ⊆ owned. A committer that took one of
+  // two fixed files passed it, and the push announced both findings fixed.
+  const { result, labels, logs } = await run({
+    reviews: oneValid, audit: { leftover: [' M src/a.c'] },
+  })
+  assert.equal(result.pass, false)
+  assert.equal(result.reason, 'push-failed')
+  assert.equal(labels.some(l => l.startsWith('push#')), false, 'the publisher is not dispatched')
+  assert.match(result.history[0].reviewPushFailed.detail, /commit left owned change\(s\) behind:  M src\/a\.c/)
+  assert.ok(logs.some(l => /committed but NOT pushed — commit left owned change/.test(l)))
 })

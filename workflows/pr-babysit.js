@@ -167,10 +167,11 @@ const COMMIT = {
 }
 const AUDIT = {
   type: 'object', additionalProperties: false,
-  required: ['sha', 'parents', 'paths'],
+  required: ['sha', 'parents', 'paths', 'leftover'],
   properties: {
     sha: { type: 'string' }, parents: { type: 'array', items: { type: 'string' } },
     paths: { type: 'array', items: { type: 'string' } },
+    leftover: { type: 'array', items: { type: 'string' } },
   },
 }
 const SCOPE = {
@@ -550,14 +551,17 @@ const commitAndPush = async (cycle, what, owned = []) => {
     `${IN_CHECKOUT}Editing and committing nothing, report the commit at HEAD: ` +
     'sha = `git rev-parse HEAD`; parents = the space-separated output of `git show -s --format=%P HEAD` ' +
     'split into a list — every parent, not only the first; ' +
-    'paths = the lines of `git -c core.quotePath=false show --name-only --no-renames --format= HEAD`. ' +
-    'Return ONLY JSON matching the schema.',
+    'paths = the lines of `git -c core.quotePath=false show --name-only --no-renames --format= HEAD`; ' +
+    `leftover = the lines of \`git -c core.quotePath=false status --porcelain -- ${owned.map(f => `'${f}'`).join(' ')}\`, ` +
+    'the owned paths still changed after the commit. Return ONLY JSON matching the schema.',
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
 
   // Audit the commit itself, not the intent: its parent must be where this run
-  // left HEAD, and it must carry nothing beyond the paths we owned.
+  // left HEAD, it must carry nothing beyond the paths we owned, and nothing the
+  // writers changed in those paths may be left behind — a partial commit would
+  // otherwise be pushed and every finding announced fixed.
   const ownedSet = new Set(owned.map(canon))
   const sha = seen.sha.trim()
   const strays = seen.paths.map(canon).filter(f => !ownedSet.has(f))
@@ -570,6 +574,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
     : seen.parents[0].trim() !== expectedHead ? `commit sits on ${seen.parents[0].trim().slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
     : seen.paths.length === 0 ? 'commit reported no paths'
     : strays.length ? `commit carries unowned path(s): ${strays.join(', ')}`
+    : seen.leftover.length ? `commit left owned change(s) behind: ${seen.leftover.join(', ')}`
     : null
   if (why) {
     log(`push#${cycle}-${what}: committed but NOT pushed — ${why}`)
@@ -601,7 +606,7 @@ const runCycle = async (cycle, entry) => {
     // Two independent lanes, launched together. The review lane never waits on
     // CI: it validates, fixes, and pushes while the CI lane is still watching.
     ciPromise = agent(
-      `Watch CI for PR #${args.pr} per your procedure; wait budget for pending checks: ${ciWait} minutes.`,
+      `${IN_CHECKOUT}Watch CI for PR #${args.pr} per your procedure; wait budget for pending checks: ${ciWait} minutes.`,
       { label: `ci#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: CI },
     ).catch(e => { log(`cycle ${cycle}: pr-ci-watcher errored — ${e && e.message}`); return null })
 
@@ -773,7 +778,7 @@ const runCycle = async (cycle, entry) => {
     if (withheld > 0) log(`cycle ${cycle}: ${withheld} drafted reply/replies withheld`)
     if (freshReplies.length > 0 && args.autoPush === true) {
       const posted = await agent(
-        `Reply to and resolve these refuted review comments on PR #${args.pr}. For each: ${postReplyRecipe('reply')}` +
+        `${IN_CHECKOUT}Reply to and resolve these refuted review comments on PR #${args.pr}. For each: ${postReplyRecipe('reply')}` +
         'If a thread already carries an identical reply of ours (a prior attempt that posted but failed to resolve), do not repost — just resolve it. ' +
         `Replies: ${JSON.stringify(freshReplies)}. pass=true only if every reply was posted and every inline thread resolved; detail = what went where. ` +
         'doneIds = the commentIds fully handled: reply posted (or already present) AND (thread resolved, or an issue comment with no thread to resolve).',
@@ -832,7 +837,7 @@ const runCycle = async (cycle, entry) => {
       }
       if (answerable.size > 0) {
         const resolved = await agent(
-          `The fixes for PR #${args.pr}'s valid review findings were just committed and pushed (${push.sha}). ` +
+          `${IN_CHECKOUT}The fixes for PR #${args.pr}'s valid review findings were just committed and pushed (${push.sha}). ` +
           `For each finding below: ${postReplyRecipe('fix note')}` +
           'Each reply states the finding is fixed in the pushed commit, with one line on the change. ' +
           `Findings: ${JSON.stringify([...answerable.values()])}. ` +

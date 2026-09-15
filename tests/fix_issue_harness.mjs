@@ -198,3 +198,9 @@ test('an agent that throws is a dead agent, not a dead workflow', async () => {
   assert.equal(result.reason, 'verify-failed')
   assert.equal(result.verify.detail, 'verify agent died')
 })
+
+test('the verifier defers to the build contract for what counts as verified', async () => {
+  const { calls } = await run()
+  const v = calls.find(c => c.label === 'verify')
+  assert.match(v.prompt, /or the command's build-contract skill defines the outcome as verified/)
+})

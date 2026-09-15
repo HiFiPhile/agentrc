@@ -115,7 +115,9 @@ if (dev.buildOk === false) {
 
 const verified = await agent(
   `From the checkout root run exactly: ${verify} (a \`<BUILD>\` placeholder becomes a fresh \`mktemp -d\`). ` +
-  'pass = exit 0, detail = a one-line summary or the first error. Then, editing and committing nothing: ' +
+  'pass = exit 0, or the command\'s build-contract skill defines the outcome as verified; ' +
+  'detail = that contract\'s reason, otherwise a one-line summary or the first error. ' +
+  'Then, editing and committing nothing: ' +
   'branch = `git rev-parse --abbrev-ref HEAD`; ' +
   `commits = the lines of \`git log --oneline ${triage.head}..HEAD\`; dirty = the lines of \`git status --porcelain\`; ` +
   `outOfScope = the paths of \`git log --name-only --no-renames --format= ${triage.head}..HEAD\` (every commit, so an edit ` +
