@@ -379,7 +379,7 @@ const fixAndVerify = async (workIn) => {
       if (!fix) return null
       // A broken build is already fatal below, so skip the verifier: its verdict
       // could not change the outcome and it is the expensive step here.
-      if (fix.buildOk === false) return verdictOf(fix, w, false, 'targeted build failed')
+      if (fix.buildOk === false) return verdictOf(fix, w, false, `targeted build failed: ${fix.notes || 'no detail'}`)
       return agent(
         `${IN_CHECKOUT}Verify the uncommitted changes for ${scopeOf(w)} (use git diff -- <the files above>, and read any newly created untracked files directly) address these issues:\n- ${textOf(w)}\n` +
         'Return {"addresses": bool, "reason": string}.',

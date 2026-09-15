@@ -390,12 +390,16 @@ test('a claim already containing a backslash-pipe stays one cell', async () => {
 })
 
 test('a fix whose build failed is not published, and skips the verifier', async () => {
-  const { result, logs, labels } = await run({ reviews: oneValid, fix: { buildOk: false } })
+  const { result, logs, labels } = await run({
+    reviews: oneValid, fix: { buildOk: false, notes: 'uncovered: src/class/bth/bth_device.c' },
+  })
   assert.equal(result.pass, false)
   assert.equal(result.reason, 'fix-verification-failed')
   assert.equal(labels.some(l => l.startsWith('push#')), false, 'the publisher is not dispatched')
-  assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: targeted build failed/,
-    'reported as unverified, and the verifier is not paid for a broken build')
+  // The writer's notes carry the build contract's reason (an uncovered path, a
+  // missing-deps remedy); without them the row says only that something failed.
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: targeted build failed: uncovered: src/,
+    'reported as unverified with the writer\'s reason, and the verifier is not paid for a broken build')
 })
 
 test('a dead code-writer withholds the fix', async () => {
