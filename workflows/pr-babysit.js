@@ -197,13 +197,48 @@ const COMMIT = {
   required: ['committed', 'detail'],
   properties: { committed: { type: 'boolean' }, detail: { type: 'string' } },
 }
+// What running the repository's hooks on the owned paths did: the tree before
+// and after, the owned files' blob hashes before and after, and which hooks said
+// they modified files. The workflow decides from these what a hook regenerated.
+const HOOKS = {
+  type: 'object', additionalProperties: false,
+  required: ['ran', 'passed', 'modifiedBy', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
+  properties: {
+    ran: { type: 'boolean' }, passed: { type: 'boolean' },
+    modifiedBy: { type: 'array', items: { type: 'string' } },
+    before: { type: 'array', items: { type: 'string' } }, after: { type: 'array', items: { type: 'string' } },
+    snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
+  },
+}
+// One `<mode> <blob> <path>` line per path, as the hook agent reports the
+// working tree and the audit reports the commit (`git ls-tree` spells it
+// `<mode> blob <sha>\t<path>`). The working-tree mode is git's, 644 or 755 by
+// the executable bit, since the filesystem's own bits (664, 775) are not what
+// git stores; ls-tree's 100644 compares on its last three digits, so a
+// symlink (120000) never matches and stops publication. A path that does not
+// exist is `absent`, so a deletion is evidence too, not a missing line.
+// Every path goes through `-z` and NUL-to-newline: with a space or a quote in
+// the name, porcelain and ls-tree would otherwise quote it and ls-tree not.
+const STATUS_RECIPE = "git status --porcelain -z | tr '\\0' '\\n'"
+const snapshotRecipe = (owned) =>
+  `{ printf '%s\\n' ${owned.map(f => `'${f}'`).join(' ')}; ${STATUS_RECIPE} | cut -c4-; } | sort -u | ` +
+  'while IFS= read -r f; do if [ -e "$f" ]; then printf \'%s %s %s\\n\' "$([ -x "$f" ] && echo 755 || echo 644)" "$(git hash-object -- "$f")" "$f"; else printf \'absent - %s\\n\' "$f"; fi; done'
+const snapshotOf = (lines) => {
+  const out = new Map()
+  for (const l of lines) {
+    const m = /^(\d+|absent)\s+(?:blob\s+)?([0-9a-f]{40}|-)[\s\t]+(.+)$/.exec(l.replace(/\s+$/, ''))
+    if (m) out.set(canon(m[3]), { mode: m[1] === 'absent' ? 'absent' : m[1].slice(-3), blob: m[2] })
+  }
+  return out
+}
 const AUDIT = {
   type: 'object', additionalProperties: false,
-  required: ['sha', 'parents', 'paths', 'leftover'],
+  required: ['sha', 'parents', 'paths', 'leftover', 'entries'],
   properties: {
     sha: { type: 'string' }, parents: { type: 'array', items: { type: 'string' } },
     paths: { type: 'array', items: { type: 'string' } },
     leftover: { type: 'array', items: { type: 'string' } },
+    entries: { type: 'array', items: { type: 'string' } },
   },
 }
 const SCOPE = {
@@ -258,8 +293,23 @@ const debt = new Map(restored
 // pushed SHA after, and across launches the SHA the previous one left.
 let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
+// A commit that landed but was not pushed is a candidate the caller must
+// decide on, never the next baseline: expectedHead stays at the published head.
+const pendingOf = () => {
+  const last = history[history.length - 1]
+  for (const [lane, key] of [['review', 'reviewPushFailed'], ['ci', 'ciPushFailed']]) {
+    const f = last && last[key]
+    if (f && f.committed && f.sha) {
+      return { sha: f.sha, parent: expectedHead, lane, stage: f.detail.startsWith('commit failed audit') ? 'audit-blocked' : 'push-failed' }
+    }
+    // A commit that landed but whose read-back died is real and unlocated.
+    if (f && f.committed) return { sha: null, parent: expectedHead, lane, stage: 'audit-unknown' }
+    if (f && f.committed === null) return { sha: null, parent: expectedHead, lane, stage: 'push-unknown' }
+  }
+  return null
+}
 const stateOut = () => ({
-  version: STATE_VERSION, pin, expectedHead, config, cyclesUsed, maxCycles,
+  version: STATE_VERSION, pin, expectedHead, pending: pendingOf(), config, cyclesUsed, maxCycles,
   answeredWith: [...answeredWith],
   debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}) }]),
   history,
@@ -504,10 +554,11 @@ const fixCell = (fixes, id, push, pushFailed) => {
     const detail = pushFailed.detail || 'no detail'
     if (pushFailed.committed === null) return `fixed, COMMIT OUTCOME UNKNOWN: ${detail} — inspect HEAD and the worktree${stat}`
     return pushFailed.committed
-      ? `fixed + committed, PUSH FAILED: ${detail}${stat}`
+      ? `fixed + committed ${pushFailed.sha ? pushFailed.sha.slice(0, 7) : '(SHA unknown)'}, NOT PUSHED: ${detail}${stat}`
       : `fixed, COMMIT FAILED: ${detail}${stat}`
   }
-  return `${push ? 'fixed + pushed' : 'fixed, uncommitted'}${stat}`
+  const hook = push && push.generated && push.generated.length ? `, with hook output ${push.generated.join(', ')}` : ''
+  return `${push ? 'fixed + pushed' : 'fixed, uncommitted'}${hook}${stat}`
 }
 const VERDICT_ORDER = { valid: 0, stale: 1, invalid: 2 }
 const answerState = (commentId) => !answeredWith.has(commentId) ? 'reply pending'
@@ -590,13 +641,66 @@ const commitAndPush = async (cycle, what, owned = []) => {
     return { pass: false, committed: false, detail: `checkout moved: ${moved}`, sha: '' }
   }
 
+  // A required hook can regenerate a file outside the fix scope (a generated
+  // doc, a formatter's output), and pre-commit refuses a commit whose hook
+  // modified a file. Run the hooks first, on the owned paths, and admit what
+  // they changed from the evidence they leave: a path that appeared in the tree
+  // only after a hook reported modifying files, while the owned files' contents
+  // stayed what the fix verifier saw. The committer is then handed the widened
+  // list and never chooses a path itself.
+  const quoted = owned.map(f => `'${f}'`).join(' ')
+  const hooks = await agent(
+    `${IN_CHECKOUT}Editing nothing by hand. before = the lines of \`${STATUS_RECIPE}\`; ` +
+    `snapshotBefore = the lines of: ${snapshotRecipe(owned)}\n` +
+    `If .pre-commit-config.yaml exists: run \`pre-commit run --files ${quoted}\`, and once more if it exited non-zero; ` +
+    'ran = true, passed = whether the last run exited 0, modifiedBy = the ids of the hooks whose output said "files were modified by this hook". ' +
+    'Otherwise ran = false, passed = true, modifiedBy = []. ' +
+    'after = the status lines again; snapshotAfter = the snapshot lines again. Return ONLY JSON matching the schema.',
+    { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'sonnet', schema: HOOKS },
+  ).catch(e => { log(`hooks#${cycle}-${what} errored — ${e && e.message}`); return null })
+  if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
+  const ownedSet = new Set(owned.map(canon))
+  const pathOf = (line) => line.length > 3 ? canon(line.slice(3)) : ''
+  const beforePaths = hooks.before.map(pathOf)
+  const outside = beforePaths.filter(f => !ownedSet.has(f))
+  const generated = hooks.after.filter(l => !beforePaths.includes(pathOf(l)))
+  // Anything staged after the hooks (X not blank) was staged by a hook: an
+  // addition the tree never held, or a rename. Untracked (`??`) is new too.
+  const created = generated.filter(l => l[0] !== ' ' || l.includes(' -> '))
+  const hookPaths = generated.map(pathOf)
+  const generatedProtected = protectedRe ? hookPaths.filter(f => protectedRe.test(f)) : []
+  // Evidence must be complete before it says anything: one snapshot entry per
+  // owned path on both sides, and one per admitted path after. Two empty lists
+  // are equal and prove nothing.
+  const snapBefore = snapshotOf(hooks.snapshotBefore)
+  const snapAfter = snapshotOf(hooks.snapshotAfter)
+  const unsnapped = [...owned.map(canon).filter(f => !snapBefore.has(f) || !snapAfter.has(f)), ...hookPaths.filter(f => !snapAfter.has(f))]
+  const ownedChanged = owned.map(canon).filter(f => snapBefore.has(f) && snapAfter.has(f) &&
+    (snapBefore.get(f).blob !== snapAfter.get(f).blob || snapBefore.get(f).mode !== snapAfter.get(f).mode))
+  const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
+    : hooks.ran && !hooks.passed ? 'the repository hooks do not pass on the fix'
+    : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'
+    : created.length ? `a hook created or renamed file(s): ${created.map(pathOf).join(', ')}`
+    : unsnapped.length ? `hook evidence is incomplete: no snapshot for ${unsnapped.join(', ')}`
+    : ownedChanged.length ? `a hook changed an owned path after it was verified: ${ownedChanged.join(', ')}`
+    : hookPaths.length && !(hooks.ran && hooks.modifiedBy.length) ? `path(s) changed outside the fix scope by no hook: ${hookPaths.join(', ')}`
+    : generatedProtected.length ? `a hook regenerated a protected path: ${generatedProtected.join(', ')}`
+    : null
+  if (hookWhy) {
+    log(`push#${cycle}-${what}: refusing to publish — ${hookWhy}`)
+    return { pass: false, committed: false, detail: hookWhy, sha: '' }
+  }
+  if (hookPaths.length) log(`push#${cycle}-${what}: hook output admitted into the commit: ${hookPaths.join(', ')}`)
+  const scope = [...owned, ...hookPaths]
+  const scopeSet = new Set(scope.map(canon))
+
   // Commit and push are separate turns so the commit can be audited before it
   // leaves the machine: what a `git commit` picks up is not what `git add`
   // staged if anything ran in between.
   const made = await agent(
     `${IN_CHECKOUT}On branch ${pinned.branch}: run \`git add --\` with exactly these paths and no others, ` +
     `then \`git commit --only --\` with the same paths, never a bare \`git commit\` (imperative message summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, repo commit conventions). ` +
-    `The \`--\` matters: a path may look like an option.\n${owned.map(f => `'${f}'`).join(' ')}\n` +
+    `The \`--\` matters: a path may look like an option. If a hook modifies a file during the commit, report committed = false and say which; do not add it and retry.\n${scope.map(f => `'${f}'`).join(' ')}\n` +
     'Do not push. Leave every other working-tree change alone. Report committed = whether the commit was ' +
     'created, and detail = one line on what you committed.',
     { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'sonnet', schema: COMMIT },
@@ -612,9 +716,10 @@ const commitAndPush = async (cycle, what, owned = []) => {
     `${IN_CHECKOUT}Editing and committing nothing, report the commit at HEAD: ` +
     'sha = `git rev-parse HEAD`; parents = the space-separated output of `git show -s --format=%P HEAD` ' +
     'split into a list — every parent, not only the first; ' +
-    'paths = the lines of `git -c core.quotePath=false show --name-only --no-renames --format= HEAD`; ' +
-    `leftover = the lines of \`git -c core.quotePath=false status --porcelain -- ${owned.map(f => `'${f}'`).join(' ')}\`, ` +
-    'the owned paths still changed after the commit. Return ONLY JSON matching the schema.',
+    "paths = the lines of `git diff-tree --no-commit-id --no-renames --name-only -r -z HEAD | tr '\\0' '\\n'`; " +
+    `leftover = the lines of \`git status --porcelain -z -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`, ` +
+    'the owned paths still changed after the commit; ' +
+    `entries = the lines of \`git ls-tree -z HEAD -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`. Return ONLY JSON matching the schema.`,
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
@@ -623,9 +728,18 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // left HEAD, it must carry nothing beyond the paths we owned, and nothing the
   // writers changed in those paths may be left behind — a partial commit would
   // otherwise be pushed and every finding announced fixed.
-  const ownedSet = new Set(owned.map(canon))
   const sha = seen.sha.trim()
-  const strays = seen.paths.map(canon).filter(f => !ownedSet.has(f))
+  const strays = seen.paths.map(canon).filter(f => !scopeSet.has(f))
+  // What the commit holds for each path must be what the hooks left: the fix
+  // the verifier saw and the regeneration the hook made, byte for byte and mode
+  // for mode. An edit between the hooks and the commit is caught here.
+  const committed = snapshotOf(seen.entries)
+  const unbound = scope.map(canon).filter(f => {
+    const want = snapAfter.get(f); const got = committed.get(f)
+    if (!want) return true
+    if (want.mode === 'absent') return got !== undefined
+    return !got || want.blob !== got.blob || want.mode !== got.mode
+  })
   // Absent evidence is not evidence of a clean commit: an empty path list, a
   // half-written SHA, or a SHA equal to the parent all mean the report does not
   // describe a commit we can vouch for.
@@ -636,10 +750,11 @@ const commitAndPush = async (cycle, what, owned = []) => {
     : seen.paths.length === 0 ? 'commit reported no paths'
     : strays.length ? `commit carries unowned path(s): ${strays.join(', ')}`
     : seen.leftover.length ? `commit left owned change(s) behind: ${seen.leftover.join(', ')}`
+    : unbound.length ? `commit content differs from what the hooks left: ${unbound.join(', ')}`
     : null
   if (why) {
     log(`push#${cycle}-${what}: committed but NOT pushed — ${why}`)
-    return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha }
+    return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(hookPaths.length ? { generated: hookPaths } : {}) }
   }
 
   const push = await agent(
@@ -651,7 +766,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
   ).catch(e => { log(`push#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha }
   if (push.pass) expectedHead = sha
-  return { ...push, committed: true, sha }
+  return { ...push, committed: true, sha, ...(hookPaths.length ? { generated: hookPaths } : {}) }
 }
 
 let napMs = 0 // backoff owed from the previous cycle, taken after its summary

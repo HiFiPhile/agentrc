@@ -40,6 +40,18 @@ const PIN = {
 // What the pre-publish recheck must still find: HEAD exactly where the run left it.
 const RECHECK = { branch: 'claude/foo', pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, staged: [] }
 
+// The paths a publishing prompt names, read from the one line that carries
+// nothing else: quoted fragments elsewhere in the prompt (commands, hook names)
+// are not paths.
+const pathLine = (prompt) => {
+  const line = String(prompt).split('\n').find(l => /^'[^']*'( '[^']*')*$/.test(l))
+  return line ? [...line.matchAll(/'([^']*)'/g)].map(m => m[1]) : []
+}
+// A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
+const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
+const hookQuoted = (prompt) => [...(String(prompt).match(/pre-commit run --files ((?:'[^']*' ?)+)/) || ['', ''])[1].matchAll(/'([^']*)'/g)].map(m => m[1])
+const lsTreeOf = (paths) => paths.map(f => `100644 blob ${blobOf(f)}\t${f}`)
+
 // Drive the workflow against stub agents. Every cycle gets the same `reviews`
 // and `ci` answer; `fix`/`push` patch (or null out) those replies.
 async function run(opts = {}) {
@@ -98,18 +110,30 @@ async function run(opts = {}) {
           ...(opts.strayDoneIds || [])],
       }
     }
+    if (label.startsWith('hooks#')) {
+      if (opts.hooks === null) return null // a dead hook agent
+      // The tree as the hooks find it: exactly the owned paths, modified. A case
+      // that wants a hook to regenerate something overrides `after`.
+      const owned = hookQuoted(prompt)
+      const status = owned.map(f => ` M ${f}`)
+      const snap = owned.map(f => `644 ${blobOf(f)} ${f}`)
+      const base = { ran: true, passed: true, modifiedBy: [], before: status, after: status, snapshotBefore: snap, snapshotAfter: snap }
+      return { ...base, ...(typeof opts.hooks === 'function' ? opts.hooks(base) : opts.hooks) }
+    }
     if (label.startsWith('commit#')) {
       if (opts.commit === null) return null // a dead commit agent
       // What the committer staged, remembered so the read-back agent can report
       // it. A distinct SHA per commit, as a real one is: the audit rejects a
       // commit whose SHA equals its parent, so reusing one would fail in cycle 2.
-      staged = [...String(prompt).matchAll(/'([^']*)'/g)].map(m => m[1])
+      staged = pathLine(prompt)
       made = shaFor(++commits)
       return { committed: true, detail: 'committed', ...opts.commit }
     }
     if (label.startsWith('audit#')) {
       if (opts.audit === null) return null // a dead read-back agent
-      return { sha: made, parents: [head], paths: staged, leftover: [], ...opts.audit }
+      // ls-tree of the commit: what the stub committed is what the tree held.
+      const entries = staged.map(f => `100644 blob ${blobOf(f)}\t${f}`)
+      return { sha: made, parents: [head], paths: staged, leftover: [], entries, ...opts.audit }
     }
     if (label.startsWith('push#')) {
       // This stage may not commit and is handed the SHA, so it reports only
@@ -616,7 +640,7 @@ test('a failed push stops the loop after a summary', async () => {
   assert.equal(result.reason, 'push-failed')
   assert.equal(summaries(logs).length, 1)
   const row = rowsOf(summaries(logs)[0])[0]
-  assert.match(row[3], /fixed \+ committed, PUSH FAILED: push rejected/,
+  assert.match(row[3], /fixed \+ committed a1b2c3d, NOT PUSHED: push rejected/,
     'the fix is committed locally — the row must say so, and say the push failed')
   assert.equal(row[4], '-', 'a failed push carries no commit SHA')
   assert.equal(result.history[0].reviewPushFailed.detail, 'push rejected')
@@ -648,7 +672,7 @@ test('a commit that never landed is not reported as committed', async () => {
   const row = rowsOf(summaries(logs)[0])[0]
   assert.match(row[3], /fixed, COMMIT FAILED: pre-commit hook rejected/,
     'nothing landed in git — the row must not send the reader after a nonexistent commit')
-  assert.doesNotMatch(row[3], /PUSH FAILED|\+ committed/, 'and must not claim a commit to recover')
+  assert.doesNotMatch(row[3], /NOT PUSHED|\+ committed/, 'and must not claim a commit to recover')
   assert.equal(row[4], '-')
 })
 
@@ -735,7 +759,7 @@ test('the commit is read back by an agent that did not write it', async () => {
   const audit = calls.find(c => c.label === 'audit#1-review')
   // A committer reporting on its own commit is the one witness not to rely on.
   assert.match(audit.prompt, /Editing and committing nothing/)
-  assert.deepEqual(audit.schema.required, ['sha', 'parents', 'paths', 'leftover'])
+  assert.deepEqual(audit.schema.required, ['sha', 'parents', 'paths', 'leftover', 'entries'])
   assert.match(audit.prompt, /every parent, not only the first/)
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.deepEqual(commit.schema.required, ['committed', 'detail'],
@@ -758,7 +782,7 @@ test('a commit on the wrong parent is committed but never pushed', async () => {
   })
   assert.equal(labels.includes('push#1-review'), false, 'an unaudited commit must not leave the machine')
   assert.ok(logs.some(l => /committed but NOT pushed — commit sits on c0ffee1/.test(l)))
-  assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ committed, PUSH FAILED: commit failed audit/)
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ committed [0-9a-f]{7}, NOT PUSHED: commit failed audit/)
 })
 
 test('a merge commit is never pushed, even on the right first parent', async () => {
@@ -815,7 +839,7 @@ test('a publisher agent that throws is a failed push, not a crash', async () => 
     assert.equal(result.history[0].reviewPushFailed.committed, committed)
     assert.match(rowsOf(summaries(logs)[0])[0][3],
       committed === null ? /fixed, COMMIT OUTCOME UNKNOWN: commit agent died/
-        : committed ? /fixed \+ committed, PUSH FAILED/ : /fixed, COMMIT FAILED/, throwOn)
+        : committed ? /fixed \+ committed [0-9a-f]{7}, NOT PUSHED/ : /fixed, COMMIT FAILED/, throwOn)
   }
 })
 
@@ -1742,4 +1766,171 @@ test('every result carries a status, an observation and the state', async () => 
     assert.equal(result.status, status, JSON.stringify(opts))
     assert.ok('observation' in result && 'state' in result)
   }
+})
+
+
+// --- hook-regenerated paths: admitted from the hooks' own evidence, never by the committer ---
+
+const gen = (base, extra = {}) => ({
+  after: [...base.after, ' M docs/boards.rst'], modifiedBy: ['gen-doc'],
+  snapshotAfter: [...base.snapshotAfter, `644 ${blobOf('docs/boards.rst')} docs/boards.rst`], ...extra,
+})
+const publishing = { reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 1 } }
+
+test('recorded hook output is committed, audited and pushed with the fix', async () => {
+  const { result, logs, calls } = await run({ ...publishing, hooks: gen })
+  assert.equal(result.history[0].reviewPush.pass, true, 'the widened commit is pushed')
+  assert.equal(result.reason, 'maxCycles reached', 'and the cycle re-arms for the fresh CI run, as after any push')
+  const commit = calls.find(c => c.label === 'commit#1-review')
+  assert.deepEqual(pathLine(commit.prompt), ['src/a.c', 'docs/boards.rst'], 'the committer is handed the widened list')
+  const audit = calls.find(c => c.label === 'audit#1-review')
+  assert.ok(audit.prompt.includes("'docs/boards.rst'"), 'leftovers are read over the widened list too')
+  assert.ok(logs.some(l => l.includes('hook output admitted into the commit: docs/boards.rst')))
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ pushed, with hook output docs\/boards\.rst/)
+  assert.deepEqual(result.history[0].reviewPush.generated, ['docs/boards.rst'])
+})
+
+test('a path changed by no hook is never admitted', async () => {
+  const { result, labels } = await run({ ...publishing, hooks: b => gen(b, { modifiedBy: [] }) })
+  assert.equal(result.reason, 'push-failed')
+  assert.match(result.history[0].reviewPushFailed.detail, /changed outside the fix scope by no hook: docs\/boards\.rst/)
+  assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')
+})
+
+test('a hook that changes an owned path stops publication', async () => {
+  for (const after of [[`644 ${'f'.repeat(40)} src/a.c`], [`755 ${blobOf('src/a.c')} src/a.c`]]) {
+    const { result, labels } = await run({ ...publishing, hooks: { modifiedBy: ['fmt'], snapshotAfter: after } })
+    assert.match(result.history[0].reviewPushFailed.detail, /a hook changed an owned path after it was verified: src\/a\.c/)
+    assert.ok(!labels.some(l => l.startsWith('commit#')), after[0])
+  }
+})
+
+test('incomplete or inconsistent hook evidence admits nothing and commits nothing', async () => {
+  for (const [hooks, expected] of [
+    [{ snapshotBefore: [], snapshotAfter: [] }, /evidence is incomplete: no snapshot for src\/a\.c/],
+    [b => gen(b, { snapshotAfter: b.snapshotAfter }), /evidence is incomplete: no snapshot for docs\/boards\.rst/],
+    [{ ran: false, modifiedBy: ['gen-doc'] }, /evidence is inconsistent/],
+  ]) {
+    const { result, labels } = await run({ ...publishing, hooks })
+    assert.match(result.history[0].reviewPushFailed.detail, expected)
+    assert.ok(!labels.some(l => l.startsWith('commit#')), String(expected))
+  }
+})
+
+test('a commit whose content differs from what the hooks left is never pushed', async () => {
+  // The committer edited the regenerated file, or the fix, between the hooks and the commit.
+  for (const path of ['docs/boards.rst', 'src/a.c']) {
+    const { result, labels } = await run({
+      ...publishing, hooks: gen,
+      audit: { entries: [`100644 blob ${blobOf('src/a.c')}\tsrc/a.c`, `100644 blob ${blobOf('docs/boards.rst')}\tdocs/boards.rst`]
+        .map(e => e.includes(`\t${path}`) ? e.replace(blobOf(path), 'e'.repeat(40)) : e) },
+    })
+    assert.match(result.history[0].reviewPushFailed.detail, new RegExp(`differs from what the hooks left: ${path.replace('.', '\\.')}`))
+    assert.ok(!labels.some(l => l.startsWith('push#')), path)
+  }
+  const mode = await run({ ...publishing, audit: { entries: [`100755 blob ${blobOf('src/a.c')}\tsrc/a.c`] } })
+  assert.match(mode.result.history[0].reviewPushFailed.detail, /differs from what the hooks left: src\/a\.c/)
+})
+
+test('a hook that creates a file, or fails, or finds the tree dirty outside the scope, commits nothing', async () => {
+  for (const [hooks, expected] of [
+    [b => ({ after: [...b.after, '?? build/log'], modifiedBy: ['gen'] }), /created or renamed file\(s\): build\/log/],
+    [{ passed: false }, /hooks do not pass/],
+    [b => ({ before: [...b.before, ' M other.c'], after: [...b.after, ' M other.c'] }), /outside the fix scope before the hooks ran: other\.c/],
+    [null, /hook agent died/],
+  ]) {
+    const { result, labels } = await run({ ...publishing, hooks })
+    assert.match(result.history[0].reviewPushFailed.detail, expected)
+    assert.ok(!labels.some(l => l.startsWith('commit#')), String(expected))
+  }
+})
+
+test('protected hook output is refused before the commit', async () => {
+  const { result, labels } = await run({ ...publishing, args: { ...publishing.args, protected: '^docs/' }, hooks: gen })
+  assert.match(result.history[0].reviewPushFailed.detail, /regenerated a protected path: docs\/boards\.rst/)
+  assert.ok(!labels.some(l => l.startsWith('commit#')))
+})
+
+test('a hook-admitted path does not excuse an unowned one in the same commit', async () => {
+  const { result, labels } = await run({ ...publishing, hooks: gen, audit: { paths: ['src/a.c', 'docs/boards.rst', 'src/z.c'] } })
+  assert.match(result.history[0].reviewPushFailed.detail, /unowned path\(s\): src\/z\.c/)
+  assert.ok(!labels.some(l => l.startsWith('push#')))
+})
+
+test('a commit that landed but was not pushed is a pending candidate in the state, not the next head', async () => {
+  const blocked = await run({ ...publishing, audit: { paths: ['src/a.c', 'src/z.c'] } })
+  assert.deepEqual(blocked.result.state.pending, { sha: shaFor(1), parent: HEAD, lane: 'review', stage: 'audit-blocked' })
+  assert.equal(blocked.result.state.expectedHead, HEAD)
+  const rejected = await run({ ...publishing, push: null })
+  assert.equal(rejected.result.state.pending.stage, 'push-failed')
+  const unknown = await run({ ...publishing, commit: null })
+  assert.deepEqual(unknown.result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'push-unknown' })
+  const pushed = await run(publishing)
+  assert.equal(pushed.result.state.pending, null)
+  assert.equal(pushed.result.state.expectedHead, shaFor(1))
+})
+
+
+test('an owned path the fix did not change, or deleted, is still complete evidence', async () => {
+  // Scope {a.c, b.c}, the fix touched only a.c: b.c is snapshotted unchanged, and
+  // ls-tree still lists it. A deleted owned path is `absent` before and after and
+  // must be absent from the commit's tree too.
+  const twoFiles = (b) => ({ ...publishing, reviews: { findings: [finding(), finding({ file: b, line: 2 })], replies: [], done: true } })
+  const quiet = await run({
+    ...twoFiles('src/b.c'),
+    hooks: b => ({ before: [' M src/a.c'], after: [' M src/a.c'] }),
+    audit: { paths: ['src/a.c', 'src/b.c'], entries: lsTreeOf(['src/a.c', 'src/b.c']) },
+  })
+  assert.equal((quiet.result.history[0].reviewPush || {}).pass, true, JSON.stringify(quiet.result.history[0].reviewPushFailed))
+  const deleted = await run({
+    ...twoFiles('src/gone.c'),
+    hooks: b => ({ before: [' M src/a.c', ' D src/gone.c'], after: [' M src/a.c', ' D src/gone.c'],
+      snapshotBefore: [b.snapshotBefore[0], 'absent - src/gone.c'], snapshotAfter: [b.snapshotAfter[0], 'absent - src/gone.c'] }),
+    audit: { paths: ['src/a.c', 'src/gone.c'], entries: lsTreeOf(['src/a.c']) },
+  })
+  assert.equal(deleted.result.history[0].reviewPush.pass, true, JSON.stringify(deleted.result.history[0].reviewPushFailed))
+  const resurrected = await run({
+    ...twoFiles('src/gone.c'),
+    hooks: b => ({ before: [' M src/a.c', ' D src/gone.c'], after: [' M src/a.c', ' D src/gone.c'],
+      snapshotBefore: [b.snapshotBefore[0], 'absent - src/gone.c'], snapshotAfter: [b.snapshotAfter[0], 'absent - src/gone.c'] }),
+    audit: { paths: ['src/a.c', 'src/gone.c'], entries: lsTreeOf(['src/a.c', 'src/gone.c']) },
+  })
+  assert.match(resurrected.result.history[0].reviewPushFailed.detail, /differs from what the hooks left: src\/gone\.c/)
+})
+
+test('modes are git modes: an executable fix commits as 100755 and a symlink never matches', async () => {
+  const exe = await run({
+    ...publishing,
+    hooks: b => ({ snapshotBefore: [`755 ${blobOf('src/a.c')} src/a.c`], snapshotAfter: [`755 ${blobOf('src/a.c')} src/a.c`] }),
+    audit: { entries: [`100755 blob ${blobOf('src/a.c')}\tsrc/a.c`] },
+  })
+  assert.equal(exe.result.history[0].reviewPush.pass, true)
+  const link = await run({ ...publishing, audit: { entries: [`120000 blob ${blobOf('src/a.c')}\tsrc/a.c`] } })
+  assert.match(link.result.history[0].reviewPushFailed.detail, /differs from what the hooks left: src\/a\.c/)
+})
+
+test('a path with a space or a quote survives status, snapshot, diff-tree and ls-tree unquoted', async () => {
+  for (const p of ['src/space name.c', 'src/quote"name.c']) {
+    const { result, calls } = await run({ ...publishing, reviews: { findings: [finding({ file: p })], replies: [], done: true } })
+    assert.equal((result.history[0].reviewPush || {}).pass, true, JSON.stringify(result.history[0].reviewPushFailed))
+    assert.deepEqual(pathLine(calls.find(c => c.label === 'commit#1-review').prompt), [p], 'the path itself was committed')
+    assert.ok(calls.find(c => c.label === 'hooks#1-review').prompt.includes("--porcelain -z | tr '\\0' '\\n'"), 'status is read NUL-separated, never quoted')
+    const audit = calls.find(c => c.label === 'audit#1-review').prompt
+    assert.ok(audit.includes('ls-tree -z HEAD') && audit.includes("--name-only -r -z HEAD | tr '\\0' '\\n'"), 'and so are the commit paths')
+  }
+})
+
+test('a file a hook created and staged is refused like an untracked one', async () => {
+  const { result, labels } = await run({
+    ...publishing,
+    hooks: b => ({ after: [...b.after, 'A  new.c'], modifiedBy: ['gen'], snapshotAfter: [...b.snapshotAfter, `644 ${blobOf('new.c')} new.c`] }),
+  })
+  assert.match(result.history[0].reviewPushFailed.detail, /created or renamed file\(s\): new\.c/)
+  assert.ok(!labels.some(l => l.startsWith('commit#')))
+})
+
+test('a commit whose audit died is a pending candidate with an unknown SHA', async () => {
+  const { result, logs } = await run({ ...publishing, audit: null })
+  assert.deepEqual(result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'audit-unknown' })
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ committed \(SHA unknown\), NOT PUSHED: audit agent/)
 })
