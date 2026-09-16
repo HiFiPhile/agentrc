@@ -45,7 +45,7 @@ const PIN = {
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
 }
 // What the pre-publish recheck must still find: HEAD exactly where the run left it.
-const RECHECK = { branch: 'claude/foo', pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, staged: [] }
+const RECHECK = { branch: 'claude/foo', pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, staged: [], status: [] }
 
 // The paths a publishing prompt names, read from the one line that carries
 // nothing else: quoted fragments elsewhere in the prompt (commands, hook names)
@@ -158,7 +158,7 @@ async function run(opts = {}) {
       if (opts.audit === null) return null // a dead read-back agent
       // ls-tree of the commit: what the stub committed is what the tree held.
       const entries = staged.map(f => `100644 blob ${blobOf(f)}\t${f}`)
-      return { sha: made, parents: [head], paths: staged, leftover: [], entries, ...opts.audit }
+      return { sha: made, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...opts.audit }
     }
     if (label.startsWith('push#')) {
       // This stage may not commit and is handed the SHA, so it reports only
@@ -265,6 +265,8 @@ test('an unknown reviewer or a malformed protected pattern throws before any age
     [{ protected: '^test/hil/(' }, /protected is not a valid regex/],
     [{ protected: '   ' }, /non-empty regex string/],
     [{ protected: 7 }, /non-empty regex string/],
+    [{ generated: '^hw/bsp/(' }, /generated is not a valid regex/],
+    [{ generated: '' }, /generated must be a non-empty regex string/],
   ]) {
     const trace = []
     await assert.rejects(run({ args, trace }), expected, JSON.stringify(args))
@@ -726,7 +728,7 @@ test('the publisher rechecks the checkout and refuses to publish onto a moved on
     assert.match(re.prompt, /Editing and committing nothing/)
     assert.match(re.prompt, /head = `git rev-parse HEAD`/, 'identity is an exact SHA, never a count')
     assert.match(re.prompt, /staged = the lines of `git diff --cached --name-only`/)
-    assert.deepEqual(re.schema.required.slice().sort(), ['branch', 'head', 'pushUrls', 'staged'])
+    assert.deepEqual(re.schema.required.slice().sort(), ['branch', 'head', 'pushUrls', 'staged', 'status'])
   }
 })
 
@@ -786,7 +788,7 @@ test('the commit is read back by an agent that did not write it', async () => {
   const audit = calls.find(c => c.label === 'audit#1-review')
   // A committer reporting on its own commit is the one witness not to rely on.
   assert.match(audit.prompt, /Editing and committing nothing/)
-  assert.deepEqual(audit.schema.required, ['sha', 'parents', 'paths', 'leftover', 'entries'])
+  assert.deepEqual(audit.schema.required, ['sha', 'parents', 'paths', 'leftover', 'entries', 'message'])
   assert.match(audit.prompt, /every parent, not only the first/)
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.deepEqual(commit.schema.required, ['committed', 'detail'],
@@ -2237,7 +2239,7 @@ test('recorded hook output is committed, audited and pushed with the fix', async
   const audit = calls.find(c => c.label === 'audit#1-review')
   assert.ok(audit.prompt.includes("'docs/boards.rst'"), 'leftovers are read over the widened list too')
   assert.ok(logs.some(l => l.includes('hook output admitted into the commit: docs/boards.rst')))
-  assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ pushed, with hook output docs\/boards\.rst/)
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ pushed, with regenerated docs\/boards\.rst/)
   assert.deepEqual(result.history[0].reviewPush.generated, ['docs/boards.rst'])
 })
 
@@ -2384,4 +2386,140 @@ test('a commit whose audit died is a pending candidate with an unknown SHA', asy
   const { result, logs } = await run({ ...publishing, audit: null })
   assert.deepEqual(result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'audit-unknown' })
   assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ committed \(SHA unknown\), NOT PUSHED: audit agent/)
+})
+
+// --- the commit message: the human is the sole author ---
+
+test('the committer is told the authorship rule and the audit reads the message back', async () => {
+  const { calls } = await run({ ...publishing })
+  const commit = calls.find(c => c.label === 'commit#1-review')
+  assert.match(commit.prompt, /no Co-Authored-By, Claude-Session, Generated-with or the like: the repository's human is the sole author/)
+  const audit = calls.find(c => c.label === 'audit#1-review')
+  assert.match(audit.prompt, /message = the output of `git log -1 --format=%B HEAD`, verbatim/)
+})
+
+test('a commit whose message credits an agent, model, tool or session is never pushed', async () => {
+  for (const [line, shown] of [
+    ['Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>', 'Co-Authored-By: Claude Sonnet 5'],
+    ['co-authored-by: Ha Thach <thach@tinyusb.org>', 'co-authored-by: Ha Thach'], // a human co-author is still not this run's to claim
+    ['Claude-Session: https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ', 'Claude-Session:'],
+    ['Codex-Session-Id: 0192', 'Codex-Session-Id: 0192'],
+    ['Session-URL: https://example', 'Session-URL:'],
+    ['🤖 Generated with [Claude Code](https://claude.com/claude-code)', '🤖 Generated with \\[Claude Code\\]'],
+    ['Generated by Codex', 'Generated by Codex'],
+    ['Generated with ChatGPT', 'Generated with ChatGPT'],
+    ['Authored-by: Claude', 'Authored-by: Claude'],
+    ['Written by an AI agent', 'Written by an AI agent'],
+    ['https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ', 'https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ'],
+  ]) {
+    const { result, labels } = await run({ ...publishing, audit: { message: `Fix the finding\n\n${line}\n` } })
+    assert.equal(result.reason, 'push-failed', line)
+    assert.equal(result.history[0].reviewPushFailed.committed, true, line)
+    assert.match(result.history[0].reviewPushFailed.detail, new RegExp(`commit failed audit: commit message carries attribution: ${shown}`), line)
+    assert.ok(!labels.some(l => l.startsWith('push#')), line)
+  }
+  const blank = await run({ ...publishing, audit: { message: '\n  \n' } })
+  assert.match(blank.result.history[0].reviewPushFailed.detail, /commit reported no message/)
+})
+
+test('a message that talks about attribution, or a human sign-off, is not attribution', async () => {
+  for (const message of [
+    'Fix handling of claude.ai/code/ URLs in the reply script\n',
+    'Session: reject expired tokens\n',
+    'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n',
+    'Refuse a commit generated with a session trailer\n\nThe audit reads the message back.\n',
+    'Drop the Generated-with footer from PR bodies\n',
+    'Generated by GPTimer\n\nWritten by an aide, generated by an aircraft simulator.\n',
+  ]) {
+    const { result } = await run({ ...publishing, audit: { message } })
+    assert.equal(result.history[0].reviewPush.pass, true, message)
+  }
+})
+
+// --- build-regenerated paths: a declared tracked modification, vouched for by the hooks ---
+
+const CATALOG = 'hw/bsp/family.json'
+const regen = { ...publishing, args: { ...publishing.args, generated: '^hw/bsp/family\\.json$' }, recheck: { status: [' M src/a.c', ` M ${CATALOG}`] } }
+// The hooks run over the fix and the catalog, so the stub's tree (built from the
+// hook prompt) already holds both as plain modifications with snapshots; a case
+// that wants the catalog otherwise swaps its status lines out.
+const catalogAs = (b, line) => ({
+  before: b.before.filter(l => !l.endsWith(CATALOG)).concat(line ? [line] : []),
+  after: b.after.filter(l => !l.endsWith(CATALOG)).concat(line ? [line] : []),
+})
+
+test('a declared build-regenerated path is checked by the hooks, committed, audited and pushed with the fix', async () => {
+  const { result, logs, calls } = await run(regen)
+  assert.equal(result.history[0].reviewPush.pass, true)
+  assert.deepEqual(hookQuoted(calls.find(c => c.label === 'hooks#1-review').prompt), ['src/a.c', CATALOG], 'the repository hooks run over the catalog too')
+  assert.deepEqual(pathLine(calls.find(c => c.label === 'commit#1-review').prompt), ['src/a.c', CATALOG])
+  assert.ok(calls.find(c => c.label === 'audit#1-review').prompt.includes(`'${CATALOG}'`))
+  assert.ok(logs.some(l => l.includes(`build output admitted into the commit: ${CATALOG}`)))
+  assert.deepEqual(result.history[0].reviewPush.generated, [CATALOG])
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ pushed, with regenerated hw\/bsp\/family\.json/)
+  const both = await run({ ...regen, hooks: gen })
+  assert.deepEqual(both.result.history[0].reviewPush.generated, [CATALOG, 'docs/boards.rst'])
+})
+
+test('the same modification is a stray without the declaration', async () => {
+  const { result, labels } = await run({ ...regen, args: publishing.args,
+    hooks: b => ({ before: [...b.before, ` M ${CATALOG}`], after: [...b.after, ` M ${CATALOG}`] }) })
+  assert.match(result.history[0].reviewPushFailed.detail, /tree changed outside the fix scope before the hooks ran: hw\/bsp\/family\.json/)
+  assert.ok(!labels.some(l => l.startsWith('commit#')))
+})
+
+test('only a plain unstaged modification is build output', async () => {
+  for (const status of [`?? ${CATALOG}`, ` D ${CATALOG}`, `MM ${CATALOG}`]) {
+    const { result, labels, calls } = await run({ ...regen, recheck: { status: [' M src/a.c', status] },
+      hooks: b => ({ before: [...b.before, status], after: [...b.after, status] }) })
+    assert.deepEqual(hookQuoted(calls.find(c => c.label === 'hooks#1-review').prompt), ['src/a.c'], status)
+    assert.match(result.history[0].reviewPushFailed.detail, /outside the fix scope before the hooks ran: hw\/bsp\/family\.json/, status)
+    assert.ok(!labels.some(l => l.startsWith('commit#')), status)
+  }
+  // Staged by the recheck: the staged refusal fires first, as for any path.
+  const staged = await run({ ...regen, recheck: { status: [' M src/a.c', `M  ${CATALOG}`], staged: [CATALOG] } })
+  assert.match(staged.result.history[0].reviewPushFailed.detail, /already staged by somebody else/)
+})
+
+test('a candidate that is no longer a plain modification when the hooks run is refused', async () => {
+  for (const line of [` D ${CATALOG}`, `M  ${CATALOG}`, null]) {
+    const { result, labels } = await run({ ...regen, hooks: b => catalogAs(b, line) })
+    assert.match(result.history[0].reviewPushFailed.detail, /no longer a plain modification when the hooks ran: hw\/bsp\/family\.json/, String(line))
+    assert.ok(!labels.some(l => l.startsWith('commit#')), String(line))
+  }
+})
+
+test('a regenerated path needs passing hooks that ran, and must stay put across them', async () => {
+  for (const [hooks, expected] of [
+    [{ ran: false }, /regenerated path\(s\) have no hook to vouch for them: hw\/bsp\/family\.json/],
+    [{ passed: false }, /hooks do not pass/],
+    [b => ({ modifiedBy: ['fmt'], snapshotAfter: [b.snapshotAfter[0], `644 ${'f'.repeat(40)} ${CATALOG}`] }), /a hook changed a regenerated path after the build left it: hw\/bsp\/family\.json/],
+    [b => ({ snapshotAfter: [b.snapshotAfter[0]] }), /evidence is incomplete: no snapshot for hw\/bsp\/family\.json/],
+  ]) {
+    const { result, labels } = await run({ ...regen, hooks })
+    assert.match(result.history[0].reviewPushFailed.detail, expected, String(expected))
+    assert.ok(!labels.some(l => l.startsWith('commit#')), String(expected))
+  }
+})
+
+test('the audit binds a regenerated path like any other', async () => {
+  const edited = await run({ ...regen, audit: { entries: [`100644 blob ${blobOf('src/a.c')}\tsrc/a.c`, `100644 blob ${'e'.repeat(40)}\t${CATALOG}`] } })
+  assert.match(edited.result.history[0].reviewPushFailed.detail, /differs from what the hooks left: hw\/bsp\/family\.json/)
+  assert.deepEqual(edited.result.history[0].reviewPushFailed.generated, [CATALOG])
+  const left = await run({ ...regen, audit: { leftover: [` M ${CATALOG}`] } })
+  assert.match(left.result.history[0].reviewPushFailed.detail, /left owned change\(s\) behind/)
+  const extra = await run({ ...regen, audit: { paths: ['src/a.c', CATALOG, 'other.c'] } })
+  assert.match(extra.result.history[0].reviewPushFailed.detail, /unowned path\(s\): other\.c/)
+})
+
+test('a protected path the build regenerated is refused before the hooks run', async () => {
+  const { result, labels } = await run({ ...regen, args: { ...regen.args, protected: '^hw/bsp/' } })
+  assert.match(result.history[0].reviewPushFailed.detail, /the build regenerated a protected path: hw\/bsp\/family\.json/)
+  assert.ok(!labels.some(l => l.startsWith('hooks#')))
+})
+
+test('a restored state records the generated pattern in its config', async () => {
+  const first = await run({ ...regen, args: { ...regen.args, yieldAfterCycle: true, maxCycles: 2 } })
+  assert.equal(first.result.state.config.generated, new RegExp('^hw/bsp/family\\.json$').source)
+  await assert.rejects(run({ ...publishing, args: { ...publishing.args, yieldAfterCycle: true, maxCycles: 2, state: first.result.state } }), /different arguments/)
 })

@@ -11,6 +11,9 @@ export const meta = {
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
 //          protected?: string (regex over canonical repo-relative paths; matches are
 //            dropped from a fix scope and never committed),
+//          generated?: string (regex over canonical repo-relative paths a fixer's build
+//            regenerates, a tracked catalog say; a modification to one is admitted into
+//            the commit on the caller's word that the repository hooks validate it),
 //          ciWait?: number (minutes to wait on pending checks, default 30),
 //          build?: string (verify command; default: the project's build contract),
 //          yieldAfterCycle?: boolean (run one cycle and return, with `state` for the next launch),
@@ -19,7 +22,7 @@ export const meta = {
 //          state?: object (a previous launch's returned state, handed back unchanged) }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, ciWait?, build?, yieldAfterCycle?, lane?, state? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, build?, yieldAfterCycle?, lane?, state? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -58,15 +61,17 @@ if (!Number.isInteger(ciWait) || ciWait < 1) {
   throw new Error('ciWait must be a positive integer number of minutes')
 }
 // Compiled here so a bad pattern fails the run rather than a later cycle.
-let protectedRe = null
-if (args.protected !== undefined && args.protected !== null) {
-  if (typeof args.protected !== 'string' || !args.protected.trim()) {
-    throw new Error('protected must be a non-empty regex string matching canonical repo-relative paths')
+const pathRe = (name) => {
+  if (args[name] === undefined || args[name] === null) return null
+  if (typeof args[name] !== 'string' || !args[name].trim()) {
+    throw new Error(`${name} must be a non-empty regex string matching canonical repo-relative paths`)
   }
-  try { protectedRe = new RegExp(args.protected) } catch (e) {
-    throw new Error(`protected is not a valid regex: ${e.message}`)
+  try { return new RegExp(args[name]) } catch (e) {
+    throw new Error(`${name} is not a valid regex: ${e.message}`)
   }
 }
+const protectedRe = pathRe('protected')
+const generatedRe = pathRe('generated')
 const buildCmd = typeof args.build === 'string' && args.build.trim() ? args.build.trim() : null
 
 // A yielding launch runs one cycle and returns its state, the ledger and the
@@ -81,7 +86,7 @@ if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs on
 const ciLane = lane !== 'reviews'
 const reviewLane = lane !== 'ci'
 const STATE_VERSION = 1
-const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, build: buildCmd }
+const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null, build: buildCmd }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
   const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
@@ -237,14 +242,26 @@ const snapshotOf = (lines) => {
 }
 const AUDIT = {
   type: 'object', additionalProperties: false,
-  required: ['sha', 'parents', 'paths', 'leftover', 'entries'],
+  required: ['sha', 'parents', 'paths', 'leftover', 'entries', 'message'],
   properties: {
     sha: { type: 'string' }, parents: { type: 'array', items: { type: 'string' } },
     paths: { type: 'array', items: { type: 'string' } },
     leftover: { type: 'array', items: { type: 'string' } },
     entries: { type: 'array', items: { type: 'string' } },
+    message: { type: 'string' },
   },
 }
+// The human is the sole author of what this workflow pushes: no line of a commit
+// message may credit an agent, a model, a tool or a session. These are the
+// recognized forms, anchored so a subject that talks about attribution is not
+// one; the committer is told the rule, the audit reads the message back.
+const ATTRIBUTION = [
+  /^[ \t]*co-authored-by[ \t]*:/i,
+  /^[ \t]*(([a-z]+-)+session(-[a-z]+)*|session-(url|id|link))[ \t]*:/i,
+  /^[ \t]*(🤖[ \t]*)?(generated|authored|written|created|made)[ \t-]*(with|by)[ \t]*:?[ \t]*\[?(claude|codex|chatgpt|gpt|copilot|openai|anthropic|an? (ai|llm|agent))\b/i,
+  /^[ \t]*https?:\/\/claude\.ai\/code\/session_[a-z0-9]+[ \t]*$/i,
+]
+const attributionIn = (message) => message.split('\n').find(l => ATTRIBUTION.some(re => re.test(l)))
 const SCOPE = {
   type: 'object', additionalProperties: false,
   required: ['files'],
@@ -562,7 +579,7 @@ const fixCell = (fixes, id, push, pushFailed) => {
       ? `fixed + committed ${pushFailed.sha ? pushFailed.sha.slice(0, 7) : '(SHA unknown)'}, NOT PUSHED: ${detail}${stat}`
       : `fixed, COMMIT FAILED: ${detail}${stat}`
   }
-  const hook = push && push.generated && push.generated.length ? `, with hook output ${push.generated.join(', ')}` : ''
+  const hook = push && push.generated && push.generated.length ? `, with regenerated ${push.generated.join(', ')}` : ''
   return `${push ? 'fixed + pushed' : 'fixed, uncommitted'}${hook}${stat}`
 }
 const VERDICT_ORDER = { valid: 0, stale: 1, invalid: 2 }
@@ -633,12 +650,12 @@ const commitAndPush = async (cycle, what, owned = []) => {
   const now = await agent(
     `${IN_CHECKOUT}Editing and committing nothing: branch = \`git rev-parse --abbrev-ref HEAD\`; ` +
     'pushUrls = the lines of `git remote get-url --push --all` for the remote that branch tracks; ' +
-    'head = `git rev-parse HEAD`; staged = the lines of `git diff --cached --name-only`. ' +
-    'Return ONLY JSON matching the schema.',
+    'head = `git rev-parse HEAD`; staged = the lines of `git diff --cached --name-only`; ' +
+    `status = the lines of \`${STATUS_RECIPE}\`. Return ONLY JSON matching the schema.`,
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low',
-      schema: { type: 'object', additionalProperties: false, required: ['branch', 'pushUrls', 'head', 'staged'],
+      schema: { type: 'object', additionalProperties: false, required: ['branch', 'pushUrls', 'head', 'staged', 'status'],
         properties: { branch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
-          head: { type: 'string' }, staged: { type: 'array', items: { type: 'string' } } } } },
+          head: { type: 'string' }, staged: { type: 'array', items: { type: 'string' } }, status: { type: 'array', items: { type: 'string' } } } } },
   ).catch(e => { log(`recheck#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
   const moved = now.branch.trim() !== pinned.branch.trim() ? `branch is ${now.branch}, not ${pinned.branch}`
@@ -651,17 +668,34 @@ const commitAndPush = async (cycle, what, owned = []) => {
     return { pass: false, committed: false, detail: `checkout moved: ${moved}`, sha: '' }
   }
 
+  // A fixer's build can rewrite a tracked path the caller declared as build
+  // output (a catalog the configure step maintains). That is not the fix and
+  // not a stray: it is admitted on the caller's word that the repository hooks
+  // validate it, so the hooks run over it too, and only a plain unstaged
+  // modification qualifies — an addition, a deletion, a rename or a staging is
+  // somebody else's doing. The snapshots below then show it stayed put across
+  // the hooks; they say nothing about which process wrote it.
+  const ownedSet = new Set(owned.map(canon))
+  const pathOf = (line) => line.length > 3 ? canon(line.slice(3)) : ''
+  const modified = (lines) => new Set(lines.filter(l => l.startsWith(' M ')).map(pathOf))
+  const regenerated = generatedRe ? [...modified(now.status)].filter(f => f && !ownedSet.has(f) && generatedRe.test(f)) : []
+  const regeneratedProtected = protectedRe ? regenerated.filter(f => protectedRe.test(f)) : []
+  if (regeneratedProtected.length) {
+    log(`push#${cycle}-${what}: refusing to publish — the build regenerated a protected path: ${regeneratedProtected.join(', ')}`)
+    return { pass: false, committed: false, detail: `the build regenerated a protected path: ${regeneratedProtected.join(', ')}`, sha: '' }
+  }
+  const checked = [...owned, ...regenerated]
   // A required hook can regenerate a file outside the fix scope (a generated
   // doc, a formatter's output), and pre-commit refuses a commit whose hook
-  // modified a file. Run the hooks first, on the owned paths, and admit what
+  // modified a file. Run the hooks first, on the checked paths, and admit what
   // they changed from the evidence they leave: a path that appeared in the tree
-  // only after a hook reported modifying files, while the owned files' contents
+  // only after a hook reported modifying files, while the checked files' contents
   // stayed what the fix verifier saw. The committer is then handed the widened
   // list and never chooses a path itself.
-  const quoted = owned.map(f => `'${f}'`).join(' ')
+  const quoted = checked.map(f => `'${f}'`).join(' ')
   const hooks = await agent(
     `${IN_CHECKOUT}Editing nothing by hand. before = the lines of \`${STATUS_RECIPE}\`; ` +
-    `snapshotBefore = the lines of: ${snapshotRecipe(owned)}\n` +
+    `snapshotBefore = the lines of: ${snapshotRecipe(checked)}\n` +
     `If .pre-commit-config.yaml exists: run \`pre-commit run --files ${quoted}\`, and once more if it exited non-zero; ` +
     'ran = true, passed = whether the last run exited 0, modifiedBy = the ids of the hooks whose output said "files were modified by this hook". ' +
     'Otherwise ran = false, passed = true, modifiedBy = []. ' +
@@ -669,10 +703,13 @@ const commitAndPush = async (cycle, what, owned = []) => {
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'sonnet', schema: HOOKS },
   ).catch(e => { log(`hooks#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
-  const ownedSet = new Set(owned.map(canon))
-  const pathOf = (line) => line.length > 3 ? canon(line.slice(3)) : ''
+  const checkedSet = new Set(checked.map(canon))
   const beforePaths = hooks.before.map(pathOf)
-  const outside = beforePaths.filter(f => !ownedSet.has(f))
+  const outside = beforePaths.filter(f => !checkedSet.has(f))
+  // The recheck's status is a moment older than the hooks' own: a candidate
+  // that is no longer a plain modification by then is not the one admitted.
+  const beforeModified = modified(hooks.before)
+  const unsteady = regenerated.filter(f => !beforeModified.has(f))
   const generated = hooks.after.filter(l => !beforePaths.includes(pathOf(l)))
   // Anything staged after the hooks (X not blank) was staged by a hook: an
   // addition the tree never held, or a rename. Untracked (`??`) is new too.
@@ -684,15 +721,20 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // are equal and prove nothing.
   const snapBefore = snapshotOf(hooks.snapshotBefore)
   const snapAfter = snapshotOf(hooks.snapshotAfter)
-  const unsnapped = [...owned.map(canon).filter(f => !snapBefore.has(f) || !snapAfter.has(f)), ...hookPaths.filter(f => !snapAfter.has(f))]
-  const ownedChanged = owned.map(canon).filter(f => snapBefore.has(f) && snapAfter.has(f) &&
+  const unsnapped = [...checked.map(canon).filter(f => !snapBefore.has(f) || !snapAfter.has(f)), ...hookPaths.filter(f => !snapAfter.has(f))]
+  const changedBy = (paths) => paths.map(canon).filter(f => snapBefore.has(f) && snapAfter.has(f) &&
     (snapBefore.get(f).blob !== snapAfter.get(f).blob || snapBefore.get(f).mode !== snapAfter.get(f).mode))
+  const ownedChanged = changedBy(owned)
+  const regeneratedChanged = changedBy(regenerated)
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
+    : unsteady.length ? `regenerated path(s) no longer a plain modification when the hooks ran: ${unsteady.join(', ')}`
     : hooks.ran && !hooks.passed ? 'the repository hooks do not pass on the fix'
     : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'
+    : !hooks.ran && regenerated.length ? `regenerated path(s) have no hook to vouch for them: ${regenerated.join(', ')}`
     : created.length ? `a hook created or renamed file(s): ${created.map(pathOf).join(', ')}`
     : unsnapped.length ? `hook evidence is incomplete: no snapshot for ${unsnapped.join(', ')}`
     : ownedChanged.length ? `a hook changed an owned path after it was verified: ${ownedChanged.join(', ')}`
+    : regeneratedChanged.length ? `a hook changed a regenerated path after the build left it: ${regeneratedChanged.join(', ')}`
     : hookPaths.length && !(hooks.ran && hooks.modifiedBy.length) ? `path(s) changed outside the fix scope by no hook: ${hookPaths.join(', ')}`
     : generatedProtected.length ? `a hook regenerated a protected path: ${generatedProtected.join(', ')}`
     : null
@@ -700,16 +742,19 @@ const commitAndPush = async (cycle, what, owned = []) => {
     log(`push#${cycle}-${what}: refusing to publish — ${hookWhy}`)
     return { pass: false, committed: false, detail: hookWhy, sha: '' }
   }
+  if (regenerated.length) log(`push#${cycle}-${what}: build output admitted into the commit: ${regenerated.join(', ')}`)
   if (hookPaths.length) log(`push#${cycle}-${what}: hook output admitted into the commit: ${hookPaths.join(', ')}`)
-  const scope = [...owned, ...hookPaths]
-  const scopeSet = new Set(scope.map(canon))
+  const generatedPaths = [...new Set([...regenerated, ...hookPaths])]
+  const scope = [...new Set([...owned, ...generatedPaths].map(canon))]
+  const scopeSet = new Set(scope)
 
   // Commit and push are separate turns so the commit can be audited before it
   // leaves the machine: what a `git commit` picks up is not what `git add`
   // staged if anything ran in between.
   const made = await agent(
     `${IN_CHECKOUT}On branch ${pinned.branch}: run \`git add --\` with exactly these paths and no others, ` +
-    `then \`git commit --only --\` with the same paths, never a bare \`git commit\` (imperative message summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, repo commit conventions). ` +
+    `then \`git commit --only --\` with the same paths, never a bare \`git commit\` (imperative message summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, repo commit conventions; ` +
+    'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author). ' +
     `The \`--\` matters: a path may look like an option. If a hook modifies a file during the commit, report committed = false and say which; do not add it and retry.\n${scope.map(f => `'${f}'`).join(' ')}\n` +
     'Do not push. Leave every other working-tree change alone. Report committed = whether the commit was ' +
     'created, and detail = one line on what you committed.',
@@ -729,7 +774,8 @@ const commitAndPush = async (cycle, what, owned = []) => {
     "paths = the lines of `git diff-tree --no-commit-id --no-renames --name-only -r -z HEAD | tr '\\0' '\\n'`; " +
     `leftover = the lines of \`git status --porcelain -z -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`, ` +
     'the owned paths still changed after the commit; ' +
-    `entries = the lines of \`git ls-tree -z HEAD -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`. Return ONLY JSON matching the schema.`,
+    `entries = the lines of \`git ls-tree -z HEAD -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`; ` +
+    'message = the output of `git log -1 --format=%B HEAD`, verbatim. Return ONLY JSON matching the schema.',
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
@@ -761,10 +807,12 @@ const commitAndPush = async (cycle, what, owned = []) => {
     : strays.length ? `commit carries unowned path(s): ${strays.join(', ')}`
     : seen.leftover.length ? `commit left owned change(s) behind: ${seen.leftover.join(', ')}`
     : unbound.length ? `commit content differs from what the hooks left: ${unbound.join(', ')}`
+    : !seen.message.trim() ? 'commit reported no message'
+    : attributionIn(seen.message) ? `commit message carries attribution: ${attributionIn(seen.message).trim()}`
     : null
   if (why) {
     log(`push#${cycle}-${what}: committed but NOT pushed — ${why}`)
-    return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(hookPaths.length ? { generated: hookPaths } : {}) }
+    return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
 
   const push = await agent(
@@ -776,7 +824,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
   ).catch(e => { log(`push#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha }
   if (push.pass) expectedHead = sha
-  return { ...push, committed: true, sha, ...(hookPaths.length ? { generated: hookPaths } : {}) }
+  return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
 }
 
 let napMs = 0 // backoff owed from the previous cycle, taken after its summary
