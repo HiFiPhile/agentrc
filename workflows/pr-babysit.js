@@ -38,9 +38,9 @@ const maxCycles = args.maxCycles ?? 5
 if (!Number.isInteger(maxCycles) || maxCycles < 1) {
   throw new Error('maxCycles must be an integer >= 1')
 }
-// The validator knows these four bots and nothing else, so an unknown name would
+// The validator knows these three bots and nothing else, so an unknown name would
 // silently review nothing; fail before dispatch instead.
-const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit', 'claude']
+const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit']
 if (!Array.isArray(args.reviewers)) {
   throw new Error(`reviewers must be an array of ${KNOWN_REVIEWERS.join(', ')}; [] runs no review lane`)
 }
@@ -49,8 +49,8 @@ const unknown = reviewers.filter(r => !KNOWN_REVIEWERS.includes(r))
 if (unknown.length) {
   throw new Error(`unknown reviewer(s) ${JSON.stringify(unknown)}; the validator knows only ${KNOWN_REVIEWERS.join(', ')}`)
 }
-// Harvesting and settling are different lists: a bot that only reviews on
-// demand (Copilot here) is harvested when it has spoken but never waited for.
+// Harvesting and settling are different lists: a bot that reviews only on
+// demand is harvested when it has spoken but never waited for.
 const autoRun = Array.isArray(args.autoRun ?? args.reviewers)
   ? (args.autoRun ?? args.reviewers).map(r => typeof r === 'string' ? r.trim().toLowerCase() : r) : null
 if (!autoRun || autoRun.some(r => !reviewers.includes(r))) {
@@ -85,14 +85,16 @@ if (!['both', 'ci', 'reviews'].includes(lane)) throw new Error("lane must be 'bo
 if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs one lane for one cycle: it needs yieldAfterCycle`)
 const ciLane = lane !== 'reviews'
 const reviewLane = lane !== 'ci'
-const STATE_VERSION = 1
+const STATE_VERSION = 2
 const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null, build: buildCmd }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
   const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
   const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
-    typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) && Array.isArray(st.history)
+    typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) && Array.isArray(st.history) &&
+    (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
+      Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
     throw new Error(`state was made by a run with different arguments: ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
@@ -147,10 +149,29 @@ const CHALLENGE = {
   },
 }
 
+// One record per auto-running bot, in the validator's six states. The workflow
+// decides only block-or-settle from `state`; `kind` and `reason` say why.
+const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown']
+const SETTLED_KINDS = ['skipped', 'limited', 'paused', 'failed']
 const REVIEWS = {
   type: 'object', additionalProperties: false,
-  required: ['findings', 'replies', 'done'],
+  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'findings', 'replies'],
   properties: {
+    headSha: { type: 'string' }, observedAt: { type: 'string' },
+    headEventAt: { type: ['string', 'null'] }, headEventEvidence: { type: 'string' },
+    bots: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['bot', 'state', 'kind', 'sha', 'evidence', 'reason'],
+        properties: {
+          bot: { type: 'string' }, state: { type: 'string', enum: BOT_STATES },
+          kind: { type: ['string', 'null'], enum: [...SETTLED_KINDS, null] },
+          sha: { type: ['string', 'null'] },
+          evidence: { type: 'array', items: { type: 'string' } }, reason: { type: 'string' },
+        },
+      },
+    },
     findings: {
       type: 'array',
       items: {
@@ -173,7 +194,6 @@ const REVIEWS = {
         properties: { commentId: { type: 'integer' }, body: { type: 'string' } },
       },
     },
-    done: { type: 'boolean' },
   },
 }
 // code-writer's output contract, verbatim: a schema that omits a key the role
@@ -316,6 +336,11 @@ const debt = new Map(restored
 // pushed SHA after, and across launches the SHA the previous one left.
 let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
+// When the wait for a silent bot began, keyed by head: the latest head event
+// the validator could date, else the first observation of that head. Kept
+// across launches so a resumed run does not restart the cap; a new head, this
+// run's own push included, starts a new clock.
+let reviewClock = restored ? restored.reviewClock : null
 // A commit that landed but was not pushed is a candidate the caller must
 // decide on, never the next baseline: expectedHead stays at the published head.
 const pendingOf = () => {
@@ -332,7 +357,7 @@ const pendingOf = () => {
   return null
 }
 const stateOut = () => ({
-  version: STATE_VERSION, pin, expectedHead, pending: pendingOf(), config, cyclesUsed, maxCycles,
+  version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, cyclesUsed, maxCycles,
   answeredWith: [...answeredWith],
   debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
   history,
@@ -365,6 +390,69 @@ const dismissalKey = (f) => f.findingId
 // unposted obligation from a reply workflow that failed.
 const unresolvedVerdict = (cycles, deferred, dryRun = false) =>
   ({ pass: false, cycles, history, reason: 'deferred-replies-unresolved', deferred, dryRun })
+
+// Minutes a bot that has not started may stay silent before the head is
+// declared unreviewed by it. Ten is a policy, not proof it cannot still come.
+const REVIEW_CAP_MIN = 10
+const FULL_SHA = /^[0-9a-f]{40}$/
+// Why a harvest cannot be accounted for, or null. Structural only: the
+// validator interprets GitHub, this checks that what it claims is about this
+// head and names its evidence, since a full but older SHA is exactly how a
+// bot's stale review once passed for a fresh one.
+const reviewsWhy = (r) => {
+  if (r.headSha !== expectedHead) return `validator observed head ${r.headSha.slice(0, 7)}, expected ${expectedHead.slice(0, 7)}`
+  const observed = Date.parse(r.observedAt)
+  if (!Number.isFinite(observed)) return `observedAt ${JSON.stringify(r.observedAt)} is not a timestamp`
+  if (r.headEventAt !== null) {
+    const event = Date.parse(r.headEventAt)
+    if (!Number.isFinite(event)) return `headEventAt ${JSON.stringify(r.headEventAt)} is not a timestamp`
+    if (event > observed) return `headEventAt ${r.headEventAt} is after observedAt ${r.observedAt}`
+  }
+  const seen = new Set()
+  for (const b of r.bots) {
+    if (!autoRun.includes(b.bot)) return `record for ${b.bot}, which does not auto-run here`
+    if (seen.has(b.bot)) return `two records for ${b.bot}`
+    seen.add(b.bot)
+    if (b.sha !== null && b.sha !== expectedHead) return `${b.bot} record names ${FULL_SHA.test(b.sha) ? b.sha.slice(0, 7) : JSON.stringify(b.sha)}, not the head`
+    if (b.state === 'reviewed' && b.sha === null) return `${b.bot} reviewed with no SHA`
+    if ((b.state === 'settled') !== (b.kind !== null)) return `${b.bot} is ${b.state} with kind ${JSON.stringify(b.kind)}`
+    if ((b.state === 'reviewed' || b.state === 'settled') && !b.evidence.some(e => e.trim())) return `${b.bot} ${b.state} with no evidence`
+    if (b.state !== 'reviewed' && !b.reason.trim()) return `${b.bot} ${b.state} with no reason`
+  }
+  const missing = autoRun.filter(bot => !seen.has(bot))
+  if (missing.length) return `no record for ${missing.join(', ')}`
+  return null
+}
+// Advance the clock for this head from a harvest, then say where each bot
+// stands: reviewed and settled are done; queued and absent are done once the
+// cap has passed, and say so; working and unknown wait without a cap.
+const settleBots = (r) => {
+  if (!reviewClock || reviewClock.sha !== r.headSha) reviewClock = { sha: r.headSha, eventAt: r.headEventAt, since: r.observedAt }
+  else if (r.headEventAt !== null && (reviewClock.eventAt === null || Date.parse(r.headEventAt) > Date.parse(reviewClock.eventAt))) {
+    reviewClock.eventAt = r.headEventAt // a reopen or ready on the same SHA restarts the wait
+  }
+  const start = reviewClock.eventAt ?? reviewClock.since
+  const waitedMin = Math.floor((Date.parse(r.observedAt) - Date.parse(start)) / 60000)
+  return {
+    waitedMin, since: start, clock: reviewClock.eventAt ? 'head event' : 'first observation',
+    bots: r.bots.map(b => ({
+      ...b,
+      done: b.state === 'reviewed' || b.state === 'settled' ||
+        ((b.state === 'queued' || b.state === 'absent') && waitedMin >= REVIEW_CAP_MIN),
+    })),
+  }
+}
+const botCell = (b, waitedMin) => {
+  if (b.state === 'reviewed') return `reviewed ${b.sha.slice(0, 7)}`
+  if (b.state === 'settled') return `settled (${b.kind}: ${b.reason})`
+  if (b.state === 'queued' || b.state === 'absent') {
+    return b.done ? `${b.state}, wait expired after ${waitedMin}m: head unreviewed (${b.reason})`
+      : `${b.state} (${b.reason}, ${Math.max(0, REVIEW_CAP_MIN - waitedMin)}m to cap)`
+  }
+  return `${b.state} (${b.reason})`
+}
+const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
+  : rs.bots.map(b => `${b.bot} ${botCell(b, rs.waitedMin)}`).join(' · ')
 
 // Backoff between cycles that have nothing to do but wait.
 const nap = (ms) => new Promise(res => setTimeout(res, ms))
@@ -622,7 +710,7 @@ const cycleSummary = (entry) => {
   }
   const head = `cycle ${entry.cycle} summary — CI ${entry.ci ? entry.ci.status : entry.lane === 'reviews' ? 'not observed this launch' : 'unknown'}, ` +
     `${entry.lane === 'ci' ? 'reviews not observed this launch' : reviewers.length === 0 ? 'no reviewers requested'
-      : entry.reviews ? (entry.reviews.done ? 'all bots settled' : 'bots still pending') : 'no review data'}` +
+      : entry.bots ? `reviews: ${botsLine(entry.bots)}` : 'no review data'}` +
     `${entry.error ? `, ERROR: ${entry.error}` : ''}`
   return rows.length === 0
     ? `${head}\n(no bot findings or real CI failures reported this launch)`
@@ -948,26 +1036,42 @@ const runCycle = async (cycle, entry) => {
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
       `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others; ` +
-      `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push and gate done` : 'none of them auto-run, so done waits on nobody'}. ${IN_CHECKOUT}` +
+      `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push: report one record for each and no other` : 'none of them auto-run: report no bot records'}. ${IN_CHECKOUT}` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report their findings again ' +
           `so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '')
     // reviewers: [] is a CI-only run: there is nobody to harvest, so the lane is
-    // skipped rather than asked to validate nothing. A `ci` launch skips it too,
-    // with the empty shape but no done: nobody looked, so nothing settled.
-    const r = !reviewLane
-      ? { findings: [], replies: [], done: false }
-      : reviewers.length === 0
-        ? { findings: [], replies: [], done: true } // the REVIEWS shape, harvested from nobody
-        : await agent(reviewPrompt, {
-          label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
-        }).catch(e => { log(`cycle ${cycle}: review validator errored — ${e && e.message}`); return null })
+    // skipped rather than asked to validate nothing. A `ci` launch skips it too:
+    // nobody looked, so nothing settled.
+    const nobody = { findings: [], replies: [], bots: [] }
+    const r = !reviewLane || reviewers.length === 0
+      ? nobody
+      : await agent(reviewPrompt, {
+        label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
+      }).catch(e => { log(`cycle ${cycle}: review validator errored — ${e && e.message}`); return null })
     if (!r) {
       entry.error = 'pr-review-validator died'
       return { pass: false, cycles: cycle, history, reason: 'review-validator-died' }
     }
     if (reviewLane && reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
     entry.reviews = reviewLane ? r : null
+    // A harvest that is not about this head, or that leaves an auto-running bot
+    // unaccounted for, settles nothing: refuse it rather than read silence as
+    // a verdict.
+    if (r !== nobody) {
+      const why = reviewsWhy(r)
+      if (why) {
+        log(`cycle ${cycle}: validator report unusable — ${why}`)
+        entry.error = `validator report unusable: ${why}`
+        return { pass: false, cycles: cycle, history, reason: 'review-report-unusable', detail: why }
+      }
+    }
+    // A `ci` launch observed no reviews, so nothing is settled there.
+    entry.bots = r === nobody
+      ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
+      : settleBots(r)
+    const reviewsSettled = !!entry.bots && entry.bots.bots.every(b => b.done)
+    const pendingBots = entry.bots ? entry.bots.bots.filter(b => !b.done) : []
 
     // findingId is the only thing telling one dismissal on a comment from
     // another. Two findings sharing one would silently collapse into a single
@@ -1189,7 +1293,7 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
       return null
     }
-    if (r.done && c.status === 'green') {
+    if (reviewsSettled && c.status === 'green') {
       const outstanding = [...debt.keys()]
       if (outstanding.length > 0) {
         if (args.autoPush !== true) {
@@ -1209,7 +1313,7 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: PR is green with no unresolved valid findings`)
       return { pass: true, cycles: cycle, history }
     }
-    if (r.done && rigSide.length > 0 && fixable.length === 0 && c.infraRerun.length === 0 && c.status !== 'running') {
+    if (reviewsSettled && rigSide.length > 0 && fixable.length === 0 && c.infraRerun.length === 0 && c.status !== 'running') {
       log(`cycle ${cycle}: CI red only from rig-side failures — human/rig attention needed, nothing to fix in the PR`)
       return { pass: false, cycles: cycle, history, reason: 'ci-red-rig-side', deferred: [...debt.keys()] }
     }
@@ -1217,15 +1321,16 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming`)
       return null
     }
-    if (!r.done) {
+    if (!reviewsSettled) {
       // A bot has not reported for this head SHA yet. With CI already green there is
       // nothing else to wait on, so back off before re-arming or the cycle budget
       // burns on back-to-back re-harvests of the same unchanged PR.
+      const who = pendingBots.map(b => `${b.bot} ${botCell(b, entry.bots.waitedMin)}`).join('; ')
       if (cycle < maxCycles) {
-        log(`cycle ${cycle}: auto-review still pending — re-arming after a wait`)
+        log(`cycle ${cycle}: auto-review still pending (${who}) — re-arming after a wait`)
         napMs = 60000 * cycle // taken at the top of the next cycle, after this one's summary
       } else {
-        log(`cycle ${cycle}: auto-review still pending — cycle budget exhausted`)
+        log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)
       }
       return null
     }
@@ -1337,6 +1442,13 @@ if (yieldAfterCycle && cyclesUsed < maxCycles) {
   // The cycle would have re-armed; the caller decides whether, and when, it does.
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'yielded', deferred: [...debt.keys()] }, 'paused')
 }
+// Reply debt outranks a silent bot: it names something this run owes, while a
+// pending bot only names what it is still waiting for. A last cycle that pushed
+// observed the head before it: its records say nothing about the new one.
+const last = history[history.length - 1]
+const stillPending = last.bots && last.head === expectedHead ? last.bots.bots.filter(b => !b.done) : []
 return finish(debt.size > 0
   ? unresolvedVerdict(maxCycles, [...debt.keys()], args.autoPush !== true)
-  : { pass: false, cycles: maxCycles, history, reason: 'maxCycles reached' })
+  : stillPending.length > 0
+    ? { pass: false, cycles: maxCycles, history, reason: 'reviews-pending', head: expectedHead, pending: stillPending.map(({ done, ...b }) => b) }
+    : { pass: false, cycles: maxCycles, history, reason: 'maxCycles reached' })
