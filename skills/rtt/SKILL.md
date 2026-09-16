@@ -30,7 +30,14 @@ JLinkExe/JLinkGDBServer/openocd/telnet pipelines (`--help` for all modes):
 # flash + reset FIRST (the console owns the probe once open), then:
 python3 ~/.claude/skills/rtt/scripts/rtt.py --backend jlink --probe <serial> --device <JLINK_DEVICE> --seconds 20
 #   -i forwards stdin to the target; --seconds 0 streams until Ctrl-C/EOF
+#   --stop-file <fresh path>: automation ends a --seconds 0 capture by creating the
+#   file (exit 0); a path that already exists is a completed cancellation, so exit 0
+#   alone never proves target output
 ```
+
+Windows is supported by the script (`JLink.exe` default, process trees retired
+with `taskkill`) but unverified on hardware. `RTT_JLINK_EXE` and `RTT_OPENOCD_EXE`
+override the server executables on any platform, as `RTT_NM` does for nm.
 
 `--device` is the J-Link device name of the MCU. Always pass the probe
 serial — rigs and benches run several probes, and an unpinned flash grabs

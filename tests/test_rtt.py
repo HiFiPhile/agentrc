@@ -3,6 +3,9 @@ classes and the CLI, against a fake JLinkExe or openocd on PATH -- real
 subprocesses and sockets, no hardware, stdlib only."""
 import importlib.util
 import os
+import re
+import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -10,6 +13,7 @@ import time
 import unittest
 from contextlib import suppress as contextlib_suppress
 from pathlib import Path
+from unittest import mock
 
 CLI = Path(__file__).resolve().parents[1] / 'skills' / 'rtt' / 'scripts' / 'rtt.py'
 
@@ -180,6 +184,23 @@ class JlinkRttFakeProbe(unittest.TestCase):
         self.addCleanup(os.rename, f'{self._dir.name}/JLinkExe.off', f'{self._dir.name}/JLinkExe')
         with self.assertRaises(RuntimeError):
             rtt.JlinkRtt(BOARD, timeout=0.1)
+
+    def test_close_escalates_to_kill_on_a_server_ignoring_term(self):
+        # the POSIX ladder: gentle stop, group SIGTERM, then SIGKILL — a server that
+        # shrugs off TERM must still be gone, and reaped, when close() returns
+        con = rtt._SocketRtt()
+        con._spawn([sys.executable, '-c',
+                    'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                    'print("ready", flush=True); time.sleep(60)'])
+        proc = con._proc
+        end = time.monotonic() + 5
+        while 'ready' not in con._server_tail() and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertIn('ready', con._server_tail(), 'the server never armed its handler')
+        started = time.monotonic()
+        con.close()
+        self.assertEqual(proc.returncode, -signal.SIGKILL)
+        self.assertLess(time.monotonic() - started, 20)
 
     def test_close_reaps_the_server(self):
         con = self._console()
@@ -377,6 +398,63 @@ class JlinkRttFakeProbe(unittest.TestCase):
             self.assertNotIn(b'Exception in thread', err)
 
 
+    def test_cli_stop_file_closes_a_continuous_capture(self):
+        env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='tick')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stop_file = Path(temp_dir) / 'capture.stop'
+            proc = subprocess.Popen(
+                [sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
+                 '--device', 'FAKE', '--seconds', '0', '--stop-file', str(stop_file)],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # the marker goes down only once the capture is demonstrably streaming
+            seen = b''
+            try:
+                end = time.monotonic() + 10
+                while b'tick' not in seen:
+                    ready, _, _ = select.select([proc.stdout], [], [], max(0, end - time.monotonic()))
+                    self.assertTrue(ready, 'no tick within 10 s')
+                    chunk = os.read(proc.stdout.fileno(), 4096)   # readline could block on a partial line
+                    self.assertTrue(chunk, 'capture ended before the first tick')
+                    seen += chunk
+                stop_file.touch()
+                stdout, stderr = proc.communicate(timeout=20)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertIn(b'hello from target', seen + stdout)
+
+    def test_cli_stop_file_created_during_connect_ends_the_capture(self):
+        # a server that never opens its port keeps the CLI in the connect loop, which
+        # is where a marker created after spawn must be noticed: deterministic, unlike
+        # racing the marker against a missing executable's immediate failure
+        never = Path(self._dir.name) / 'never_listens'
+        never.write_text('#!/usr/bin/env python3\nimport os, sys, time\n'
+                         'open(os.environ["NEVER_STARTED"], "w").close()\ntime.sleep(60)\n')
+        never.chmod(0o755)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stop_file = Path(temp_dir) / 'capture.stop'
+            started = Path(temp_dir) / 'server.started'
+            env = dict(os.environ, RTT_JLINK_EXE=str(never), NEVER_STARTED=str(started))
+            proc = subprocess.Popen(
+                [sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
+                 '--device', 'FAKE', '--stop-file', str(stop_file)],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                end = time.monotonic() + 10
+                while not started.exists() and time.monotonic() < end:
+                    time.sleep(0.05)
+                self.assertTrue(started.exists(), 'the server never started')
+                self.assertIsNone(proc.poll(), 'the CLI must still be connecting')
+                stop_file.touch()
+                _, stderr = proc.communicate(timeout=20)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+        self.assertEqual(proc.returncode, 0, stderr)
+
 
 class StripBanner(unittest.TestCase):
     # both harness consumers (device_info verdict, pool_check aliveness) judge
@@ -480,6 +558,325 @@ class OpenocdRttFakeProbe(unittest.TestCase):
         self.assertIsNotNone(proc.poll())      # no zombie, no probe held
         with self.assertRaises(RuntimeError):
             con.write(b'x')                    # same post-close contract as JlinkRtt
+
+
+class RttPlatformLifecycle(unittest.TestCase):
+    def test_cli_missing_jlink_is_a_clean_error_on_this_platform(self):
+        env = dict(os.environ, RTT_JLINK_EXE='definitely-not-a-jlink-tool')
+        r = subprocess.run([sys.executable, str(CLI), '--backend', 'jlink',
+                            '--probe', '000', '--device', 'FAKE', '--seconds', '0.1'],
+                           env=env, capture_output=True, timeout=15)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn(b'not on PATH', r.stderr)
+        self.assertNotIn(b'Traceback', r.stderr)
+
+    def test_process_group_creation_matches_platform(self):
+        options = rtt._popen_group_options()
+        if os.name == 'nt':
+            self.assertEqual(options, {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP})
+        else:
+            self.assertEqual(options, {'start_new_session': True})
+
+    def test_windows_termination_uses_process_api_and_taskkill(self):
+        class FakeProc:
+            pid = 123
+
+            def __init__(self):
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+        proc = FakeProc()
+        with mock.patch.object(rtt, 'IS_WINDOWS', True), \
+             mock.patch.object(rtt.subprocess, 'run') as taskkill:
+            rtt._terminate_process_group(proc, force=False)
+        taskkill.assert_called_once()
+        self.assertEqual(taskkill.call_args.args[0][:4], ['taskkill', '/PID', '123', '/T'])
+        self.assertIn('/F', taskkill.call_args.args[0])
+        self.assertTrue(proc.terminated)
+
+        proc = FakeProc()
+        with mock.patch.object(rtt, 'IS_WINDOWS', True), \
+             mock.patch.object(rtt.subprocess, 'run') as taskkill:
+            rtt._terminate_process_group(proc, force=True)
+        self.assertIn('/F', taskkill.call_args.args[0])
+        self.assertTrue(proc.killed)
+
+    def test_windows_close_stops_the_tree_before_the_parent_can_exit(self):
+        class FakeProc:
+            pid = 123
+            stdin = None
+            stdout = None
+
+            def __init__(self):
+                self.alive = True
+
+            def poll(self):
+                return None if self.alive else 0
+
+            def wait(self, timeout):
+                if self.alive:
+                    raise subprocess.TimeoutExpired('fake', timeout)
+                return 0
+
+        class FakeConsole(rtt._SocketRtt):
+            def __init__(self, proc):
+                super().__init__()
+                self._proc = proc
+                self.gentle_called = False
+
+            def _gentle_stop(self, proc):
+                self.gentle_called = True
+                proc.alive = False
+
+        proc = FakeProc()
+        con = FakeConsole(proc)
+
+        def stop_tree(stopped_proc, force):
+            self.assertIs(stopped_proc, proc)
+            self.assertFalse(force)
+            stopped_proc.alive = False
+
+        with mock.patch.object(rtt, 'IS_WINDOWS', True), \
+             mock.patch.object(rtt, '_terminate_process_group', side_effect=stop_tree) as stop:
+            con.close()
+        stop.assert_called_once_with(proc, force=False)
+        self.assertFalse(con.gentle_called)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows process-tree semantics')
+    def test_windows_close_reaps_a_real_child_process(self):
+        import ctypes
+
+        def pid_exists(pid):
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == 259  # STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+
+        child_code = 'import time; time.sleep(60)'
+        parent_code = ('import subprocess, sys, time; '
+                       f'p = subprocess.Popen([sys.executable, "-c", {child_code!r}]); '
+                       'print(p.pid, flush=True); time.sleep(60)')
+        con = rtt._SocketRtt()
+        con._spawn([sys.executable, '-c', parent_code])
+        proc = con._proc
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while child_pid is None and time.monotonic() < deadline:
+                match = re.search(r'\d+', con._server_tail())
+                if match:
+                    child_pid = int(match.group())
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(child_pid, 'child PID was not written to the server log')
+            taskkill_results = []
+            real_run = subprocess.run
+
+            def run_taskkill(cmd, **kwargs):
+                kwargs['stdout'] = subprocess.PIPE
+                kwargs['stderr'] = subprocess.PIPE
+                result = real_run(cmd, **kwargs)
+                taskkill_results.append(result)
+                return result
+
+            with mock.patch.object(rtt.subprocess, 'run', side_effect=run_taskkill):
+                con.close()
+            self.assertEqual(taskkill_results[0].returncode, 0, taskkill_results[0].stderr)
+            self.assertIsNotNone(proc.poll())
+            deadline = time.monotonic() + 2
+            while pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(pid_exists(child_pid))
+        finally:
+            con.close()
+            for pid in (proc.pid, child_pid):
+                if pid and pid_exists(pid):
+                    subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
+                                   capture_output=True, check=False)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows temporary-file sharing semantics')
+    def test_server_log_can_be_reopened_and_is_removed(self):
+        class DoneProc:
+            stdin = None
+            stdout = None
+
+            def poll(self):
+                return 0
+
+        con = rtt._SocketRtt()
+        with mock.patch.object(rtt.subprocess, 'Popen', return_value=DoneProc()):
+            con._spawn(['fake-server'])
+        log_name = con._log.name
+        con._log.write(b'useful server failure')
+        con._log.flush()
+        self.assertIn('useful server failure', con._server_tail())
+        con.close()
+        self.assertFalse(os.path.exists(log_name))
+
+    def test_posix_server_log_keeps_automatic_deletion(self):
+        class DoneProc:
+            stdin = None
+            stdout = None
+
+            def poll(self):
+                return 0
+
+        con = rtt._SocketRtt()
+        named_temporary_file = tempfile.NamedTemporaryFile
+        with mock.patch.object(rtt, 'IS_WINDOWS', False), \
+             mock.patch.object(rtt.tempfile, 'NamedTemporaryFile',
+                               wraps=named_temporary_file) as named_log, \
+             mock.patch.object(rtt.subprocess, 'Popen', return_value=DoneProc()):
+            con._spawn(['fake-server'])
+        self.assertTrue(named_log.call_args.kwargs['delete'])
+        con.close()
+
+    def test_connect_honors_a_stop_request_during_setup(self):
+        class FakeProc:
+            def poll(self):
+                return None
+
+        con = rtt._SocketRtt()
+        con._proc = FakeProc()
+        con.close = mock.Mock()
+        stop = mock.Mock(side_effect=(False, True))
+        with mock.patch.object(rtt.socket, 'create_connection', side_effect=OSError), \
+             mock.patch.object(rtt.time, 'sleep'), \
+             self.assertRaises(rtt._StopCapture):
+            con._connect(1234, stop=stop)
+        con.close.assert_called_once()
+
+    def test_symbol_lookup_honors_a_stop_request(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_nm = Path(temp_dir) / 'slow_nm.py'
+            fake_nm.write_text('import time\ntime.sleep(30)\n')
+            stop = mock.Mock(side_effect=(False, False, True))
+            started = time.monotonic()
+            with self.assertRaises(rtt._StopCapture):
+                rtt.nm_rtt_addr(str(fake_nm), nm=sys.executable, stop=stop)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_symbol_lookup_reaps_nm_when_interrupted(self):
+        class InterruptedNm:
+            returncode = None
+
+            def __init__(self):
+                self.terminated = False
+                self.reaped = False
+
+            def communicate(self, timeout=None):
+                if not self.terminated:
+                    raise KeyboardInterrupt
+                self.reaped = True
+                self.returncode = -1
+                return '', ''
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.terminated = True
+
+        proc = InterruptedNm()
+        with mock.patch.object(rtt.subprocess, 'Popen', return_value=proc), \
+             self.assertRaises(KeyboardInterrupt):
+            rtt.nm_rtt_addr('fake.elf', nm='fake-nm', stop=lambda: False)
+        self.assertTrue(proc.terminated)
+        self.assertTrue(proc.reaped)
+
+    def test_windows_defaults_to_jlink_exe(self):
+        with mock.patch.object(rtt, 'IS_WINDOWS', True), \
+             mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(rtt._tool_exe('RTT_JLINK_EXE', 'JLinkExe', 'JLink.exe'),
+                             'JLink.exe')
+
+    def test_cli_accepts_an_existing_stop_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stop_file = Path(temp_dir) / 'capture.stop'
+            stop_file.touch()
+            r = subprocess.run(
+                [sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
+                 '--device', 'FAKE', '--stop-file', str(stop_file)],
+                capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_cli_validates_arguments_before_honoring_an_existing_stop_file(self):
+        # a stale marker must not turn a bad invocation into a silent success
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stop_file = Path(temp_dir) / 'capture.stop'
+            stop_file.touch()
+            for extra in (['--backend', 'jlink', '--probe', '000'],                       # no --device
+                          ['--backend', 'openocd', '--probe', '000', '--elf', 'x.elf'],   # no --cfg
+                          ['--backend', 'openocd', '--probe', '000', '--cfg', '-f x.cfg'],  # no --elf/--addr
+                          ['--backend', 'openocd', '--probe', '000', '--cfg', '-f x.cfg', '--addr', 'zz'],
+                          ['--backend', 'jlink', '--probe', '000', '--device', 'FAKE',
+                           '--dump', str(Path(temp_dir) / 'ring.bin'), '--addr', '0x20000000']):
+                r = subprocess.run([sys.executable, str(CLI), *extra, '--stop-file', str(stop_file)],
+                                   capture_output=True, timeout=20)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertNotIn(b'Traceback', r.stderr)
+            self.assertFalse((Path(temp_dir) / 'ring.bin').exists())
+
+    def test_symbol_lookup_with_a_stop_hook_reads_the_symbol_and_reports_failures(self):
+        # the CLI always takes the cancellable branch; it must match the plain one
+        with tempfile.TemporaryDirectory() as temp_dir:
+            good = Path(temp_dir) / 'nm_ok.py'
+            good.write_text('print("20000400 D _SEGGER_RTT")\n')
+            self.assertEqual(rtt.nm_rtt_addr(str(good), nm=sys.executable, stop=lambda: False), 0x20000400)
+            bad = Path(temp_dir) / 'nm_bad.py'
+            bad.write_text('import sys; sys.stderr.write("file format not recognized"); sys.exit(1)\n')
+            with self.assertRaises(SystemExit) as cm:
+                rtt.nm_rtt_addr(str(bad), nm=sys.executable, stop=lambda: False)
+            self.assertIn('could not read', str(cm.exception))
+            with self.assertRaises(SystemExit) as cm:
+                rtt.nm_rtt_addr('x.elf', nm='definitely-not-an-nm', stop=lambda: False)
+            self.assertIn('not on PATH', str(cm.exception))
+
+    def test_cli_stop_file_cancels_connection_setup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stop_file = Path(temp_dir) / 'capture.stop'
+
+            def start_console(*_args, **kwargs):
+                stop_file.touch()
+                self.assertTrue(kwargs['stop']())
+                raise rtt._StopCapture
+
+            argv = [str(CLI), '--backend', 'jlink', '--probe', '000', '--device', 'FAKE',
+                    '--stop-file', str(stop_file)]
+            with mock.patch.object(sys, 'argv', argv), \
+                 mock.patch.object(rtt, 'JlinkRtt', side_effect=start_console):
+                self.assertEqual(rtt.main(), 0)
+
+    def test_cli_stop_file_cancels_symbol_lookup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stop_file = Path(temp_dir) / 'capture.stop'
+
+            def find_symbol(_elf, nm=None, stop=None):
+                self.assertIsNone(nm)
+                stop_file.touch()
+                self.assertTrue(stop())
+                raise rtt._StopCapture
+
+            argv = [str(CLI), '--backend', 'openocd', '--probe', '000', '--cfg', '-f fake.cfg',
+                    '--elf', 'fake.elf', '--stop-file', str(stop_file)]
+            with mock.patch.object(sys, 'argv', argv), \
+                 mock.patch.object(rtt, 'nm_rtt_addr', side_effect=find_symbol):
+                self.assertEqual(rtt.main(), 0)
 
 
 if __name__ == '__main__':
