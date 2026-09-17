@@ -1,22 +1,21 @@
 # agentrc
 
-Personal agent config shared by Claude Code and Codex: user-wide instructions,
-skills and commands, versioned in git.
+Personal agent config shared by Claude Code and Codex, versioned in git.
 
 ```
-install.py        symlink chosen parts of this checkout into ~/.claude and ~/.codex
-CLAUDE.md         user-wide instructions (~/.codex/AGENTS.md symlinks here too)
-skills/           ~/.claude/skills and ~/.codex/skills
-agents/           <name>.md for Claude, plus <name>.toml for Codex, into ~/.claude/agents and ~/.codex/agents
-hooks/            Claude Code hooks, one folder each with a hooks.json; switched on per repository (see below)
-workflows/        <name>.js saved workflows, into ~/.claude/workflows (Claude only)
-tests/            unit tests for skill scripts, hooks and the installer
+install.py   symlinks chosen parts of this checkout into ~/.claude and ~/.codex
+CLAUDE.md    user-wide instructions, also ~/.codex/AGENTS.md
+skills/      skills for both agents
+agents/      <name>.md for both agents, plus <name>.toml for Codex
+hooks/       Claude Code hooks, one folder each with a hooks.json
+workflows/   saved workflows (Claude only)
+tests/       unit tests for skill scripts, hooks and the installer
 ```
 
 ## Install
 
-Skills are invoked by bare name and edits are live with no reinstall step.
-Nothing is installed by default: each flag takes every entry of its kind.
+Every entry is a symlink, so edits are live. Each flag takes every entry of
+its kind; nothing is installed by default.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
@@ -24,74 +23,64 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
 ~/code/agentrc/install.py remove --skill
 ```
 
-- `--skill`: links each skill into `~/.claude/skills` and `~/.codex/skills`.
-  A skill with a hook of the same name (`simplify-gate`) also links it into
-  `~/.claude/hooks` and registers its `hooks.json` events in
-  `~/.claude/settings.json` (first-time backup kept beside it, idempotent).
-- `--agent`: links each agent's `.md` into `~/.claude/agents` and
-  `~/.codex/agents`, and its `.toml`, when present, into `~/.codex/agents`, where Codex
-  discovers it.
-- `--workflow`: links each workflow into `~/.claude/workflows` (Claude only).
-- `--claude-md`: links `~/.claude/CLAUDE.md`, and `~/.codex/AGENTS.md` to it.
+- `--skill`: into `~/.claude/skills` and `~/.codex/skills`. A skill's hook of
+  the same name links into `~/.claude/hooks` and its events are registered in
+  `~/.claude/settings.json` (backed up the first time).
+- `--agent`: the `.md` into `~/.claude/agents` and `~/.codex/agents`, the
+  `.toml`, if any, into `~/.codex/agents`.
+- `--workflow`: into `~/.claude/workflows`.
+- `--claude-md`: `~/.claude/CLAUDE.md`, and `~/.codex/AGENTS.md` to it.
 
-Those directories stay real directories, so a machine can keep its own
-skills, or ones added with `npx skills add`, beside the linked ones. The
-installer refuses before touching anything if a destination holds something
-that is not a link; `remove` unlinks whatever the named link points to but
-never deletes a real file or directory, and removes the CLAUDE.md links only
-when they point into this checkout. Rerun after adding a skill, agent or
-hook: dead links into this repo are pruned, other people's links stay.
+The target directories stay real, so local entries sit beside the links.
+`install` refuses before touching anything if a target is a file or a
+nonempty directory; `remove` never deletes one, and leaves CLAUDE.md links
+that point elsewhere. Rerun after adding an entry: dead links into this repo
+are pruned.
 
-Project repos such as tinyusb reference these skills by bare name only, e.g.
-`read-doc`, and expect this install to have run; without it their agents take
-the "skill unavailable" branch.
+Project repos such as tinyusb call these skills by bare name and expect this
+install.
 
 ## Simplify gate (per repository)
 
-`hooks/simplify-gate/simplify_gate.py` snapshots the checkout, every worktree of it, when a
-prompt arrives and again when the session stops, and sends the diff to a
-read-only `codex exec` YAGNI challenge: at most two rounds per user turn, one
-retry on Codex failure, then it lets the stop through with a notice. One
-review runs at a time; edits a round did not cover, or made while one was
-running, stay queued for the next turn. A peer sharing the checkout
-may have made some of the diff; the challenge says so, and Claude rejects
-findings on files it neither wrote nor commissioned. Codex never edits.
+`hooks/simplify-gate` snapshots the checkout and its worktrees when a prompt
+arrives and when the session stops, then sends the diff to a read-only
+`codex exec` YAGNI challenge at Stop: at most two rounds per user turn, one
+retry on Codex failure, then the stop goes through with a notice. One review
+runs at a time; edits it did not cover wait for the next turn. The challenge notes that
+a peer sharing the checkout may have made part of the diff, and Claude rejects
+findings on files it neither wrote nor commissioned.
 
-Installing the skill registers its hooks once per machine; then switch the gate on per repository:
+`--skill` registers the hook; switch the gate on per repository with
+`/simplify-gate on` in a Claude session there, or:
 
 ```sh
-~/code/agentrc/install.py install --skill                  # remove undoes it
-cd ~/code/tinyusb && /simplify-gate on                     # or: skills/simplify-gate/scripts/gate.py on
+cd ~/code/tinyusb && ~/.claude/skills/simplify-gate/scripts/gate.py on
 ```
 
-Each registered entry runs the linked `simplify-gate` launcher, which costs
-one `git rev-parse` in every checkout and
-starts the Python gate only where `<git common dir>/simplify-gate` exists, so
-one marker covers a repository and all of its worktrees. `/simplify-gate status`
-prints the state with the effective model and effort; `on --model M --effort E`
-stores overrides in the marker, the defaults are the constants at the top of
-`simplify_gate.py`. Per-session state lives under
+The hook costs one `git rev-parse` per checkout and starts the gate only where
+`<git common dir>/simplify-gate` exists, so one marker covers a repository and
+its worktrees. `/simplify-gate status` prints the state with the effective
+model and effort; `on --model M --effort E` overrides the defaults at the top
+of `simplify_gate.py`. Session state lives under
 `~/.cache/agentrc/simplify-gate/`.
 
 ## Chief session
 
-`agents/chief.md` is a dispatch-only main session: no file or shell tools, so every
-read, edit, build and review is delegated to the repository's agents, skills and
-workflows. The chief's own Codex exchanges (review rounds, second opinions) go
-through `agents/coworker.md`, the one `cowork.py` transport; a repository
-workflow it launches may carry its own schema-bound Codex bridge, and its
-results come back through the workflow. `workflows/code-audit.js` is the saved
-review it launches: one `code-verifier` per directory x dimension, then
-`finding-verifier` refutes every finding (`args: { dirs, dimensions }`, both
-required). The task worktree exists first; the session starts inside it:
+`agents/chief.md` is a dispatch-only main session with no file or shell tools:
+every read, edit, build and review goes to the repository's agents, skills and
+workflows. Its direct Codex exchanges go through `agents/coworker.md`, the
+`cowork.py` transport. `workflows/code-audit.js` is its saved review: one `code-verifier`
+per directory x dimension, then `finding-verifier` on every finding
+(`args: { dirs, dimensions }`, both required). Start it inside the task
+worktree:
 
 ```sh
-~/code/agentrc/install.py install --agent chief --agent coworker
+~/code/agentrc/install.py install --agent --workflow
 git worktree add .worktrees/<branch> -b <branch> <base> && cd .worktrees/<branch> && claude --agent chief
 ```
 
-Headless (`claude -p --agent chief`), set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`:
-by default `-p` kills units still running ten minutes after the chief's turn ends.
+Headless (`claude -p --agent chief`), set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`,
+or `-p` kills units still running ten minutes after the chief's turn ends.
 
 ## Tests
 
@@ -99,4 +88,4 @@ by default `-p` kills units still running ten minutes after the chief's turn end
 python3 -m unittest discover -s tests
 ```
 
-Needs PyYAML. The same command runs from the pre-commit hook (`pre-commit install`).
+Needs PyYAML; the pre-commit hook runs the same command (`pre-commit install`).
