@@ -31,6 +31,18 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('`findingId` of `<commentId>#<n>`', body)
         self.assertIn('`commentDigest` of the first 12 hex characters of that body\'s sha256', body)
 
+    def test_pr_ci_watcher_example_carries_the_verdict_pr_babysit_keys_on(self):
+        """pr-babysit fixes only verdict 'real' and stops honestly on 'unclassified'."""
+        body = (AGENTS / 'pr-ci-watcher.md').read_text()
+        example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
+        failure = example['realFailures'][0]
+        self.assertEqual(example['status'], 'red', 'a listed failure is red; the example must not teach green-with-failures')
+        self.assertEqual(sorted(failure), ['check', 'files', 'firstError', 'verdict'])
+        self.assertIn(failure['verdict'], ('real', 'rig-side', 'unclassified'))
+        for verdict in ('"real"', '"rig-side"', '"unclassified"'):
+            self.assertIn(verdict, body)
+        self.assertNotIn('rigSide', body)
+
 
 if __name__ == '__main__':
     unittest.main()

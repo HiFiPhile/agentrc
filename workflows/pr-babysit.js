@@ -15,6 +15,8 @@ export const meta = {
 //            regenerates, a tracked catalog say; a modification to one is admitted into
 //            the commit on the caller's word that the repository hooks validate it),
 //          ciWait?: number (minutes to wait on pending checks, default 30),
+//          ciNotes?: string (what the caller already established about this PR's CI, handed
+//            to the watcher verbatim: an investigated exit code, a check known rig-side),
 //          build?: string (verify command; default: the project's build contract),
 //          yieldAfterCycle?: boolean (run one cycle and return, with `state` for the next launch),
 //          lane?: 'both' | 'ci' | 'reviews' (which lane this launch runs, default both; a single lane
@@ -22,7 +24,7 @@ export const meta = {
 //          state?: object (a previous launch's returned state, handed back unchanged) }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, build?, yieldAfterCycle?, lane?, state? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, build?, yieldAfterCycle?, lane?, state? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -57,6 +59,7 @@ if (!autoRun || autoRun.some(r => !reviewers.includes(r))) {
   throw new Error(`autoRun must be a subset of reviewers ${JSON.stringify(reviewers)}; got ${JSON.stringify(args.autoRun)}`)
 }
 const ciWait = args.ciWait ?? 30
+const ciNotes = args.ciNotes == null ? '' : String(args.ciNotes).trim()
 if (!Number.isInteger(ciWait) || ciWait < 1) {
   throw new Error('ciWait must be a positive integer number of minutes')
 }
@@ -119,14 +122,16 @@ const CI = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['check', 'firstError', 'files', 'rigSide'],
+        required: ['check', 'firstError', 'files', 'verdict'],
         properties: {
           check: { type: 'string' }, firstError: { type: 'string' },
           files: { type: 'array', items: { type: 'string' } },
-          // Set by pr-ci-watcher when the failure is the rig's, not the PR's: a
-          // board that will not enumerate, a cable, a lock. Such a failure is
-          // never fixed or committed here; it ends the run red for the user.
-          rigSide: { type: 'boolean' },
+          // pr-ci-watcher's call: `real` is the PR's to fix; `rig-side` is the rig's
+          // (a board that will not enumerate, a cable, a lock, a tool's own status
+          // exit seen elsewhere too); `unclassified` is a failure its evidence could
+          // not place, firstError carrying that evidence. Only `real` is fixed or
+          // committed here; the other two end the run red for the user.
+          verdict: { type: 'string', enum: ['real', 'rig-side', 'unclassified'] },
         },
       },
     },
@@ -703,9 +708,11 @@ const cycleSummary = (entry) => {
     rows.push([
       cell(`ci:${rf.check}`, 24),
       cell(rf.firstError),
-      rf.rigSide ? 'rig-side' : 'ci-real',
-      rf.rigSide ? 'left red for the rig' : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
-      rf.rigSide ? '-' : shaOf(entry.ciPush),
+      rf.verdict === 'real' ? 'ci-real' : rf.verdict,
+      rf.verdict === 'rig-side' ? 'left red for the rig'
+        : rf.verdict === 'unclassified' ? 'left red: not placed by its evidence'
+          : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
+      rf.verdict === 'real' ? shaOf(entry.ciPush) : '-',
     ])
   }
   const head = `cycle ${entry.cycle} summary — CI ${entry.ci ? entry.ci.status : entry.lane === 'reviews' ? 'not observed this launch' : 'unknown'}, ` +
@@ -1027,9 +1034,18 @@ const runCycle = async (cycle, entry) => {
     entry.lane = lane
     if (ciLane) {
       ciPromise = agent(
-        `${IN_CHECKOUT}Watch CI for PR #${args.pr} per your procedure; wait budget for pending checks: ${ciWait} minutes.`,
+        `${IN_CHECKOUT}Watch CI for PR #${args.pr} per your procedure; wait budget for pending checks: ${ciWait} minutes.` +
+          (ciNotes ? `\nWhat the caller established about this PR's CI already, to weigh with your own evidence: ${ciNotes}` : ''),
         { label: `ci#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: CI },
-      ).catch(e => { log(`cycle ${cycle}: pr-ci-watcher errored — ${e && e.message}`); return null })
+      ).then(c => {
+        // A listed failure is a failure whatever the status word says, for every
+        // reader of this result, the observation included.
+        if (c && c.status === 'green' && c.realFailures.length > 0) {
+          log(`cycle ${cycle}: watcher reported green with ${c.realFailures.length} failure(s) listed — reading it as red`)
+          c.status = 'red'
+        }
+        return c
+      }).catch(e => { log(`cycle ${cycle}: pr-ci-watcher errored — ${e && e.message}`); return null })
     }
 
     const owedLastCycle = [...debt.keys()]
@@ -1262,9 +1278,11 @@ const runCycle = async (cycle, entry) => {
       return null
     }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })
-    const rigSide = c.realFailures.filter(rf => rf.rigSide)
-    for (const rf of rigSide) log(`cycle ${cycle}: rig-side CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
-    const fixable = c.realFailures.filter(rf => !rf.rigSide)
+    // Only a failure the watcher placed on the PR is fixed; the rig's and the
+    // ones its evidence could not place are reported and left red.
+    const unfixable = c.realFailures.filter(rf => rf.verdict !== 'real')
+    for (const rf of unfixable) log(`cycle ${cycle}: ${rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
+    const fixable = c.realFailures.filter(rf => rf.verdict === 'real')
     if (fixable.length > 0) {
       const work = groupWork(fixable.map(rf => ({
         id: rf.id, scopeFile: rf.files[0] || rf.check, files: rf.files,
@@ -1313,9 +1331,21 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: PR is green with no unresolved valid findings`)
       return { pass: true, cycles: cycle, history }
     }
-    if (reviewsSettled && rigSide.length > 0 && fixable.length === 0 && c.infraRerun.length === 0 && c.status !== 'running') {
-      log(`cycle ${cycle}: CI red only from rig-side failures — human/rig attention needed, nothing to fix in the PR`)
-      return { pass: false, cycles: cycle, history, reason: 'ci-red-rig-side', deferred: [...debt.keys()] }
+    if (unfixable.length > 0 && fixable.length === 0 && c.infraRerun.length === 0 && c.status !== 'running') {
+      // Two honest stops. An unclassified failure needs someone to place it
+      // before anyone fixes anything, so it stops at once, reviews settled or
+      // not: another cycle would only meet the same unexplained exit, and the
+      // reply debt rides along in the state. The rig's failures wait for the
+      // reviews first, then need the rig.
+      const unclassified = unfixable.filter(rf => rf.verdict === 'unclassified')
+      if (unclassified.length > 0) {
+        log(`cycle ${cycle}: CI red with ${unclassified.length} failure(s) the watcher could not place — no justified fix; investigate before relaunching`)
+        return { pass: false, cycles: cycle, history, reason: 'ci-red-unclassified', deferred: [...debt.keys()] }
+      }
+      if (reviewsSettled) {
+        log(`cycle ${cycle}: CI red only from rig-side failures — human/rig attention needed, nothing to fix in the PR`)
+        return { pass: false, cycles: cycle, history, reason: 'ci-red-rig-side', deferred: [...debt.keys()] }
+      }
     }
     if (c.status === 'running' || c.infraRerun.length > 0) {
       log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming`)

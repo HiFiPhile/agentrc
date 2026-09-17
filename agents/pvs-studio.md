@@ -43,6 +43,7 @@ plog-converter -a GA:1,2 -t json -o pvs-report.json pvs-report.log  # what you g
 
 - Without a license the analyzer prints an error naming the missing license file and exits non-zero. Register from `$PVS_STUDIO_CREDENTIALS` ("<name> <key>"): `read -r n k <<< "$PVS_STUDIO_CREDENTIALS"; pvs-studio-analyzer credentials "$n" "$k"`. If it is unset, report the failure; do not hunt for keys.
 - The rules file already carries the project's exclusions and accepted deviations: never add suppressions; surviving findings are real.
+- With under 30 days of license left the analyzer prints "Your license will expire in N days", finishes the analysis, and exits 2; that is its licensing status, not a statement about the report, which is still written. `--disableLicenseExpirationCheck` suppresses it, and left on after a renewal it can turn into exit 6. A `bash -e` step dies on the 2 before any converter or upload runs, so the job shows no findings at all.
 
 ## Output contract
 

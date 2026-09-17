@@ -54,6 +54,21 @@ const PIN = {
 // What the pre-publish recheck must still find: HEAD exactly where the run left it.
 const RECHECK = { branch: 'claude/foo', pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, staged: [], status: [] }
 
+// The runtime validates a stub's reply against its schema; the harness does the
+// same for the CI stub, the one whose shape changed, so a fixture in the old
+// shape fails here as a stale watcher would there.
+const conforms = (schema, value, at) => {
+  if (schema.enum && !schema.enum.includes(value)) throw new Error(`${at}: ${JSON.stringify(value)} not in ${schema.enum}`)
+  if (schema.type === 'object') {
+    for (const k of schema.required || []) if (!(k in value)) throw new Error(`${at}: missing ${k}`)
+    for (const k of Object.keys(value)) {
+      if (!(k in (schema.properties || {}))) { if (schema.additionalProperties === false) throw new Error(`${at}: unexpected ${k}`); continue }
+      conforms(schema.properties[k], value[k], `${at}.${k}`)
+    }
+  } else if (schema.type === 'array') value.forEach((v, i) => conforms(schema.items, v, `${at}[${i}]`))
+  return value
+}
+
 // The paths a publishing prompt names, read from the one line that carries
 // nothing else: quoted fragments elsewhere in the prompt (commands, hook names)
 // are not paths.
@@ -96,7 +111,7 @@ async function run(opts = {}) {
       const over = typeof opts.recheck === 'function' ? opts.recheck(label) : opts.recheck
       return patch({ ...RECHECK, head }, over)
     }
-    if (label.startsWith('ci#')) return structuredClone(ci)
+    if (label.startsWith('ci#')) return conforms(options.schema, structuredClone(ci), 'ci')
     if (label.startsWith('reviews#')) {
       if (reviews instanceof Error) throw reviews
       const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle() : reviews)
@@ -559,8 +574,8 @@ test('groups the overlap merge joins get one writer and one verifier, and every 
   const { result, calls, logs } = await run({
     args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
     ci: { status: 'red', infraRerun: [], realFailures: [
-      { check: 'build / arm', firstError: 'boom in a', files: ['src/a.c'], rigSide: false },
-      { check: 'build / riscv', firstError: 'boom in the bsp', files: ['hw/bsp/x/board.c', 'src/a.c'], rigSide: false },
+      { check: 'build / arm', firstError: 'boom in a', files: ['src/a.c'], verdict: 'real' },
+      { check: 'build / riscv', firstError: 'boom in the bsp', files: ['hw/bsp/x/board.c', 'src/a.c'], verdict: 'real' },
     ] },
   })
   assert.equal(calls.filter(c => c.label.startsWith('fix:')).length, 1)
@@ -671,7 +686,7 @@ test('a path whose name has a leading or trailing space is rejected, not trimmed
   const { calls } = await run({
     ci: {
       status: 'red', infraRerun: [],
-      realFailures: [{ check: 'build / arm', firstError: 'the log named no files', files: [], rigSide: false }],
+      realFailures: [{ check: 'build / arm', firstError: 'the log named no files', files: [], verdict: 'real' }],
     },
     scope: [' src/lead.c', 'src/trail.c ', 'src/keep me.c'],
   })
@@ -689,7 +704,7 @@ test('the scoper offers every candidate to git, and keeps only the paths it know
   const { calls } = await run({
     ci: {
       status: 'red', infraRerun: [],
-      realFailures: [{ check: 'build / arm', firstError: 'the log named no files', files: [], rigSide: false }],
+      realFailures: [{ check: 'build / arm', firstError: 'the log named no files', files: [], verdict: 'real' }],
     },
     scope: ['src/my file (v2).c', 'src/./plus+@~[1].c', 'src/nope/../plus+@~[1].c', 'src/invented.c'],
     lsFiles: (offered) => offered.filter(f => f !== 'src/invented.c'),
@@ -707,8 +722,8 @@ test('two matrix legs of one check name keep separate fixes', async () => {
     ci: {
       status: 'red', infraRerun: [],
       realFailures: [
-        { check: 'build / arm', firstError: 'error in stm32f4', files: ['hw/bsp/stm32f4/family.c'], rigSide: false },
-        { check: 'build / arm', firstError: 'error in nrf', files: ['hw/bsp/nrf/family.c'], rigSide: false },
+        { check: 'build / arm', firstError: 'error in stm32f4', files: ['hw/bsp/stm32f4/family.c'], verdict: 'real' },
+        { check: 'build / arm', firstError: 'error in nrf', files: ['hw/bsp/nrf/family.c'], verdict: 'real' },
       ],
     },
   })
@@ -722,13 +737,121 @@ test('a rig-side CI failure is left red, with no fix and no commit', async () =>
     reviews: { findings: [], replies: [], bots: 'reviewed' },
     ci: {
       status: 'red', infraRerun: [],
-      realFailures: [{ check: 'hil / pico', firstError: 'board did not enumerate', files: [], rigSide: true }],
+      realFailures: [{ check: 'hil / pico', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }],
     },
   })
   assert.equal(result.reason, 'ci-red-rig-side')
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
   const row = rowsOf(summaries(logs)[0])[0]
   assert.deepEqual([row[2], row[3], row[4]], ['rig-side', 'left red for the rig', '-'])
+})
+
+const UNPLACED = { check: 'PVS-Studio (raspberry_pi_pico)', firstError: 'Analysis finished, then exit 2 after "Your license will expire in 28 days"; no diagnostic; no other run of this job in the last day', files: [], verdict: 'unclassified' }
+
+test('an unclassified CI failure is left red with its evidence, no fix, and an honest stop', async () => {
+  const { result, logs, labels } = await run({
+    reviews: { findings: [], replies: [], bots: 'reviewed' },
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] },
+  })
+  assert.equal(result.reason, 'ci-red-unclassified')
+  assert.equal(labels.some(l => l.startsWith('fix:') || l.startsWith('scope:')), false)
+  const row = rowsOf(summaries(logs)[0])[0]
+  assert.deepEqual([row[2], row[3], row[4]], ['unclassified', 'left red: not placed by its evidence', '-'])
+  assert.match(row[1], /license will expire/)
+  assert.ok(logs.some(l => /could not place — no justified fix; investigate/.test(l)))
+})
+
+test('beside a real CI failure only the real one is fixed; the unclassified row gets no commit', async () => {
+  const { result, logs, labels } = await run({
+    reviews: { findings: [], replies: [], bots: 'reviewed' },
+    ci: { status: 'red', infraRerun: [], realFailures: [
+      { check: 'build / arm', firstError: 'error in src/a.c', files: ['src/a.c'], verdict: 'real' },
+      { ...UNPLACED, files: ['hw/bsp/family_support.cmake'] }, // a file named without a diagnostic is still not a scope
+    ] },
+  })
+  assert.deepEqual(labels.filter(l => l.startsWith('fix:')), ['fix:src/a.c'])
+  assert.ok(labels.includes('push#1-ci'), 'the real fix is published')
+  const rows = rowsOf(summaries(logs)[0])
+  assert.match(rows[0][3], /^fixed/)
+  assert.notEqual(rows[0][4], '-')
+  assert.deepEqual([rows[1][2], rows[1][3], rows[1][4]], ['unclassified', 'left red: not placed by its evidence', '-'])
+  assert.notEqual(result.pass, true)
+})
+
+test('a green status with a failure listed is read as red, in the observation too', async () => {
+  const { result, logs } = await run({
+    reviews: { findings: [], replies: [], bots: 'reviewed' },
+    ci: { status: 'green', infraRerun: [], realFailures: [UNPLACED] },
+  })
+  assert.notEqual(result.pass, true)
+  assert.equal(result.reason, 'ci-red-unclassified')
+  assert.ok(logs.some(l => /reported green with 1 failure\(s\) listed/.test(l)))
+  // a dry run with a valid finding returns before the CI lane reads the result:
+  // the observation it hands back must already say red
+  const early = await run({
+    args: { autoPush: false }, reviews: oneValid,
+    ci: { status: 'green', infraRerun: [], realFailures: [UNPLACED] },
+  })
+  assert.equal(early.result.dryRun, true)
+  assert.equal(early.result.observation.ci.status, 'red')
+})
+
+test('an unclassified failure stops at once, reviews settled or not, and the debt survives a resumed launch', async () => {
+  const pending = await run({
+    args: { autoPush: true, maxCycles: 3 },
+    reviews: { findings: [], replies: [], bots: 'pending' },
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] },
+  })
+  assert.equal(pending.result.reason, 'ci-red-unclassified', 'not reviews-pending: another cycle meets the same exit')
+  assert.equal(pending.result.cycles, 1)
+  const rig = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviews: { findings: [], replies: [], bots: 'pending' },
+    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'hil / pico', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }] },
+  })
+  assert.notEqual(rig.result.reason, 'ci-red-rig-side', 'a rig-side failure alone still waits for the reviews')
+  const stop = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true },
+    reviews: owing, challenge: upheld,
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] },
+  })
+  const resumed = await run({
+    args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: stop.result.state },
+    reviews: { findings: [], replies: [], bots: 'reviewed' },
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] },
+  })
+  assert.deepEqual(resumed.result.state.debt.map(([id]) => id), [5], 'the owed reply is still owed after the stop and resume')
+})
+
+test('a CI reply in the old rigSide shape is a dead watcher, never a fix', async () => {
+  // The runtime's schema check refuses the reply and the workflow reads that as a
+  // watcher that died: the cycle re-arms, nothing is fixed on the stale shape.
+  for (const [failure, why] of [
+    [{ check: 'x', firstError: 'y', files: ['src/a.c'], rigSide: false }, /missing verdict/], // the first violation named; rigSide is the second
+    [{ check: 'x', firstError: 'y', files: ['src/a.c'], verdict: 'real', rigSide: false }, /unexpected rigSide/],
+    [{ check: 'x', firstError: 'y', files: ['src/a.c'], verdict: 'maybe' }, /not in real,rig-side,unclassified/],
+    [{ check: 'x', firstError: 'y', files: ['src/a.c'] }, /missing verdict/],
+  ]) {
+    const { result, logs, labels } = await run({ ci: { status: 'red', infraRerun: [], realFailures: [failure] } })
+    assert.ok(logs.some(l => /pr-ci-watcher errored/.test(l) && why.test(l)), `${JSON.stringify(failure)} refused`)
+    assert.equal(labels.some(l => l.startsWith('fix:')), false)
+    assert.notEqual(result.pass, true)
+  }
+})
+
+test('ciNotes reach the watcher prompt verbatim, and only when given', async () => {
+  const noted = await run({ args: { ciNotes: 'PVS-Studio exit 2 is the license expiry warning: rig-side, see run 35171132943' } })
+  assert.match(noted.calls.find(c => c.label === 'ci#1').prompt, /caller established[\s\S]*license expiry warning: rig-side, see run 35171132943/)
+  const bare = await run({})
+  assert.doesNotMatch(bare.calls.find(c => c.label === 'ci#1').prompt, /caller established/)
+})
+
+test('the CI contract names the three verdicts and nothing else', async () => {
+  const { calls } = await run({})
+  const item = calls.find(c => c.label === 'ci#1').schema.properties.realFailures.items
+  assert.deepEqual(item.required, ['check', 'firstError', 'files', 'verdict'])
+  assert.deepEqual(item.properties.verdict.enum, ['real', 'rig-side', 'unclassified'])
+  assert.equal(item.additionalProperties, false)
 })
 
 test('a mislabeled commit SHA is not shown as a commit', async () => {
@@ -983,7 +1106,7 @@ test('reviews go to the validator role directly, and no lane leaves the roles', 
   const scoped = await run({
     ci: {
       status: 'red', infraRerun: [],
-      realFailures: [{ check: 'build / arm', firstError: 'no files in the log', files: [], rigSide: false }],
+      realFailures: [{ check: 'build / arm', firstError: 'no files in the log', files: [], verdict: 'real' }],
     },
     scope: ['src/a.c'],
   })
@@ -1893,7 +2016,7 @@ test('a ci launch watches CI and never runs the validator', async () => {
   // Chief saw only a check conclude: this launch spends no opus on a harvest.
   const { result, labels, logs } = await run({
     args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
-    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build', firstError: 'boom', files: ['src/a.c'], rigSide: false }] },
+    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
   })
   assert.equal(labels.some(l => l.startsWith('reviews#') || l.startsWith('challenge#') || l.startsWith('replies#')), false)
   assert.ok(labels.some(l => l === 'ci#1'))
@@ -2027,7 +2150,7 @@ test('a dry run runs the CI fixer before reporting withheld replies', async () =
     ci: {
       status: 'red',
       infraRerun: [],
-      realFailures: [{ check: 'build-arm', firstError: 'undefined reference', files: ['src/a.c'], rigSide: false }],
+      realFailures: [{ check: 'build-arm', firstError: 'undefined reference', files: ['src/a.c'], verdict: 'real' }],
     },
   })
   assert.ok(calls.some(c => c.label.startsWith('fix:')), 'the dry run skipped the CI fixer')
@@ -2270,7 +2393,7 @@ test('a rig-side pause keeps the reply debt', async () => {
   const { result } = await run({
     args: { autoPush: true, maxCycles: 3 },
     reviews: owing, challenge: upheld,
-    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'hil / pico', firstError: 'board did not enumerate', files: [], rigSide: true }] },
+    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'hil / pico', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }] },
   })
   assert.equal(result.reason, 'ci-red-rig-side')
   assert.deepEqual(result.deferred, [5], 'the caller sees what is still owed when it decides to stop')
