@@ -207,22 +207,10 @@ const DEV = {
     board: { type: 'string' }, notes: { type: 'string' },
   },
 }
-// One verdict per fix group submitted, keyed by the group's index in the batch.
-const VERIFY = {
+const CHECK = {
   type: 'object', additionalProperties: false,
-  required: ['verdicts'],
-  properties: {
-    verdicts: {
-      type: 'array',
-      items: {
-        type: 'object', additionalProperties: false,
-        required: ['id', 'addresses', 'reason'],
-        properties: {
-          id: { type: 'integer' }, addresses: { type: 'boolean' }, reason: { type: 'string' },
-        },
-      },
-    },
-  },
+  required: ['addresses', 'reason'],
+  properties: { addresses: { type: 'boolean' }, reason: { type: 'string' } },
 }
 // The push stage may not commit, and the SHA it sends is already known, so it
 // reports only whether the send succeeded.
@@ -532,10 +520,7 @@ const groupWork = (notes) => {
 
 // Fix + verify one work list; returns { ok, fixes } — ok only if every group
 // was scoped, fixed by a live worker, AND passed finding-verifier verification.
-// One writer per group, then one verifier for the whole batch: a verifier's fixed
-// cost (instructions, the PR context) is most of its bill, and the fixes are
-// judged one by one either way.
-const fixAndVerify = async (workIn, cycle) => {
+const fixAndVerify = async (workIn) => {
   const textOf = (w) => w.notes.map(n => n.text).join('\n- ')
   // The note ids ride along on the fix so the cycle summary can say which
   // finding each fix answered, after grouping and the overlap merge.
@@ -597,8 +582,9 @@ const fixAndVerify = async (workIn, cycle) => {
   }
   for (const w of withheld) work.splice(work.indexOf(w), 1)
   const scopeOf = (w) => [...w.files].join(', ')
-  const written = await parallel(work.map(w => () =>
-    agent(
+  const fixes = await pipeline(
+    work,
+    w => agent(
       `Fix the following issues on the PR branch. ${IN_CHECKOUT}\n` +
       (protectedRe ? `Constraint: never modify a path matching ${protectedRe.source} — it is the caller's, and a failure that needs it changed stays red for the user.\n` : '') +
       (buildCmd
@@ -607,40 +593,20 @@ const fixAndVerify = async (workIn, cycle) => {
       STOPS + '\n' +
       `Scope: ${scopeOf(w)}\nIssues:\n- ${textOf(w)}`,
       { label: `fix:${w.key}`, phase: 'Fix', agentType: 'code-writer', schema: DEV },
-    )))
-  // The batch is keyed by index: note ids are comment ids or CI strings and may
-  // repeat across groups. A broken build is already fatal below, so it is not
-  // submitted: the verifier's verdict could not change its outcome.
-  const paired = work.map((w, id) => ({ id, w, fix: written[id] }))
-  const submitted = paired.filter(p => p.fix && p.fix.buildOk !== false)
-  const verdicts = new Map()
-  let batchFailed = null
-  if (submitted.length > 0) {
-    const v = await agent(
-      `${IN_CHECKOUT}Verify the uncommitted fixes below, each judged on its own. For every id: run git diff -- <its scope>, read any newly created untracked file in that scope directly, and decide whether the changes address every issue listed under it. addresses=true only when each of its issues no longer occurs; the diffstat is context, not evidence; reason names the evidence.\n` +
-      `Fixes: ${JSON.stringify(submitted.map(p => ({ id: p.id, scope: [...p.w.files], diffstat: p.fix.diffstat, issues: p.w.notes.map(n => n.text) })))}\n` +
-      'Return exactly one verdict per submitted id and no others.',
-      { label: `check#${cycle}`, phase: 'Fix', agentType: 'finding-verifier', schema: VERIFY },
-    ).catch(e => { log(`check#${cycle} errored — ${e && e.message}`); return null })
-    if (!v) batchFailed = 'verifier died'
-    else {
-      // A verdict for an id nobody submitted means the verifier lost the mapping,
-      // so none of its verdicts can be trusted; a duplicated id is unverified
-      // rather than resolved by whichever verdict came last.
-      const unknown = v.verdicts.filter(x => !submitted.some(p => p.id === x.id)).map(x => x.id)
-      if (unknown.length > 0) batchFailed = `verifier answered for unknown id(s) ${unknown.join(', ')}`
-      else for (const x of v.verdicts) verdicts.set(x.id, verdicts.has(x.id) ? 'duplicate' : x)
-    }
-  }
-  const fixes = paired.map(({ id, w, fix }) => {
-    if (!fix) return null
-    if (fix.buildOk === false) return verdictOf(fix, w, false, `targeted build failed: ${fix.notes || 'no detail'}`)
-    if (batchFailed) return verdictOf(fix, w, false, batchFailed)
-    const v = verdicts.get(id)
-    if (!v) return verdictOf(fix, w, false, 'verifier gave no verdict')
-    if (v === 'duplicate') return verdictOf(fix, w, false, 'verifier gave two verdicts')
-    return verdictOf(fix, w, !!v.addresses, v.reason)
-  })
+    ),
+    (fix, w) => {
+      if (!fix) return null
+      // A broken build is already fatal below, so skip the verifier: its verdict
+      // could not change the outcome and it is the expensive step here.
+      if (fix.buildOk === false) return verdictOf(fix, w, false, `targeted build failed: ${fix.notes || 'no detail'}`)
+      return agent(
+        `${IN_CHECKOUT}Verify the uncommitted changes for ${scopeOf(w)} (use git diff -- <the files above>, and read any newly created untracked files directly) address these issues:\n- ${textOf(w)}\n` +
+        'addresses=true only when every listed issue is addressed. Return {"addresses": bool, "reason": string}.',
+        { label: `check:${w.key}`, phase: 'Fix', agentType: 'finding-verifier', schema: CHECK },
+      ).catch(e => { log(`check:${w.key} errored — ${e && e.message}`); return null })
+        .then(v => verdictOf(fix, w, !!(v && v.addresses), v ? v.reason : 'verifier died'))
+    },
+  )
   const alive = fixes.filter(Boolean)
   if (alive.length < work.length) log(`${work.length - alive.length} fix group(s) lost to dead workers`)
   const unverified = alive.filter(f => f.addresses !== true)
@@ -1244,7 +1210,7 @@ const runCycle = async (cycle, entry) => {
         id: f.commentId, scopeFile: f.file, files: [f.file],
         text: `${f.file}:${f.line} [${f.source}] ${f.claim} — hint: ${f.fixHint}`,
       })))
-      const { ok, fixes, owned } = await fixAndVerify(work, cycle)
+      const { ok, fixes, owned } = await fixAndVerify(work)
       entry.reviewFixes = fixes
       if (args.autoPush !== true) {
         log('autoPush not set: review-lane fixes left uncommitted (dry run)')
@@ -1304,7 +1270,7 @@ const runCycle = async (cycle, entry) => {
         id: rf.id, scopeFile: rf.files[0] || rf.check, files: rf.files,
         text: `CI ${rf.check}: ${rf.firstError}`,
       })))
-      const { ok, fixes, owned } = await fixAndVerify(work, cycle)
+      const { ok, fixes, owned } = await fixAndVerify(work)
       entry.ciFixes = fixes
       if (args.autoPush !== true) {
         log('autoPush not set: CI-lane fixes left uncommitted (dry run)')

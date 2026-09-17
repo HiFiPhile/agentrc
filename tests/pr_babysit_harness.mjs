@@ -199,14 +199,13 @@ async function run(opts = {}) {
       }
       return opts.challenge === null ? null : structuredClone(opts.challenge)
     }
-    if (label.startsWith('check#')) {
+    if (label.startsWith('check:')) {
       assert.equal(options.agentType, 'finding-verifier')
-      // One verdict per submitted id: opts.verify is the verdict every id gets,
-      // a function of the ids for a shaped reply, or null for a dead verifier.
+      // opts.verify is every group's verdict, a function of the label for one per
+      // group, or null for a dead verifier.
       if ('verify' in opts && opts.verify === null) return null
-      const ids = [...String(prompt).matchAll(/"id":(\d+)/g)].map(m => Number(m[1]))
-      if (typeof opts.verify === 'function') return opts.verify(ids, prompt)
-      return { verdicts: ids.map(id => ({ id, ...(opts.verify ?? { addresses: true, reason: 'verified' }) })) }
+      if (typeof opts.verify === 'function') return opts.verify(label)
+      return structuredClone(opts.verify ?? { addresses: true, reason: 'verified' })
     }
     throw new Error(`unstubbed agent label ${label}`)
   }
@@ -494,7 +493,7 @@ test('a fix whose build failed is not published, and skips the verifier', async 
   // missing-deps remedy); without them the row says only that something failed.
   assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: targeted build failed: uncovered: src/,
     'reported as unverified with the writer\'s reason, and the verifier is not paid for a broken build')
-  assert.equal(labels.some(l => l.startsWith('check#')), false, 'no verifier for an empty batch')
+  assert.equal(labels.some(l => l.startsWith('check:')), false, 'no verifier for a broken build')
 })
 
 test('a dead code-writer withholds the fix', async () => {
@@ -512,70 +511,20 @@ test('a fix the verifier rejects is reported unverified, not pushed', async () =
   assert.equal(result.reason, 'fix-verification-failed')
   assert.equal(labels.some(l => l.startsWith('push#')), false)
   assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: does not address the claim/)
-  assert.equal(calls.find(c => c.label.startsWith('check#')).agentType, 'finding-verifier')
+  assert.equal(calls.find(c => c.label.startsWith('check:')).agentType, 'finding-verifier')
 })
 
-// Two valid findings in two files: two writers, one verifier batch of ids 0 and 1.
+// Two valid findings in two files: two writers, two verifiers.
 const twoValid = { findings: [finding(), finding({ commentId: 2, file: 'src/b.c', line: 2 })], replies: [], bots: 'reviewed' }
 const outcomes = (logs) => rowsOf(summaries(logs)[0]).map(r => r[3])
 
-test('one verifier judges every fix after the last writer lands, whatever order they finish in', async () => {
-  const finished = []
-  let finishedAtCheck = null
-  const { result, calls } = await run({
-    reviews: twoValid,
-    // run() swaps setTimeout for the nap, so the first writer lags on the
-    // immediate queue instead and lands after the second.
-    fix: async (label) => {
-      for (let i = label === 'fix:src/a.c' ? 5 : 0; i > 0; i--) await new Promise(r => setImmediate(r))
-      finished.push(label)
-      return {}
-    },
-    verify: (ids) => { finishedAtCheck = [...finished]; return { verdicts: ids.map(id => ({ id, addresses: true, reason: 'ok' })) } },
-  })
-  const checks = calls.filter(c => c.label.startsWith('check#'))
-  assert.equal(checks.length, 1)
-  assert.equal(checks[0].label, 'check#1')
-  assert.deepEqual(finishedAtCheck, ['fix:src/b.c', 'fix:src/a.c'], 'both writers had finished, the lagging one last')
-  const batch = JSON.parse(checks[0].prompt.match(/Fixes: (\[.*\])\n/)[1])
-  assert.deepEqual(batch.map(b => [b.id, b.scope]), [[0, ['src/a.c']], [1, ['src/b.c']]])
-  assert.deepEqual(result.history[0].reviewFixes.map(f => [f.ids, f.addresses]), [[[1], true], [[2], true]])
-  assert.ok(calls.some(c => c.label.startsWith('push#')), 'both verified, so the lane publishes')
-})
-
-test('verdicts map by id, not by order, and a rejected group stays unverified beside an accepted one', async () => {
-  const { result, logs } = await run({
-    reviews: twoValid,
-    verify: () => ({ verdicts: [{ id: 1, addresses: false, reason: 'src/b.c still leaks' }, { id: 0, addresses: true, reason: 'fixed' }] }),
-  })
-  assert.equal(result.reason, 'fix-verification-failed')
-  assert.match(outcomes(logs)[0], /^fixed/)
-  assert.match(outcomes(logs)[1], /unverified: src\/b\.c still leaks/)
-})
-
-test('a missing or duplicated verdict leaves that group unverified; an unknown id voids the batch', async () => {
-  let { logs } = await run({ reviews: twoValid, verify: () => ({ verdicts: [{ id: 0, addresses: true, reason: 'ok' }] }) })
-  assert.match(outcomes(logs)[0], /^fixed/)
-  assert.match(outcomes(logs)[1], /unverified: verifier gave no verdict/)
-  ;({ logs } = await run({
-    reviews: twoValid,
-    verify: () => ({ verdicts: [{ id: 0, addresses: true, reason: 'ok' }, { id: 0, addresses: true, reason: 'ok again' }, { id: 1, addresses: true, reason: 'ok' }] }),
-  }))
-  assert.match(outcomes(logs)[0], /unverified: verifier gave two verdicts/)
-  assert.match(outcomes(logs)[1], /^fixed/)
-  ;({ logs } = await run({
-    reviews: twoValid,
-    verify: () => ({ verdicts: [{ id: 0, addresses: true, reason: 'ok' }, { id: 7, addresses: true, reason: 'ok' }] }),
-  }))
-  assert.deepEqual(outcomes(logs).map(o => /unverified: verifier answered for unknown id\(s\) 7/.test(o)), [true, true])
-})
-
-test('a dead or thrown verifier leaves every submitted group unverified', async () => {
-  for (const opts of [{ verify: null }, { throwOn: 'check#' }]) {
+test('a dead or thrown verifier leaves only its own group unverified', async () => {
+  for (const opts of [{ verify: (label) => label === 'check:src/a.c' ? null : { addresses: true, reason: 'ok' } }, { throwOn: 'check:src/a.c' }]) {
     const { result, logs, labels } = await run({ reviews: twoValid, ...opts })
     assert.equal(result.reason, 'fix-verification-failed')
     assert.equal(labels.some(l => l.startsWith('push#')), false)
-    assert.deepEqual(outcomes(logs).map(o => /unverified: verifier died/.test(o)), [true, true])
+    assert.match(outcomes(logs)[0], /unverified: verifier died/)
+    assert.match(outcomes(logs)[1], /^fixed/)
   }
 })
 
@@ -586,19 +535,17 @@ test('a thrown writer is a dead one: its group is withheld and the survivor is s
   })
   assert.notEqual(result.reason, 'cycle-threw')
   assert.ok(logs.some(l => /1 fix group\(s\) lost to dead workers/.test(l)))
-  const batch = JSON.parse(calls.find(c => c.label === 'check#1').prompt.match(/Fixes: (\[.*\])\n/)[1])
-  assert.deepEqual(batch.map(b => [b.id, b.scope]), [[1, ['src/b.c']]])
+  assert.deepEqual(calls.filter(c => c.label.startsWith('check:')).map(c => c.label), ['check:src/b.c'])
   assert.match(outcomes(logs)[0], /withheld/)
   assert.match(outcomes(logs)[1], /^fixed/)
 })
 
-test('only live writers with a passing build are submitted, and one bad group still blocks publishing', async () => {
+test('only live writers with a passing build are verified, and one bad group still blocks publishing', async () => {
   const { result, calls, logs, labels } = await run({
     reviews: { findings: [...twoValid.findings, finding({ commentId: 3, file: 'src/c.c', line: 3 })], replies: [], bots: 'reviewed' },
     fix: (label) => label === 'fix:src/a.c' ? null : label === 'fix:src/b.c' ? { buildOk: false, notes: 'boom' } : {},
   })
-  const batch = JSON.parse(calls.find(c => c.label === 'check#1').prompt.match(/Fixes: (\[.*\])\n/)[1])
-  assert.deepEqual(batch.map(b => [b.id, b.scope]), [[2, ['src/c.c']]])
+  assert.deepEqual(calls.filter(c => c.label.startsWith('check:')).map(c => c.label), ['check:src/c.c'])
   assert.equal(result.reason, 'fix-verification-failed')
   assert.equal(labels.some(l => l.startsWith('push#')), false)
   assert.match(outcomes(logs)[0], /withheld/)
@@ -606,9 +553,9 @@ test('only live writers with a passing build are submitted, and one bad group st
   assert.match(outcomes(logs)[2], /^fixed/)
 })
 
-test('groups the overlap merge joins are one batch item, and every finding keeps its row', async () => {
+test('groups the overlap merge joins get one writer and one verifier, and every finding keeps its row', async () => {
   // Two CI failures with different scope keys that both name src/a.c: two groups
-  // from groupWork, one after the merge, so one writer and one batch id.
+  // from groupWork, one after the merge.
   const { result, calls, logs } = await run({
     args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
     ci: { status: 'red', infraRerun: [], realFailures: [
@@ -617,21 +564,12 @@ test('groups the overlap merge joins are one batch item, and every finding keeps
     ] },
   })
   assert.equal(calls.filter(c => c.label.startsWith('fix:')).length, 1)
-  const batch = JSON.parse(calls.find(c => c.label === 'check#1').prompt.match(/Fixes: (\[.*\])\n/)[1])
-  assert.deepEqual(batch.map(b => [b.id, b.scope.sort(), b.issues.length]), [[0, ['hw/bsp/x/board.c', 'src/a.c'], 2]])
+  const check = calls.filter(c => c.label.startsWith('check:'))
+  assert.equal(check.length, 1)
+  assert.match(check[0].prompt, /boom in a[\s\S]*boom in the bsp/, 'both issues in the one verification')
   assert.equal(result.history[0].ciFixes.length, 1)
   assert.equal(result.history[0].ciFixes[0].ids.length, 2, 'both original ids ride on the one fix')
   assert.deepEqual(outcomes(logs).map(o => /^fixed/.test(o)), [true, true])
-})
-
-test('the CI lane verifies its fixes under the cycle label too', async () => {
-  const { calls } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
-    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build', firstError: 'boom', files: ['src/a.c'], rigSide: false }] },
-  })
-  const check = calls.find(c => c.label.startsWith('check#'))
-  assert.equal(check.label, 'check#1')
-  assert.match(check.prompt, /CI build: boom/)
 })
 
 test('a dry run leaves the fix uncommitted', async () => {

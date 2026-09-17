@@ -1,6 +1,6 @@
 ---
 name: finding-verifier
-description: Adversarially verify one review finding ("try to refute this") or one or more fixes ("does this diff address finding X?"), a yes/no answer each in the JSON shape the prompt names. Read-only; default verdict is refuted.
+description: Adversarially verify one review finding ("try to refute this") or one fix ("does this diff address finding X?") with a yes/no answer in the JSON shape the prompt names. Read-only; default verdict is refuted.
 tools: Bash, Read, Grep, Glob, Skill
 model: opus
 effort: xhigh
