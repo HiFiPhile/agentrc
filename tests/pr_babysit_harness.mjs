@@ -339,6 +339,15 @@ test('the auto-running reviewers are named apart from the harvest list', async (
   assert.match(nobody.calls.find(c => c.label.startsWith('reviews#')).prompt, /none of them auto-run: report no bot records/)
 })
 
+test('the usual launch, copilot and coderabbit, settles without codex', async () => {
+  const { calls, result } = await run({ args: { reviewers: ['copilot', 'coderabbit'] } })
+  const reviews = calls.find(c => c.label.startsWith('reviews#'))
+  assert.match(reviews.prompt, /the reviewers to harvest on this PR are copilot, coderabbit, and no others/)
+  assert.deepEqual(result.state.config.reviewers, ['copilot', 'coderabbit'])
+  assert.deepEqual(result.state.config.autoRun, ['copilot', 'coderabbit'])
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+})
+
 test('reviewers: [] runs no review lane at all and still completes', async () => {
   const { result, labels, logs } = await run({
     args: { reviewers: [] },

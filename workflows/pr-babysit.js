@@ -5,7 +5,8 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-// args: { pr: number, reviewers: string[] (required; [] runs no review lane),
+// args: { pr: number, reviewers: string[] (required, of codex, copilot, coderabbit; the usual
+//            launch names ['copilot', 'coderabbit'], codex only when wanted; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default: reviewers),
 //          maxCycles?: number (ceiling on review/fix/CI cycles, default 5), autoPush?: boolean (default false = dry run),
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
@@ -53,8 +54,8 @@ if (unknown.length) {
 }
 // Harvesting and settling are different lists: a bot that reviews only on
 // demand is harvested when it has spoken but never waited for.
-const autoRun = Array.isArray(args.autoRun ?? args.reviewers)
-  ? (args.autoRun ?? args.reviewers).map(r => typeof r === 'string' ? r.trim().toLowerCase() : r) : null
+const autoRun = Array.isArray(args.autoRun ?? reviewers)
+  ? (args.autoRun ?? reviewers).map(r => typeof r === 'string' ? r.trim().toLowerCase() : r) : null
 if (!autoRun || autoRun.some(r => !reviewers.includes(r))) {
   throw new Error(`autoRun must be a subset of reviewers ${JSON.stringify(reviewers)}; got ${JSON.stringify(args.autoRun)}`)
 }
