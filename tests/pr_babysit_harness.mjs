@@ -299,7 +299,7 @@ test('args validation', async () => {
 test('an unknown reviewer or a malformed protected pattern throws before any agent runs', async () => {
   for (const [args, expected] of [
     [{ reviewers: ['codex', 'gpt'] }, /unknown reviewer\(s\) \["gpt"\]/],
-    [{ reviewers: 'codex' }, /reviewers must be an array of codex, copilot, coderabbit; \[\] runs no review lane/],
+    [{ reviewers: 'codex' }, /reviewers must be an array of codex, copilot, coderabbit, greptile; \[\] runs no review lane/],
     [{ reviewers: [4] }, /unknown reviewer/],
     [{ reviewers: ['codex'], autoRun: ['copilot'] }, /autoRun must be a subset of reviewers \["codex"\]/],
     [{ reviewers: ['codex'], autoRun: 'codex' }, /autoRun must be a subset/],
@@ -337,6 +337,15 @@ test('the auto-running reviewers are named apart from the harvest list', async (
   assert.match(same.calls.find(c => c.label.startsWith('reviews#')).prompt, /of those, codex, copilot auto-run/)
   const nobody = await run({ args: { reviewers: ['copilot'], autoRun: [] } })
   assert.match(nobody.calls.find(c => c.label.startsWith('reviews#')).prompt, /none of them auto-run: report no bot records/)
+})
+
+test('greptile is harvested and waited for, or harvested only', async () => {
+  const waited = await run({ args: { reviewers: [' Greptile '] } })
+  assert.match(waited.calls.find(c => c.label.startsWith('reviews#')).prompt, /harvest on this PR are greptile, and no others; of those, greptile auto-run on every push/)
+  assert.deepEqual(waited.result.state.config.autoRun, ['greptile'])
+  const harvested = await run({ args: { reviewers: ['greptile'], autoRun: [] } })
+  assert.match(harvested.calls.find(c => c.label.startsWith('reviews#')).prompt, /harvest on this PR are greptile, and no others; none of them auto-run/)
+  assert.equal(harvested.result.pass, true, JSON.stringify(harvested.result.reason))
 })
 
 test('the usual launch, copilot and coderabbit, settles without codex', async () => {

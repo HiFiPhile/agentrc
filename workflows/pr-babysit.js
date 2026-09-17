@@ -5,7 +5,7 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-// args: { pr: number, reviewers: string[] (required, of codex, copilot, coderabbit; the usual
+// args: { pr: number, reviewers: string[] (required, of codex, copilot, coderabbit, greptile; the usual
 //            launch names ['copilot', 'coderabbit'], codex only when wanted; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default: reviewers),
 //          maxCycles?: number (ceiling on review/fix/CI cycles, default 5), autoPush?: boolean (default false = dry run),
@@ -41,9 +41,9 @@ const maxCycles = args.maxCycles ?? 5
 if (!Number.isInteger(maxCycles) || maxCycles < 1) {
   throw new Error('maxCycles must be an integer >= 1')
 }
-// The validator knows these three bots and nothing else, so an unknown name would
+// The validator knows these bots and nothing else, so an unknown name would
 // silently review nothing; fail before dispatch instead.
-const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit']
+const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit', 'greptile']
 if (!Array.isArray(args.reviewers)) {
   throw new Error(`reviewers must be an array of ${KNOWN_REVIEWERS.join(', ')}; [] runs no review lane`)
 }
