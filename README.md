@@ -11,10 +11,9 @@ agents/           <name>.md for Claude, plus <name>.toml for Codex, into ~/.clau
 hooks/            Claude Code hooks, one folder each with a hooks.json; switched on per repository (see below)
 workflows/        <name>.js saved workflows, into ~/.claude/workflows (Claude only)
 tests/            unit tests for skill scripts, hooks and the installer
-.claude-plugin/   plugin and marketplace manifests
 ```
 
-## Install by symlink (preferred)
+## Install
 
 Skills are invoked by bare name and edits are live with no reinstall step.
 Nothing is installed by default: each flag takes every entry of its kind.
@@ -25,12 +24,16 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
 ~/code/agentrc/install.py remove --skill
 ```
 
-`--claude-md` links `~/.claude/CLAUDE.md` and points `~/.codex/AGENTS.md` at
-it. Skills link one by one into `~/.claude/skills` and `~/.codex/skills`;
-agents link their `.md` into `~/.claude/agents` and `~/.codex/agents` and
-their `.toml` into `~/.codex/agents`, where Codex discovers it; hooks link
-into `~/.claude/hooks` and register the events from their `hooks.json` in
-`~/.claude/settings.json` (first-time backup kept beside it, idempotent).
+- `--skill`: links each skill into `~/.claude/skills` and `~/.codex/skills`.
+  A skill with a hook of the same name (`simplify-gate`) also links it into
+  `~/.claude/hooks` and registers its `hooks.json` events in
+  `~/.claude/settings.json` (first-time backup kept beside it, idempotent).
+- `--agent`: links each agent's `.md` into `~/.claude/agents` and
+  `~/.codex/agents`, and its `.toml`, when present, into `~/.codex/agents`, where Codex
+  discovers it.
+- `--workflow`: links each workflow into `~/.claude/workflows` (Claude only).
+- `--claude-md`: links `~/.claude/CLAUDE.md`, and `~/.codex/AGENTS.md` to it.
+
 Those directories stay real directories, so a machine can keep its own
 skills, or ones added with `npx skills add`, beside the linked ones. The
 installer refuses before touching anything if a destination holds something
@@ -42,18 +45,6 @@ hook: dead links into this repo are pruned, other people's links stay.
 Project repos such as tinyusb reference these skills by bare name only, e.g.
 `read-doc`, and expect this install to have run; without it their agents take
 the "skill unavailable" branch.
-
-## Install as a plugin
-
-The repo is also its own marketplace, so it installs directly:
-
-```
-/plugin marketplace add hathach/agentrc
-/plugin install agentrc@hathach
-```
-
-Skills are then namespaced as `agentrc:<skill>`. Do not combine this with the
-symlink install on the same machine or every skill shows up twice.
 
 ## Simplify gate (per repository)
 
