@@ -61,23 +61,31 @@ adds only what it may edit and when it stops.
 
 - **Scope.** Stay within the prompt's board, operations and source paths;
   resolve the build and access through the project's contracts or the ELF,
-  device/config and procedure it supplies. A missing technical input returns
-  `blocked`, a missing authorization or human action `needs-user`, instead of
-  waiting for an answer. A technique that needs unconfirmed physical setup is a
-  proposed next experiment, not permission to touch the hardware: for ETM,
-  follow `etm-trace`'s per-board wiring rule, and when it is unmet name ETM in
-  `next` and the missing setup in the limits.
+  device/config and procedure it supplies. The dispatch supplies hardware task
+  scope; no human grant or verbatim exchange is needed for its hardware
+  operations. Missing technical inputs or scope return `blocked` with what the
+  caller must supply. Use `needs-user` for human-only action or a permission
+  still required for publishing, destructive actions on data or third-party
+  access, instead of waiting for an answer. Establish the physical setup a
+  technique needs before using it. If wiring cannot be established from
+  current evidence or the supplied setup information, name the missing setup
+  and proposed experiment in `next`: for ETM, follow `etm-trace`'s per-board
+  wiring rule.
 - **Identity.** Verify worktree, branch and HEAD, then board, probe serial and
   host against the prompt, or the probe against the HIL config entry it names,
   before acting. Resolve the board's family and debug backend from the
   project's metadata before choosing probe tools, never from the board name or
   its flashing backend.
-- **Lock.** Hold the board lock for the whole hardware phase; a refused hold
-  allows retries within the prompt's lock-wait budget, then `blocked` with the
-  holder. A reproducer that takes the lock itself (tinyusb's `hil_test.py`)
-  never runs under your hold and its guard is never bypassed. Reuse a supplied
-  HIL reproduction while its firmware, configuration, reproducer and relevant
-  rig inputs match; otherwise resolve equivalent manual steps through the HIL
+- **Lock.** Ordinary hardware sessions hold the project's board lock for the
+  whole hardware phase; a refused hold waits within the lock-wait budget, then
+  returns `blocked` with the holder. Forced-lock recovery is a separate,
+  explicitly scoped operation naming the holder, affected resources and
+  recovery procedure; a refusal alone never adds that scope, and it never
+  includes stopping the CI runner. A reproducer that takes the lock itself
+  (tinyusb's `hil_test.py`) never runs under your hold, and its guard is
+  bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
+  reproduction while its firmware, configuration, reproducer and relevant rig
+  inputs match; otherwise resolve equivalent manual steps through the HIL
   contract, and if there are none return `blocked` naming the exact HIL
   reproduction needed, so the caller arranges it through the project's HIL
   role. A later manual session re-establishes firmware identity and state and
@@ -144,8 +152,10 @@ adds only what it may edit and when it stops.
 
 ## Rig discipline — lock first, always
 
-On a shared rig, hold the project's board lock for the WHOLE manual session
-(instrument, build, flash, capture, GDB) and never stop its CI runner. Rigs and
+On a shared rig, an ordinary session holds the project's board lock for the
+WHOLE manual session (instrument, build, flash, capture, GDB), forcing it only
+under a scoped forced-lock recovery (Delegated sessions' Lock), and never stops
+its CI runner. Rigs and
 benches run many identical probes:
 
 - Select the probe by serial: J-Link `-SelectEmuBySN <uid>`, its GDB server
@@ -298,7 +308,8 @@ the wire itself: `usb-sniffer` skill (hardware tap, PID-level).
 - **UART logging blocks in the write path** (worst perturbation, including
   inside the ISR); RTT is much cheaper but not free; verbose logging multiplies both.
 - Flash/GDB only with the board lock held; a hold refused because CI is
-  mid-test on that board means wait, don't force.
+  mid-test on that board means wait, and force only under an explicitly
+  scoped forced-lock recovery (Delegated sessions' Lock).
 - **Instrumentation is temporary**: before `release`, restore the pinned
   restoration firmware as Delegated sessions' Cleanup says (the next CI run
   must not inherit a debug build) and revert the instrumentation diff. Handing

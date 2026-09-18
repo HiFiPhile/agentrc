@@ -170,9 +170,28 @@ class AgentFiles(unittest.TestCase):
         for phrase in ('one named PR', 'repository, PR URL, head branch and permitted actions',
                        "question and the human's affirmative answer verbatim", 'during this chief invocation',
                        'solely through the workflow\'s publishing switch', 'requires a fresh exchange',
-                       'no new PRs or issues, force-push, merge, hardware operations or onward delegation'):
+                       'no new PRs or issues, force-push, merge or onward delegation'):
             self.assertIn(phrase, exception)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
+
+    def test_hardware_is_task_scope_not_a_grant(self):
+        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
+        self.assertIn('Hardware work needs task scope, not a human grant or verbatim authorization exchange; a human or agent launcher may supply that scope.', chief)
+        self.assertIn('Rig repair, rig roster edits, host-side USB recovery and forced-lock recovery are also task scope', chief)
+        self.assertIn('In-scope hardware work and local worktree commits need no human grant.', chief)
+        self.assertNotIn("direct words under the provenance rule", chief)
+        self.assertNotIn('missing hardware authorization', chief)
+        self.assertIn('Hardware operations follow Hardware\'s task-scope rules independently of this publishing exception.', chief)
+        # what stays gated
+        self.assertIn('A commit to the primary checkout still needs its own explicit grant.', chief)
+        self.assertIn('hardware task scope does not waive it', chief)
+        self.assertIn('Changing the issue\'s acceptance criterion or accepting a red CI remains the human\'s decision', chief)
+        skill = ' '.join((SKILLS / 'target-debug' / 'SKILL.md').read_text().split())
+        self.assertIn('no human grant or verbatim exchange is needed for its hardware operations', skill)
+        self.assertIn('Forced-lock recovery is a separate, explicitly scoped operation', skill)
+        self.assertIn('it never includes stopping the CI runner', skill)
+        for role in ('hw-debugger.md', 'hw-validator.md'):
+            self.assertIn('a permission still required under the shared Scope rule', (AGENTS / role).read_text())
 
     def test_chief_quotes_unit_json_and_leaves_verdicts_to_the_role(self):
         body = (AGENTS / 'chief.md').read_text()
