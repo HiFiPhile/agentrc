@@ -5,8 +5,8 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-// args: { pr: number, reviewers: string[] (required, of codex, copilot, coderabbit, greptile; the usual
-//            launch names ['copilot', 'coderabbit'], codex only when wanted; [] runs no review lane),
+// args: { pr: number, reviewers?: string[] (of codex, copilot, coderabbit, greptile; default
+//            ['copilot', 'coderabbit']; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default: reviewers),
 //          maxCycles?: number (ceiling on review/fix/CI cycles, default 5), autoPush?: boolean (default false = dry run),
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
@@ -28,7 +28,7 @@ export const meta = {
 //            it under autoPush and continues from it with the same state; per launch, never saved) }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, build?, yieldAfterCycle?, lane?, state?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, build?, yieldAfterCycle?, lane?, state?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -47,10 +47,12 @@ if (!Number.isInteger(maxCycles) || maxCycles < 1) {
 // The validator knows these bots and nothing else, so an unknown name would
 // silently review nothing; fail before dispatch instead.
 const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit', 'greptile']
-if (!Array.isArray(args.reviewers)) {
+const DEFAULT_REVIEWERS = ['copilot', 'coderabbit']
+const reviewersArg = args.reviewers ?? DEFAULT_REVIEWERS
+if (!Array.isArray(reviewersArg)) {
   throw new Error(`reviewers must be an array of ${KNOWN_REVIEWERS.join(', ')}; [] runs no review lane`)
 }
-const reviewers = args.reviewers.map(r => typeof r === 'string' ? r.trim().toLowerCase() : r)
+const reviewers = reviewersArg.map(r => typeof r === 'string' ? r.trim().toLowerCase() : r)
 const unknown = reviewers.filter(r => !KNOWN_REVIEWERS.includes(r))
 if (unknown.length) {
   throw new Error(`unknown reviewer(s) ${JSON.stringify(unknown)}; the validator knows only ${KNOWN_REVIEWERS.join(', ')}`)

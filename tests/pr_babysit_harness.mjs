@@ -168,7 +168,9 @@ async function run(opts = {}) {
       const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle() : reviews)
       // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
       // state; explicit records are filled the same way, one field at a time.
-      const autoRun = (opts.args?.autoRun ?? opts.args?.reviewers ?? ['codex']).map(b => b.trim().toLowerCase())
+      // run() launches with ['codex'] unless a test sets reviewers; set to null/undefined, the workflow's default applies
+      const named = opts.args && 'reviewers' in opts.args ? opts.args.reviewers ?? ['copilot', 'coderabbit'] : ['codex']
+      const autoRun = (opts.args?.autoRun ?? named).map(b => b.trim().toLowerCase())
       const bots = r.bots === 'reviewed' || r.bots === undefined ? autoRun.map(b => bot(b))
         : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
           : r.bots
@@ -340,7 +342,6 @@ test('args validation', async () => {
   await assert.rejects(run({ args: { pr: -3 } }), /positive integer/)
   await assert.rejects(run({ args: { pr: 'abc' } }), /positive integer/)
   await assert.rejects(run({ args: { maxCycles: 0 } }), /maxCycles must be/)
-  await assert.rejects(run({ args: { reviewers: undefined } }), /reviewers must be an array/)
   await assert.rejects(run({ args: { ciWait: 0 } }), /ciWait must be a positive integer/)
   await assert.rejects(run({ args: { ciWait: 1.5 } }), /ciWait must be a positive integer/)
   await assert.rejects(run({ args: { lane: 'review' } }), /lane must be 'both', 'ci' or 'reviews'/)
@@ -369,6 +370,15 @@ test('an unknown reviewer or a malformed protected pattern throws before any age
   assert.equal(named.result.pass, true)
   const none = await run({ args: { reviewers: [] } })
   assert.equal(none.result.pass, true)
+})
+
+test('omitted reviewers default to copilot and coderabbit, both auto-running', async () => {
+  for (const reviewers of [undefined, null]) {
+    const { calls, result } = await run({ args: { reviewers } })
+    assert.equal(result.pass, true)
+    const prompt = calls.find(c => c.label.startsWith('reviews#')).prompt
+    assert.match(prompt, /harvest on this PR are copilot, coderabbit, and no others; of those, copilot, coderabbit auto-run on every push/)
+  }
 })
 
 test('the requested reviewers, normalized, are the ones the validator is asked for', async () => {
