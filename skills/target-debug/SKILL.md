@@ -99,7 +99,10 @@ adds only what it may edit and when it stops.
   before opening the restoration flasher, dispose of the source as your role
   says, reflash the pristine artifact and verify its programmed contents with
   the backend's procedure (the artifact hash recorded apart from that
-  result), close the flasher, restore host settings, release the lock. Do
+  result), remove owned breakpoints and watchpoints, restore the firmware's
+  expected run state and record an observation that establishes it (a
+  verified flash alone does not), close the flasher, restore host settings,
+  release the lock. Run state not established is a failed cleanup. Do
   only the cleanup your own actions or the explicitly assigned recovery state
   call for, establishing ownership before restoring a predecessor's state.
   Blocked before touching hardware with no recovery state assigned, the

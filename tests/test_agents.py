@@ -60,8 +60,10 @@ class AgentFiles(unittest.TestCase):
         cleanup = example['cleanup']
         self.assertIn('pristine', cleanup)
         self.assertEqual(sorted(cleanup['flashVerify']), ['command', 'result'], 'a hash alone does not verify a flash')
-        for key in ('sourceRestored', 'clientsStopped', 'hostRestored', 'lockReleased'):
+        for key in ('instrumentRemoved', 'clientsStopped', 'hostRestored', 'lockReleased'):
             self.assertIn(cleanup[key], ('done', 'failed', 'n-a'))
+        self.assertIn(cleanup['sourceDisposition'], ('restored', 'unrestored'))
+        self.assertEqual(sorted(cleanup['runState']), ['command', 'result'], 'a verified flash alone does not restore the run state')
         allowed, used = example['budget']['allowed'], example['budget']['used']
         for key in ('wallMin', 'cleanupReserveMin', 'lockWaitMin', 'observationWindowS', 'experimentalFlashes',
                     'restorationFlashes', 'repetitionsPerFirmware'):
@@ -87,6 +89,7 @@ class AgentFiles(unittest.TestCase):
         for entry in example['changed']:
             self.assertEqual(sorted(entry), ['artifact', 'entry', 'removed'])
         self.assertIn(example['cleanup']['sourceDisposition'], ('restored', 'fix-committed', 'unrestored'))
+        self.assertEqual(sorted(example['cleanup']['runState']), ['command', 'result'])
         allowed, used = example['budget']['allowed'], example['budget']['used']
         for key in ('wallMin', 'cleanupReserveMin', 'lockWaitMin', 'observationWindowS', 'experimentalFlashes', 'restorationFlashes',
                     'repetitionsPerExperiment', 'candidateComparisonRepetitions', 'hypotheses', 'finalizationMin'):
