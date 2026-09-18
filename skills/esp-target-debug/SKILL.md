@@ -1,6 +1,6 @@
 ---
 name: esp-target-debug
-description: Use when debugging firmware on Espressif boards (ESP32-S3/P4; in TinyUSB the dcd_dwc2 examples built with idf.py) with the chips' built-in USB-Serial-JTAG — attach/halt/backtrace, breakpoints, FreeRTOS task lists, console capture — or when JTAG "could not find or open device", the 303a:1001 port vanishes, or the S3's debug port turns into the firmware's USB device.
+description: Use when debugging firmware on Espressif ESP32-S3 or ESP32-P4 boards through the chip's built-in USB-Serial-JTAG — attach, backtrace, breakpoints, FreeRTOS task lists, console — or when openocd says "could not find or open device", the 303a:1001 port vanishes, or the S3 debug port turns into the firmware's own USB device.
 ---
 
 # esp-target-debug — Espressif built-in USB-JTAG backend
@@ -11,10 +11,12 @@ different gdb, a different openocd (fork), no probe serial (the debugger IS a
 USB device), and a PHY story that decides whether JTAG exists at all.
 Built-in USB-Serial-JTAG only; external JTAG is a TODO (no rig adapter).
 
-## The PHY map — decides everything (verified on the rig)
+## The PHY map — decides everything (verified on the rig, 2026-09-16)
 
-Observed on these two rig boards running TinyUSB device examples on the OTG
-controller; other S3/P4 boards share the chip-level facts, not the wiring.
+Observed on these two rig boards (names are TinyUSB BSP aliases) running USB
+device firmware on the OTG controller; other S3/P4 boards share the chip-level
+facts, not the wiring. Project specifics (symbols, which uid is which):
+`target-debug`'s `projects/`.
 
 | Board                    | USB-SJ vs OTG                                        | JTAG while USB device runs? |
 |--------------------------|------------------------------------------------------|-----------------------------|
@@ -22,7 +24,7 @@ controller; other S3/P4 boards share the chip-level facts, not the wiring.
 | espressif_s3_devkitm     | ONE shared PHY/port                                  | **no** — the same hub port flips 303a:1001 → cafe:4008 as the app boots; openocd fails `esp_usb_jtag: could not find or open device!` |
 
 Flashing works in ANY PHY state: the rig flashes via the boards' CP2102N UART
-bridges (in TinyUSB: the `tinyusb.json` esptool uids are CP210x serials, not MACs). The
+bridges. The
 UART side is also the remote reset: `esptool.py --after hard_reset read_mac`.
 
 ### P4 (Function-EV) notes
@@ -34,9 +36,8 @@ UART side is also the remote reset: `esptool.py --after hard_reset read_mac`.
 
 ### S3 (DevKitM) notes
 
-- Debugging windows: non-USB firmware (verified with TinyUSB's `board_test`:
-  attach/halt/symbol resolution; `usb_new_phy` is absent from the ELF when
-  `CFG_TUD/TUH_ENABLED` are 0), bootloader/ROM (always stable), or external
+- Debugging windows: firmware that never starts the OTG controller (verified:
+  attach/halt/symbol resolution), bootloader/ROM (always stable), or external
   JTAG (TODO).
 - **Keep-alive quirk (verified)**: with app firmware running and nothing
   attached, USB-SJ drops ~4 s after boot (device-side disconnect, then
@@ -55,21 +56,20 @@ UART side is also the remote reset: `esptool.py --after hard_reset read_mac`.
 openocd -c 'set ESP_RTOS FreeRTOS' -f board/esp32p4-builtin.cfg \
         -c 'adapter serial <MAC-with-colons>' &        # S3: board/esp32s3-builtin.cfg
 riscv32-esp-elf-gdb -batch -ex 'target extended-remote :3333' \
-  -ex 'tbreak <app symbol>' -ex continue -ex bt -ex 'info threads' -ex detach <elf>   # in TinyUSB: tud_task_ext
+  -ex 'tbreak <app symbol>' -ex continue -ex bt -ex 'info threads' -ex detach <elf>
 # S3 is Xtensa: use xtensa-esp32s3-elf-gdb with the same arguments
 ```
 
 - `adapter serial` = the chip MAC **with colons** — the USB-SJ device's
   iSerial exactly as `lsusb -v -d 303a:1001` or
   `/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_<MAC>-if00`
-  prints it. (In TinyUSB the `tinyusb.json` esptool uids are the CP2102N
-  *flasher* serials — a different port; never pass those to openocd.)
+  prints it. Read it from the device: a rig config's flasher uid may name a
+  different port (the project's notes say which).
 - `set ESP_RTOS FreeRTOS` must precede the board cfg: with it, `info threads`
   lists every task with name/state/CPU (verified: usbd Running @CPU0, IDLE1
   @CPU1, ...); without it, one bare "Remote target".
-- The ELF: the firmware's own build output (in TinyUSB: `idf.py -B <builddir>
-  -DBOARD=<board> build` under the example) — symbolized app backtraces
-  verified on TinyUSB (`tud_task_ext` ← `usb_device_task` ← `vPortTaskWrapper`).
+- The ELF: the firmware's own build output (an `idf.py` build directory) —
+  symbolized app backtraces verified.
 - **Attach may reset the target** (a boot-fresh FreeRTOS tick observed on a
   minutes-old session). Until pinned down, do NOT trust built-in-JTAG attach
   for post-mortem autopsy of a wedged board (`target-debug`'s
@@ -86,8 +86,7 @@ riscv32-esp-elf-gdb -batch -ex 'target extended-remote :3333' \
 - cpu1 debug-logic examination can fail (`OCD_ID = 00000000`) —
   `-c 'set ESP_ONLYCPU 1'` degrades to cpu0-only debugging.
 - ROM-frame backtraces (`0x4004xxxx` on S3, `0x4fc0xxxx` on P4, all `??`)
-  mean the core idles in ROM — break in app code (`tbreak <app symbol>`, in
-  TinyUSB `tud_task_ext`) for symbolized frames.
+  mean the core idles in ROM — break in app code (`tbreak <app symbol>`) for symbolized frames.
 
 ## Technique mapping (vs the `target-debug` arsenal)
 
@@ -102,8 +101,8 @@ riscv32-esp-elf-gdb -batch -ex 'target extended-remote :3333' \
 
 ## Rig deltas
 
-- Shared rig boards: hold the project's board lock first (in TinyUSB: the
-  `hil` skill); reflash-pristine before release applies unchanged.
+- Shared rig boards: hold the project's board lock first (its `HIL contract:`
+  names the skill that owns it); reflash-pristine before release applies unchanged.
 - One client per USB-SJ: openocd and a terminal on the USB-SJ CDC side
   conflict the same way J-Link clients do.
 
