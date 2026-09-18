@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 AGENTS = Path(__file__).resolve().parents[1] / 'agents'
+SKILLS = AGENTS.parent / 'skills'
 
 
 class AgentFiles(unittest.TestCase):
@@ -72,6 +73,8 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(key, used)
         for verdict in ('`real`', '`fixed`', '`rig-side`', '`not-reproduced`', '`inconclusive`'):
             self.assertIn(verdict, body)
+        self.assertEqual(used['restorationFlashes'], 0, 'a verified tested image that is the restoration image is kept, not reflashed')
+        self.assertIn(example['runs'][0]['firmware'], cleanup['pristine'])
     def test_hw_debugger_example_carries_what_chief_relaunches_on(self):
         """chief relaunches only on a non-empty `changed`; `fixed` is the validator's alone."""
         body = (AGENTS / 'hw-debugger.md').read_text()
@@ -91,6 +94,8 @@ class AgentFiles(unittest.TestCase):
             self.assertEqual(sorted(entry), ['artifact', 'entry', 'removed'])
         self.assertIn(example['cleanup']['sourceDisposition'], ('restored', 'fix-committed', 'unrestored'))
         self.assertEqual(sorted(example['cleanup']['runState']), ['command', 'result'])
+        self.assertTrue(example['cleanup']['pristine'].startswith(example['base']), 'restoration is pinned to the pre-fix revision')
+        self.assertNotEqual(example['base'], example['head'])
         allowed, used = example['budget']['allowed'], example['budget']['used']
         for key in ('wallMin', 'cleanupReserveMin', 'lockWaitMin', 'observationWindowS', 'experimentalFlashes', 'restorationFlashes',
                     'repetitionsPerExperiment', 'candidateComparisonRepetitions', 'hypotheses', 'finalizationMin'):
@@ -110,6 +115,16 @@ class AgentFiles(unittest.TestCase):
             body = (AGENTS / name).read_text()
             self.assertIn('git commit --only -m "<subject>" -- <same paths>', body, name)
             self.assertNotIn('git commit --only -- <same paths>', body, name)
+
+    def test_cleanup_pins_restoration_and_keeps_a_verified_image(self):
+        body = ' '.join((SKILLS / 'target-debug' / 'SKILL.md').read_text().split())
+        self.assertIn('save the restoration artifact apart from later build outputs and pin it', body)
+        self.assertIn('establishes that it matches the pinned artifact', body)
+        self.assertIn('`restorationFlashes` counts actual programming attempts', body)
+        self.assertNotIn('reflash pristine firmware', body)
+        chief = (AGENTS / 'chief.md').read_text()
+        self.assertIn('the bench runs the pinned restoration firmware, which may predate the fix', chief)
+        self.assertIn('keeps the evidence and handoff artifacts', chief)
 
     def test_chief_quotes_unit_json_and_leaves_verdicts_to_the_role(self):
         body = (AGENTS / 'chief.md').read_text()

@@ -84,9 +84,12 @@ adds only what it may edit and when it stops.
   never treats a snapshot taken after that handoff as the earlier failure
   state without evidence.
 - **Builds.** Through the build contract into a private build directory,
-  leaving firmware staged for HIL untouched; save the pristine restoration
-  artifact before changing the target. Tracked paths a build may rewrite are
-  in the prompt's temporary scope, or reported before building.
+  leaving firmware staged for HIL untouched. Before the first hardware change,
+  save the restoration artifact apart from later build outputs and pin it: its
+  revision, configuration and hash, recorded as `cleanup.pristine`; cleanup
+  restores that identity, and later commits do not move it. Tracked paths a
+  build may rewrite are in the prompt's temporary scope, or reported before
+  building.
 - **Instrumentation.** Only the listed paths, from a clean checkout,
   uncommitted, each diff saved as a patch in the artifact directory. From a
   previous unit's dirty state (a recovery prompt): inspect the recorded patch
@@ -108,19 +111,23 @@ adds only what it may edit and when it stops.
   report the overrun.
 - **Cleanup, before releasing the lock.** Stop owned capture and debug clients
   before opening the restoration flasher, dispose of the source as your role
-  says, reflash the pristine artifact and verify its programmed contents with
-  the backend's procedure (the artifact hash recorded apart from that
-  result), remove owned breakpoints and watchpoints, restore the firmware's
-  expected run state and record an observation that establishes it (a
-  verified flash alone does not), close the flasher, restore host settings,
-  release the lock. Run state not established is a failed cleanup. Do
-  only the cleanup your own actions or the explicitly assigned recovery state
-  call for, establishing ownership before restoring a predecessor's state.
-  Blocked before touching hardware with no recovery state assigned, the
-  untouched actions are `n-a`, nothing is flashed and another holder's lock
-  stays. If restoration cannot complete, keep the lock where
-  you can, report the exact remaining source, firmware, process and lock
-  state, and do not call the board ready.
+  says, establish the pinned restoration image on the board (retain the
+  programmed image when verification with the backend's procedure establishes
+  that it matches the pinned artifact and nothing since changed its contents
+  or made them uncertain, citing that verification; otherwise program the
+  pinned artifact and verify its programmed contents, the artifact hash
+  recorded apart from that result), remove owned breakpoints and watchpoints,
+  restore the firmware's expected run state and record an observation that
+  establishes it (a verified flash alone does not), close the flasher, restore
+  host settings, release the lock. `restorationFlashes` counts actual
+  programming attempts. Run state not established is a failed cleanup. Do only
+  the cleanup your own actions or the explicitly assigned recovery state call
+  for, establishing ownership before restoring a predecessor's state. Blocked
+  before touching hardware with no recovery state assigned, the untouched
+  actions are `n-a`, nothing is flashed and another holder's lock stays. If
+  restoration cannot complete, keep the lock where you can, report the exact
+  remaining source, firmware, process and lock state, and do not call the
+  board ready.
 - **Return.** The tested firmware identity, decisive observations, artifact
   locations, cleanup state and budget used; sampling done by hand on a native
   probe comes back with its command, and the limits name only what was
@@ -283,10 +290,11 @@ the wire itself: `usb-sniffer` skill (hardware tap, PID-level).
   inside the ISR); RTT is much cheaper but not free; verbose logging multiplies both.
 - Flash/GDB only with the board lock held; a hold refused because CI is
   mid-test on that board means wait, don't force.
-- **Instrumentation is temporary**: before `release`, reflash pristine
-  firmware (the next CI run must not inherit a debug build) and revert the
-  instrumentation diff. Handing the diff over with the diagnosis preserves the
-  evidence; it does not count as cleanup.
+- **Instrumentation is temporary**: before `release`, restore the pinned
+  restoration firmware as Delegated sessions' Cleanup says (the next CI run
+  must not inherit a debug build) and revert the instrumentation diff. Handing
+  the diff over with the diagnosis preserves the evidence; it does not count
+  as cleanup.
 - **A register snapshot without a validity anchor lies**: J-Link tool sessions
   can reset or briefly halt the DUT as a side effect, and a snapshot of a
   freshly-reset chip (e.g. NVIC ISER = 0) reads like a smoking gun. Read DHCSR
