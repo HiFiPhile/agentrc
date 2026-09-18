@@ -55,14 +55,62 @@ between boards, named with `--probe`.
 
 ## Delegated sessions
 
-When an agent dispatches this work, its prompt is the scope: stay within its
-board, operations and source paths, and resolve the build and access through
-the project's contracts or the ELF, device/config and procedure it supplies.
-Return a missing technical input as blocked and a missing authorization or
-human action as needs-user instead of waiting for an answer. Return the tested
-firmware identity, the decisive observations, the artifact locations and the
-cleanup state; sampling done by hand on a native probe comes back with its
-command, and the limits name only what was actually unavailable.
+When an agent dispatches this work (chief's `hw-validator` and `hw-debugger`
+units), the prompt is the scope and these rules bind the unit; its role file
+adds only what it may edit and when it stops.
+
+- **Scope.** Stay within the prompt's board, operations and source paths;
+  resolve the build and access through the project's contracts or the ELF,
+  device/config and procedure it supplies. A missing technical input returns
+  `blocked`, a missing authorization or human action `needs-user`, instead of
+  waiting for an answer.
+- **Identity.** Verify worktree, branch and HEAD, then board, probe serial and
+  host against the prompt, or the probe against the HIL config entry it names,
+  before acting.
+- **Lock.** Hold the board lock for the whole hardware phase; a refused hold
+  allows retries within the prompt's lock-wait budget, then `blocked` with the
+  holder. A reproducer that takes the lock itself (tinyusb's `hil_test.py`)
+  never runs under your hold and its guard is never bypassed: resolve the
+  equivalent manual steps through the HIL contract, or return `blocked`.
+- **Builds.** Through the build contract into a private build directory,
+  leaving firmware staged for HIL untouched; save the pristine restoration
+  artifact before changing the target. Tracked paths a build may rewrite are
+  in the prompt's temporary scope, or reported before building.
+- **Instrumentation.** Only the listed paths, from a clean checkout,
+  uncommitted, each diff saved as a patch in the artifact directory. From a
+  previous unit's dirty state (a recovery prompt): inspect the recorded patch
+  and current changes first, restore only what is attributable to it, report
+  ambiguous ownership untouched.
+- **Observation.** Stay within the prompt's observation window and repetition
+  budget; every attempted reproducer counts toward it, including failed or
+  truncated captures. An early decisive observation may settle the claim;
+  otherwise a shortened capture is partial evidence and cannot establish a
+  pass that needs the full exposure. Anchor every
+  state reading with the backend's validity check (Cortex-M: DHCSR) and record
+  whether attaching halted or reset the target; a post-reset snapshot is never
+  the failure state.
+- **Host.** Leave the host as found: never clear kernel logs (`dmesg -C`) or
+  other shared history, and restore every setting you change (dynamic debug,
+  module parameters).
+- **Budget.** Stop starting experiments when the remaining time cannot cover
+  the experiment plus cleanup; never cut a restoration short for the deadline,
+  report the overrun.
+- **Cleanup, before releasing the lock.** Stop owned capture and debug clients
+  before opening the restoration flasher, dispose of the source as your role
+  says, reflash the pristine artifact and verify its programmed contents with
+  the backend's procedure (the artifact hash recorded apart from that
+  result), close the flasher, restore host settings, release the lock. Do
+  only the cleanup your own actions or the explicitly assigned recovery state
+  call for, establishing ownership before restoring a predecessor's state.
+  Blocked before touching hardware with no recovery state assigned, the
+  untouched actions are `n-a`, nothing is flashed and another holder's lock
+  stays. If restoration cannot complete, keep the lock where
+  you can, report the exact remaining source, firmware, process and lock
+  state, and do not call the board ready.
+- **Return.** The tested firmware identity, decisive observations, artifact
+  locations, cleanup state and budget used; sampling done by hand on a native
+  probe comes back with its command, and the limits name only what was
+  actually unavailable.
 
 ## Rig discipline — lock first, always
 
@@ -95,8 +143,9 @@ that IS a finding (timing-sensitive): move down in intrusiveness, not up.
 | GDB halt / breakpoints             | stops USB service entirely     | post-mortem state autopsy once wedged                   |
 
 SWO exception trace and DWT data trace: `swo-dwt.md`. Vector catch and the fault
-registers: `fault-autopsy.md`. GDB servers, the hardware breakpoint budget,
-watchpoints, dprintf, FreeRTOS threads: `gdb.md` (all beside this file).
+registers: `fault-autopsy.md`. GDB servers, OpenOCD batch sessions, the hardware
+breakpoint budget, watchpoints, dprintf, FreeRTOS threads: `gdb.md` (all beside
+this file).
 
 ## PC-sampling — where the core spins, without halting
 

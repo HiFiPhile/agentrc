@@ -43,14 +43,14 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(verdict, body)
         self.assertNotIn('rigSide', body)
 
-    def test_hw_debugger_example_carries_what_chief_adjudicates_on(self):
+    def test_hw_validator_example_carries_what_chief_adjudicates_on(self):
         """chief reads status apart from verdict and trusts a board only on a cleanup receipt."""
-        body = (AGENTS / 'hw-debugger.md').read_text()
+        body = (AGENTS / 'hw-validator.md').read_text()
         example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
         self.assertIn(example['status'], ('complete', 'blocked', 'needs-user'))
         self.assertIn(example['verdict'], ('real', 'fixed', 'rig-side', 'not-reproduced', 'inconclusive'))
         for key in ('question', 'criterion', 'reason', 'worktree', 'branch', 'head', 'host', 'board', 'probe', 'example', 'peer',
-                    'runs', 'cleanup', 'limits', 'blocker', 'next'):
+                    'runs', 'cleanup', 'budget', 'limits', 'blocker', 'next'):
             self.assertIn(key, example)
         run = example['runs'][0]
         for key in ('revision', 'configuration', 'firmware', 'instrument', 'technique', 'command', 'repetitions', 'duration',
@@ -62,8 +62,43 @@ class AgentFiles(unittest.TestCase):
         self.assertEqual(sorted(cleanup['flashVerify']), ['command', 'result'], 'a hash alone does not verify a flash')
         for key in ('sourceRestored', 'clientsStopped', 'hostRestored', 'lockReleased'):
             self.assertIn(cleanup[key], ('done', 'failed', 'n-a'))
+        allowed, used = example['budget']['allowed'], example['budget']['used']
+        for key in ('wallMin', 'cleanupReserveMin', 'lockWaitMin', 'observationWindowS', 'experimentalFlashes',
+                    'restorationFlashes', 'repetitionsPerFirmware'):
+            self.assertIn(key, allowed)
+        for key in ('wallMin', 'cleanupMin', 'lockWaitMin', 'observationS', 'experimentalFlashes', 'restorationFlashes', 'repetitions'):
+            self.assertIn(key, used)
         for verdict in ('`real`', '`fixed`', '`rig-side`', '`not-reproduced`', '`inconclusive`'):
             self.assertIn(verdict, body)
+    def test_hw_debugger_example_carries_what_chief_relaunches_on(self):
+        """chief relaunches only on a non-empty `changed`; `fixed` is the validator's alone."""
+        body = (AGENTS / 'hw-debugger.md').read_text()
+        example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
+        self.assertIn(example['verdict'], ('real', 'rig-side', 'not-reproduced', 'inconclusive'))
+        for key in ('question', 'reproducer', 'head', 'base', 'board', 'probe', 'hypotheses', 'cause', 'fix', 'changed',
+                    'runs', 'cleanup', 'budget', 'limits', 'blocker', 'next'):
+            self.assertIn(key, example)
+        for h in example['hypotheses']:
+            self.assertIn(h['result'], ('supported', 'refuted', 'unresolved'))
+            for key in ('claim', 'prediction', 'experiment', 'evidence', 'doc'):
+                self.assertIn(key, h)
+        self.assertIn(example['cause']['confidence'], ('supported', 'unresolved'))
+        self.assertIn(example['fix']['state'], ('committed', 'pending-finalization', 'patch-only', 'none'))
+        for entry in example['changed']:
+            self.assertEqual(sorted(entry), ['artifact', 'entry', 'removed'])
+        self.assertIn(example['cleanup']['sourceDisposition'], ('restored', 'fix-committed', 'unrestored'))
+        allowed, used = example['budget']['allowed'], example['budget']['used']
+        for key in ('wallMin', 'cleanupReserveMin', 'lockWaitMin', 'observationWindowS', 'experimentalFlashes', 'restorationFlashes',
+                    'repetitionsPerExperiment', 'candidateComparisonRepetitions', 'hypotheses', 'finalizationMin'):
+            self.assertIn(key, allowed)
+        for key in ('wallMin', 'cleanupMin', 'lockWaitMin', 'observationS', 'experimentalFlashes', 'restorationFlashes',
+                    'repetitions', 'hypotheses', 'finalizationMin'):
+            self.assertIn(key, used)
+        ids = {run['id'] for run in example['runs']}
+        refs = [h['experiment'] for h in example['hypotheses']] + example['cause']['evidence'] + [c['artifact'] for c in example['changed']]
+        self.assertLessEqual(set(refs), ids, 'every referenced run is in runs')
+        self.assertEqual(sum(run['repetitions'] for run in example['runs']), used['repetitions'])
+        self.assertEqual(len(example['hypotheses']), used['hypotheses'])
 
 
 if __name__ == '__main__':
