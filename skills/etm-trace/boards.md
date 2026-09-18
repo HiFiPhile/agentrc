@@ -3,9 +3,14 @@
 Validated boards: trace config table + hard-won caveats. Read the row AND the
 caveat for a board before capturing on it; add a row + caveat when a new board
 is validated (the reference project, the firmware's clock selection and this
-file must agree). In TinyUSB the reference project is
-`hw/bsp/<family>/boards/<board>/ozone/*.jdebug`, printed by
-`python3 tools/build_utils.py board-info <board>`; pass it with `--jdebug`.
+file must agree).
+
+Board names are TinyUSB BSP aliases (`hw/bsp/<family>/boards/<name>` in
+`hathach/tinyusb`), whose reference project is `ozone/*.jdebug` beside the board,
+printed by `python3 tools/build_utils.py board-info <board>`; pass it with
+`--jdebug`. The firmware behind every row is a TinyUSB `TRACE_ETM=1` build: the
+silicon, wiring and timing facts carry over to another project, the symbol and
+build names do not.
 
 "Core (trace build)" is the CPU clock a trace build runs (in TinyUSB:
 `TRACE_ETM=1`) — where it differs from the stock clock, the board header
@@ -60,9 +65,11 @@ Board caveats (beyond the table):
   reference. BOARD_BootClockRUN sets the 132 MHz trace root but leaves it
   gated; TinyUSB's `trace_etm_init` ungates it. The first Ozone run after a fresh
   flash can fail to reach main — transient, retry once.
+- **mcb1800, ra8m1_ek**: their reference projects define no (mcb1800) or only
+  one (ra8m1_ek) of the reset/download hooks — capture with
+  `--cortex-m-default-hooks`, which is how both were validated.
 - **mcb1800**: a bad ribbon mating yields register-perfect silence — re-seat
   BOTH ribbon ends first; SWD working proves nothing about the trace lines.
-  in TinyUSB `--isr USB0_IRQHandler,dcd_int_handler`.
 - **nrf5340dk**: the interface MCU's UART1 flow control rides the trace
   pins — it actively drives CTS onto P0.10/TRACEDATA1 (dead line, any
   timing) and loads P0.11/TRACEDATA0: cut SB27/SB28 (or flip SW7 to FC-off).
@@ -70,7 +77,10 @@ Board caveats (beyond the table):
   builds force the TAD port to 16 MHz (SystemInit's 64 MHz is marginal).
 - **ea4088_quickstart**: FS enumeration ends < 100 ms — for `--isr` use
   `--duration-ms 150`. Boot-ROM address warning (0x1FFF1FF0) is normal.
-- **mimxrt1170_evkb**: width 1 only — D1-D3 are stone silent at any config
+- **mimxrt1170_evkb** (UNRESOLVED, flagged 2026-09-18: this caveat calls
+  R1882/R1883/R1884 all open, the table's TODO says only R1884/D3 is open with
+  D1/D2 meter-verified good; re-measure before reworking and fix whichever is
+  wrong): width 1 only — D1-D3 are stone silent at any config
   (pinmux register-perfect, PHY quieted, funnel enabled): the welded 0402s
   R1882/R1883/R1884 are electrically open — reflow to unlock width 4.
   TinyUSB's `trace_etm_init` fixes the JTAG_nTRST/DMIC_DATA1 pad, holds the 100M
@@ -92,8 +102,6 @@ Board caveats (beyond the table):
   unusable on this board — swept widths 1/4 across -2..+4 ns, all dead;
   TinyUSB TRACE_ETM builds use div-4 (25 MHz pin). The TCLK pin runs TRCLK/2. 50 MHz SWD TIF
   caused intermittent "Failed to initialize DAP" — the reference runs 4 MHz.
-  ISR entry in TinyUSB: `--isr tusb_int_handler,dcd_int_handler` (FSP's
-  usbfs_interrupt_handler symbol never actually executes).
 - **ra6m5_ek / ra8m1_ek — `--attach` needs a debugger-booted target**: the
   firmware TRCKCR setup is gated on DHCSR.C_DEBUGEN (an unguarded write
   wedges a standalone boot un-attachable until power-cycle), so a board
@@ -107,7 +115,7 @@ Board caveats (beyond the table):
   clock after the FSP clock switch — without it the MOCO→PLL step desyncs
   the decoder at t≈0.05 s every run. Runs both chip maxima (120 MHz TRCLK,
   60 MHz pin) clean. `ReadIntoTraceCache 0x0 0x10000` in the download hook
-  covers runtime chip-ROM execution. ISR entry in TinyUSB: `tusb_int_handler`.
+  covers runtime chip-ROM execution.
 - **pico2_etm_trace** (Pico 2 / RP2350 on the carrier; board `raspberry_pi_pico2`
   is the bare module and has no trace wiring): rig = **pico2 trace motherboard PCB**
   (~/code/pcb/pico2_trace_motherboard: MIPI-20, 27 Ohm source-terminated,
@@ -117,18 +125,13 @@ Board caveats (beyond the table):
   +1 ns** (committed in the reference; idle eye -1000..+2000 ps, +3000 dead;
   TD aliases modulo the 6.67 ns UI); soak: cdc_msc_throughput under a live
   host CDC+MSC bulk pump, 3/3 x 15 s, zero overflow, 53.7M fetches (DCD hot
-  path at 9% load). in TinyUSB `TRACE_ETM` is set by the board's own board.cmake - no
-  build flag needed.
-  **Other rates need a hand-built clock**: pass `SYS_CLK_KHZ` *together with*
-  `PLL_SYS_VCO_FREQ_HZ`/`POSTDIV1`/`POSTDIV2` from the SDK's
-  `scripts/vcocalc.py` as compile definitions (a bare `-DSYS_CLK_KHZ=` only
-  sets a CMake cache var and is silently ignored - the BSP no longer carries
-  a PLL table). Measured: 180000 = 90 MHz TRACECLK, loaded eye
+  path at 9% load).
+  **Other rates need a hand-built clock** (the compile definitions: the project's
+  notes). Measured: 180000 = 90 MHz TRACECLK, loaded eye
   +4000..+5000 ps (3/3); 240000 = **the J-Trace PRO V2 ceiling** (120 MHz
   TRACECLK, TD +3500) — **⚠ 240 MHz was measured with the core regulator
-  raised to 1.15 V, which nothing does automatically any more: add
-  `SYS_CLK_VREG_VOLTAGE_AUTO_ADJUST=1` and
-  `SYS_CLK_VREG_VOLTAGE_MIN=VREG_VOLTAGE_1_15` yourself, or the chip runs
+  raised to 1.15 V, which nothing does automatically any more: raise it
+  yourself (definitions in the project's notes), or the chip runs
   60% over its 150 MHz rating at stock 1.10 V.** >=125 MHz
   TRACECLK is a hard probe wall at every sample delay/width (the V2 AT its
   documented limit: Arm spec 100 MHz in-spec, SEGGER's tuned-V2 best is
@@ -154,9 +157,7 @@ Board caveats (beyond the table):
   re-switch the clock at runtime.
   **This is the only trace-capable board in the rp2040 family** - it owns the
   sole reference project (RP2350 device and hooks, not a reference for other
-  rp2040/rp2350 boards); capture it with
-  `--jdebug hw/bsp/rp2040/boards/pico2_etm_trace/ozone/rp2350.jdebug` (in
-  TinyUSB).
+  rp2040/rp2350 boards); capture it with that project's `--jdebug`.
   **Arm-phase flake**: an occasional instant unknown-packet death at
   offset ~0x10-0x6C right at trace start — just re-run; only mid-stream
   deaths indicate a real problem. **Loose MIPI-20 cable symptom ladder**:

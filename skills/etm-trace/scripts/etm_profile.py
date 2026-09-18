@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Analyze an etm_capture.py output dir: hot functions, coverage, itrace digest,
-ISR episode timing, and optimization hints.
+and ISR episode timing.
 
 Input:  code_profile.txt (Ozone Export.CodeProfile text report), and optionally
         itrace.csv (Export.Trace raw instruction history) with --elf for
@@ -10,13 +10,20 @@ Output: markdown report on stdout.
 --isr SYM[,SYM..]  episode timing for an interrupt handler: first symbol is the
         entry anchor (its first instruction marks each ISR entry), all symbols
         form the body address set. Example: --isr OTG_HS_IRQHandler,dcd_int_handler
-        Durations are calibrated against SysTick_Handler beats (1 ms apart), so
-        the itrace must be captured with timestamps enabled.
+        Durations are calibrated against a periodic handler the firmware runs:
+        --tick-symbol names it and --tick-hz gives its rate (e.g. SysTick_Handler
+        1000). Both come from the firmware, neither is guessed; the itrace must be
+        captured with timestamps enabled. Check both entries in the ELF's
+        disassembly: the --isr entry instruction must execute once per invocation
+        (a loop head placed there splits one invocation into several episodes),
+        and the tick handler must return to other code between beats (short, not
+        tail-chained into itself).
 """
 
 import argparse
 import bisect
 import csv
+import math
 import os
 import re
 import statistics
@@ -85,9 +92,12 @@ def parse_profile(path):
 
 def load_symbols(elf):
     """Sorted (addr, size, name) from nm; for mapping itrace addresses."""
-    nm = "arm-none-eabi-nm"
-    out = subprocess.run([nm, "-S", "--defined-only", "-C", elf],
-                         capture_output=True, text=True)
+    nm = os.environ.get("ETM_NM") or "arm-none-eabi-nm"
+    try:
+        out = subprocess.run([nm, "-S", "--defined-only", "-C", elf],
+                             capture_output=True, text=True)
+    except OSError as e:
+        sys.exit(f"error: cannot run {nm}: {e} - install it or set ETM_NM=<path>")
     if out.returncode != 0:
         sys.exit(f"error: {nm} failed on {elf}: {out.stderr.strip()}")
     syms = []
@@ -110,16 +120,20 @@ def addr_to_func(syms, addr):
 
 def sym_ranges(syms, names):
     """(lo, hi) address ranges for the named symbols (base name match);
-    None if any symbol is missing (caller degrades gracefully)."""
+    None if any symbol is missing (caller degrades gracefully). A name that
+    matches several addresses (same-named statics) is refused: picking one
+    would time the wrong function."""
     out = []
     for want in names:
-        for a, sz, n in syms:
-            if n == want or n.split("(")[0] == want:
-                out.append((a, a + sz))
-                break
-        else:
+        hits = sorted({(a, a + sz) for a, sz, n in syms
+                       if n == want or n.split("(")[0] == want})
+        if len(hits) > 1:
+            sys.exit(f"error: symbol '{want}' is ambiguous in the ELF: "
+                     + ", ".join(f"0x{lo:08x}" for lo, _ in hits))
+        if not hits:
             print(f"note: symbol '{want}' not found in ELF")
             return None
+        out.append(hits[0])
     return out
 
 
@@ -194,45 +208,68 @@ def time_by_func(path, syms):
     return tf, cf, n
 
 
-def isr_report(itrace, elf, isr_arg, top):
+def isr_report(itrace, elf, isr_arg, tick_symbol, tick_hz):
+    if not tick_symbol:
+        print("\n## ISR timing: unavailable - trace timestamps are seconds only as "
+              "far as the capture's core clock was right; pass --tick-symbol and "
+              "--tick-hz to calibrate them")
+        return
     syms = load_symbols(elf)
     names = [s.strip() for s in isr_arg.split(",") if s.strip()]
     body = sym_ranges(syms, names)
-    tick = sym_ranges(syms, ["SysTick_Handler"])
+    tick = sym_ranges(syms, [tick_symbol])
     if not body or not tick:
         print("\n## ISR timing: skipped (missing symbols above - needs the ISR "
-              "symbol(s) and SysTick_Handler for calibration)")
+              f"symbol(s) and {tick_symbol} for calibration)")
         return
     entry = body[0][0]
+    tick_entry = tick[0][0]
     unit = itrace_unit(itrace)
 
-    usb_rows, tick_rows, tmin, tmax = [], [], None, None
-    for t, a in iter_itrace(itrace):
-        if t is None:
-            continue  # --no-timestamps capture: the <20-rows message below applies
-        tmin = t if tmin is None else min(tmin, t)
-        tmax = t if tmax is None else max(tmax, t)
+    usb_rows, starts, tmin, tmax = [], [], None, None
+
+    def in_tick(a):
+        return any(lo <= a < hi for lo, hi in tick)
+
+    def take(row, older_addr):
+        t, a = row
         if any(lo <= a < hi for lo, hi in body):
             usb_rows.append((t, a))
-        # independent, not elif: when the ISR under test IS SysTick_Handler,
-        # its rows must still feed the calibration
-        if any(lo <= a < hi for lo, hi in tick):
-            tick_rows.append((t, a))
+        # independent, not elif: the ISR under test may be the tick handler itself.
+        # A beat is the entry instruction reached from outside the handler: a
+        # compiler may put a loop head there, and those re-executions are not beats
+        if a == tick_entry and older_addr is not None and not in_tick(older_addr):
+            starts.append(t)
+
+    newer = None
+    for t, a in iter_itrace(itrace):
+        if t is None:
+            continue  # --no-timestamps capture: the too-few-beats message below applies
+        tmin = t if tmin is None else min(tmin, t)
+        tmax = t if tmax is None else max(tmax, t)
+        if newer:
+            take(newer, a)
+        newer = (t, a)
+    if newer:
+        take(newer, None)
     usb_rows.reverse()
-    tick_rows.reverse()
-    if len(tick_rows) < 20:
-        print(f"\n## ISR timing: not enough SysTick beats for calibration "
-              f"({len(tick_rows)} rows) - capture with timestamps enabled")
+    starts.reverse()
+    # a beat is one execution of the handler's first instruction; fewer than
+    # three leaves no period to take a median of
+    if len(starts) < 3:
+        print(f"\n## ISR timing: not enough {tick_symbol} beats for calibration "
+              f"({len(starts)}) - capture with timestamps enabled, for longer "
+              f"than a few periods of {tick_hz:g} Hz")
         return
 
-    # rough raw-units-per-1ms from the large mode of consecutive tick deltas;
-    # threshold from the median, not the max - one trace-overflow gap would
-    # otherwise inflate the cut and leave only outliers in the sample
-    deltas = [b[0] - a[0] for a, b in zip(tick_rows, tick_rows[1:])]
-    big = [d for d in deltas if d > 10 * statistics.median(deltas)]
-    raw_ms = statistics.median(big) if big else statistics.median(deltas)
-    gap = 0.03 * raw_ms       # 30 us in raw units
-    edge = 0.05 * raw_ms
+    # median, not mean: one trace-overflow gap must not stretch the period
+    raw_period = statistics.median(b - a for a, b in zip(starts, starts[1:]))
+    if raw_period <= 0:
+        print(f"\n## ISR timing: {tick_symbol} beats carry no usable timestamps")
+        return
+    raw_s = raw_period * tick_hz
+    gap = 30e-6 * raw_s
+    edge = 50e-6 * raw_s
 
     def episodes(rows, g):
         out, cur = [], []
@@ -245,18 +282,23 @@ def isr_report(itrace, elf, isr_arg, top):
             out.append(cur)
         return out
 
-    starts = [e[0][0] for e in episodes(tick_rows, 0.1 * raw_ms)]
-
     def local_scale(t):
         i = bisect.bisect_left(starts, t)
         if 0 < i < len(starts):
             sp = starts[i] - starts[i - 1]
-            if 0 < sp < 3 * raw_ms:
-                return 1e-3 / sp
-        return 1e-3 / raw_ms
+            # a lost beat doubles the interval: that is not clock drift to follow
+            if 0.8 * raw_period < sp < 1.2 * raw_period:
+                return 1 / (tick_hz * sp)
+        return 1 / raw_s
 
-    eps = []
+    # body rows resuming after a gap without passing the entry belong to the
+    # episode before the gap (preempted, or running outside the body symbols):
+    # its visible part is a prefix, not a duration
+    eps, interrupted, open_ep = [], 0, False
     for cluster in episodes(usb_rows, gap):
+        if cluster[0][1] != entry and open_ep:
+            eps.pop()
+            interrupted += 1
         cur = None
         for t, a in cluster:
             if a == entry:
@@ -267,10 +309,14 @@ def isr_report(itrace, elf, isr_arg, top):
                 cur.append((t, a))
         if cur:
             eps.append(cur)
+        open_ep = cur is not None
     eps = [e for e in eps if e[0][0] - tmin > edge and tmax - e[-1][0] > edge
           and len(e) >= 10]
     print(f"\n## ISR timing: {names[0]} (+{len(names) - 1} body syms), "
-          f"unit '{unit}', {len(starts)} SysTick beats")
+          f"unit '{unit}', {len(starts)} {tick_symbol} beats at {tick_hz:g} Hz")
+    if interrupted:
+        print(f"- {interrupted} episode(s) excluded: a hole longer than 30 us inside "
+              f"(preempted, or a timestamp jump), only a prefix is visible")
     if not eps:
         print("- no complete episodes in window (wrong symbols? window missed "
               "the traffic phase?)")
@@ -328,44 +374,6 @@ def branch_bias(insts_csv, funcs, top):
         print(f"- `{short(fn)}` @{addr} {kind} ({fetched:,}x): `{asm[:50]}`")
 
 
-def suggestions(funcs, totals, tshare, cshare, exclude):
-    """Rule-based optimization hints (after UM08025 §5.19)."""
-    print("\n## Optimization hints")
-    total_fetch = totals.get("fetch") or 1
-    ex = [n for n in funcs if exclude and re.search(exclude, n)]
-    ex_fetch = sum(funcs[n]["fetch"] for n in ex)
-    if ex:
-        print(f"- excluded from load ranking (--exclude): {len(ex)} functions, "
-              f"{100.0 * ex_fetch / total_fetch:.1f}% of fetches")
-    rest = {n: v for n, v in funcs.items() if n not in ex}
-    rt = sum(v["fetch"] for v in rest.values()) or 1
-    hot = sorted(rest.items(), key=lambda kv: -kv[1]["fetch"])[:5]
-    print("- top load after exclusion: " + ", ".join(
-        f"`{short(n)}` {100.0 * v['fetch'] / rt:.1f}%" for n, v in hot))
-    polls = [(n, v) for n, v in rest.items()
-             if v["fetch"] / total_fetch > 0.02 and v["run"]
-             and v["fetch"] / v["run"] < 40]
-    if polls:
-        print("- busy-poll candidates (>2% load, <40 instr/entry - called in a "
-              "tight loop; consider event-driven or rate-limiting):")
-        for n, v in sorted(polls, key=lambda kv: -kv[1]["fetch"]):
-            print(f"  - `{short(n)}`: {v['run']:,} calls, "
-                  f"{v['fetch'] / v['run']:.0f} instr/call, "
-                  f"{100.0 * v['fetch'] / total_fetch:.1f}% load")
-    if tshare:
-        stalls = []
-        for n, ts in tshare.items():
-            cs = cshare.get(n, 0)
-            if ts > 0.01 and cs and ts / cs > 4:
-                stalls.append((n, ts, ts / cs))
-        if stalls:
-            print("- stall/wait-dominated (time share >> instruction share - "
-                  "waiting on hardware, consider DMA/IRQ instead of polling):")
-            for n, ts, ratio in sorted(stalls, key=lambda x: -x[1])[:5]:
-                print(f"  - `{short(n)}`: {100 * ts:.1f}% of time, "
-                      f"{ratio:.0f}x its instruction share")
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -373,9 +381,19 @@ def main():
     p.add_argument("--top", type=int, default=10, help="table size")
     p.add_argument("--elf", help="firmware ELF, enables itrace analyses")
     p.add_argument("--isr", help="entry[,body..] symbols for ISR episode timing")
-    p.add_argument("--exclude", help="regex of functions to exclude from the "
-                   "optimization load ranking (e.g. the idle poll loop)")
+    p.add_argument("--tick-symbol", help="periodic handler that calibrates --isr "
+                   "durations (e.g. SysTick_Handler); needs --tick-hz")
+    p.add_argument("--tick-hz", type=float, help="rate the firmware runs "
+                   "--tick-symbol at, in Hz (e.g. 1000)")
     args = p.parse_args()
+    if (args.tick_symbol is None) != (args.tick_hz is None):
+        p.error("--tick-symbol and --tick-hz go together")
+    if args.tick_symbol is not None and not args.tick_symbol.strip():
+        p.error("--tick-symbol is empty")
+    if args.tick_symbol is not None and not args.isr:
+        p.error("--tick-symbol/--tick-hz only calibrate --isr")
+    if args.tick_hz is not None and not (math.isfinite(args.tick_hz) and args.tick_hz > 0):
+        p.error("--tick-hz must be a positive, finite rate")
 
     profile = os.path.join(args.capture_dir, "code_profile.txt")
     itrace = os.path.join(args.capture_dir, "itrace.csv")
@@ -413,7 +431,6 @@ def main():
     for mod in sorted(by_mod, key=str):
         print(f"  - {mod}: {', '.join('`%s`' % f for f in by_mod[mod])}")
 
-    tshare, cshare = {}, {}
     if os.path.isfile(itrace) and args.elf:
         syms = load_symbols(args.elf)
         tf, cf, n = time_by_func(itrace, syms)
@@ -457,9 +474,7 @@ def main():
     if args.isr:
         if not (os.path.isfile(itrace) and args.elf):
             sys.exit("error: --isr needs itrace.csv (--trace-csv capture) and --elf")
-        isr_report(itrace, args.elf, args.isr, args.top)
-
-    suggestions(funcs, totals, tshare, cshare, args.exclude)
+        isr_report(itrace, args.elf, args.isr, args.tick_symbol, args.tick_hz)
     return 0
 
 

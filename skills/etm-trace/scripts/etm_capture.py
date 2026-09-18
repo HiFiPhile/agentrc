@@ -16,7 +16,6 @@ Analyze results with etm_profile.py in this directory.
 """
 
 import argparse
-import glob
 import os
 import re
 import shutil
@@ -35,7 +34,7 @@ PROJECT_TEMPLATE = string.Template("""\
 void OnProjectLoad (void) {
   Project.SetDevice ("$device");
   Project.SetHostIF ("USB", "$probe");
-  Project.SetTargetIF ("SWD");
+  Project.SetTargetIF ("$target_if");
   Project.SetTIFSpeed ("$tif_speed");
   Project.SetTraceSource ("Trace Pins");
   Project.SetTracePortWidth ($port_width);
@@ -104,60 +103,162 @@ void BeforeTargetConnect (void) {
 """
 
 
+def run_tool(env, name, args, what, **kw):
+    """Run an external tool whose name `env` may override; a missing tool or a
+    failed run is an error here, never an empty result to parse."""
+    exe = os.environ.get(env) or name
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, **kw)
+    except OSError as e:
+        sys.exit(f"error: cannot run {exe} ({what}): {e} - install it or set {env}=<path>")
+    except subprocess.TimeoutExpired as e:
+        sys.exit(f"error: {exe} hung ({what}): no answer in {e.timeout:g} s - "
+                 "is the probe held, or the host's USB stuck enumerating a device?")
+    if r.returncode != 0:
+        sys.exit(f"error: {exe} failed ({what}, rc={r.returncode}): "
+                 f"{(r.stderr or r.stdout).strip()[-300:]}")
+    return r
+
+
+FUNC_HEAD = re.compile(r"^\w[^;{}()]*\([^;{}()]*\)\s*\{", re.M)
+SCRIPT_CALL = re.compile(r'(Project\.SetJLinkScript\s*\(\s*")([^"]*)(")')
+
+# OnProjectLoad belongs to the template, so every statement of the reference's
+# must be one it carries over or one it replaces on purpose: the probe comes from
+# --probe, the program from --elf, the power rate from --power-hz; SVD files and
+# SWO only feed views a headless trace-pin capture never opens.
+QUOTED = r'"([^"]*)"'
+CARRIED = {"Project.SetDevice": ("device", QUOTED),
+           "Project.SetTargetIF": ("target_if", QUOTED),
+           "Project.SetTIFSpeed": ("tif_speed", QUOTED),
+           "Project.SetJLinkScript": ("jlink_script", QUOTED),
+           "Project.SetTracePortWidth": ("port_width", r"(\d+)"),
+           "Project.SetTraceTiming": ("timing", r"(-?\d+(?:\s*,\s*-?\d+){3})")}
+REPLACED = {"Project.SetHostIF", "File.Open", "Project.AddSvdFile", "Project.SetSWO"}
+
+
+def strip_comments(text):
+    """String-aware: a '//' inside a quoted path is not a comment."""
+    return re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/',
+                  lambda m: m.group(0) if m.group(0)[0] == '"' else "", text, flags=re.S)
+
+
+def project_load_settings(path, block):
+    """The settings OnProjectLoad makes, from literal arguments only: a prefix
+    match would read `1 << 2` as width 1."""
+    found = {}
+    body = block.split("{", 1)[1].rsplit("}", 1)[0]
+    for stmt in (s.strip() for s in body.split(";")):
+        m = re.fullmatch(r"(\w+\.\w+)\s*\((.*)\)", stmt, re.S)
+        call, arg = (m.group(1), m.group(2).strip()) if m else (None, "")
+        key = value = None
+        if not stmt or call in REPLACED:
+            continue
+        if call in CARRIED:
+            key, pat = CARRIED[call]
+            value = re.fullmatch(pat, arg)
+        elif call == "Edit.SysVar":
+            value = re.fullmatch(r"VAR_TRACE_CORE_CLOCK\s*,\s*(\d+)", arg)
+            key = "core_clock"
+            if not value and arg.split(",")[0].strip() == "VAR_POWER_SAMPLING_SPEED":
+                continue
+        elif call == "Project.SetTraceSource" and arg == '"Trace Pins"':
+            continue
+        if not value:
+            sys.exit(f"error: {path}: OnProjectLoad statement the capture would drop or "
+                     f"cannot read as a literal: {' '.join(stmt.split())!r}")
+        text = value.group(1)
+        found.setdefault(key, set()).add(" ".join(text.split()) if key == "timing" else text)
+    for key, values in found.items():
+        if len(values) > 1:
+            sys.exit(f"error: {path} sets {key} more than once, to different values: "
+                     + ", ".join(sorted(values)))
+    return {key: values.pop() for key, values in found.items()}
+
+
 def resolve_jdebug(path):
-    """Trace config inherited from a reference Ozone project (device, TIF speed,
-    trace timing/width, core clock, user hooks, J-Link script)."""
-    cfg = {"device": None, "tif_speed": "4 MHz", "timing": None, "port_width": 4,
-           "core_clock": None, "ref": path}
+    """Trace config inherited from a reference Ozone project (device, target
+    interface, TIF speed, trace timing/width, core clock, user hooks, J-Link
+    script). Anything in the file this cannot carry over is refused: a hook or
+    a setting dropped silently changes how the target is brought up."""
+    cfg = {"device": None, "target_if": None, "tif_speed": None, "timing": None,
+           "port_width": None, "core_clock": None, "ref": path}
     if not os.path.isfile(path):
         sys.exit(f"error: reference project not found: {path}")
-    text = open(path).read()
-    # config regexes must not match //-commented lines
-    cfgtext = re.sub(r"^\s*//.*$", "", text, flags=re.M)
+    text = strip_comments(open(path).read())
     # inherit every user function verbatim except OnProjectLoad, which the
     # template owns (e.g. STM32H5's AfterTargetConnect must clock the trace
     # CoreSight domain; RT1176 replaces the SP/PC reset/download hooks for
     # ROM-bootloader boot; Nordic hooks call a _SetupTarget helper that
     # must ride along or hook execution fails at runtime)
-    extra = []
+    extra, rest = [], text
     for m in re.finditer(r"^void (\w+)\s*\(void\)\s*\{.*?^\}", text,
                          re.M | re.S):
         name, block = m.group(1), m.group(0)
+        rest = rest.replace(block, "", 1)
+        if len(FUNC_HEAD.findall(block)) > 1:
+            sys.exit(f"error: {path}: '{name}' does not end with a '}}' at column 0, "
+                     f"so the function after it cannot be told apart - unsupported")
+        if name != "BeforeTargetConnect" and name != "OnProjectLoad" and SCRIPT_CALL.search(block):
+            sys.exit(f"error: {path}: Project.SetJLinkScript inside '{name}' - supported "
+                     f"only in OnProjectLoad and BeforeTargetConnect")
         if name == "OnProjectLoad":
-            continue
+            cfg.update(project_load_settings(path, block))
         elif name == "BeforeTargetConnect":
-            # the generated project synthesizes its own BeforeTargetConnect
-            # (JLINK_SCRIPT_HOOK) from the SetJLinkScript regex below;
-            # inheriting the reference's copy too would emit a duplicate
-            # function definition
-            continue
+            cfg["before_connect"] = block
         elif name == "AfterTargetReset":
             cfg["reset_hook"] = block
         elif name == "AfterTargetDownload":
             cfg["download_hook"] = block
         else:
             extra.append(block)
+    left = rest.strip()
+    if left:
+        sys.exit(f"error: {path}: unsupported content outside 'void NAME (void) {{...}}' "
+                 f"functions, it would be dropped: {left.splitlines()[0].strip()!r}")
     if extra:
         cfg["connect_hook"] = "\n\n".join(extra) + "\n"
-    for key, pat in (("device", r'Project\.SetDevice\s*\(\s*"([^"]+)"'),
-                     ("tif_speed", r'Project\.SetTIFSpeed\s*\(\s*"([^"]+)"'),
-                     ("timing", r'Project\.SetTraceTiming\s*\(([-\d\s,]+)\)'),
-                     ("port_width", r'Project\.SetTracePortWidth\s*\(\s*(\d+)'),
-                     ("core_clock", r'VAR_TRACE_CORE_CLOCK\s*,\s*(\d+)')):
-        m = re.search(pat, cfgtext)
-        if m:
-            cfg[key] = m.group(1).strip()
-    # inherit a J-Link script (e.g. RT1176 must declare its off-ROM-table
-    # TPIU/funnel); relative paths resolve against the reference's dir
-    m = re.search(r'Project\.SetJLinkScript\s*\(\s*"([^"]+)"', cfgtext)
-    if m:
-        # $(ProjectDir) = the reference's own directory
-        rel = m.group(1).replace("$(ProjectDir)", ".")
-        cfg["jlink_script"] = os.path.normpath(os.path.join(
-            os.path.dirname(path), rel))
-    if not cfg["device"]:
-        sys.exit(f"error: {path} has no Project.SetDevice - not an Ozone project?")
+    hook_scripts = set(m.group(2) for m in SCRIPT_CALL.finditer(cfg.get("before_connect", "")))
+    if len(hook_scripts) > 1 or (hook_scripts and cfg.get("jlink_script")):
+        sys.exit(f"error: {path} sets the J-Link script more than once - which call "
+                 f"runs depends on Ozone, so the capture cannot reproduce it")
+    if hook_scripts:
+        cfg["jlink_script"] = hook_scripts.pop()
+    # e.g. RT1176 must declare its off-ROM-table TPIU/funnel in a J-Link script;
+    # $(ProjectDir) = the reference's own directory
+    if cfg.get("jlink_script"):
+        rel = cfg["jlink_script"].replace("$(ProjectDir)", ".")
+        if "$(" in rel:
+            sys.exit(f"error: {path}: cannot resolve the macro in J-Link script path "
+                     f"{cfg['jlink_script']!r} (only $(ProjectDir) is known)")
+        cfg["jlink_script"] = os.path.normpath(os.path.join(os.path.dirname(path), rel))
+        # rewritten where it stands: a call the reference guards stays guarded
+        if "before_connect" in cfg and SCRIPT_CALL.search(cfg["before_connect"]):
+            cfg["before_connect"] = SCRIPT_CALL.sub(
+                lambda m: m.group(1) + cfg["jlink_script"] + m.group(3), cfg["before_connect"])
+            cfg["script_in_hook"] = True
+    for key, call in (("device", "Project.SetDevice"), ("target_if", "Project.SetTargetIF"),
+                      ("tif_speed", "Project.SetTIFSpeed"),
+                      ("port_width", "Project.SetTracePortWidth")):
+        if not cfg[key]:
+            sys.exit(f"error: {path} has no {call} - not an Ozone project?")
     return cfg
+
+
+def before_connect_hook(cfg, cli_script):
+    """The one BeforeTargetConnect of the generated project: the reference's own
+    statements, plus the J-Link script call with its path made absolute."""
+    if cli_script and cfg.get("jlink_script"):
+        sys.exit(f"error: --jlink-script conflicts with the reference project's own "
+                 f"J-Link script {cfg['jlink_script']}")
+    script = os.path.abspath(cli_script) if cli_script else cfg.get("jlink_script")
+    block = cfg.get("before_connect")
+    if not script or cfg.get("script_in_hook"):
+        return "\n" + block + "\n" if block else ""
+    if not block:
+        return JLINK_SCRIPT_HOOK % script
+    head, body = block.split("{", 1)
+    return f'\n{head}{{\n  Project.SetJLinkScript ("{script}");{body}\n'
 
 
 def trace_only_points(elf, syms_arg):
@@ -165,8 +266,8 @@ def trace_only_points(elf, syms_arg):
     stop at each return instruction inside it (pop ...pc / bx lr, via objdump).
     Hardware comparators are scarce (ETM-M7) - keep the symbol list short."""
     lines = ""
-    nm = subprocess.run(["arm-none-eabi-nm", "-S", "--defined-only", elf],
-                        capture_output=True, text=True).stdout
+    nm = run_tool("ETM_NM", "arm-none-eabi-nm", ["-S", "--defined-only", elf],
+                  "symbols for --trace-only").stdout
     for want in [s.strip() for s in syms_arg.split(",") if s.strip()]:
         m = re.search(rf"^([0-9a-f]+) ([0-9a-f]+) [TtWw] {re.escape(want)}$",
                       nm, re.M)
@@ -174,10 +275,9 @@ def trace_only_points(elf, syms_arg):
             sys.exit(f"error: --trace-only symbol '{want}' not in ELF")
         lo, sz = int(m.group(1), 16) & ~1, int(m.group(2), 16)
         lines += f'  Trace.SetPoint (TP_OP_START_TRACE, "{want}");\n'
-        dis = subprocess.run(
-            ["arm-none-eabi-objdump", "-d", f"--start-address={lo:#x}",
-             f"--stop-address={lo + sz:#x}", elf],
-            capture_output=True, text=True).stdout
+        dis = run_tool("ETM_OBJDUMP", "arm-none-eabi-objdump",
+                       ["-d", f"--start-address={lo:#x}", f"--stop-address={lo + sz:#x}", elf],
+                       "return instructions for --trace-only").stdout
         exits = re.findall(
             r"^\s*([0-9a-f]+):.*?(?:(?:pop|ldmia[.\w]*\s+sp!,)[^\n]*\bpc\b|bx\s+lr)",
             dis, re.M | re.I)
@@ -188,15 +288,45 @@ def trace_only_points(elf, syms_arg):
     return lines
 
 
+SECTION_ROW = re.compile(r"^\s*\d+\s+(\S+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s", re.I)
+
+
+def ram_code_sections(elf):
+    """(name, address, size) of each code section startup copies elsewhere
+    (VMA != LMA). Ozone analyses code from the program file's load image only:
+    a trace through such code is 'not covered by trace cache' and an
+    instruction-trace export that meets it comes out truncated."""
+    dump = run_tool("ETM_OBJDUMP", "arm-none-eabi-objdump", ["-h", elf],
+                    "section headers").stdout.splitlines()
+    found = []
+    for row, flags in zip(dump, dump[1:]):
+        m = SECTION_ROW.match(row)
+        if m and "CODE" in re.split(r"[,\s]+", flags):
+            name, size, vma, lma = m.group(1), *(int(v, 16) for v in m.group(2, 3, 4))
+            if vma != lma and size:
+                found.append((name, vma, size))
+    return found
+
+
+RUN_MARK = "=== traced run:"
+
+
+def unknown_code(session_log):
+    """Addresses Ozone traced without an image of the code, within the traced
+    run; the boot ROM before main shows up earlier and costs nothing."""
+    run = session_log.partition(RUN_MARK)[2]
+    return sorted(set(re.findall(r"Addr\. (0x[0-9A-Fa-f]+) was traced but is not covered", run)))
+
+
 def resolve_probe(probe):
     """Ozone's SetHostIF needs a serial - with several probes connected a
     nickname makes it block on a selection dialog. JLinkExe DOES resolve
     nicknames, so borrow its banner to map nickname -> serial. The serial only
     ever lands in the throwaway project file, never in committed files."""
-    if not probe or probe.isdigit():
+    if probe.isdigit():
         return probe
-    r = subprocess.run(["JLinkExe", "-USB", probe, "-nogui", "1"],
-                       input="qc\n", capture_output=True, text=True, timeout=30)
+    r = run_tool("ETM_JLINK_EXE", "JLinkExe", ["-USB", probe, "-nogui", "1"],
+                 "probe nickname to serial", input="qc\n", timeout=30)
     m = re.search(r"S/N:\s*(\d+)", r.stdout)
     if not m:
         sys.exit(f"error: cannot resolve probe nickname '{probe}' to a serial "
@@ -207,10 +337,7 @@ def resolve_probe(probe):
 def gen_project(cfg, args, outdir):
     timing = ""
     if args.trace_timing is not None:
-        d = [int(v) for v in str(args.trace_timing).split(",")]
-        if len(d) not in (1, 4):
-            sys.exit("error: --trace-timing takes one value or d0,d1,d2,d3")
-        d = d * 4 if len(d) == 1 else d
+        d = args.trace_timing
         timing = ("  Project.SetTraceTiming "
                   f"({d[0]}, {d[1]}, {d[2]}, {d[3]});\n")
     elif cfg["timing"]:
@@ -223,16 +350,11 @@ def gen_project(cfg, args, outdir):
     if cfg.get("connect_hook"):
         user_funcs += "\n" + cfg["connect_hook"]
     if args.trace_only:
-        user_funcs += TRACEPOINT_FUNC % trace_only_points(
-            os.path.abspath(args.elf), args.trace_only)
+        user_funcs += TRACEPOINT_FUNC % args.tracepoints
     if args.profile_lines_csv:
         user_funcs += LINES_CSV_FUNC % os.path.join(outdir, "profile_lines.csv")
     if args.profile_insts_csv:
         user_funcs += INSTS_CSV_FUNC % os.path.join(outdir, "profile_insts.csv")
-    if args.os_plugin and not glob.glob(
-            f"/opt/SEGGER/Ozone*/Plugins/OS/{args.os_plugin}.js"):
-        sys.exit(f"error: RTOS plugin '{args.os_plugin}' not in "
-                 f"/opt/SEGGER/Ozone*/Plugins/OS (e.g. FreeRTOSPlugin_CM7)")
     os_plugin = (f'  Project.SetOSPlugin ("{args.os_plugin}");\n'
                  if args.os_plugin else "")
     if args.attach:
@@ -246,16 +368,14 @@ def gen_project(cfg, args, outdir):
     power = ("  Edit.SysVar (VAR_TARGET_POWER_ON, 1);\n"
              f"  Edit.SysVar (VAR_POWER_SAMPLING_SPEED, {args.power_hz});\n"
              if args.power else "")
-    jlink_script = args.jlink_script or cfg.get("jlink_script")
-    jls_hook = (JLINK_SCRIPT_HOOK % os.path.abspath(jlink_script)
-                if jlink_script else "")
+    jls_hook = before_connect_hook(cfg, args.jlink_script)
     proj = os.path.join(outdir, "etm_capture.jdebug")
     if args.trace_width:
         cfg["port_width"] = args.trace_width
     with open(proj, "w") as f:
         f.write(PROJECT_TEMPLATE.substitute(
-            device=cfg["device"], probe=resolve_probe(args.probe),
-            tif_speed=cfg["tif_speed"],
+            device=cfg["device"], probe=args.probe_serial,
+            target_if=cfg["target_if"], tif_speed=cfg["tif_speed"],
             port_width=cfg["port_width"], timing_line=timing, core_clock_line=clk_line,
             timestamps_line=ts_line, max_inst=args.max_inst, outdir=outdir,
             elf=os.path.abspath(args.elf), user_funcs=user_funcs,
@@ -265,6 +385,113 @@ def gen_project(cfg, args, outdir):
             download_hook=cfg.get("download_hook",
                                   DEFAULT_HOOK % "AfterTargetDownload")))
     return proj
+
+
+LOOPBACK = ("0100007F", "0000000000000000FFFF00000100007F")
+WILDCARD = ("00000000", "00000000000000000000000000000000")
+
+
+def _tcp_rows():
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            rows = open(table).read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            f = row.split()
+            (laddr, lport), (raddr, rport) = (x.rsplit(":", 1) for x in f[1:3])
+            yield laddr, int(lport, 16), raddr, int(rport, 16), f[3], f[9]
+
+
+def _holders(inodes):
+    owners = {inode: set() for inode in inodes}
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                if link.startswith("socket:[") and link[8:-1] in owners:
+                    owners[link[8:-1]].add(int(pid))
+        except OSError:
+            continue   # gone meanwhile, or not ours to read
+    return owners
+
+
+def listener_owner(port):
+    """{inode: pids} of the sockets a connect to 127.0.0.1:port would reach (Linux
+    /proc): the loopback listeners if there are any, else the wildcard ones. A
+    listener on another address that only shares the port is not counted."""
+    found = {inode: laddr in LOOPBACK for laddr, lport, _, _, state, inode in _tcp_rows()
+             if state == "0A" and lport == port and laddr in LOOPBACK + WILDCARD}
+    return _holders({i for i, specific in found.items() if specific} or set(found))
+
+
+def peer_owner(port, client_port):
+    """Pids holding the server end of our own connection: the listener can change
+    hands between the ownership scan and the connect. Empty until the server
+    accept()s - a connection still in the backlog has no owner yet."""
+    inodes = {inode for laddr, lport, raddr, rport, state, inode in _tcp_rows()
+              if state == "01" and inode != "0" and laddr in LOOPBACK and lport == port
+              and raddr in LOOPBACK and rport == client_port}
+    return set().union(*_holders(inodes).values()) if inodes else set()
+
+
+def port_is_taken(port):
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def fresh_outdir(out, device):
+    """A run directory nothing was written to before: a reused one lets an older
+    run's exports pass for this capture's."""
+    if not out:
+        return tempfile.mkdtemp(prefix=f"etm-{device}-")
+    outdir = os.path.abspath(out)
+    if os.path.lexists(outdir) and (not os.path.isdir(outdir) or os.listdir(outdir)):
+        sys.exit(f"error: --out {outdir} already exists and is not an empty "
+                 f"directory - give each capture its own directory")
+    os.makedirs(outdir, exist_ok=True)
+    return outdir
+
+
+def requested_exports(args):
+    names = ["code_profile.txt"]
+    for wanted, name in ((args.profile_lines_csv, "profile_lines.csv"),
+                         (args.profile_insts_csv, "profile_insts.csv"),
+                         (args.trace_csv, "itrace.csv"),
+                         (args.sample, "samples.csv"),
+                         (args.power, "power.csv")):
+        if wanted:
+            names.append(name)
+    return names
+
+
+def missing_exports(outdir, names):
+    return [n for n in names
+            if not (os.path.isfile(os.path.join(outdir, n))
+                    and os.path.getsize(os.path.join(outdir, n)) > 0)]
+
+
+class Terminated(Exception):
+    pass
+
+
+STOP_SIGNALS = {signal.SIGTERM, signal.SIGINT}
+
+
+def check_signals():
+    """The session runs with its stop signals blocked, so none can cut through the
+    launch or the teardown; every wait calls this instead."""
+    pending = signal.sigpending() & STOP_SIGNALS
+    if pending:
+        raise Terminated(min(pending))
+
+
+def _pgid(pid):
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
 
 
 class OzoneSession:
@@ -281,16 +508,46 @@ class OzoneSession:
         self.logf.write(line + "\n")
         self.logf.flush()
 
-    def connect(self, timeout_s):
+    def connect(self, timeout_s, proc):
         deadline = time.time() + timeout_s
         while time.time() < deadline:
+            check_signals()
+            if proc.poll() is not None:
+                break
+            # a live child does not make the socket ours: the listener must sit
+            # in the process group this capture started
+            owners = listener_owner(self.port)
+            foreign = [sorted(pids) for pids in owners.values()
+                       if not any(_pgid(pid) == proc.pid for pid in pids)]
+            if foreign:
+                raise RuntimeError(f"127.0.0.1:{self.port} is now held by a process outside "
+                                   f"this capture (pids {foreign}) - refusing to drive it")
+            if not owners:
+                time.sleep(1)
+                continue
             try:
-                self.sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
-                self.sock.settimeout(0.5)
-                self.log(f"connected to Ozone automation socket :{self.port}")
-                return
+                sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
             except OSError:
                 time.sleep(1)
+                continue
+            accepted_by = set()
+            for _ in range(50):
+                accepted_by = peer_owner(self.port, sock.getsockname()[1])
+                if accepted_by:
+                    break
+                time.sleep(0.1)
+            if not any(_pgid(pid) == proc.pid for pid in accepted_by):
+                sock.close()
+                raise RuntimeError(f"the connection to 127.0.0.1:{self.port} was not accepted by "
+                                   f"this capture's Ozone (pids {sorted(accepted_by) or 'none'}) "
+                                   f"- refusing to drive it")
+            self.sock = sock
+            self.sock.settimeout(0.5)
+            self.log(f"connected to Ozone automation socket :{self.port}")
+            return
+        if proc.poll() is not None:
+            raise RuntimeError(f"Ozone exited (rc={proc.returncode}) before opening its "
+                               f"automation socket (see ozone_gui.log)")
         raise TimeoutError(f"Ozone automation socket :{self.port} not reachable "
                            f"after {timeout_s}s (see ozone_gui.log)")
 
@@ -298,6 +555,7 @@ class OzoneSession:
         buf = b""
         end = time.time() + wait_s
         while time.time() < end:
+            check_signals()
             try:
                 chunk = self.sock.recv(65536)
                 if not chunk:
@@ -350,9 +608,12 @@ def main():
                    "device, TIF speed, trace timing/width, core clock, hooks and "
                    "J-Link script from; never opened by Ozone itself")
     p.add_argument("--device", help="J-Link device name when there is no reference "
-                   "project (e.g. STM32F407VE for a SEGGER trace reference board)")
-    p.add_argument("--tif-speed", default="4 MHz",
-                   help="SWD speed for --device targets (default '4 MHz')")
+                   "project (e.g. STM32F407VE for a SEGGER trace reference board); "
+                   "needs --target-if, --tif-speed and --trace-width")
+    p.add_argument("--target-if", choices=("SWD", "JTAG"),
+                   help="debug interface of a --device target")
+    p.add_argument("--tif-speed", help="debug interface speed of a --device target, "
+                   "as Ozone writes it (e.g. '4 MHz')")
     p.add_argument("--jlink-script",
                    help="J-Link script file (.pex/.JLinkScript) for trace-pin "
                         "init when the firmware doesn't do it (SEGGER per-MCU "
@@ -365,11 +626,11 @@ def main():
                    help="power sampling frequency in Hz (default 10000)")
     p.add_argument("--elf", required=True, help="firmware ELF with trace init built in")
     p.add_argument("--duration-ms", type=int, default=10000, help="traced run time")
-    p.add_argument("--out", help="output dir (default: mkdtemp under /tmp)")
+    p.add_argument("--out", help="output dir, new or empty (default: mkdtemp under /tmp)")
     p.add_argument("--port", type=int, default=19201,
                    help="automation socket port (19200 = interactive Ozone default; keep 19201)")
-    p.add_argument("--probe", default="",
-                   help="J-Link USB nickname or serial ('' = sole connected probe)")
+    p.add_argument("--probe", required=True,
+                   help="J-Trace USB nickname or serial")
     p.add_argument("--trace-csv", action="store_true",
                    help="also export raw instruction history (itrace.csv, can be >100 MB)")
     p.add_argument("--max-inst", type=int, default=10000000,
@@ -383,8 +644,9 @@ def main():
                         "'d0,d1,d2,d3' to de-skew individual lines (boards can "
                         "have per-line RC delays, e.g. strap pulls on muxed pads)")
     p.add_argument("--trace-width", type=int, choices=(1, 2, 4),
-                   help="trace port width override (fewer pins = tolerant of a "
-                        "single bad line, at reduced bandwidth)")
+                   help="trace port width: overrides the board reference (fewer "
+                        "pins = tolerant of a single bad line, at reduced "
+                        "bandwidth), required with --device")
     p.add_argument("--no-timestamps", action="store_true",
                    help="disable trace timestamps (less trace bandwidth -> fewer "
                         "overflows/decode errors; itrace.csv loses its time column)")
@@ -409,10 +671,19 @@ def main():
                    help="data sampling frequency in Hz (default 1000)")
     p.add_argument("--os-plugin",
                    help="Ozone RTOS-awareness plugin for task/ISR-attributed "
-                        "timeline, e.g. FreeRTOSPlugin_CM7 (see "
-                        "/opt/SEGGER/Ozone*/Plugins/OS)")
+                        "timeline, e.g. FreeRTOSPlugin_CM7 (from Plugins/OS of "
+                        "the Ozone in use)")
+    p.add_argument("--cortex-m-default-hooks", action="store_true",
+                   help="fill a missing AfterTargetReset/AfterTargetDownload with the "
+                        "generic Cortex-M one (SP/PC from the ELF's vector table); hooks "
+                        "a reference project defines are always kept")
     args = p.parse_args()
 
+    if sys.platform != "linux":
+        sys.exit(f"error: unattended ETM capture is Linux-only (xvfb-run, /proc); "
+                 f"this is {sys.platform}")
+    if not args.probe.strip():
+        p.error("--probe is empty: name the J-Trace (nickname or serial)")
     if bool(args.jdebug) == bool(args.device):
         sys.exit("error: need exactly one of --jdebug <reference.jdebug> or --device <name>")
     if args.max_inst > 10000000:
@@ -430,27 +701,62 @@ def main():
               "timing prefer a full --trace-csv capture + etm_profile.py --isr.",
               file=sys.stderr)
     if args.device:
-        cfg = {"device": args.device, "tif_speed": args.tif_speed, "timing": None,
-               "port_width": 4, "core_clock": None, "ref": "--device"}
+        unset = [f for f, v in (("--target-if", args.target_if), ("--tif-speed", args.tif_speed),
+                                ("--trace-width", args.trace_width)) if not v]
+        if unset:
+            sys.exit(f"error: --device has no reference project to take "
+                     f"{', '.join(unset)} from - pass them")
+        cfg = {"device": args.device, "target_if": args.target_if, "tif_speed": args.tif_speed,
+               "timing": None, "port_width": args.trace_width, "core_clock": None,
+               "ref": "--device"}
     else:
+        if args.target_if or args.tif_speed:
+            sys.exit("error: --target-if/--tif-speed come from the reference project "
+                     "with --jdebug; edit the reference instead")
         cfg = resolve_jdebug(os.path.abspath(args.jdebug))
-    outdir = os.path.abspath(args.out) if args.out else tempfile.mkdtemp(
-        prefix=f"etm-{cfg['device']}-")
-    os.makedirs(outdir, exist_ok=True)
+    no_hook = [call for hook, call in (("reset_hook", "AfterTargetReset"),
+                                       ("download_hook", "AfterTargetDownload"))
+               if hook not in cfg]
+    # an attach neither resets nor downloads: no hook of either kind ever runs
+    if no_hook and not args.attach and not args.cortex_m_default_hooks:
+        sys.exit(f"error: no {' / '.join(no_hook)} from {cfg['ref']} - pass "
+                 f"--cortex-m-default-hooks if this target boots with SP/PC taken from "
+                 f"the ELF's vector table, or give the reference its own hook")
+    if port_is_taken(args.port):
+        sys.exit(f"error: something already listens on 127.0.0.1:{args.port} - the session "
+                 f"would drive that Ozone, not its own; close it or pass another --port")
+    if not shutil.which("xvfb-run"):
+        # never the caller's DISPLAY: Ozone would open there and take the keyboard
+        sys.exit("error: xvfb-run not found - install xvfb; the capture only runs "
+                 "Ozone on a virtual display")
+    ozone_bin = os.environ.get("ETM_OZONE") or shutil.which("ozone") or shutil.which("Ozone")
+    if not (ozone_bin and os.path.isfile(ozone_bin)):
+        sys.exit(f"error: Ozone not found ({ozone_bin or 'ozone/Ozone not on PATH'}) - "
+                 f"install SEGGER Ozone or set ETM_OZONE=<path>")
+    if args.os_plugin:
+        # the Ozone that will run, not any install that happens to have the plugin
+        plugins = os.path.join(os.path.dirname(os.path.realpath(ozone_bin)), "Plugins", "OS")
+        if not os.path.isfile(os.path.join(plugins, f"{args.os_plugin}.js")):
+            sys.exit(f"error: RTOS plugin '{args.os_plugin}' not in {plugins} "
+                     f"(e.g. FreeRTOSPlugin_CM7)")
+    # everything that can refuse runs before the output directory exists
+    if args.trace_timing is not None:
+        try:
+            d = [int(v) for v in args.trace_timing.split(",")]
+        except ValueError:
+            d = []
+        if len(d) not in (1, 4) or not all(-5000 <= v <= 5000 for v in d):
+            sys.exit("error: --trace-timing takes one value or d0,d1,d2,d3, each "
+                     "-5000..5000 ps")
+        args.trace_timing = d * 4 if len(d) == 1 else d
+    args.tracepoints = (trace_only_points(os.path.abspath(args.elf), args.trace_only)
+                        if args.trace_only else "")
+    ram_code = ram_code_sections(os.path.abspath(args.elf))
+    args.probe_serial = resolve_probe(args.probe)
+    outdir = fresh_outdir(args.out, cfg["device"])
     proj = gen_project(cfg, args, outdir)
 
-    ozone_bin = shutil.which("ozone") or shutil.which("Ozone")
-    if not ozone_bin:
-        sys.exit("error: ozone not on PATH (install SEGGER Ozone)")
-    cmd = [ozone_bin, "-project", proj, "-port", str(args.port)]
-    if shutil.which("xvfb-run"):
-        cmd = ["xvfb-run", "-a"] + cmd
-    elif os.environ.get("DISPLAY"):
-        print("warning: xvfb-run not found - Ozone window will appear on "
-              f"DISPLAY={os.environ['DISPLAY']} and may steal keyboard focus",
-              file=sys.stderr)
-    else:
-        sys.exit("error: no DISPLAY and no xvfb-run; install xvfb")
+    cmd = ["xvfb-run", "-a", ozone_bin, "-project", proj, "-port", str(args.port)]
 
     gui_log = open(os.path.join(outdir, "ozone_gui.log"), "w")
     ses_logf = open(os.path.join(outdir, "session.log"), "w")
@@ -458,18 +764,54 @@ def main():
     ses.log(f"device={cfg['device']} ref={cfg['ref']}")
     ses.log(f"elf={args.elf}")
     ses.log(f"out={outdir}")
-    proc = subprocess.Popen(cmd, stdout=gui_log, stderr=gui_log,
-                            start_new_session=True)
+    def teardown(proc):
+        if proc:
+            # the group, not the child: xvfb-run can be gone while its Ozone lives on
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        if args.power:
+            # guarantee probe power is off, whatever happened above
+            exe = os.environ.get("ETM_JLINK_EXE") or "JLinkExe"
+            try:
+                r = subprocess.run([exe, "-USB", args.probe, "-nogui", "1"],
+                                   input="power off\nqc\n", capture_output=True,
+                                   text=True, timeout=30)
+                result = "issued" if r.returncode == 0 else (
+                    f"FAILED rc={r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}")
+            except (OSError, subprocess.TimeoutExpired) as e:
+                result = f"FAILED ({e})"
+            ses.log(f"probe power off {result}")
+            if result != "issued":
+                return f"probe power may still be ON: power off {result}"
+
+    def pause(seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            check_signals()
+            time.sleep(min(0.5, max(0, end - time.time())))
+
+    # blocked, not handled: a handler could fire between Popen and recording the
+    # child, or inside the teardown; check_signals() honours them at every wait
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     profile_out = os.path.join(outdir, "code_profile.txt")
     itrace_out = os.path.join(outdir, "itrace.csv")
+    failure = stopped = proc = None
     try:
-        ses.connect(20)
+        proc = subprocess.Popen(
+            cmd, stdout=gui_log, stderr=gui_log, start_new_session=True,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS))
+        ses.connect(20, proc)
         ses.drain(3)  # version banner
         ses.send("Debug.Start", 5)
         if not ses.is_halted(90):
             raise TimeoutError("Debug.Start did not reach the startup completion "
                                "point (connect/flash failed? see jlink.log)")
         ses.log("startup complete (halted at main)")
+        for name, addr, size in ram_code:  # copied by now, so target memory has it
+            ses.wait_echo(f"Debug.ReadIntoInstCache (0x{addr:08X}, {size})", 30)
         if args.trace_only:
             ses.wait_echo('Script.Exec ("SetupTracepoints")', 15)
         ses.send('Window.Show ("Code Profile")', 2)
@@ -481,9 +823,9 @@ def main():
                 ses.send(f'Window.Add ("Data Sampling", "{expr.strip()}")', 2)
         ses.send("Coverage.ExcludeNOPs()", 2)
 
-        ses.log(f"=== traced run: {args.duration_ms} ms ===")
+        ses.log(f"{RUN_MARK} {args.duration_ms} ms ===")
         ses.send("Debug.Continue", 1)
-        time.sleep(args.duration_ms / 1000.0)
+        pause(args.duration_ms / 1000.0)
         ses.send("Debug.Halt", 3)
         if not ses.is_halted(30):
             raise TimeoutError("target did not halt")
@@ -502,37 +844,41 @@ def main():
             ses.wait_echo(f'Export.PowerGraphs ("{outdir}/power.csv")', 60)
         ses.send("Debug.Stop", 5)
         ses.send("File.Exit", 2)
-    finally:
         for _ in range(15):
             if proc.poll() is not None:
                 break
-            time.sleep(1)
-        if proc.poll() is None:
-            ses.log("killing leftover Ozone process group")
-            os.killpg(proc.pid, signal.SIGKILL)
-        if args.power:
-            # guarantee probe power is off, whatever happened above
-            sel = ["-USB", args.probe] if args.probe else []
-            r = subprocess.run(["JLinkExe", *sel, "-nogui", "1"],
-                               input="power off\nqc\n", capture_output=True,
-                               text=True, timeout=30)
-            ses.log("probe power off " +
-                    ("issued" if r.returncode == 0 else f"FAILED rc={r.returncode}"))
+            pause(1)
+    except Terminated as t:
+        stopped = t.args[0]
+    except (TimeoutError, RuntimeError, OSError) as e:
+        failure = str(e)
+    finally:
+        power_failure = teardown(proc)
+    # one that arrived during the teardown is still pending: it must not turn
+    # into "capture OK"
+    stopped = stopped or min(signal.sigpending() & STOP_SIGNALS, default=None)
+    if stopped:
+        sys.exit(128 + stopped)
 
-    if not (os.path.isfile(profile_out) and os.path.getsize(profile_out) > 0
-            and "Code Profile Report" in open(profile_out, errors="replace").read(200)):
-        sys.exit(f"error: capture ran but {profile_out} is missing/empty - "
-                 f"check {outdir}/session.log and ozone_console.log")
-    if args.trace_csv and not (os.path.isfile(itrace_out)
-                               and os.path.getsize(itrace_out) > 0):
-        sys.exit(f"error: --trace-csv requested but {itrace_out} is missing/empty")
-    if args.power and not os.path.getsize(os.path.join(outdir, "power.csv")):
-        sys.exit("error: --power requested but power.csv is missing/empty")
-    if "Trace collection stopped!" in open(os.path.join(outdir, "session.log"),
-                                           errors="replace").read():
+    failure = "; ".join(f for f in (failure, power_failure) if f)
+    if failure:
+        sys.exit(f"error: {failure} - evidence in {outdir}")
+    missing = missing_exports(outdir, requested_exports(args))
+    if missing:
+        sys.exit(f"error: capture ran but {', '.join(missing)} missing/empty in "
+                 f"{outdir} - check session.log and ozone_console.log there")
+    if "Code Profile Report" not in open(profile_out, errors="replace").read(200):
+        sys.exit(f"error: {profile_out} is not an Ozone code-profile report")
+    session = open(os.path.join(outdir, "session.log"), errors="replace").read()
+    if "Trace collection stopped!" in session:
         sys.exit("error: trace stream died mid-run (unknown trace data packet) - "
                  "the profile only covers up to that point. Retry with "
                  "--no-timestamps, or reduce the core clock (see SKILL.md).")
+    unknown = unknown_code(session)
+    if args.trace_csv and unknown:
+        sys.exit(f"error: itrace.csv is truncated - the traced run executed code "
+                 f"Ozone has no image of (at {', '.join(unknown)}: ROM, or code "
+                 f"built at run time), and its export stops there. Evidence in {outdir}")
     prof = open(profile_out, errors="replace").read()
     m = re.search(r"^\s*Total\s*\|[\d ]*\|\s*([\d ]+)$", prof, re.M)
     if not m or int(m.group(1).replace(" ", "") or 0) == 0:
@@ -540,6 +886,9 @@ def main():
                  "(profile totals are zero) - trace signal not reaching the "
                  "probe: check wiring/connector, trace pinmux, sample timing.")
     print(f"\ncapture OK: {outdir}")
+    if unknown:
+        print(f"  warning: the run executed code Ozone has no image of (at "
+              f"{', '.join(unknown)}); its fetches are missing from the profile")
     print(f"  code_profile.txt  ({os.path.getsize(profile_out)} bytes)")
     if args.trace_csv:
         print(f"  itrace.csv        ({os.path.getsize(itrace_out)} bytes)")
