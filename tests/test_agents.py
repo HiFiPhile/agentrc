@@ -53,6 +53,14 @@ class AgentFiles(unittest.TestCase):
         for key in ('question', 'criterion', 'reason', 'worktree', 'branch', 'head', 'host', 'board', 'probe', 'example', 'peer',
                     'runs', 'cleanup', 'budget', 'limits', 'blocker', 'next'):
             self.assertIn(key, example)
+        for row in example['runs']:
+            self.assertIn(row['purpose'], ('criterion', 'setup', 'cleanup'))
+        self.assertEqual(sum(row['repetitions'] for row in example['runs']), example['budget']['used']['repetitions'])
+        criterion = sum(row['repetitions'] for row in example['runs'] if row['purpose'] == 'criterion')
+        self.assertLess(criterion, example['budget']['used']['repetitions'], 'auxiliary invocations are counted apart from the criterion runs')
+        self.assertLess(example['budget']['used']['observationS'],
+                        example['budget']['allowed']['observationWindowS'] * example['budget']['used']['repetitions'],
+                        'a deterministic attempt ends before the window ceiling')
         run = example['runs'][0]
         for key in ('revision', 'configuration', 'firmware', 'instrument', 'technique', 'command', 'repetitions', 'duration',
                     'observed', 'evidence', 'artifacts'):
@@ -125,6 +133,13 @@ class AgentFiles(unittest.TestCase):
         chief = (AGENTS / 'chief.md').read_text()
         self.assertIn('the bench runs the pinned restoration firmware, which may predate the fix', chief)
         self.assertIn('keeps the evidence and handoff artifacts', chief)
+
+    def test_observation_window_bounds_one_attempt_and_every_invocation_counts(self):
+        body = ' '.join((SKILLS / 'target-debug' / 'SKILL.md').read_text().split())
+        self.assertIn('observation window is the ceiling on one reproducer attempt', body)
+        self.assertIn('a completed deterministic operation ends the attempt', body)
+        self.assertIn('costs time, not a repetition', body)
+        self.assertIn('Observation window per attempt (ceiling)', (AGENTS / 'chief.md').read_text())
 
     def test_chief_quotes_unit_json_and_leaves_verdicts_to_the_role(self):
         body = (AGENTS / 'chief.md').read_text()

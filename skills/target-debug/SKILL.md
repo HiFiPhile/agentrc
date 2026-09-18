@@ -95,14 +95,20 @@ adds only what it may edit and when it stops.
   previous unit's dirty state (a recovery prompt): inspect the recorded patch
   and current changes first, restore only what is attributable to it, report
   ambiguous ownership untouched.
-- **Observation.** Stay within the prompt's observation window and repetition
-  budget; every attempted reproducer counts toward it, including failed or
-  truncated captures. An early decisive observation may settle the claim;
+- **Observation.** The prompt's observation window is the ceiling on one
+  reproducer attempt; the criterion states the required operations or minimum
+  exposure, and a completed deterministic operation ends the attempt. Every
+  reproducer invocation, including smoke checks, cleanup checks that invoke it
+  and failed or truncated captures, is accounted for in `runs` and counts
+  toward the repetition ceiling; a state read or run-state observation that
+  does not invoke the reproducer costs time, not a repetition. A `runs` row
+  aggregates identical attempts and splits where purpose, firmware, conditions
+  or outcome differ. An early decisive observation may settle the claim;
   otherwise a shortened capture is partial evidence and cannot establish a
-  pass that needs the full exposure. Anchor every
-  state reading with the backend's validity check (Cortex-M: DHCSR) and record
-  whether attaching halted or reset the target; a post-reset snapshot is never
-  the failure state.
+  pass that needs the full exposure. Anchor every state reading with the
+  backend's validity check (Cortex-M: DHCSR) and record whether attaching
+  halted or reset the target; a post-reset snapshot is never the failure
+  state.
 - **Host.** Leave the host as found: never clear kernel logs (`dmesg -C`) or
   other shared history, and restore every setting you change (dynamic debug,
   module parameters).

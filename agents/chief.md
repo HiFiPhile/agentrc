@@ -71,14 +71,14 @@ Per-unit budgets are ceilings, not quotas:
 | | `hw-validator`, shared rig | `hw-validator`, dev bench | `hw-debugger`, shared rig | `hw-debugger`, dev bench |
 |---|---|---|---|---|
 | Repetitions | 3 per firmware | 3 per firmware | 2 per experiment, 3 per candidate comparison | same |
-| Observation window | 60 s | 60 s | 60 s | 120 s |
+| Observation window per attempt (ceiling) | 60 s | 60 s | 60 s | 120 s |
 | Hypotheses | — | — | 4 | 6 |
 | Experimental + restoration flashes | 3 + 1 | 3 + 1 | 5 + 1 | 8 + 1 |
 | Hardware wall time, cleanup included | 25 min | 30 min | 45 min | 75 min |
 | Cleanup reserve within it | 5 min | 7 min | 7 min | 10 min |
 | Lock wait | 20 min | 2 min | 20 min | 2 min |
 
-A shared rig is one where CI also holds boards (ci.lan); a dev bench has no CI. Scale the observation window and wall time together to the failure's known latency; for an intermittent failure, choose repetitions and exposure from the observed failure rate or the issue's requirement. The debugger's finalization budget is separate, from the project's build and check timings and scope. A validator receives at most one capture-method correction within its other ceilings.
+A shared rig is one where CI also holds boards (ci.lan); a dev bench has no CI. Size the observation window from the reproducer's latency, scaling wall time with it; budget repetitions for the criterion runs and the auxiliary reproducer invocations (smoke checks, cleanup checks) together; for an intermittent failure, choose repetitions and exposure from the observed failure rate or the issue's requirement. The debugger's finalization budget is separate, from the project's build and check timings and scope. A validator receives at most one capture-method correction within its other ceilings.
 
 Settle a hardware claim from valid observations of the identified firmware under the stated conditions: a reviewer's conclusion or a green build cannot overturn a reproduced failure, and a passing run cannot refute an unexercised scenario. Only `hw-validator` returns `fixed`. `not-reproduced` neither fixes nor refutes an earlier reproduction, `inconclusive` is never `rig-side`, and neither turns a red check green. Reuse a result only while its firmware, configuration, reproducer and rig inputs are unchanged.
 
