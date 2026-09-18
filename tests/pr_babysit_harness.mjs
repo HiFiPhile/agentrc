@@ -169,7 +169,7 @@ async function run(opts = {}) {
       // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
       // state; explicit records are filled the same way, one field at a time.
       // run() launches with ['codex'] unless a test sets reviewers; set to null/undefined, the workflow's default applies
-      const named = opts.args && 'reviewers' in opts.args ? opts.args.reviewers ?? ['copilot', 'coderabbit'] : ['codex']
+      const named = opts.args && 'reviewers' in opts.args ? opts.args.reviewers ?? ['copilot', 'coderabbit', 'greptile'] : ['codex']
       const autoRun = (opts.args?.autoRun ?? named).map(b => b.trim().toLowerCase())
       const bots = r.bots === 'reviewed' || r.bots === undefined ? autoRun.map(b => bot(b))
         : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
@@ -372,12 +372,12 @@ test('an unknown reviewer or a malformed protected pattern throws before any age
   assert.equal(none.result.pass, true)
 })
 
-test('omitted reviewers default to copilot and coderabbit, both auto-running', async () => {
+test('omitted reviewers default to copilot, coderabbit and greptile, all auto-running', async () => {
   for (const reviewers of [undefined, null]) {
     const { calls, result } = await run({ args: { reviewers } })
     assert.equal(result.pass, true)
     const prompt = calls.find(c => c.label.startsWith('reviews#')).prompt
-    assert.match(prompt, /harvest on this PR are copilot, coderabbit, and no others; of those, copilot, coderabbit auto-run on every push/)
+    assert.match(prompt, /harvest on this PR are copilot, coderabbit, greptile, and no others; of those, copilot, coderabbit, greptile auto-run on every push/)
   }
 })
 

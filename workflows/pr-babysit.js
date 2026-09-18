@@ -6,7 +6,7 @@ export const meta = {
 }
 
 // args: { pr: number, reviewers?: string[] (of codex, copilot, coderabbit, greptile; default
-//            ['copilot', 'coderabbit']; [] runs no review lane),
+//            ['copilot', 'coderabbit', 'greptile']; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default: reviewers),
 //          maxCycles?: number (ceiling on review/fix/CI cycles, default 5), autoPush?: boolean (default false = dry run),
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
@@ -47,7 +47,7 @@ if (!Number.isInteger(maxCycles) || maxCycles < 1) {
 // The validator knows these bots and nothing else, so an unknown name would
 // silently review nothing; fail before dispatch instead.
 const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit', 'greptile']
-const DEFAULT_REVIEWERS = ['copilot', 'coderabbit']
+const DEFAULT_REVIEWERS = ['copilot', 'coderabbit', 'greptile']
 const reviewersArg = args.reviewers ?? DEFAULT_REVIEWERS
 if (!Array.isArray(reviewersArg)) {
   throw new Error(`reviewers must be an array of ${KNOWN_REVIEWERS.join(', ')}; [] runs no review lane`)
