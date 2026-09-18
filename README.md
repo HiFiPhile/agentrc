@@ -82,6 +82,16 @@ git worktree add .worktrees/<branch> -b <branch> <base> && cd .worktrees/<branch
 Headless (`claude -p --agent chief`), set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`,
 or `-p` kills units still running ten minutes after the chief's turn ends.
 
+For headless PR publishing, follow `agents/chief.md`'s Authorization exception
+before launching. Include the named PR, head repository and branch, expected
+HEAD, worktree, task scope, and the verbatim authorization exchange in the
+task. Leave the checkout to chief until it exits. Each new chief invocation
+requires a fresh exchange.
+
+```sh
+CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 claude -p --agent chief "$task"
+```
+
 ## Tests
 
 ```sh
