@@ -77,9 +77,10 @@ class AgentFiles(unittest.TestCase):
         body = (AGENTS / 'hw-debugger.md').read_text()
         example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
         self.assertIn(example['verdict'], ('real', 'rig-side', 'not-reproduced', 'inconclusive'))
-        for key in ('question', 'reproducer', 'head', 'base', 'board', 'probe', 'hypotheses', 'cause', 'fix', 'changed',
+        for key in ('question', 'reason', 'reproducer', 'head', 'base', 'board', 'probe', 'hypotheses', 'cause', 'fix', 'changed',
                     'runs', 'cleanup', 'budget', 'limits', 'blocker', 'next'):
             self.assertIn(key, example)
+        self.assertTrue(example['reason'].strip())
         for h in example['hypotheses']:
             self.assertIn(h['result'], ('supported', 'refuted', 'unresolved'))
             for key in ('claim', 'prediction', 'experiment', 'evidence', 'doc'):
@@ -102,6 +103,18 @@ class AgentFiles(unittest.TestCase):
         self.assertLessEqual(set(refs), ids, 'every referenced run is in runs')
         self.assertEqual(sum(run['repetitions'] for run in example['runs']), used['repetitions'])
         self.assertEqual(len(example['hypotheses']), used['hypotheses'])
+
+    def test_hardware_commit_recipes_put_options_before_the_pathspec(self):
+        """An option after `--` is read as a path, so the recipe must carry -m before it."""
+        for name in ('chief.md', 'hw-debugger.md'):
+            body = (AGENTS / name).read_text()
+            self.assertIn('git commit --only -m "<subject>" -- <same paths>', body, name)
+            self.assertNotIn('git commit --only -- <same paths>', body, name)
+
+    def test_chief_quotes_unit_json_and_leaves_verdicts_to_the_role(self):
+        body = (AGENTS / 'chief.md').read_text()
+        self.assertIn("Every hardware dispatch requests the role's Output contract unchanged.", body)
+        self.assertIn('quoted verbatim in a fenced block labelled with the unit', body)
 
 
 if __name__ == '__main__':
