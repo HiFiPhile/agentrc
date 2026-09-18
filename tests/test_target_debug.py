@@ -48,6 +48,9 @@ for line in lines:
     if mode == 'truncate' and done > total // 2:
         print('Could not read memory.')
         sys.exit(0)
+if mode == 'dies_after_reads':
+    print('USB communication error: probe disconnected')
+    sys.exit(1)
 '''
 
 # addr2line -f: two lines per address, function then file:line. FAKE_SYMS maps
@@ -70,6 +73,9 @@ if mode == 'short':
     out = out[:-1]
 print('\\n'.join(out))
 '''
+
+
+LINK = ('--interface', 'swd', '--speed', '4000')
 
 
 class ParseTest(unittest.TestCase):
@@ -101,7 +107,7 @@ class CliTest(unittest.TestCase):
 
     def run_cli(self, *args, **env):
         e = {**self.env, **env}
-        return subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'FAKE',
+        return subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'FAKE', *LINK,
                                '--elf', str(self.elf), '--addr2line', 'fake-addr2line', *args],
                               capture_output=True, text=True, timeout=30, env=e, cwd='/')
 
@@ -163,10 +169,25 @@ class CliTest(unittest.TestCase):
         self.assertRegex(r.stderr, r'incomplete capture: \d+/10 samples, 1/2 DHCSR reads')
         self.assertIn('Could not read memory', r.stderr)
 
+    def test_a_commander_that_fails_after_answering_is_no_capture(self):
+        r = self.run_cli('--samples', '3', FAKE_MODE='dies_after_reads', FAKE_SYMS='0x20000100=loop@main.c:1')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('JLinkExe exited 1', r.stderr)
+        self.assertIn('USB communication error', r.stderr)
+        self.assertNotIn('usable of', r.stdout)
+
+    def test_blank_selectors_never_reach_the_commander(self):
+        for flag in ('--probe', '--device'):
+            r = subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'FAKE', *LINK,
+                                '--elf', str(self.elf), f'{flag}=  '], capture_output=True, text=True,
+                               timeout=30, env={**self.env, 'FAKE_MODE': 'hang'})
+            self.assertEqual(r.returncode, 2, flag)
+            self.assertIn('must not be empty', r.stderr)
+
     def test_missing_or_hanging_jlink(self):
         r = self.run_cli(PATH='/nonexistent')
         self.assertEqual(r.returncode, 1)
-        self.assertIn('JLinkExe not on PATH', r.stderr)
+        self.assertIn('JLinkExe not found - install J-Link Commander or set PC_SAMPLE_JLINK_EXE', r.stderr)
         r = self.run_cli('--samples', '1', '--timeout', '1', FAKE_MODE='hang')
         self.assertEqual(r.returncode, 1)
         self.assertIn('JLinkExe did not finish within 1 s', r.stderr)
@@ -182,12 +203,41 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn('no-such-addr2line not on PATH', r.stderr)
 
+    def test_the_link_and_the_commander_come_from_the_caller(self):
+        base = [sys.executable, str(SCRIPT), '--probe', '000', '--device', 'X', '--elf', str(self.elf)]
+        for given in ((), ('--interface', 'swd'), ('--speed', '4000')):
+            r = subprocess.run([*base, *given], capture_output=True, text=True, timeout=30, env=self.env)
+            self.assertEqual(r.returncode, 2, given)
+        for bad in ('0', 'fast', '4000kHz'):
+            r = subprocess.run([*base, '--interface', 'swd', f'--speed={bad}'], capture_output=True, text=True,
+                               timeout=30, env=self.env)
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn('--speed must be kHz', r.stderr)
+        d = Path(self._dir.name)
+        argv = d / 'argv'
+        other = d / 'commander'
+        other.write_text(f'#!{sys.executable}\nimport sys\nopen({str(argv)!r}, "w").write(" ".join(sys.argv[1:]))\n')
+        other.chmod(0o755)
+        r = subprocess.run([*base, '--interface', 'jtag', '--speed', 'adaptive', '--samples', '1'],
+                           capture_output=True, text=True, timeout=30,
+                           env={**self.env, 'PC_SAMPLE_JLINK_EXE': str(other)})
+        self.assertIn('incomplete capture: 0/1 samples', r.stderr)      # the override ran, and said nothing
+        self.assertIn('-if jtag -speed adaptive', argv.read_text())
+
+    def test_raw_never_overwrites(self):
+        raw = Path(self._dir.name) / 'pcs.txt'
+        raw.write_text('earlier run')
+        r = self.run_cli('--samples', '1', '--raw', str(raw))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('already exists', r.stderr)
+        self.assertEqual(raw.read_text(), 'earlier run')
+
     def test_argument_refusals(self):
         for args in (('--samples', '0'), ('--interval-ms', '-1'), ('--top', '0'),
                      ('--timeout', '0'), ('--timeout', '-1'), ('--timeout', 'nan'), ('--timeout', 'inf')):
             r = self.run_cli(*args)
             self.assertEqual(r.returncode, 2, args)
-        r = subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'X',
+        r = subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'X', *LINK,
                             '--elf', '/nonexistent.elf'], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 2)
         self.assertIn('ELF not found', r.stderr)

@@ -1,0 +1,85 @@
+# GDB — state autopsy, breakpoints and watchpoints
+
+Part of the `target-debug` skill.
+
+Start one server using the board's device/config and probe serial. These
+OpenOCD examples cover STM32H7 with ST-Link and RP2040 with CMSIS-DAP;
+select the installed OpenOCD `interface/` and `target/` configs for other boards:
+
+```bash
+JLinkGDBServer -device <JLINK_DEVICE> -select usb=<uid> -if SWD -speed 4000 -port 2331 -nogui -singlerun
+openocd -f interface/stlink.cfg -f target/stm32h7x.cfg -c 'adapter serial <uid>'
+openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg -c 'adapter serial <uid>' -c 'adapter speed 5000'
+```
+
+Connect with the matching toolchain's GDB (`arm-none-eabi-gdb <flashed.elf>`
+for ARM), then `target remote :2331` for J-Link or `target remote :3333`
+for OpenOCD. For an autopsy, use `monitor halt`; for a fresh start only,
+use `monitor reset halt`, `load`, then `continue`.
+
+Script JLinkGDBServer sessions with `-singlerun` — the server exits with the connection, and
+back-to-back relaunches race the probe handle and hang. Symbols need the
+firmware's DWARF: check the project's release configuration keeps it.
+
+**Autopsy of a wedged board: attach and halt ONLY** — skip
+`monitor reset halt` + `load` (those are for fresh starts; a reset destroys
+the evidence). Symbolize with the ELF that is actually flashed — the one from the build
+that wedged; do not rebuild while the wedge is still on the board. The
+names to put in these slots are the project's (`projects/<name>.md` when the
+skill keeps notes for it, else read the stack and the port driver first):
+
+```gdb
+p/x <device stack's endpoint state table>   # busy/stalled/claimed per endpoint
+p <host stack's per-device state>           # addr, enum/config
+p/x <port's private state>                  # per-port names — read the port driver first
+x/32wx <USB peripheral base>                # raw EP/FIFO regs; base = the macro the driver uses
+watch  <port's transfer bookkeeping field>  # HW watchpoint (Cortex-M: ~4)
+break <the USB ISR>                         # works, but see warning below
+```
+
+**Hardware budget — read it off the chip** (verified: F407/M4 = 6 bp + 4 wp,
+rp2040/M0+ = 4 + 2; M7 typically 8/4):
+
+```gdb
+p ((*(unsigned*)0xE0002000)>>4) & 0xF   # FPB NUM_CODE = hw breakpoints (M7 adds bits[14:12])
+p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparators
+```
+
+- `hbreak`/`thbreak` force a hardware breakpoint (software breaks in flash
+  need flash-breakpoint support — J-Link has it; OpenOCD: `bp <addr> 2 hw`);
+  `tbreak` = one-shot.
+- `watch -l <expr>` watches the address expr evaluates to once — almost
+  always what you want; `rwatch`/`awatch` trap reads/any access (hardware-
+  only — they error, never fall back). OpenOCD adds a data-VALUE match GDB
+  can't express: `wp <addr> 4 w <value> [mask]` — catch who writes 0 into a
+  busy flag, ignoring writes of 1.
+- **Demand the word "Hardware" in the confirmation.** `watch` silently falls
+  back to a software watchpoint when no DWT comparator fits — GDB then
+  single-steps the whole program, hundreds of times slower: certain USB
+  death. Plain `Watchpoint 2:` = delete it and narrow the expression
+  (`watch -l`, cast to a 4-byte int).
+- Conditional breaks (`break ... if ep_addr==0x81`) and `dprintf
+  <loc>,"fmt",args` (printf without recompiling; keep `dprintf-style gdb`)
+  are host-evaluated — no Cortex-M agent expressions in these stubs: every hit
+  halts+resumes (~ms) even when the condition is false. Post-wedge/cold
+  paths only; ISR-rate events belong in the RAM ring.
+- `commands <bpnum> ... end` (start `silent`, end `continue`) auto-collects
+  evidence per hit — same halt-per-hit cost.
+- Stepping with the USB ISR firing between steps is chaos: OpenOCD
+  `cortex_m maskisr steponly`. The bus runs either way — the host may still
+  reset a halted-looking device.
+- Poking state while halted (`set var <endpoint state>.busy = 0`)
+  tests a hypothesis but invalidates the post-mortem — dump first, poke after.
+- FreeRTOS examples: `-rtos GDBServer/RTOSPlugin_FreeRTOS` (OpenOCD: `-rtos
+  FreeRTOS`) → `info threads` lists every task with state/prio/frame
+  (verified: 6 tasks). It populates only after a
+  run→stop cycle — plain attach shows one 0xDEAD placeholder. Semihosting is
+  never the answer (traps + halts per call — RTT instead). **Monitor-mode
+  debugging** (J-Link, M3+) keeps chosen IRQs serviced at a breakpoint —
+  needs SEGGER's JLINK_MONITOR files + `SetMonModeDebug=1`; not set up here:
+  <https://kb.segger.com/Monitor_Mode_Debugging> (untested).
+
+While halted the device answers **nothing**: host control transfers time out
+in ~5 s and the OS may reset/re-enumerate — after `continue`, the bus traffic
+shows recovery, not the original bug. Prefer one halt for a post-mortem dump
+over stepping through live USB traffic.
