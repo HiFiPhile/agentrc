@@ -22,10 +22,13 @@ export const meta = {
 //          yieldAfterCycle?: boolean (run one cycle and return, with `state` for the next launch),
 //          lane?: 'both' | 'ci' | 'reviews' (which lane this launch runs, default both; a single lane
 //            needs yieldAfterCycle and never declares the PR done),
-//          state?: object (a previous launch's returned state, handed back unchanged) }
+//          state?: object (a previous launch's returned state, handed back unchanged),
+//          adoptHead?: string (full SHA of commits the caller made and audited on top of the
+//            state's expectedHead, a hardware repair say: this launch audits the chain, publishes
+//            it under autoPush and continues from it with the same state; per launch, never saved) }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, build?, yieldAfterCycle?, lane?, state? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers: string[], autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, build?, yieldAfterCycle?, lane?, state?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -106,6 +109,16 @@ if (args.state !== undefined && args.state !== null) {
   restored = st
 }
 let cyclesUsed = restored ? restored.cyclesUsed : 0
+// Adoption continues a state from commits its caller made, so it needs the
+// state and the published head that state pinned; the caller's audit is the
+// reason to trust them, this run's audit only rechecks what a commit can show.
+const adoptHead = args.adoptHead === undefined || args.adoptHead === null ? null : args.adoptHead
+if (adoptHead !== null) {
+  if (typeof adoptHead !== 'string' || !/^[0-9a-f]{40}$/.test(adoptHead)) throw new Error('adoptHead must be a full 40-hex commit SHA')
+  if (!restored) throw new Error('adoptHead continues a previous launch: it needs that launch\'s state')
+  if (!restored.pin) throw new Error('adoptHead needs a state whose preflight pinned the PR head')
+  if (adoptHead === restored.expectedHead) throw new Error('adoptHead equals the state\'s expectedHead: there is nothing to adopt')
+}
 
 // Writers are asked not to publish or commit: this workflow's own publisher
 // commits the paths it audited, so a writer that staged its work would put
@@ -224,6 +237,30 @@ const PUSH = {
   type: 'object', additionalProperties: false,
   required: ['pass', 'detail'],
   properties: { pass: { type: 'boolean' }, detail: { type: 'string' } },
+}
+// The chain a caller asks this run to adopt, oldest first, read back commit by
+// commit so every one is audited, not only the tip.
+const ADOPT_AUDIT = {
+  type: 'object', additionalProperties: false,
+  required: ['commits'],
+  properties: {
+    commits: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['sha', 'parents', 'paths', 'message'],
+        properties: {
+          sha: { type: 'string' }, parents: { type: 'array', items: { type: 'string' } },
+          paths: { type: 'array', items: { type: 'string' } }, message: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+const READBACK = {
+  type: 'object', additionalProperties: false,
+  required: ['prHead'],
+  properties: { prHead: { type: 'string' } },
 }
 // The agent that makes the commit says only that it made one; what the commit
 // actually contains is read back in a separate turn that is asked not to edit.
@@ -351,6 +388,10 @@ let reviewClock = restored ? restored.reviewClock : null
 // decide on, never the next baseline: expectedHead stays at the published head.
 const pendingOf = () => {
   const last = history[history.length - 1]
+  const a = last && last.adoption
+  if (a && (a.publication === 'failed' || a.publication === 'unknown')) {
+    return { sha: a.to, parent: a.from, lane: 'adopt', stage: a.publication === 'failed' ? 'adopt-push-failed' : 'adopt-push-unknown' }
+  }
   for (const [lane, key] of [['review', 'reviewPushFailed'], ['ci', 'ciPushFailed']]) {
     const f = last && last[key]
     if (f && f.committed && f.sha) {
@@ -380,6 +421,7 @@ const finish = (verdict, status) => {
       reviewFixes: last.reviewFixes || null, ciFixes: last.ciFixes || null,
       reviewPush: last.reviewPush || last.reviewPushFailed || null, ciPush: last.ciPush || last.ciPushFailed || null,
       refutedPosts: last.refutedPosts || null, fixNotePosts: last.fixNotePosts || null, error: last.error || null,
+      adoption: last.adoption || null,
     } : null,
   }
   return { ...verdict, status: status || (verdict.pass ? 'complete' : 'blocked'), observation, state: stateOut() }
@@ -911,17 +953,20 @@ const commitAndPush = async (cycle, what, owned = []) => {
     return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
 
-  const push = await agent(
-    `${IN_CHECKOUT}Run exactly: git push '${pinned.remote.trim()}' '${sha}:refs/heads/${pinned.branch.trim()}'\n` +
-    'That refspec is the point: pushing the branch instead would publish whatever HEAD has become, ' +
-    'not the commit that was audited. Commit nothing, amend nothing, force nothing, add no flags. ' +
-    'pass = whether the push succeeded; detail = one line on what was pushed.',
-    { label: `push#${cycle}-${what}`, phase: 'Push', model: 'sonnet', schema: PUSH },
-  ).catch(e => { log(`push#${cycle}-${what} errored — ${e && e.message}`); return null })
+  const push = await pushExact(sha, `push#${cycle}-${what}`)
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha }
   if (push.pass) expectedHead = sha
   return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
 }
+
+// Publishes one audited SHA to the pinned branch; null when the agent died.
+const pushExact = (sha, label) => agent(
+  `${IN_CHECKOUT}Run exactly: git push '${pinned.remote.trim()}' '${sha}:refs/heads/${pinned.branch.trim()}'\n` +
+  'That refspec is the point: pushing the branch instead would publish whatever HEAD has become, ' +
+  'not the commit that was audited. Commit nothing, amend nothing, force nothing, add no flags. ' +
+  'pass = whether the push succeeded; detail = one line on what was pushed.',
+  { label, phase: 'Push', model: 'sonnet', schema: PUSH },
+).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
 
 let napMs = 0 // backoff owed from the previous cycle, taken after its summary
 
@@ -1412,7 +1457,7 @@ if (pinned.prBranch.trim() !== pinned.branch.trim()) {
 }
 // A branch name is not an identity: the same name can be stale, ahead, or from
 // another fork entirely, and its commits would then become the trusted baseline.
-if (pinned.head.trim() !== pinned.prHead.trim()) {
+if (adoptHead === null && pinned.head.trim() !== pinned.prHead.trim()) {
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but PR #${args.pr} heads ${pinned.prHead.slice(0, 7)}`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-head', head: pinned.head.trim(), expected: pinned.prHead.trim() })
 }
@@ -1423,7 +1468,7 @@ if (restored && restored.pin && JSON.stringify(currentPin) !== JSON.stringify(re
   log(`preflight: this is not the PR the state belongs to — ${JSON.stringify(currentPin)} vs ${JSON.stringify(restored.pin)}`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'state-mismatch', pin: currentPin, expected: restored.pin })
 }
-if (restored && restored.pin && pinned.head.trim() !== restored.expectedHead) {
+if (adoptHead === null && restored && restored.pin && pinned.head.trim() !== restored.expectedHead) {
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but the previous launch left ${restored.expectedHead.slice(0, 7)}`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'stale-head', head: pinned.head.trim(), expected: restored.expectedHead })
 }
@@ -1443,9 +1488,101 @@ if (!expectedOrigin || badPush !== undefined) {
   // only one this workflow supports rather than a bare repo name.
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-remote', remoteUrl: badPush, expected: expectedOrigin || `${HOST}/${pinned.prRepo.trim().toLowerCase()}` })
 }
-expectedHead = pinned.prHead.trim()
+// Adoption stands in for the two head checks above: the checkout must be at the
+// named commit, the PR at the state's head or already at that commit, and the
+// chain between them audited commit by commit before anything is published.
+let adoption = null
+if (adoptHead !== null) {
+  const X = restored.expectedHead
+  const prHead = pinned.prHead.trim()
+  if (pinned.head.trim() !== adoptHead) {
+    log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
+    return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-head-mismatch', head: pinned.head.trim(), expected: adoptHead })
+  }
+  if (prHead !== X && prHead !== adoptHead) {
+    log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor ${adoptHead.slice(0, 7)}`)
+    return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-head', head: prHead, expected: [X, adoptHead] })
+  }
+  // An unpublished candidate of this run's own is the caller's decision, and a
+  // chain on top of it would publish it unasked; only a retry of this same
+  // adoption may pass.
+  const p = restored.pending
+  if (p && !(p.lane === 'adopt' && p.sha === adoptHead && p.parent === X)) {
+    log(`preflight: the state holds an unpublished candidate (${p.stage}); resolve it before adopting`)
+    return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-pending', pending: p })
+  }
+  const audit = await agent(
+    `${IN_CHECKOUT}Editing and committing nothing, report every commit in ${X}..${adoptHead}, oldest first: ` +
+    `the SHAs are the lines of \`git rev-list --reverse ${X}..${adoptHead}\`; for each, parents = the space-separated output of ` +
+    '`git show -s --format=%P <sha>` split into a list, every parent; ' +
+    'paths = run `git diff-tree --no-commit-id --no-renames --name-only -r -z <sha>` and split its output only on NUL, dropping the ' +
+    'terminal empty element; each complete filename is one JSON string, embedded newlines and whitespace preserved; ' +
+    'message = the output of `git log -1 --format=%B <sha>`, verbatim. Return ONLY JSON matching the schema.',
+    { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
+  ).catch(e => { log(`adopt:audit errored — ${e && e.message}`); return null })
+  const commits = audit ? audit.commits : []
+  const shas = commits.map(c => String(c.sha).trim())
+  const paths = commits.flatMap(c => c.paths)
+  const badPath = paths.find(f => !canon(f))
+  const guarded = protectedRe ? [...new Set(paths.map(canon).filter(f => f && protectedRe.test(f)))] : []
+  const signed = commits.find(c => attributionIn(c.message))
+  const why = !audit ? 'the audit agent died'
+    : !commits.length ? `no commits reported in ${X.slice(0, 7)}..${adoptHead.slice(0, 7)}`
+    : shas.some(h => !FULL_SHA.test(h)) ? `a commit reported no full SHA: ${JSON.stringify(shas.find(h => !FULL_SHA.test(h)))}`
+    : new Set(shas).size !== shas.length ? 'a commit is reported twice'
+    : shas[shas.length - 1] !== adoptHead ? `the chain ends at ${shas[shas.length - 1].slice(0, 7)}, not ${adoptHead.slice(0, 7)}`
+    : commits.some((c, i) => c.parents.length !== 1) ? `${shas[commits.findIndex(c => c.parents.length !== 1)].slice(0, 7)} is a merge or a root: history this run cannot audit`
+    : commits.some((c, i) => c.parents[0].trim() !== (i ? shas[i - 1] : X)) ? `${shas[commits.findIndex((c, i) => c.parents[0].trim() !== (i ? shas[i - 1] : X))].slice(0, 7)} does not sit on the commit before it in the chain from ${X.slice(0, 7)}`
+    : commits.some(c => !c.paths.length) ? `${shas[commits.findIndex(c => !c.paths.length)].slice(0, 7)} reported no paths`
+    : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
+    : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}`
+    : signed ? `commit message carries attribution: ${attributionIn(signed.message).trim()}`
+    : null
+  if (why) {
+    log(`preflight: adoption refused — ${why}`)
+    return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-audit-failed', detail: why })
+  }
+  if (prHead === X && args.autoPush !== true) {
+    log(`preflight: ${adoptHead.slice(0, 7)} is audited but unpublished, and this is a dry run`)
+    return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-needs-push', dryRun: true })
+  }
+  adoption = { from: X, to: adoptHead, commits: shas, paths: [...new Set(paths.map(canon))], published: prHead === adoptHead }
+}
+expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
+
+// Runs as the prelude of the launch's first cycle, before any watcher: the
+// record exists before any dispatch, so an exception cannot erase the attempt,
+// and only a read-back of the PR head proves the push landed.
+const adopt = async (entry) => {
+  const { from, to, commits, paths } = adoption
+  entry.adoption = { from, to, commits, paths, publication: 'unknown', detail: 'publication not attempted yet' }
+  if (adoption.published) {
+    Object.assign(entry.adoption, { publication: 'already-published', detail: `PR #${args.pr} already heads ${to.slice(0, 7)}` })
+  } else {
+    const push = await pushExact(to, 'adopt:push')
+    if (push && !push.pass) {
+      Object.assign(entry.adoption, { publication: 'failed', detail: push.detail || 'push refused' })
+      return { pass: false, cycles: entry.cycle, history, reason: 'adopt-push-failed', detail: entry.adoption.detail }
+    }
+    const seen = await agent(
+      `${IN_CHECKOUT}Editing nothing, report prHead = headRefOid from \`gh pr view ${args.pr} --json headRefOid\`, verbatim. Return ONLY JSON matching the schema.`,
+      { label: 'adopt:readback', phase: 'Push', model: 'haiku', effort: 'low', schema: READBACK },
+    ).catch(e => { log(`adopt:readback errored — ${e && e.message}`); return null })
+    const landed = !!push && !!seen && seen.prHead.trim() === to
+    if (!landed) {
+      const detail = !push ? 'the push agent died' : !seen ? 'the read-back agent died' : `PR #${args.pr} heads ${seen.prHead.trim().slice(0, 7)} after the push, not ${to.slice(0, 7)}`
+      Object.assign(entry.adoption, { publication: 'unknown', detail })
+      return { pass: false, cycles: entry.cycle, history, reason: 'adopt-push-unknown', detail }
+    }
+    Object.assign(entry.adoption, { publication: 'pushed', detail: push.detail })
+  }
+  log(`cycle ${entry.cycle}: adopted ${from.slice(0, 7)}..${to.slice(0, 7)} (${commits.length} commit(s), ${entry.adoption.publication})`)
+  expectedHead = to
+  entry.head = to
+  return null
+}
 
 const firstCycle = cyclesUsed + 1
 const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
@@ -1458,7 +1595,8 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   // keeps `history`, a rethrow would drop it.
   let verdict
   try {
-    verdict = await runCycle(cycle, entry)
+    verdict = adoption && cycle === firstCycle ? await adopt(entry) : null
+    if (!verdict) verdict = await runCycle(cycle, entry)
   } catch (e) {
     entry.error = `cycle threw: ${e && e.message}`
     verdict = { pass: false, cycles: cycle, history, reason: 'cycle-threw' }

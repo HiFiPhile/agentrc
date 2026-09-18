@@ -53,6 +53,34 @@ const PIN = {
 }
 // What the pre-publish recheck must still find: HEAD exactly where the run left it.
 const RECHECK = { branch: 'claude/foo', pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, staged: [], status: [] }
+const ADOPT = '1111111111111111111111111111111111111111'
+const ADOPT_MID = '2222222222222222222222222222222222222222'
+const STATE_PIN = {
+  prRepo: PIN.prRepo, prBranch: PIN.prBranch, prUrl: PIN.prUrl,
+  remote: PIN.remote, pushUrls: PIN.pushUrls,
+}
+const adoptCommit = (sha = ADOPT, parents = [HEAD], paths = ['src/adopted.c'], over = {}) => ({
+  sha, parents, paths, message: 'Adopt the hardware fix\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...over,
+})
+const adoptionState = ({
+  maxCycles = 4, cyclesUsed = 1, reviewers = ['codex'], autoRun = reviewers,
+  protected: protectedPattern = null, pin = STATE_PIN, ...over
+} = {}) => ({
+  version: 2, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
+  config: {
+    pr: 3888, reviewers, autoRun, maxCycles, checkoutDir: '.', ciWait: 30,
+    protected: protectedPattern === null ? null : new RegExp(protectedPattern).source,
+    generated: null, build: null,
+  },
+  cyclesUsed, maxCycles, answeredWith: [], debt: [],
+  history: cyclesUsed ? [{ cycle: cyclesUsed, head: HEAD }] : [], ...over,
+})
+const adoptionArgs = (state, over = {}) => ({
+  reviewers: state.config.reviewers, autoRun: state.config.autoRun,
+  maxCycles: state.config.maxCycles, ciWait: state.config.ciWait,
+  protected: state.config.protected, generated: state.config.generated, build: state.config.build,
+  yieldAfterCycle: true, state, adoptHead: ADOPT, ...over,
+})
 
 // The runtime validates a stub's reply against its schema; the harness does the
 // same for the CI stub, the one whose shape changed, so a fixture in the old
@@ -94,6 +122,7 @@ async function run(opts = {}) {
   // pushed — the same rule the workflow's own expectedHead follows, so a second
   // cycle rechecks against what the first one actually left behind.
   let head = (opts.preflight && opts.preflight.head) || HEAD
+  let prHead = (opts.preflight && opts.preflight.prHead) || HEAD
   let made = SHA
   let commits = 0 // so each stub commit gets its own SHA, as a real one would
   let staged = [] // what the committer put in it, read back by the audit agent
@@ -106,7 +135,29 @@ async function run(opts = {}) {
       phase: options.phase, schema: options.schema,
     })
     if (opts.throwOn && label.startsWith(opts.throwOn)) throw new Error(`${label} exploded`)
-    if (label === 'preflight') return patch(PIN, opts.preflight)
+    if (label === 'preflight') return patch({ ...PIN, head, prHead }, opts.preflight)
+    if (label === 'adopt:audit') {
+      const fallback = { commits: [adoptCommit(opts.args?.adoptHead, [opts.args?.state?.expectedHead ?? HEAD])] }
+      const answer = typeof opts.adoptAudit === 'function' ? await opts.adoptAudit(label)
+        : opts.adoptAudit === undefined ? fallback : opts.adoptAudit
+      if (answer instanceof Error) throw answer
+      return answer === null ? null : conforms(options.schema, structuredClone(answer), label)
+    }
+    if (label === 'adopt:push') {
+      const answer = typeof opts.adoptPush === 'function' ? await opts.adoptPush(label)
+        : opts.adoptPush === undefined ? { pass: true, detail: 'pushed adopted head' } : opts.adoptPush
+      if (answer instanceof Error) throw answer
+      if (answer === null) return null
+      const push = conforms(options.schema, structuredClone(answer), label)
+      if (push.pass) prHead = opts.args.adoptHead
+      return push
+    }
+    if (label === 'adopt:readback') {
+      const answer = typeof opts.adoptReadback === 'function' ? await opts.adoptReadback(label)
+        : opts.adoptReadback === undefined ? { prHead } : opts.adoptReadback
+      if (answer instanceof Error) throw answer
+      return answer === null ? null : conforms(options.schema, structuredClone(answer), label)
+    }
     if (label.startsWith('recheck#')) {
       const over = typeof opts.recheck === 'function' ? opts.recheck(label) : opts.recheck
       return patch({ ...RECHECK, head }, over)
@@ -2435,6 +2486,378 @@ test('a state from a run with other arguments, or of another shape, is refused',
   await assert.rejects(run({ args: { maxCycles: 3, reviewers: ['codex', 'copilot'], state: first.result.state } }),
     /different arguments/)
   await assert.rejects(run({ args: { maxCycles: 3, state: { version: 0 } } }), /not a pr-babysit state/)
+})
+
+// --- adopting an audited local chain without resetting the carried ledger ---
+
+test('adoption publishes before cycle watchers and reviews the adopted head', async () => {
+  const state = adoptionState()
+  const { result, labels, calls } = await run({
+    args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+  })
+  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:push', 'adopt:readback'])
+  assert.ok(labels.indexOf('adopt:readback') < labels.indexOf('ci#2'), 'publication is confirmed before either watcher')
+  assert.ok(labels.indexOf('adopt:readback') < labels.indexOf('reviews#2'))
+  assert.equal(result.history[1].cycle, 2, 'adoption occupies the next carried cycle')
+  assert.equal(result.history[1].head, ADOPT)
+  assert.equal(result.state.cyclesUsed, 2)
+  assert.equal(result.state.expectedHead, ADOPT)
+  assert.equal(result.observation.reviewedHead, ADOPT)
+  assert.equal(result.history[1].adoption.publication, 'pushed')
+  assert.deepEqual(result.history[1].adoption.commits, [ADOPT])
+  assert.deepEqual(result.history[1].adoption.paths, ['src/adopted.c'])
+  assert.deepEqual(result.observation.actions.adoption, result.history[1].adoption)
+  assert.equal(typeof result.history[1].adoption.detail, 'string')
+  assert.equal(JSON.stringify(result.state).includes('adoptHead'), false, 'the launch argument is not persisted')
+  const audit = calls.find(c => c.label === 'adopt:audit')
+  assert.equal(audit.phase, 'Triage')
+  assert.deepEqual(audit.schema.required, ['commits'])
+  assert.deepEqual(audit.schema.properties.commits.items.required, ['sha', 'parents', 'paths', 'message'])
+  assert.match(audit.prompt, /--no-renames/)
+  const push = calls.find(c => c.label === 'adopt:push')
+  assert.equal(push.phase, 'Push')
+  assert.ok(push.prompt.includes("git push 'origin' '1111111111111111111111111111111111111111:refs/heads/claude/foo'"))
+  assert.match(calls.find(c => c.label === 'adopt:readback').prompt, /gh pr view 3888 --json headRefOid/)
+})
+
+test('an already-published adopted head needs no push even in a dry-run launch', async () => {
+  for (const autoPush of [true, false]) {
+    const state = adoptionState()
+    const { result, labels } = await run({
+      args: adoptionArgs(state, { autoPush }), preflight: { head: ADOPT, prHead: ADOPT },
+    })
+    assert.ok(result.history[1]?.adoption, 'the adopted head must get a receipt in the next cycle')
+    assert.equal(result.history[1].adoption.publication, 'already-published', String(autoPush))
+    assert.equal(result.state.expectedHead, ADOPT)
+    assert.equal(labels.some(l => l === 'adopt:push' || l === 'adopt:readback'), false)
+    assert.ok(labels.includes('ci#2') && labels.includes('reviews#2'), 'the normal cycle still runs')
+  }
+})
+
+test('an unpublished adoption without autoPush is a zero-cycle dry run', async () => {
+  const state = adoptionState({
+    debt: [[5, { dismissals: ['5#1'], note: false, renumbered: false, digest: 'd5' }]],
+  })
+  const before = structuredClone(state)
+  const { result, labels } = await run({
+    args: adoptionArgs(state, { autoPush: false }), preflight: { head: ADOPT, prHead: HEAD },
+  })
+  assert.equal(result.status, 'blocked')
+  assert.equal(result.reason, 'adopt-needs-push')
+  assert.equal(result.dryRun, true)
+  assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+  assert.equal(result.state.cyclesUsed, before.cyclesUsed)
+  assert.equal(result.state.expectedHead, HEAD)
+  assert.deepEqual(result.state.history, before.history)
+  assert.deepEqual(result.state.debt, before.debt)
+  assert.deepEqual(state, before, 'the supplied state itself is not mutated')
+})
+
+test('adoption accepts a complete two-commit chain and canonicalizes its receipt paths', async () => {
+  const state = adoptionState()
+  const { result } = await run({
+    args: adoptionArgs(state), preflight: { head: ADOPT, prHead: ADOPT },
+    adoptAudit: { commits: [
+      adoptCommit(ADOPT_MID, [HEAD], ['src/./a.c']),
+      adoptCommit(ADOPT, [ADOPT_MID], ['src/a.c', 'src/b.c']),
+    ] },
+  })
+  assert.ok(result.history[1]?.adoption, 'the complete audited chain must be adopted')
+  assert.deepEqual(result.history[1].adoption.commits, [ADOPT_MID, ADOPT])
+  assert.deepEqual(result.history[1].adoption.paths, ['src/a.c', 'src/b.c'])
+  assert.equal(result.history[1].adoption.publication, 'already-published')
+})
+
+test('an omitted intermediate commit or a list not ending at the candidate is refused', async () => {
+  for (const [name, commits] of [
+    ['omitted intermediate', [adoptCommit(ADOPT, [ADOPT_MID])]],
+    ['wrong endpoint', [adoptCommit(ADOPT_MID, [HEAD])]],
+  ]) {
+    const state = adoptionState()
+    const { result, labels } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: { commits },
+    })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.equal(typeof result.detail, 'string')
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
+    assert.deepEqual(result.state.history, state.history)
+  }
+})
+
+test('adoptHead argument errors throw before any agent runs', async () => {
+  const malformed = adoptionState()
+  const equal = adoptionState()
+  const unpinned = adoptionState({ pin: null })
+  for (const [name, args] of [
+    ['no state', { adoptHead: ADOPT }],
+    ['malformed SHA', adoptionArgs(malformed, { adoptHead: 'not-a-full-sha' })],
+    ['candidate equals expected head', adoptionArgs(equal, { adoptHead: HEAD })],
+    ['state has no pin', adoptionArgs(unpinned)],
+  ]) {
+    const trace = []
+    await assert.rejects(run({ args, trace }), /adoptHead|adopt head/i, name)
+    assert.deepEqual(trace, [], `${name}: argument validation precedes preflight`)
+  }
+})
+
+test('adoption keeps ordinary preflight refusals ahead of its own checks', async () => {
+  const badPush = 'git@evil.example:hathach/tinyusb.git'
+  const cases = [
+    ['dirty-start', adoptionState(), { head: ADOPT, prHead: FOREIGN, dirty: [' M src/a.c'] }],
+    ['wrong-branch', adoptionState(), { head: ADOPT, prHead: FOREIGN, branch: 'main' }],
+    ['state-mismatch', adoptionState(), {
+      head: ADOPT, prHead: FOREIGN, prRepo: 'someone/tinyusb',
+      prUrl: 'https://github.com/someone/tinyusb/pull/3888', pushUrls: ['git@github.com:someone/tinyusb.git'],
+    }],
+    ['wrong-remote', adoptionState({ pin: { ...STATE_PIN, pushUrls: [badPush] } }), {
+      head: ADOPT, prHead: FOREIGN, pushUrls: [badPush],
+    }],
+  ]
+  for (const [reason, state, preflight] of cases) {
+    const { result, labels } = await run({ args: adoptionArgs(state), preflight })
+    assert.equal(result.reason, reason)
+    assert.deepEqual(labels, ['preflight'], `${reason}: the audit is later in preflight`)
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
+    assert.deepEqual(result.state.history, state.history)
+  }
+  for (const preflight of [null]) {
+    const state = adoptionState()
+    const { result, labels } = await run({ args: adoptionArgs(state), preflight })
+    assert.equal(result.reason, 'preflight-died')
+    assert.deepEqual(labels, ['preflight'])
+  }
+  const state = adoptionState()
+  const thrown = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, throwOn: 'preflight' })
+  assert.equal(thrown.result.reason, 'preflight-died')
+  assert.deepEqual(thrown.labels, ['preflight'])
+})
+
+test('adoption refuses a local head other than the candidate and a remote head outside the pair', async () => {
+  const mismatch = adoptionState()
+  const local = await run({
+    args: adoptionArgs(mismatch), preflight: { head: HEAD, prHead: HEAD },
+  })
+  assert.equal(local.result.reason, 'adopt-head-mismatch')
+  assert.equal(local.result.head, HEAD)
+  assert.equal(local.result.expected, ADOPT)
+  assert.deepEqual(local.labels, ['preflight'])
+
+  const unexpected = adoptionState()
+  const remote = await run({
+    args: adoptionArgs(unexpected), preflight: { head: ADOPT, prHead: FOREIGN },
+  })
+  assert.equal(remote.result.reason, 'wrong-head')
+  assert.equal(remote.result.head, FOREIGN)
+  assert.deepEqual(remote.result.expected, [HEAD, ADOPT])
+  assert.deepEqual(remote.labels, ['preflight'])
+})
+
+test('an audit that dies, throws, or omits required evidence is refused without a cycle', async () => {
+  for (const [name, adoptAudit] of [
+    ['dead', null],
+    ['thrown', new Error('audit exploded')],
+    ['incomplete', { commits: [{ sha: ADOPT, parents: [HEAD], paths: ['src/a.c'] }] }],
+  ]) {
+    const state = adoptionState()
+    const { result, labels } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit,
+    })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.equal(typeof result.detail, 'string')
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
+  }
+})
+
+test('empty, malformed, duplicate, or pathless audit commits are refused', async () => {
+  for (const [name, commits] of [
+    ['empty chain', []],
+    ['malformed SHA', [adoptCommit('bad', [HEAD]), adoptCommit(ADOPT, ['bad'])]],
+    ['duplicate SHA', [adoptCommit(ADOPT, [HEAD]), adoptCommit(ADOPT, [ADOPT])]],
+    ['empty paths', [adoptCommit(ADOPT, [HEAD], [])]],
+  ]) {
+    const state = adoptionState()
+    const { result, labels } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: { commits },
+    })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
+  }
+})
+
+test('merge and off-chain commits fail the adoption audit', async () => {
+  for (const [name, commits] of [
+    ['merge', [adoptCommit(ADOPT, [HEAD, FOREIGN])]],
+    ['off-chain', [adoptCommit(ADOPT_MID, [HEAD]), adoptCommit(ADOPT, [FOREIGN])]],
+  ]) {
+    const state = adoptionState()
+    const { result, labels } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: { commits },
+    })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+    assert.equal(labels.some(l => l.startsWith('ci#') || l.startsWith('reviews#')), false)
+  }
+})
+
+test('protected modifications, deletions, and either side of a rename fail adoption', async () => {
+  for (const [name, paths] of [
+    ['modification', ['protected/config.json']],
+    ['deletion', ['protected/deleted.json']],
+    ['rename from protected', ['protected/old.json', 'src/new.json']],
+    ['rename to protected', ['src/old.json', 'protected/new.json']],
+    ['a name with a newline, kept whole', ['protected/\nconfig.json']],
+  ]) {
+    const state = adoptionState({ protected: '^protected/' })
+    const { result, labels, calls } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+      adoptAudit: { commits: [adoptCommit(ADOPT, [HEAD], paths)] },
+    })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+    const prompt = calls.find(c => c.label === 'adopt:audit').prompt
+    assert.match(prompt, /--no-renames/, 'both rename sides must be visible to the path check')
+    assert.match(prompt, /split its output only on NUL/, 'a filename must reach the check whole')
+    assert.doesNotMatch(prompt, /tr '\\0' '\\n'/, 'turning NULs into newlines splits a name that holds one')
+  }
+})
+
+test('an uncanonicalizable adopted path or an attributed message fails the audit', async () => {
+  for (const path of ['../outside.c', '/tmp/absolute.c', ' src/leading.c', 'src/trailing.c ']) {
+    const state = adoptionState()
+    const { result } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+      adoptAudit: { commits: [adoptCommit(ADOPT, [HEAD], [path])] },
+    })
+    assert.equal(result.reason, 'adopt-audit-failed', JSON.stringify(path))
+  }
+  const state = adoptionState()
+  const attributed = await run({
+    args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+    adoptAudit: { commits: [adoptCommit(ADOPT, [HEAD], ['src/a.c'], { message: 'Fix it\n\nGenerated by Codex\n' })] },
+  })
+  assert.equal(attributed.result.reason, 'adopt-audit-failed')
+  assert.match(attributed.result.detail, /attribution/i)
+})
+
+test('unrelated or unknown pending publication blocks adoption before the audit', async () => {
+  for (const pending of [
+    { sha: FOREIGN, parent: HEAD, lane: 'review', stage: 'push-failed' },
+    { sha: null, parent: HEAD, lane: 'review', stage: 'push-unknown' },
+    { sha: ADOPT, parent: HEAD, lane: 'review', stage: 'push-failed' },
+  ]) {
+    const state = adoptionState({ pending })
+    const { result, labels } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+    })
+    assert.equal(result.reason, 'adopt-pending', JSON.stringify(pending))
+    assert.deepEqual(result.pending, pending)
+    assert.deepEqual(labels, ['preflight'])
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
+  }
+})
+
+test('a successful adoption push with no confirming read-back is unknown', async () => {
+  for (const [name, adoptReadback] of [
+    ['dead', null],
+    ['thrown', new Error('read-back exploded')],
+    ['contradictory', { prHead: FOREIGN }],
+  ]) {
+    const state = adoptionState()
+    const { result, labels } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptReadback,
+    })
+    assert.equal(result.reason, 'adopt-push-unknown', name)
+    assert.equal(result.history[1].adoption.publication, 'unknown')
+    assert.equal(result.state.expectedHead, HEAD)
+    assert.equal(result.state.cyclesUsed, 2, 'the publication attempt consumes its cycle')
+    assert.deepEqual(result.state.pending,
+      { sha: ADOPT, parent: HEAD, lane: 'adopt', stage: 'adopt-push-unknown' })
+    assert.deepEqual(result.observation.actions.adoption, result.history[1].adoption)
+    assert.equal(labels.some(l => l.startsWith('ci#') || l.startsWith('reviews#')), false)
+  }
+})
+
+test('rejected or dead adoption pushes preserve the ledger and recover without repushing', async () => {
+  for (const [name, adoptPush, publication, reason, stage] of [
+    ['rejected', { pass: false, detail: 'non-fast-forward' }, 'failed', 'adopt-push-failed', 'adopt-push-failed'],
+    ['dead', null, 'unknown', 'adopt-push-unknown', 'adopt-push-unknown'],
+    ['thrown', new Error('publisher exploded'), 'unknown', 'adopt-push-unknown', 'adopt-push-unknown'],
+  ]) {
+    const state = adoptionState({
+      debt: [[5, { dismissals: ['5#1'], note: false, renumbered: false, digest: 'd5' }]],
+      answeredWith: [[6, { how: 'refutation', digest: 'd6' }]],
+    })
+    const failed = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptPush,
+    })
+    assert.equal(failed.result.reason, reason, name)
+    assert.equal(failed.result.history[1].adoption.publication, publication)
+    assert.equal(failed.result.state.expectedHead, HEAD)
+    assert.equal(failed.result.state.cyclesUsed, 2)
+    assert.deepEqual(failed.result.state.pending, { sha: ADOPT, parent: HEAD, lane: 'adopt', stage })
+    assert.deepEqual(failed.result.state.debt, state.debt)
+    assert.deepEqual(failed.result.state.answeredWith, state.answeredWith)
+    assert.equal(failed.labels.some(l => l.startsWith('ci#') || l.startsWith('reviews#')), false)
+
+    const recovered = await run({
+      args: adoptionArgs(failed.result.state), preflight: { head: ADOPT, prHead: ADOPT },
+    })
+    assert.equal(recovered.result.history[2].adoption.publication, 'already-published')
+    assert.equal(recovered.result.state.expectedHead, ADOPT)
+    assert.equal(recovered.result.state.pending, null)
+    assert.deepEqual(recovered.result.state.debt, state.debt)
+    assert.deepEqual(recovered.result.state.answeredWith, state.answeredWith)
+    assert.equal(recovered.labels.includes('adopt:push'), false, `${name}: recovery must not repush`)
+  }
+})
+
+test('old bot timing cannot settle reviewers on a newly adopted head', async () => {
+  const reviewers = ['codex', 'copilot', 'coderabbit']
+  const state = adoptionState({
+    maxCycles: 2, reviewers, reviewClock: { sha: HEAD, eventAt: null, since: at(-100) },
+  })
+  const { result } = await run({
+    args: adoptionArgs(state), preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 20,
+    reviews: { findings: [], replies: [], bots: [bot('codex'), bot('copilot', { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }), bot('coderabbit')] },
+  })
+  assert.equal(result.reason, 'reviews-pending')
+  assert.deepEqual(result.state.reviewClock, { sha: ADOPT, eventAt: null, since: at(20) },
+    'the first observation of Y starts Y\'s own clock')
+})
+
+test('an exhausted budget refuses adoption before preflight', async () => {
+  const state = adoptionState({ maxCycles: 2, cyclesUsed: 2 })
+  const { result, labels } = await run({
+    args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+  })
+  assert.equal(result.reason, 'budget-exhausted')
+  assert.deepEqual(labels, [])
+  assert.equal(result.state.cyclesUsed, 2)
+  assert.deepEqual(result.state.history, state.history)
+})
+
+test('a continuation after adoption omits adoptHead and advances normally', async () => {
+  const state = adoptionState()
+  const adopted = await run({
+    args: adoptionArgs(state), preflight: { head: ADOPT, prHead: ADOPT },
+    reviews: { findings: [], replies: [], bots: 'pending' },
+  })
+  assert.equal(adopted.result.reason, 'yielded')
+  assert.equal(adopted.result.state.expectedHead, ADOPT)
+  const nextArgs = adoptionArgs(adopted.result.state)
+  delete nextArgs.adoptHead
+  const next = await run({
+    args: nextArgs, preflight: { head: ADOPT, prHead: ADOPT },
+    reviews: { findings: [], replies: [], bots: 'pending' },
+  })
+  assert.equal(next.result.state.cyclesUsed, 3)
+  assert.equal(next.result.state.expectedHead, ADOPT)
+  assert.equal(next.result.observation.actions.adoption, null)
+  assert.equal(next.labels.some(l => l.startsWith('adopt:')), false)
+  assert.ok(next.labels.includes('ci#3') && next.labels.includes('reviews#3'))
 })
 
 test('every result carries a status, an observation and the state', async () => {
