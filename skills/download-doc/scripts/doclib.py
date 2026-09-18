@@ -846,6 +846,10 @@ def peek_order(docs: list) -> list:
     return sorted(docs, key=lambda d: (rank.get(d.doc_type, 9), d.doc_id))
 
 
+# ST/NXP document codes (rm0433, ds12110, um10736); "pf3000" is a part, not a document.
+DOC_CODE = re.compile(r"(?:rm|ds|es|an|um|pm|tn)\d{4,}")
+
+
 def norm_title(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
@@ -874,19 +878,17 @@ def plan(docs: list, idx: dict, legacy: dict | None = None) -> dict:
                 # of its own reads identically to "already current".
                 out["incomparable"].append((d, have, verdict, detail))
             continue
-        hit = None
-        for alias in [d.doc_id, *d.aliases]:
-            key = norm_title(alias)
-            hit = (legacy or {}).get(key)
-            if hit is None and len(key) > 12:
+        keys = [norm_title(alias) for alias in [d.doc_id, *d.aliases]]
+        # An exact title first, from any alias, before any prefix guess.
+        hit = next((legacy[k] for k in keys if k in (legacy or {})), None)
+        for key in keys:
+            if hit is None and (len(key) > 12 or DOC_CODE.fullmatch(key)):
                 # Hand-filed titles often append the vendor's cover blurb or a date —
                 # "RP2040 Datasheet: A microcontroller by Raspberry Pi. Feb 2025".
                 # Match on a whole-word prefix so "Pico Datasheet" still can't claim
-                # "Pico W Datasheet".
-                hit = next((v for k, v in (legacy or {}).items()
-                            if k == key or k.startswith(key + " ")), None)
-            if hit:
-                break
+                # "Pico W Datasheet". A document code (RM0433) is as distinctive; a
+                # part number is not: "TM4C123GH6PM Errata" is not its datasheet.
+                hit = next((v for k, v in (legacy or {}).items() if k.startswith(key + " ")), None)
         (out["legacy"].append((d, hit)) if hit else out["new"].append(d))
     return out
 
