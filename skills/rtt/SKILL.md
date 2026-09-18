@@ -1,6 +1,6 @@
 ---
 name: rtt
-description: Use when you need console or printf I/O, log capture, or a raw byte channel over a debug probe on real hardware — the board has no UART wired or its probe no VCOM, firmware that logs over RTT needs reading or writing, "RTT Control Block not found", an RTT server won't come up or drops output, JLinkRTTLogger/JLinkRTTClient/JLinkGDBServer/openocd rtt misbehave, or another workflow (HIL console, SystemView capture) needs RTT stood up on a J-Link, ST-Link, CMSIS-DAP or WCH-Link probe.
+description: Use when console, printf or log I/O must go over a debug probe on real hardware — no UART wired, no probe VCOM, "RTT Control Block not found", an RTT server that will not start or drops output, JLinkRTTLogger or openocd rtt misbehaving, or the RTT ring needs reading post-mortem.
 ---
 
 # rtt — SEGGER RTT transport and console
@@ -14,22 +14,24 @@ SystemView claims its own `"SysView"` up-buffer on the same control block —
 they coexist. The debug probe reads/writes this RAM while the core runs, so
 everything here is zero-wiring: no UART, no VCOM.
 
-Scope: byte transport and console. Timing/profiling → `etm-trace`/`sysview`;
-debugging decision flows and the wedged-target drain model → `target-debug`;
+Scope: byte transport and console. Timing/profiling → `etm-trace`;
+debugging decision flows → `target-debug`;
 Espressif consoles → `esp-target-debug` (USB-Serial-JTAG, no SEGGER RTT).
 
 ## Quick start — console on a J-Link probe
 
-Use the skill's `scripts/rtt.py` (installed at `~/.claude/skills/rtt/scripts/rtt.py`) for every route; do not hand-roll
+Use `<skill dir>/scripts/rtt.py` for every route; do not hand-roll
 JLinkExe/JLinkGDBServer/openocd/telnet pipelines (`--help` for all modes):
 
 ```bash
-# firmware: printf/stdio routed to RTT channel 0 (in TinyUSB: cmake -DBOARD=<board>
-#   -DLOG=2 -DLOGGER=rtt, or Make LOG=2 LOGGER=rtt; the BSP routes sys_read too)
+# firmware: printf/stdio routed to RTT channel 0 — how to build that variant is the
+#   project's build contract (target-debug, "What the project supplies")
 
 # flash + reset FIRST (the console owns the probe once open), then:
-python3 ~/.claude/skills/rtt/scripts/rtt.py --backend jlink --probe <serial> --device <JLINK_DEVICE> --seconds 20
-#   -i forwards stdin to the target; --seconds 0 streams until Ctrl-C/EOF
+python3 <skill dir>/scripts/rtt.py --backend jlink --probe <serial> --device <JLINK_DEVICE> --interface swd --speed auto --seconds 20
+#   or, from the project's HIL config (the backend follows from the board):
+#     --hil-config <file> --board <name> --interface swd --speed auto --seconds 20
+#   --interface and --speed have no default; -i forwards stdin to the target; --seconds 0 streams until Ctrl-C/EOF
 #   --stop-file <fresh path>: automation ends a --seconds 0 capture by creating the
 #   file (exit 0); a path that already exists is a completed cancellation, so exit 0
 #   alone never proves target output
@@ -42,28 +44,20 @@ override the server executables on any platform, as `RTT_NM` does for nm.
 `--device` is the J-Link device name of the MCU. Always pass the probe
 serial — rigs and benches run several probes, and an unpinned flash grabs
 whichever J-Link enumerates first: flash with `JLinkExe -SelectEmuBySN` or
-the build system's equivalent. In TinyUSB: `python3 tools/build_utils.py
-board-info <board>` prints the device name, `-DJLINK_OPTION="-USB <serial>"`
-pins the `ninja <example>-jlink` flash target, and the HIL harness opens the
-same `JlinkRtt` class as a board's console (`"logger": "rtt"` in the roster;
-its `hil` skill). Keep unattended console builds quiet (RTT logging WITHOUT
-verbose log levels): reset-then-attach only preserves what fits the
-up-buffer (stock 1 KB, NO_BLOCK_SKIP), and a chatty boot burst truncates at
-the ring boundary before the drain attaches — measured 1022-1023 B captures
-on ea4088 with verbose logging, enumeration lines falling off the end.
-`BUFFER_SIZE_UP` is the knob when verbose logs are really needed. Shared rig
-boards: hold the project's board lock first.
+the build system's equivalent. Keep unattended console builds quiet (RTT
+logging WITHOUT verbose log levels): reset-then-attach only preserves what
+fits the up-buffer (stock 1 KB, NO_BLOCK_SKIP), and a chatty boot burst
+truncates at the ring boundary before the drain attaches. `BUFFER_SIZE_UP` is
+the knob when verbose logs are really needed. Shared rig boards: hold the
+project's board lock first.
 
 To validate bidirectionality end-to-end you need firmware that both polls
 the console AND replies through the RTT-routed printf; an echo that goes
-out another path proves nothing. In TinyUSB: `board_test` polls
-`board_getchar()` (RTT-aware via `sys_read`) but echoes through
-`board_putchar` → `board_uart_write`, which is NOT logger-aware — on a
-UART-less board the echo hits the `-1` stub and vanishes (measured on
-ea4088); patch its echo to `printf` locally, or drive a host example's menu
-(`msc_file_explorer`, `cdc_msc_hid` — they reply via printf). Sending
-keystrokes to `cdc_msc` and expecting an echo proves nothing: it never polls
-the console.
+out another path proves nothing. Which firmware of a project does that is in
+its notes (`target-debug`'s `projects/`). Without one, prove delivery at the
+target: read the down-buffer's `WrOff` over the probe before and after sending
+(aDown[0] sits at control block + 0x18 + 24 × MaxNumUpBuffers, `WrOff` its
+fourth word) — it advances by the bytes sent.
 
 ## Transport matrix
 
@@ -80,13 +74,8 @@ Validated boards, directions and per-board caveats: [boards.md](boards.md).
 
 ## Capture: J-Link route
 
-`rtt.py` above is this route packaged. Raw form (what it runs):
-
-```bash
-JLinkExe -USB <serial> -device <dev> -if swd -speed 4000 -NoGui 1 -AutoConnect 1 \
-         -RTTTelnetPort <port>     # keep stdin open; 'exit' tears it down
-nc localhost <port>                # JLinkRTTClient minus the banner; carries input too
-```
+`rtt.py` above is this route packaged: JLinkExe owns the probe and serves
+channel 0 on an RTT telnet port.
 
 Commander keeps hunting for the control block and delivers the buffered boot
 burst once the target's first printf creates it. `JLinkGDBServer
@@ -104,12 +93,12 @@ FLASHED elf; the script takes the exact control-block address from `nm` —
 a full-RAM scan is slower and can match stale RAM after a soft reset):
 
 ```bash
-python3 ~/.claude/skills/rtt/scripts/rtt.py --backend openocd --probe <serial> \
+python3 <skill dir>/scripts/rtt.py --backend openocd --probe <serial> \
   --cfg "-f interface/stlink.cfg -f target/stm32h7x.cfg" --elf <flashed.elf> --seconds 20
-#   --channel: up-buffer index (0 = "Terminal" console, 1 = SystemView's "SysView"
-#   buffer in TinyUSB builds; other projects: whichever up-buffer they configured); -i forwards stdin → down-buffer 0
-#   --vid-pid "0x2e8a 0x000c": pin the probe by USB IDs (with or instead of --probe;
-#   also keeps openocd discovery off foreign usbfs nodes)
+#   --channel: up-buffer index (0 = "Terminal" console; any other is whatever the
+#   firmware configured there, e.g. SystemView's "SysView"); -i forwards stdin → the SAME-numbered down-buffer
+#   --vid-pid "0x2e8a 0x000c": pin the probe by USB IDs. With --probe it keeps openocd
+#   discovery off foreign usbfs nodes; alone it must match exactly ONE attached probe
 #   --addr 0x2000xxxx: explicit control-block address when the flashed elf is not at hand
 #   --reset-before-attach: reset the target INSIDE the session (2 s settle, then
 #   attach — the control block must exist before `rtt start` can find it; the ring's
@@ -121,10 +110,6 @@ python3 ~/.claude/skills/rtt/scripts/rtt.py --backend openocd --probe <serial> \
 #   entirely and this flag captures it. NOT for SAMD5x (an in-session reset via the DSU
 #   leaves the core held) or WCH SDI.
 ```
-
-What it runs: `openocd <cfg> -c "adapter serial <sn>" -c init -c "rtt setup
-<nm-addr> 0x800 \"SEGGER RTT\"" -c "rtt polling_interval 1" -c "rtt start"
--c "rtt server start <port> <ch>"`, then a socket on that port.
 
 Attach WITHOUT reset when the flash step already reset the board (on SAMD5x,
 an in-session `reset run` goes through the DSU CPU Reset Extension and leaves
@@ -145,8 +130,7 @@ capture, not a tuning nicety. Prefer SEGGER tools where a J-Link exists.
 ## Post-mortem: reading the ring without a live server
 
 Default log mode is `NO_BLOCK_SKIP`: with no reader draining, the ring holds
-the **first KB after boot, not the tail** — interpretation rules in
-`target-debug`. To keep the last N bytes instead, the firmware must log via
+the **first KB after boot, not the tail**. To keep the last N bytes instead, the firmware must log via
 `SEGGER_RTT_WriteWithOverwriteNoLock` (target drags `RdOff` itself; no host
 needed) — but SEGGER's own restriction comes with it: *"Do not use
 SEGGER_RTT_WriteWithOverwriteNoLock if a J-Link connection reads RTT data"*
@@ -156,14 +140,14 @@ board that also runs a live console (every rig console board does). Reading a we
 core:
 
 ```bash
-python3 ~/.claude/skills/rtt/scripts/rtt.py --backend jlink --dump ring.bin \
-  --probe <serial> --device <JLINK_DEVICE> --elf <flashed.elf>   # or --addr 0x...
+python3 <skill dir>/scripts/rtt.py --backend jlink --dump ring.bin \
+  --probe <serial> --device <JLINK_DEVICE> --interface swd --speed auto \
+  --elf <flashed.elf>   # or --addr 0x...
 # prints pBuffer/Size/WrOff/RdOff; WrOff/RdOff delimit the valid bytes
+# never overwrites: ring.bin must not exist yet; a block without the "SEGGER RTT"
+# signature or with offsets outside its ring is refused before the ring itself is read;
+# only a dump of exactly the ring's size is kept
 ```
-
-(What it runs, for hand-driving JLinkExe: `nm` the ELF for `_SEGGER_RTT`,
-`mem32 <addr+0x18>, 6` = aUp[0] {sName,pBuffer,Size,WrOff,RdOff,Flags},
-then `savebin <file> <pBuffer> <SizeOfBuffer>`.)
 
 ## Buffer modes and locking (target side)
 
@@ -174,13 +158,8 @@ then `savebin <file> <pBuffer> <SizeOfBuffer>`.)
   RTT console output is NOT lossless under load; for high-bandwidth streams
   size the buffer up (SystemView needs 2048–8192) and watch for overflow.
 - Non-ARM ports must supply `SEGGER_RTT_LOCK/UNLOCK`: the vendored generic
-  RISC-V lock uses `mstatus` CSRs that trap (mcause=2) on WCH QingKe. A
-  working port exists in TinyUSB, unmerged (branch
-  `claude/add-systemview-debug`, not on master):
-  `hw/bsp/ch583/sysview_rtt_lock_wch.h` (brace-scoped save/restore of CSR
-  0x800), and the shared `hw/bsp/sysview_rtt_conf_wch.h` that the
-  ch32v20x/ch32v30x family.cmake force-include to win the include-guard race
-  against the vendored conf.
+  RISC-V lock uses `mstatus` CSRs that trap (mcause=2) on WCH QingKe, which
+  needs a save/restore of its own interrupt-enable CSR (0x800) instead.
 
 ## Common mistakes
 
@@ -203,7 +182,9 @@ then `savebin <file> <pBuffer> <SizeOfBuffer>`.)
 - **Unpinned flash with several probes attached** — pin by serial, always.
 - **Two probes wired to one SWD header** — wedges the target; rewire.
 - **Expecting an echo from firmware that never reads the console** — only
-  code that reads down-buffer 0 consumes input (in TinyUSB: `board_getchar()`
-  pollers such as `board_test`).
+  code that reads down-buffer 0 consumes input.
+- **`-i` input that did not arrive** — the capture exits 1 and says so ("did not
+  reach the target"); a stalled write is bounded by `HIL_SERIAL_WRITE_TIMEOUT`
+  (seconds, default 10).
 - **Full-RAM `rtt setup` scans** — can lock onto a stale pre-reset block;
   use the `nm` address.

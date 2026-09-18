@@ -1,7 +1,9 @@
 """Tests for the rtt skill's rtt.py: the JlinkRtt and OpenocdRtt console
 classes and the CLI, against a fake JLinkExe or openocd on PATH -- real
 subprocesses and sockets, no hardware, stdlib only."""
+import contextlib
 import importlib.util
+import io
 import os
 import re
 import select
@@ -31,6 +33,8 @@ _spec.loader.exec_module(rtt)
 FAKE_JLINK = '''#!/usr/bin/env python3
 import os, socket, sys, threading, time
 port = int(sys.argv[sys.argv.index('-RTTTelnetPort') + 1])
+if os.environ.get('FAKE_JLINK_PIDFILE'):
+    open(os.environ['FAKE_JLINK_PIDFILE'], 'w').write(str(os.getpid()))
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(('127.0.0.1', port)); srv.listen(1)
 mode = os.environ.get('FAKE_JLINK_MODE', '')
@@ -44,6 +48,9 @@ def serve():
     if mode == 'banner_only':
         while True:
             if not conn.recv(4096): os._exit(0)
+    if mode == 'deaf':
+        conn.sendall(b'hello from target\\r\\n')
+        time.sleep(600)   # never reads: the client's writes back up
     if mode == 'rst':
         import struct
         conn.recv(4096)   # wait for the client to speak, then reset the connection
@@ -81,6 +88,7 @@ for line in sys.stdin:
     if line.strip() == 'exit': break
 '''
 
+LINK = ('--interface', 'swd', '--speed', 'auto')
 BOARD = {'flasher': {'uid': '000', 'args': '-device FAKE'}}
 
 
@@ -212,7 +220,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
         # --seconds 0 must end on server EOF (rc 1), not hang forever
         env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='die_after_greet')
         r = subprocess.run([sys.executable, str(CLI),
-                            '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--seconds', '0'],
+                            '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', '0'],
                            env=env, capture_output=True, timeout=20)
         self.assertEqual(r.returncode, 1)
         self.assertIn(b'hello from target', r.stdout)
@@ -256,15 +264,15 @@ class JlinkRttFakeProbe(unittest.TestCase):
         def run(*a):
             return subprocess.run([sys.executable, str(CLI), *a], capture_output=True, timeout=15)
         for bad in ('-5', 'nan'):
-            r = run('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--seconds', bad)
+            r = run('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', bad)
             self.assertEqual(r.returncode, 2, f'--seconds {bad} was accepted')
         # the jlink telnet route serves channel 0 only; asking for another is an error,
         # not silence (--dump can read any ring, so it stays allowed there)
-        r = run('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--channel', '1')
+        r = run('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--channel', '1')
         self.assertEqual(r.returncode, 2)
         self.assertIn(b'channel 0 only', r.stderr)
         # a negative index would walk backwards off aUp[] (dump route included)
-        r = run('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--channel', '-1')
+        r = run('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--channel', '-1')
         self.assertEqual(r.returncode, 2)
         self.assertIn(b'>= 0', r.stderr)
 
@@ -313,10 +321,10 @@ class JlinkRttFakeProbe(unittest.TestCase):
         def run(*a, inp=b''):
             return subprocess.run([sys.executable, str(CLI), *a],
                                   input=inp, capture_output=True, timeout=15)
-        r = run('--probe', '000', '--device', 'FAKE')          # no --backend
+        r = run('--probe', '000', '--device', 'FAKE', *LINK)          # no --backend
         self.assertEqual(r.returncode, 2)
         self.assertIn(b'--backend', r.stderr)
-        r = run('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--vid-pid', '0x1 0x2')
+        r = run('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--vid-pid', '0x1 0x2')
         self.assertEqual(r.returncode, 2)                       # vid-pid is openocd-only
         r = run('--backend', 'openocd', '--cfg', '-f x.cfg', '--addr', '0x20000000')
         self.assertEqual(r.returncode, 2)                       # needs --probe or --vid-pid
@@ -328,7 +336,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
     def test_cli_interactive_echo(self):
         env = dict(os.environ, PATH=self._path)
         r = subprocess.run([sys.executable, str(CLI),
-                            '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--seconds', '2', '-i'],
+                            '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', '2', '-i'],
                            env=env, input=b'hi', capture_output=True, timeout=20)
         self.assertEqual(r.returncode, 0)
         self.assertIn(b'HI', r.stdout)         # bytes forwarded without needing a newline
@@ -340,7 +348,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
         # on the rig: instant 'ping' lost, delayed 'ping' echoed)
         env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='late_cb')
         r = subprocess.run([sys.executable, str(CLI),
-                            '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--seconds', '3', '-i'],
+                            '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', '3', '-i'],
                            env=env, input=b'hi', capture_output=True, timeout=25)
         self.assertEqual(r.returncode, 0)
         self.assertIn(b'HI', r.stdout)
@@ -351,7 +359,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
         # which releases after 5 s and forwards anyway on longer runs
         env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='banner_only')
         r = subprocess.run([sys.executable, str(CLI),
-                            '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--seconds', '1', '-i'],
+                            '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', '1', '-i'],
                            env=env, input=b'', capture_output=True, timeout=20)
         self.assertEqual(r.returncode, 0)
         self.assertIn(b'never forwarded', r.stderr)
@@ -363,7 +371,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
         # fails if the handler is removed — subprocess.run capture can't cover it)
         env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='tick')
         p = subprocess.Popen([sys.executable, str(CLI),
-                              '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--seconds', '8'],
+                              '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', '8'],
                              env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         p.stdout.read(10)          # let it stream a little
         p.stdout.close()           # downstream hangs up
@@ -379,7 +387,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
         env = dict(os.environ, PATH=self._path)
         for _ in range(3):
             p = subprocess.Popen([sys.executable, str(CLI),
-                                  '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', '--seconds', '1', '-i'],
+                                  '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', '1', '-i'],
                                  env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE)
             try:
@@ -398,13 +406,57 @@ class JlinkRttFakeProbe(unittest.TestCase):
             self.assertNotIn(b'Exception in thread', err)
 
 
+    def test_cli_input_the_target_never_got_fails_the_capture(self):
+        env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='deaf', HIL_SERIAL_WRITE_TIMEOUT='0.5')
+        with tempfile.TemporaryFile() as flood:
+            flood.write(b'x' * (32 << 20))   # more than the socket buffers will hold
+            flood.seek(0)
+            r = subprocess.run([sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
+                                '--device', 'FAKE', *LINK, '--seconds', '20', '-i'],
+                               stdin=flood, capture_output=True, timeout=60, env=env)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn(b'rtt: -i input did not reach the target: RTT console write stalled', r.stderr)
+        self.assertIn(b'hello from target', r.stdout)
+
+    def test_cli_a_write_under_way_when_the_capture_ends_still_decides_the_result(self):
+        # the capture window closes long before the stalled write gives up
+        env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='deaf', HIL_SERIAL_WRITE_TIMEOUT='2')
+        with tempfile.TemporaryFile() as flood:
+            flood.write(b'x' * (32 << 20))
+            flood.seek(0)
+            r = subprocess.run([sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
+                                '--device', 'FAKE', *LINK, '--seconds', '0.3', '-i'],
+                               stdin=flood, capture_output=True, timeout=60, env=env)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn(b'rtt: -i input did not reach the target: RTT console write stalled', r.stderr)
+
+    def test_cli_a_term_while_waiting_out_a_write_still_closes_the_server(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryFile() as flood:
+            pidfile = Path(d) / 'server.pid'
+            env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='deaf', HIL_SERIAL_WRITE_TIMEOUT='3',
+                       FAKE_JLINK_PIDFILE=str(pidfile))
+            flood.write(b'x' * (32 << 20))
+            flood.seek(0)
+            p = subprocess.Popen([sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
+                                  '--device', 'FAKE', *LINK, '--seconds', '0.3', '-i'],
+                                 stdin=flood, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            time.sleep(1.5)                 # the window is over, the stalled write is not
+            p.send_signal(signal.SIGTERM)
+            _, err = p.communicate(timeout=60)
+            server = int(pidfile.read_text())
+        self.assertNotIn(b'Traceback', err)
+        self.assertEqual(p.returncode, 1, err)
+        self.assertIn(b'RTT console write stalled', err)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(server, 0)
+
     def test_cli_stop_file_closes_a_continuous_capture(self):
         env = dict(os.environ, PATH=self._path, FAKE_JLINK_MODE='tick')
         with tempfile.TemporaryDirectory() as temp_dir:
             stop_file = Path(temp_dir) / 'capture.stop'
             proc = subprocess.Popen(
                 [sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
-                 '--device', 'FAKE', '--seconds', '0', '--stop-file', str(stop_file)],
+                 '--device', 'FAKE', *LINK, '--seconds', '0', '--stop-file', str(stop_file)],
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             # the marker goes down only once the capture is demonstrably streaming
             seen = b''
@@ -439,7 +491,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
             env = dict(os.environ, RTT_JLINK_EXE=str(never), NEVER_STARTED=str(started))
             proc = subprocess.Popen(
                 [sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
-                 '--device', 'FAKE', '--stop-file', str(stop_file)],
+                 '--device', 'FAKE', *LINK, '--stop-file', str(stop_file)],
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 end = time.monotonic() + 10
@@ -454,6 +506,222 @@ class JlinkRttFakeProbe(unittest.TestCase):
                     proc.kill()
                     proc.communicate()
         self.assertEqual(proc.returncode, 0, stderr)
+
+
+class CliSelection(unittest.TestCase):
+    """What the CLI refuses before any server is started."""
+
+    def run_cli(self, *a, env=None):
+        return subprocess.run([sys.executable, str(CLI), *a], capture_output=True, text=True,
+                              timeout=15, env=dict(os.environ, **(env or {})))
+
+    def fake_sysfs(self, devices):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        for name, attrs in devices.items():
+            (Path(d.name) / name).mkdir()
+            for k, v in attrs.items():
+                (Path(d.name) / name / k).write_text(v + '\n')
+        return d.name
+
+    def test_a_blank_probe_is_refused_by_either_backend(self):
+        for backend in (('--backend', 'jlink', '--device', 'X', *LINK), ('--backend', 'openocd', '--cfg', 'x.cfg')):
+            r = self.run_cli(*backend, '--probe', '   ', '--addr', '20000000')
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn('--probe is empty', r.stderr)
+
+    def test_the_jlink_link_is_never_assumed(self):
+        base = ('--backend', 'jlink', '--probe', '000', '--device', 'X')
+        for given in ((), ('--interface', 'swd'), ('--speed', '4000')):
+            r = self.run_cli(*base, *given)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn('needs --probe, --device, --interface and --speed', r.stderr)
+        for bad in ('fast', '0', '4000kHz', '-1'):
+            r = self.run_cli(*base, '--interface', 'swd', f'--speed={bad}')
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn('--speed must be kHz', r.stderr)
+        r = self.run_cli('--backend', 'openocd', '--probe', '000', '--cfg', 'x.cfg', '--addr', '20000000',
+                         '--interface', 'swd')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('belong to --cfg', r.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX exec semantics')
+    def test_the_link_reaches_jlinkexe_after_its_defaults_for_a_stream_and_a_dump(self):
+        with tempfile.TemporaryDirectory() as d:
+            argv = Path(d) / 'argv'
+            exe = Path(d) / 'jlink'
+            exe.write_text(f'#!{sys.executable}\nimport sys\n'
+                           f'open({str(argv)!r}, "a").write(" ".join(sys.argv[1:]) + "\\n")\nsys.exit(1)\n')
+            exe.chmod(0o755)
+            base = ('--backend', 'jlink', '--probe', '000', '--device', 'X', '--interface', 'jtag', '--speed', '1000')
+            self.run_cli(*base, '--seconds', '1', env={'RTT_JLINK_EXE': str(exe)})
+            self.run_cli(*base, '--dump', str(Path(d) / 'ring.bin'), '--addr', '20000000',
+                         env={'RTT_JLINK_EXE': str(exe)})
+            stream, dump = argv.read_text().splitlines()[:2]
+        self.assertLess(stream.index('-if swd'), stream.index('-if jtag -speed 1000'))
+        self.assertIn('-if jtag -speed 1000', dump)
+        self.assertNotIn('swd', dump)
+
+    def test_usb_serials_counts_only_matching_devices(self):
+        sysfs = self.fake_sysfs({
+            '1-1': {'idVendor': '2e8a', 'idProduct': '000c', 'serial': 'E661AAAA'},
+            '1-2': {'idVendor': '2e8a', 'idProduct': '000c', 'serial': 'E661BBBB'},
+            '1-3': {'idVendor': '2e8a', 'idProduct': '000c'},               # no serial string
+            '1-4': {'idVendor': '0483', 'idProduct': '374b', 'serial': 'STLINK'},
+            '1-0:1.0': {},                                                  # an interface node
+        })
+        self.assertEqual(rtt.usb_serials('0x2e8a 0x000c', sysfs), ['E661AAAA', 'E661BBBB', ''])
+        self.assertEqual(rtt.usb_serials('0x0483 0x374B', sysfs), ['STLINK'])
+        self.assertEqual(rtt.usb_serials('0x1366 0x0101', sysfs), [])
+        self.assertIsNone(rtt.usb_serials('0x1366 0x0101', sysfs + '/absent'))
+
+    def main_with(self, serials, *argv):
+        err = io.StringIO()
+        with mock.patch.object(rtt, 'usb_serials', return_value=serials), \
+                mock.patch.object(sys, 'argv', ['rtt.py', *argv]), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            rtt.main()
+        return cm.exception.code, err.getvalue()
+
+    def test_usb_ids_alone_must_name_exactly_one_probe(self):
+        argv = ('--backend', 'openocd', '--vid-pid', '0x2e8a 0x000c', '--cfg', '-f x.cfg',
+                '--addr', '0x20000000')
+        code, err = self.main_with(['E661AAAA', 'E661BBBB'], *argv)
+        self.assertEqual(code, 2)
+        self.assertIn('matches 2 attached device(s) (serials: E661AAAA, E661BBBB)', err)
+        self.assertIn('--probe', err)
+        code, err = self.main_with([], *argv)
+        self.assertIn('matches 0 attached device(s)', err)
+        code, err = self.main_with(None, *argv)
+        self.assertIn('cannot count the attached probes', err)
+
+    def test_a_malformed_vid_pid_is_refused_before_counting(self):
+        r = self.run_cli('--backend', 'openocd', '--vid-pid', '2e8a:000c', '--cfg', '-f x.cfg',
+                         '--addr', '0x20000000')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('0xVVVV 0xPPPP', r.stderr)
+
+    def test_one_source_for_the_control_block_address(self):
+        r = self.run_cli('--backend', 'openocd', '--probe', '000', '--cfg', '-f x.cfg',
+                         '--addr', '0x20000000', '--elf', 'fw.elf')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('pass one', r.stderr)
+
+    def test_seconds_must_be_finite(self):
+        r = self.run_cli('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', 'inf')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('finite', r.stderr)
+
+    def test_the_cli_refuses_a_write_timeout_it_cannot_honour(self):
+        for bad in ('soon', '0', 'inf'):
+            r = self.run_cli('--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK,
+                             env={'HIL_SERIAL_WRITE_TIMEOUT': bad})
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn('HIL_SERIAL_WRITE_TIMEOUT', r.stderr)
+
+
+# JLinkExe for the dump route: answers mem32/savebin from a synthetic target whose
+# control block sits at 0x20000000 with aUp[0] = 0x400 B at 0x20001000. FAKE_DUMP picks
+# what is wrong with it.
+FAKE_DUMP_JLINK = r"""
+import os, re, struct, sys
+mode = os.environ.get('FAKE_DUMP', '')
+CB, RING, SIZE = 0x20000000, 0x20001000, 0x400
+ident = b'SEGGER XXX' if mode == 'no_signature' else b'SEGGER RTT'
+wroff = SIZE if mode == 'wroff_out_of_range' else 0x10
+mem = ident.ljust(16, b'\0') + struct.pack('<2I', 2, 2)
+mem += struct.pack('<6I', 0x10001234, RING, SIZE, wroff, 0, 0)       # aUp[0]
+mem += struct.pack('<6I', 0, 0, 0, 0, 0, 0)                           # aUp[1]: never set up
+for line in sys.stdin:
+    m = re.match(r'mem32 (0x[0-9a-f]+), (\d+)', line)
+    if m:
+        a, n = int(m.group(1), 16), int(m.group(2))
+        if mode == 'read_fails' and a != CB:
+            print('Could not read memory.')
+            continue
+        shown = a + 4 if mode == 'shifted' and a != CB else a
+        if a - CB + 4 * n > len(mem):
+            print('Could not read memory.')
+            continue
+        w = struct.unpack_from(f'<{n}I', mem, a - CB)
+        for i in range(0, n, 4):
+            print(f'J-Link>{shown + 4 * i:08X} = ' + ' '.join(f'{x:08X}' for x in w[i:i + 4]))
+    m = re.match(r'savebin (\S+), (0x[0-9a-f]+), (0x[0-9a-f]+)', line)
+    if m and mode != 'no_file':
+        n = int(m.group(3), 16) + {'short': -1, 'long': 1}.get(mode, 0)
+        open(m.group(1), 'wb').write(b'R' * n)
+if mode in ('transport_dies', 'transport_dies_late'):
+    if mode == 'transport_dies' or os.path.exists(os.environ['FAKE_DUMP_OUT']):
+        print('USB communication error: probe disconnected')
+        sys.exit(1)
+"""
+
+
+@unittest.skipIf(os.name == 'nt', 'POSIX exec semantics')
+class DumpRing(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.tmp = Path(d.name)
+        self.exe = self.tmp / 'jlink'
+        self.exe.write_text(f'#!{sys.executable}\n{FAKE_DUMP_JLINK}')
+        self.exe.chmod(0o755)
+        self.out = self.tmp / 'ring.bin'
+
+    def dump(self, mode='', out=None, channel='0'):
+        return subprocess.run(
+            [sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK,
+             '--addr', '20000000', '--channel', channel, '--dump', str(out or self.out)],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, RTT_JLINK_EXE=str(self.exe), FAKE_DUMP=mode,
+                     FAKE_DUMP_OUT=str(out or self.out)))
+
+    def test_a_whole_ring_is_dumped(self):
+        r = self.dump()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.out.read_bytes(), b'R' * 0x400)
+        self.assertIn('ring: 1024 B at 0x20001000, WrOff=0x10 RdOff=0x0', r.stderr)
+
+    def test_an_existing_file_is_never_overwritten(self):
+        self.out.write_text('an earlier dump')
+        r = self.dump()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('already exists', r.stderr)
+        self.assertEqual(self.out.read_text(), 'an earlier dump')
+        r = self.dump(out=self.tmp / 'no-such-dir' / 'ring.bin')
+        self.assertIn('no such directory', r.stderr)
+
+    def test_a_descriptor_that_cannot_be_trusted_is_refused_before_the_ring_is_read(self):
+        for mode, says in (('no_signature', 'no RTT control block at 0x20000000'),
+                           ('wroff_out_of_range', 'WrOff=0x400 RdOff=0x0 must be below its size 0x400'),
+                           ('read_fails', 'could not read aUp[0] at 0x20000018'),
+                           ('shifted', 'could not read aUp[0] at 0x20000018')):
+            r = self.dump(mode)
+            self.assertEqual(r.returncode, 1, mode)
+            self.assertIn(says, r.stderr, mode)
+            self.assertFalse(self.out.exists(), mode)
+        r = self.dump(channel='1')
+        self.assertIn('up-buffer 1 is not initialized', r.stderr)
+        r = self.dump(channel='2')
+        self.assertIn('this firmware has 2 up-buffer(s)', r.stderr)
+
+    def test_a_commander_that_fails_after_answering_fails_the_dump(self):
+        for mode in ('transport_dies', 'transport_dies_late'):   # during the descriptor read; during savebin
+            r = self.dump(mode)
+            self.assertEqual(r.returncode, 1, mode)
+            self.assertIn('jlink exited 1:', r.stderr, mode)
+            self.assertIn('USB communication error: probe disconnected', r.stderr, mode)
+            self.assertFalse(self.out.exists(), mode)
+            self.assertNotIn('ring: 1024 B', r.stderr, mode)
+
+    def test_only_a_dump_of_exactly_the_ring_is_kept(self):
+        for mode, says in (('short', 'savebin wrote 1023 B for a 1024 B ring'),
+                           ('long', 'savebin wrote 1025 B for a 1024 B ring'),
+                           ('no_file', 'savebin produced no data')):
+            r = self.dump(mode)
+            self.assertEqual(r.returncode, 1, mode)
+            self.assertIn(says, r.stderr, mode)
+            self.assertFalse(self.out.exists(), mode)
 
 
 class StripBanner(unittest.TestCase):
@@ -564,7 +832,7 @@ class RttPlatformLifecycle(unittest.TestCase):
     def test_cli_missing_jlink_is_a_clean_error_on_this_platform(self):
         env = dict(os.environ, RTT_JLINK_EXE='definitely-not-a-jlink-tool')
         r = subprocess.run([sys.executable, str(CLI), '--backend', 'jlink',
-                            '--probe', '000', '--device', 'FAKE', '--seconds', '0.1'],
+                            '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', '0.1'],
                            env=env, capture_output=True, timeout=15)
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn(b'not on PATH', r.stderr)
@@ -811,7 +1079,7 @@ class RttPlatformLifecycle(unittest.TestCase):
             stop_file.touch()
             r = subprocess.run(
                 [sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
-                 '--device', 'FAKE', '--stop-file', str(stop_file)],
+                 '--device', 'FAKE', *LINK, '--stop-file', str(stop_file)],
                 capture_output=True, timeout=20)
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -824,7 +1092,7 @@ class RttPlatformLifecycle(unittest.TestCase):
                           ['--backend', 'openocd', '--probe', '000', '--elf', 'x.elf'],   # no --cfg
                           ['--backend', 'openocd', '--probe', '000', '--cfg', '-f x.cfg'],  # no --elf/--addr
                           ['--backend', 'openocd', '--probe', '000', '--cfg', '-f x.cfg', '--addr', 'zz'],
-                          ['--backend', 'jlink', '--probe', '000', '--device', 'FAKE',
+                          ['--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK,
                            '--dump', str(Path(temp_dir) / 'ring.bin'), '--addr', '0x20000000']):
                 r = subprocess.run([sys.executable, str(CLI), *extra, '--stop-file', str(stop_file)],
                                    capture_output=True, timeout=20)
@@ -856,7 +1124,7 @@ class RttPlatformLifecycle(unittest.TestCase):
                 self.assertTrue(kwargs['stop']())
                 raise rtt._StopCapture
 
-            argv = [str(CLI), '--backend', 'jlink', '--probe', '000', '--device', 'FAKE',
+            argv = [str(CLI), '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK,
                     '--stop-file', str(stop_file)]
             with mock.patch.object(sys, 'argv', argv), \
                  mock.patch.object(rtt, 'JlinkRtt', side_effect=start_console):

@@ -1,11 +1,14 @@
 # rtt — per-board validation matrix
 
+Board names are TinyUSB BSP aliases (`hw/bsp/*/boards/<name>` in `hathach/tinyusb`)
+and the firmware was its examples: the record of what was measured, on what. The
+probe, route and device/cfg columns are what carries over to another project.
+
 A row appears here only after the board was exercised on real hardware; a new
 validation adds the row AND any caveat it surfaced. "Read" = console/log
 capture reached the host; "Write" = the target demonstrably consumed console
-input (an echoing firmware returned the sent bytes; in TinyUSB a
-printf-patched `board_test`, stock cannot — see SKILL.md's echo-validation
-note). Routes match
+input (an echoing firmware returned the sent bytes; which firmware can is in the
+project's notes, `target-debug`'s `projects/tinyusb.md`, "Logs and RTT"). Routes match
 SKILL.md's capture sections; `Device/cfg` is the J-Link `--device` string or
 the openocd target cfg. Rig rows (ci.lan) were validated 2026-08-24 by a
 flash→capture→`ping`-echo sweep under per-board rig locks, and
@@ -13,7 +16,11 @@ re-validated 2026-08-25 end-to-end through the skill's own CLI
 (`scripts/rtt.py`, jlink + openocd backends): 20/20 read+write —
 including CONCURRENTLY at 8 parallel consoles (20 boards in 39 s, mixed
 routes, no port collisions or cross-board output bleed: one server per
-probe on its own ephemeral port). htpc rows on the local bench. The openocd backend's `--reset-before-attach`
+probe on its own ephemeral port). htpc rows on the local bench (a dev PC). The two
+htpc rows dated 2026-09-18 are that day's CLI runs: pico2_etm_trace boot log
+read and `--dump` byte-identical to an independent memory read;
+raspberry_pi_pico boot log read, input delivery shown by the down-buffer `WrOff`
+advancing 5 → 8, which is delivery, not a Write. The openocd backend's `--reset-before-attach`
 is decode-validated: a channel-1 SystemView capture on stm32h743nucleo
 (byte-identical boot preamble to the sysview campaign's golden reference,
 49765 events decoded, ISR/task timings matching to 0.1 µs, overflow 0).
@@ -22,6 +29,8 @@ is decode-validated: a channel-1 SystemView capture on stm32h743nucleo
 | ------------------------ | ---- | ---------------------- | ------- | ---- | ----- | --------------------- |
 | ea4088_quickstart        | htpc | LPC-Link2 J-Link fw    | J-Link  | yes  | yes   | `LPC4088`             |
 | raspberry_pi_pico2       | htpc | J-Trace PRO            | J-Link  | yes  | —     | `rp2350_m33_0`        |
+| pico2_etm_trace (2026-09-18) | htpc | J-Trace PRO        | J-Link  | yes  | —     | `RP2350_M33_0`        |
+| raspberry_pi_pico (2026-09-18) | htpc | debugprobe (CMSIS-DAP) | OpenOCD | yes | — | `target/rp2040.cfg`   |
 | frdm_k64f                | ci   | J-Link                 | J-Link  | yes  | yes   | `MK64FN1M0xxx12`      |
 | feather_nrf52840_express | ci   | J-Link                 | J-Link  | yes  | yes   | `nrf52840_xxaa`       |
 | metro_m4_express         | ci   | J-Link                 | J-Link  | yes  | yes   | `ATSAMD51J19`         |
@@ -57,8 +66,7 @@ always pass them (`--probe` / `adapter serial`).
   USB; physical replug). JLinkGDBServer never finds the CB headless on this
   part; JLinkRTTLogger 0/6.
 - **raspberry_pi_pico2 (htpc, J-Trace)**: pin the probe by serial — that
-  bench runs two J-Links (in TinyUSB: `-DJLINK_OPTION="-USB <sn>"` for the
-  flash target). Never set a custom JLinkScript for RP2350 over J-Link. Write path
+  bench runs two J-Links, the flash step included. Never set a custom JLinkScript for RP2350 over J-Link. Write path
   untested there only because the flashed example doesn't poll the console
   (the ci row's debugprobe sweep validated RP2350 writes).
 - **ST-Link rows**: flashed by `STM32_Programmer_CLI`; RTT capture is a
@@ -73,7 +81,6 @@ always pass them (`--probe` / `adapter serial`).
   the rig.
 - `nanoch32v203`, `ch32v103r_r1_1v0`, `ch32v307v_r1_1v0`, `ch582m_evt` — in
   TinyUSB a `LOGGER=rtt` build traps on WCH QingKe (the vendored generic RISC-V
-  `SEGGER_RTT_LOCK` reads `mstatus` CSRs → mcause=2; the working lock port
-  `sysview_rtt_lock_wch.h` lives only on TinyUSB branch `claude/add-systemview-debug`),
-  and SDI permits no live streaming anyway (transport matrix). Revisit after
-  that branch merges.
+  `SEGGER_RTT_LOCK` reads `mstatus` CSRs → mcause=2; the lock port's history is in
+  `target-debug`'s `projects/tinyusb.md`), and SDI permits no live streaming anyway
+  (transport matrix).

@@ -3,10 +3,11 @@
 skill's SKILL.md is the manual).
 
 Three routes (see the skill's transport matrix for which route a probe gets).
---backend is always explicit:
+--backend is explicit unless --hil-config supplies it:
 
   J-Link route (console/capture, channel 0 only)
-      rtt.py --backend jlink --probe <sn> --device <JLINK_DEVICE> [--seconds N] [-i]
+      rtt.py --backend jlink --probe <sn> --device <JLINK_DEVICE> --interface swd --speed auto \\
+             [--seconds N] [-i]
   OpenOCD route (native probes: ST-Link/CMSIS-DAP; console/capture, any channel)
       rtt.py --backend openocd [--probe <sn>] [--vid-pid "0xVVVV 0xPPPP"] \\
              --cfg "-f interface/stlink.cfg -f target/stm32h7x.cfg" \\
@@ -14,22 +15,22 @@ Three routes (see the skill's transport matrix for which route a probe gets).
              [--reset-before-attach]   # capture from the target's boot (SystemView)
   Post-mortem ring dump (J-Link, no halt — debug-AP reads)
       rtt.py --backend jlink --dump <out.bin> --probe <sn> --device <JLINK_DEVICE> \\
-             (--elf <flashed.elf> | --addr 0x...)
+             --interface swd --speed 4000 (--elf <flashed.elf> | --addr 0x...)
 
 The probe is owned for the whole run: flash and reset BEFORE starting this, never
 reset the target while it is attached. Pin the probe: rigs and benches run
 several (jlink: --probe serial; openocd: --probe and/or --vid-pid).
 
-The classes (JlinkRtt for J-Link, OpenocdRtt for openocd-driven probes) expose
-the slice of pyserial the HIL harness uses — read/in_waiting/write/close/timeout,
-reset_input_buffer, context-manager use, plus an `eof` latch — and are imported
-by test/hil/helper/hil_util.py, so this file is HARNESS-CRITICAL: a change here
-is classified like a test/hil/ harness change (tools/ci_select.py) and runs the
-console unit tests (pre-commit hil-test hook, test/hil/test/test_hil_rtt.py).
-Stdlib only — hil_util imports this file, never the other way around.
+Importable API, kept stable for harnesses that load this file by path: JlinkRtt
+(J-Link) and OpenocdRtt (openocd-driven probes) expose the slice of pyserial a
+test harness uses — read/in_waiting/write/close/timeout, reset_input_buffer,
+context-manager use, plus an `eof` latch — alongside RttError, RTT_BANNER_RE and
+strip_banner. One self-contained file, stdlib only: it is copied to rigs as is.
 """
 import argparse
 import contextlib
+import json
+import math
 import os
 import re
 import select
@@ -229,7 +230,27 @@ def nm_rtt_addr(elf: str, nm: str = None, stop=None) -> int:
         m = re.match(r'^([0-9a-fA-F]+)\s+[bBdD]\s+_SEGGER_RTT$', line.strip())
         if m:
             return int(m.group(1), 16)
-    raise SystemExit(f'no defined _SEGGER_RTT symbol in {elf} — was it built with LOGGER=rtt?')
+    raise SystemExit(f'no defined _SEGGER_RTT symbol in {elf} — was it built with RTT logging?')
+
+
+def usb_serials(vid_pid: str, sysfs: str = '/sys/bus/usb/devices'):
+    """Serial numbers of the attached USB devices with these IDs ('' for one that has
+    none); None where there is no sysfs to ask, so the caller can refuse to guess."""
+    if not os.path.isdir(sysfs):
+        return None
+    vid, pid = (int(x, 16) for x in vid_pid.split())
+    found = []
+    for dev in sorted(os.listdir(sysfs)):
+        def attr(name):
+            try:
+                with open(os.path.join(sysfs, dev, name)) as f:
+                    return f.read().strip()
+            except OSError:
+                return None
+        ids = attr('idVendor'), attr('idProduct')
+        if None not in ids and (int(ids[0], 16), int(ids[1], 16)) == (vid, pid):
+            found.append(attr('serial') or '')
+    return found
 
 
 class _SocketRtt:
@@ -593,71 +614,97 @@ class OpenocdRtt(_SocketRtt):
         _terminate_process_group(proc, force=False)
 
 
-def dump_ring(probe: str, device: str, addr: int, out_path: str, channel: int = 0) -> int:
+def _mem32_words(stdout: str) -> dict:
+    """address -> word for every mem32 row JLinkExe printed."""
+    words = {}
+    for line in stdout.splitlines():
+        # UNANCHORED: when the script arrives on stdin, some JLinkExe versions glue
+        # the 'J-Link>' prompt onto the result line with no newline between
+        m = re.search(r'([0-9A-Fa-f]{8}) = ((?:[0-9A-Fa-f]{8} ?)+)$', line.strip())
+        if m:
+            for n, w in enumerate(m.group(2).split()):
+                words[int(m.group(1), 16) + 4 * n] = int(w, 16)
+    return words
+
+
+def dump_ring(probe: str, device: str, addr: int, out_path: str, channel: int = 0, *,
+              interface: str, speed: str) -> int:
     """Post-mortem: read aUp[channel]'s ring over the debug AP (no halt) via JLinkExe.
     NO_BLOCK_SKIP means an undrained ring holds the FIRST KB after boot, not the
-    tail — interpretation rules in the target-debug skill."""
+    tail."""
     if re.search(r'[\s"\']', out_path):
         raise SystemExit(f'--dump path must not contain whitespace or quotes: {out_path!r} '
                          f'(it is spliced into a JLinkExe script line)')
-    # a stale file from an earlier run must not satisfy the success check below
-    with contextlib.suppress(OSError):
-        os.remove(out_path)
-    # SEGGER_RTT_CB: acID[16], MaxNumUpBuffers, MaxNumDownBuffers, then aUp[] at 0x18,
-    # each ring 6 words {sName, pBuffer, SizeOfBuffer, WrOff, RdOff, Flags}. Read the
-    # counts with the descriptor so an out-of-range channel is rejected instead of
-    # reading whatever RAM follows the array.
+    # an earlier dump is evidence, and a stale file must not pass for this run's
+    if os.path.lexists(out_path):
+        raise SystemExit(f'--dump {out_path} already exists: a dump never overwrites, name a new file')
+    if not os.path.isdir(os.path.dirname(os.path.abspath(out_path))):
+        raise SystemExit(f'--dump {out_path}: no such directory')
     jlink = [_tool_exe('RTT_JLINK_EXE', 'JLinkExe', 'JLink.exe'),
-             '-USB', probe, '-device', device, '-if', 'swd',
-             '-speed', '4000', '-NoGui', '1', '-AutoConnect', '1']
+             '-USB', probe, '-device', device, '-if', interface,
+             '-speed', speed, '-NoGui', '1', '-AutoConnect', '1']
 
     def _jlink_run(script: str):
         # same clean-exit contract as nm_rtt_addr/_spawn: a missing binary or a wedged
         # probe must not reach the CLI as a traceback
         try:
-            return subprocess.run(jlink, input=script, capture_output=True, text=True, timeout=60)
+            r = subprocess.run(jlink, input=script, capture_output=True, text=True, timeout=60)
         except FileNotFoundError:
             raise SystemExit(f'{jlink[0]} not on PATH — the --dump route needs J-Link Commander')
         except subprocess.TimeoutExpired:
             raise SystemExit(f'{jlink[0]} did not finish in 60 s — probe wedged or target unreachable?')
+        if r.returncode != 0:
+            # what it printed until then may read like a good answer
+            raise SystemExit(f'{jlink[0]} exited {r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}')
+        return r
 
-    script = f'mem32 {addr + 0x10:#x}, 2\nmem32 {addr + 0x18 + channel * 24:#x}, 6\nexit\n'
-    r = _jlink_run(script)
-    words = []
-    for line in r.stdout.splitlines():
-        # UNANCHORED: when the script arrives on stdin, some JLinkExe versions glue
-        # the 'J-Link>' prompt onto the result line with no newline between
-        m = re.search(r'([0-9A-Fa-f]{8}) = ((?:[0-9A-Fa-f]{8} ?)+)$', line.strip())
-        if m:
-            words += [int(w, 16) for w in m.group(2).split()]
-    if len(words) < 8:
-        print(r.stdout[-500:], file=sys.stderr)
-        raise SystemExit(f'could not read the aUp[{channel}] descriptor — wrong control block address?')
-    max_up = words[0]
+    # SEGGER_RTT_CB: acID[16], MaxNumUpBuffers, MaxNumDownBuffers, then aUp[] at 0x18,
+    # each ring 6 words {sName, pBuffer, SizeOfBuffer, WrOff, RdOff, Flags}
+    desc = addr + 0x18 + channel * 24
+    r = _jlink_run(f'mem32 {addr:#x}, 6\nmem32 {desc:#x}, 6\nexit\n')
+    words = _mem32_words(r.stdout)
+    # by address, not by position: a read that failed or came back for another
+    # address must not shift a neighbour's words into the descriptor
+    def need(base, what):
+        if any(base + 4 * n not in words for n in range(6)):
+            print(r.stdout[-500:], file=sys.stderr)
+            raise SystemExit(f'could not read {what} at {base:#x} — probe, target or address problem')
+        return [words[base + 4 * n] for n in range(6)]
+
+    header = need(addr, 'the control block')
+    ident = b''.join(w.to_bytes(4, 'little') for w in header[:4])
+    if ident.rstrip(b'\0') != b'SEGGER RTT':
+        raise SystemExit(f'no RTT control block at {addr:#x} (found {ident!r} where "SEGGER RTT" '
+                         f'belongs) — wrong address, or the firmware has not initialized RTT yet')
+    max_up = header[4]
     if not 0 < max_up <= 32:
-        raise SystemExit(f'control block at {addr:#x} looks uninitialized '
-                         f'(MaxNumUpBuffers={max_up}) — the target has not written to RTT yet, '
-                         f'or the address is wrong')
+        raise SystemExit(f'control block at {addr:#x} is corrupt (MaxNumUpBuffers={max_up})')
     if channel >= max_up:
         raise SystemExit(f'--channel {channel}: this firmware has {max_up} up-buffer(s) (0..{max_up - 1})')
-    _, pbuf, size, wroff, rdoff, _ = words[2:8]
+    _, pbuf, size, wroff, rdoff, _ = need(desc, f'aUp[{channel}]')
     if not pbuf or not size:
         raise SystemExit(f'up-buffer {channel} is not initialized (pBuffer={pbuf:#x} size={size}) — '
                          f'the target has not written to it yet')
-    script = f'savebin {out_path}, {pbuf:#x}, {size:#x}\nexit\n'
-    _jlink_run(script)
+    if wroff >= size or rdoff >= size:
+        raise SystemExit(f'up-buffer {channel} is corrupt: WrOff={wroff:#x} RdOff={rdoff:#x} must be '
+                         f'below its size {size:#x}')
+    try:
+        _jlink_run(f'savebin {out_path}, {pbuf:#x}, {size:#x}\nexit\n')
+    except SystemExit:
+        # ours, and of unknown completeness: it must not block the next attempt either
+        with contextlib.suppress(OSError):
+            os.remove(out_path)
+        raise
     # JLinkExe exits 0 even when a command inside its script fails, so the only proof
-    # savebin worked is the file itself: it must hold the WHOLE ring, since a read that
-    # dies partway (probe disconnect, unreadable address) still leaves a short file that
-    # would otherwise be reported as a complete dump. Removing it also keeps the
-    # invariant above -- no stale file can satisfy a later run's check.
+    # savebin worked is the file itself, and only at exactly the ring's size: a read
+    # that dies partway leaves a short file that would pass for a complete dump
     got = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-    if got < size:
+    if got != size:
         with contextlib.suppress(OSError):
             os.remove(out_path)
         if got == 0:
             raise SystemExit(f'savebin produced no data at {out_path} — probe or address problem')
-        raise SystemExit(f'savebin wrote {got}/{size} B to {out_path} (truncated dump removed) '
+        raise SystemExit(f'savebin wrote {got} B for a {size} B ring to {out_path} (removed) '
                          f'— probe or address problem')
     print(f'ring: {size} B at {pbuf:#x}, WrOff={wroff:#x} RdOff={rdoff:#x} -> {out_path}\n'
           f'valid bytes wrap at WrOff; default NO_BLOCK_SKIP holds the FIRST data after '
@@ -665,18 +712,89 @@ def dump_ring(probe: str, device: str, addr: int, out_path: str, channel: int = 
     return 0
 
 
+HIL_PROBE_ROUTES = {'jlink': 'jlink', 'openocd': 'openocd', 'stlink': 'openocd'}
+
+
+def hil_flasher(path, board):
+    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name",
+    "flasher": {"name", "uid", "args", "vid_pid"}}]}), checked but not completed: only
+    flasher.name must be there, what else is missing is the caller's to supply. Raises
+    ValueError. Kept identical in rtt.py and pc_sample.py, which are copied around alone."""
+    try:
+        with open(path) as f:
+            config = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(f'--hil-config {path}: {e}')
+    boards = config.get('boards') if isinstance(config, dict) else None
+    if not isinstance(boards, list) or not all(isinstance(b, dict) for b in boards):
+        raise ValueError(f'--hil-config {path}: expected {{"boards": [{{...}}, ...]}}')
+    found = [b for b in boards if b.get('name') == board]
+    if len(found) != 1:
+        names = ', '.join(sorted(str(b.get('name')) for b in boards))
+        raise ValueError(f'--board {board}: {len(found)} entries of that name in {path} (it has: {names})')
+    flasher = found[0].get('flasher')
+    if not isinstance(flasher, dict) or not isinstance(flasher.get('name'), str):
+        raise ValueError(f'--board {board}: no flasher.name in {path}')
+    if flasher['name'] not in HIL_PROBE_ROUTES:
+        raise ValueError(f"--board {board} is flashed over {flasher['name']!r}, which is no debug-probe route "
+                         f"(known: {', '.join(HIL_PROBE_ROUTES)}); name the probe with explicit flags")
+    for key in ('uid', 'args', 'vid_pid'):
+        if key in flasher and (not isinstance(flasher[key], str) or not flasher[key].strip()):
+            raise ValueError(f'--board {board}: flasher.{key} in {path} must be a non-empty string, '
+                             f'got {flasher[key]!r}')
+    return flasher
+
+
+def hil_jlink_device(board, flasher):
+    """The J-Link device of a jlink entry, whose args may be exactly `-device NAME`: any
+    other flag there would be one this script silently drops."""
+    if 'args' not in flasher:
+        return None
+    try:
+        words = shlex.split(flasher['args'])
+    except ValueError as e:
+        raise ValueError(f"--board {board}: flasher.args {flasher['args']!r}: {e}")
+    if len(words) != 2 or words[0] != '-device' or not words[1].strip():
+        raise ValueError(f"--board {board}: flasher.args must be exactly '-device NAME', got "
+                         f"{flasher['args']!r}; pass the probe flags explicitly instead")
+    return words[1]
+
+
+def hil_merge(given, board, **resolved):
+    """Fill the flags the caller left out; one the caller gave must agree with the file."""
+    for flag, value in resolved.items():
+        explicit = getattr(given, flag)
+        if value is None:
+            continue
+        if explicit is not None and explicit.strip() != value.strip():
+            raise ValueError(f"--{flag.replace('_', '-')} {explicit!r} contradicts --board {board}, "
+                             f"which has {value!r}")
+        setattr(given, flag, value)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--backend', choices=['jlink', 'openocd'], required=True,
-                    help='transport route — explicit, no default (skill transport matrix)')
+    ap.add_argument('--backend', choices=['jlink', 'openocd'],
+                    help='transport route — explicit, no default (skill transport matrix); '
+                         'with --hil-config it follows from the board')
+    ap.add_argument('--hil-config', metavar='FILE',
+                    help="the project's HIL config json; with --board it supplies --backend, --probe, "
+                         "--device or --cfg, and --vid-pid. A flag given as well must agree")
+    ap.add_argument('--board', metavar='NAME', help='board name in --hil-config')
     ap.add_argument('--probe', help='probe serial (JLinkExe -USB / openocd "adapter serial")')
     ap.add_argument('--vid-pid', help='openocd probe pin by USB IDs, e.g. "0x2e8a 0x000c" '
                                       '(with or instead of --probe)')
     ap.add_argument('--device', help='JLINK_DEVICE from board.cmake/family.cmake (jlink backend)')
+    ap.add_argument('--interface', choices=['swd', 'jtag'],
+                    help='jlink backend: target interface, no default (openocd: part of --cfg)')
+    ap.add_argument('--speed', help='jlink backend: interface speed in kHz, or "auto"/"adaptive"; '
+                                    'no default (openocd: part of --cfg)')
     ap.add_argument('--cfg', help='openocd -f/-c args, e.g. "-f interface/stlink.cfg -f target/stm32h7x.cfg"')
     ap.add_argument('--elf', help='the FLASHED elf: exact _SEGGER_RTT address via nm (openocd/--dump)')
     ap.add_argument('--addr', help='SEGGER RTT control block address (hex), instead of --elf')
-    ap.add_argument('--channel', type=int, default=0, help='up-buffer index (0 console, 1 SysView)')
+    ap.add_argument('--channel', type=int, default=0,
+                    help='up-buffer index; 0 is the console, any other is whatever the '
+                         'firmware configured there')
     ap.add_argument('--seconds', type=float, default=0, help='capture duration; 0 = until Ctrl-C/EOF')
     ap.add_argument('--stop-file', help='exit successfully when this path appears')
     ap.add_argument('-i', '--interactive', action='store_true', help='forward stdin to the target')
@@ -688,8 +806,13 @@ def main() -> int:
                     help='post-mortem ring dump (jlink backend; needs --elf or --addr)')
     args = ap.parse_args()
 
-    if args.seconds < 0 or args.seconds != args.seconds:   # negative or nan
-        ap.error(f'--seconds must be >= 0 (0 = until Ctrl-C/EOF), got {args.seconds}')
+    if not (math.isfinite(args.seconds) and args.seconds >= 0):
+        ap.error(f'--seconds must be a finite number >= 0 (0 = until Ctrl-C/EOF), got {args.seconds}')
+    raw = os.environ.get('HIL_SERIAL_WRITE_TIMEOUT')
+    if raw is not None and _pos_float_env('HIL_SERIAL_WRITE_TIMEOUT', -1) == -1:
+        # the import-time fallback is for harnesses loading the classes; a CLI run
+        # with a knob it cannot honour says so
+        ap.error(f'HIL_SERIAL_WRITE_TIMEOUT={raw!r} is not a positive, finite number of seconds')
     if args.channel < 0:
         # a negative index would walk backwards off aUp[] into the control-block
         # header and read garbage as a descriptor
@@ -698,6 +821,8 @@ def main() -> int:
         return bool(args.stop_file and os.path.exists(args.stop_file))
 
     addr = None
+    if args.addr and args.elf:
+        ap.error('--addr and --elf both name the control block; pass one')
     if args.addr:
         try:
             addr = int(args.addr, 16)
@@ -711,6 +836,36 @@ def main() -> int:
             return nm_rtt_addr(args.elf, stop=stop_requested)
         ap.error('need --elf (flashed elf, address via nm) or --addr')
 
+    if bool(args.hil_config) != bool(args.board):
+        ap.error('--hil-config and --board go together')
+    if args.hil_config:
+        try:
+            flasher = hil_flasher(args.hil_config, args.board)
+            route = HIL_PROBE_ROUTES[flasher['name']]
+            if flasher['name'] == 'stlink' and 'args' in flasher:
+                raise ValueError(f"--board {args.board}: a stlink entry's args are st-flash's, not "
+                                 f"openocd's; pass --cfg, and the probe flags, explicitly")
+            hil_merge(args, args.board, backend=route, probe=flasher.get('uid'),
+                      vid_pid=flasher.get('vid_pid') if route == 'openocd' else None,
+                      device=hil_jlink_device(args.board, flasher) if route == 'jlink' else None,
+                      cfg=flasher.get('args') if flasher['name'] == 'openocd' else None)
+        except ValueError as e:
+            ap.error(str(e))
+    if not args.backend:
+        ap.error('--backend is required (or --hil-config with --board)')
+    if args.probe is not None and not args.probe.strip():
+        ap.error('--probe is empty: name the probe by its serial')
+    if args.device is not None and not args.device.strip():
+        ap.error('--device is empty')
+    # whatever supplied them, flags or the HIL config: refused here, not by a server later
+    if args.vid_pid is not None and not re.fullmatch(r'0x[0-9a-fA-F]{1,4} 0x[0-9a-fA-F]{1,4}', args.vid_pid.strip()):
+        ap.error(f'--vid-pid must be "0xVVVV 0xPPPP", got {args.vid_pid!r}')
+    if args.cfg is not None:
+        try:
+            if not shlex.split(args.cfg):
+                ap.error('--cfg is empty')
+        except ValueError as e:
+            ap.error(f'--cfg {args.cfg!r}: {e}')
     if args.backend == 'jlink':
         if args.reset_before_attach:
             ap.error('--reset-before-attach is openocd-only (the J-Link route attaches '
@@ -721,10 +876,23 @@ def main() -> int:
                      'for another channel, or --dump to read one)')
         if args.vid_pid:
             ap.error('--vid-pid is openocd-only; J-Link probes are selected by serial (--probe)')
-        if not (args.probe and args.device):
-            ap.error('the jlink backend needs --probe and --device')
+        if not (args.probe and args.device and args.interface and args.speed):
+            ap.error('the jlink backend needs --probe, --device, --interface and --speed')
+        if not re.fullmatch(r'[1-9][0-9]*|auto|adaptive', args.speed):
+            ap.error(f'--speed must be kHz, "auto" or "adaptive", got {args.speed!r}')
+    elif args.interface or args.speed:
+        ap.error('--interface/--speed are jlink-only; with openocd they belong to --cfg')
     elif not (args.probe or args.vid_pid):
         ap.error('the openocd backend needs --probe and/or --vid-pid')
+    elif not args.probe:
+        # USB IDs name a probe MODEL: fine for one, a coin toss for two of them
+        serials = usb_serials(args.vid_pid.strip())
+        if serials is None:
+            ap.error('cannot count the attached probes on this platform: pass --probe <serial>')
+        if len(serials) != 1:
+            ap.error(f'--vid-pid {args.vid_pid} matches {len(serials)} attached device(s)'
+                     + (f' (serials: {", ".join(x or "<none>" for x in serials)})' if serials else '')
+                     + ' — pass --probe <serial>')
     if (args.backend == 'openocd' or args.dump) and not (args.addr or args.elf):
         ap.error('need --elf (flashed elf, address via nm) or --addr')
     if args.backend == 'openocd' and not args.cfg:
@@ -735,7 +903,8 @@ def main() -> int:
             ap.error('--stop-file is not valid with --dump')
         if args.backend != 'jlink':
             ap.error('--dump uses the jlink backend (debug-AP reads via JLinkExe)')
-        return dump_ring(args.probe, args.device, rtt_addr(), args.dump, args.channel)
+        return dump_ring(args.probe, args.device, rtt_addr(), args.dump, args.channel,
+                         interface=args.interface, speed=args.speed)
     # A marker that already exists is a cancellation that completed: exit as a
     # stopped capture would, but only for an invocation that could have captured.
     if stop_requested():
@@ -758,7 +927,10 @@ def main() -> int:
                              reset_before_attach=args.reset_before_attach,
                              stop=stop_requested)
         else:
-            con = JlinkRtt({'flasher': {'uid': args.probe, 'args': f'-device {args.device}'}},
+            # after JlinkRtt's own -if/-speed, so these win; joined so that JlinkRtt's split
+            # gives the device back as ONE argument, whatever it holds
+            link = shlex.join(['-device', args.device, '-if', args.interface, '-speed', args.speed])
+            con = JlinkRtt({'flasher': {'uid': args.probe, 'args': link}},
                            timeout=0.1, stop=stop_requested)
     except _StopCapture:
         return 0
@@ -772,6 +944,9 @@ def main() -> int:
 
     saw_output = threading.Event()
     forwarded = threading.Event()
+    write_errors = []   # input the target never got: the capture must not end as a success
+    write_lock = threading.Lock()   # held across each write, so the end can wait one out
+    stopping = threading.Event()
     if args.interactive:
         def pump_stdin():
             # Hold input until the capture side has seen TARGET output (or 5 s for a
@@ -784,22 +959,57 @@ def main() -> int:
             # thread blocked holding that lock at interpreter shutdown aborts
             # CPython (_enter_buffered_busy).
             saw_output.wait(5)
-            try:
-                while True:
+            while True:
+                try:
                     data = os.read(0, 4096)
-                    if not data:
+                except (OSError, ValueError):
+                    return   # stdin gone: nothing was taken that could be lost
+                if not data:
+                    return
+                # the outcome is recorded under the lock: whoever takes it next sees it
+                with write_lock:
+                    if stopping.is_set():
+                        return   # arrived after the capture ended: nobody promised it
+                    try:
+                        con.write(data)
+                    except (RttError, OSError, ValueError) as e:
+                        write_errors.append(e)
                         return
-                    con.write(data)
                     forwarded.set()
-            except (RttError, OSError, ValueError):
-                return   # console closed/stalled/dead; capture side reports the state
         threading.Thread(target=pump_stdin, daemon=True).start()
+
+    def _ignore_termination():
+        for _sig in _termination_signals():
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(_sig, signal.SIG_IGN)
+
+    def _finish(rc):
+        # a write already under way decides the result too: wait it out (it is bounded by
+        # RTT_WRITE_TIMEOUT), never the pump thread itself, which may sit in read(stdin)
+        stopping.set()
+        if write_lock.acquire(timeout=RTT_WRITE_TIMEOUT + 2):
+            write_lock.release()
+        else:
+            write_errors.append(RttError('a write was still under way when the capture ended'))
+        if write_errors:
+            print(f'rtt: -i input did not reach the target: {write_errors[0]}', file=sys.stderr)
+            rc = 1
+        if args.interactive and not forwarded.is_set():
+            # only claim what is true: the gate releases after 5 s and forwards anyway,
+            # so "never forwarded" must come from the forwarded flag, not the gate
+            print('rtt: -i stdin was never forwarded to the target (no input arrived, '
+                  'or the console closed first)', file=sys.stderr)
+        if args.interactive and not saw_output.is_set():
+            print('rtt: no target output within the window', file=sys.stderr)
+        return rc
 
     deadline = time.monotonic() + args.seconds if args.seconds else None
     rc = 0
     seen = b''   # pre-release accumulator for the banner check only
     try:
         while ((deadline is None or time.monotonic() < deadline) and not stop_requested()):
+            if write_errors:
+                break
             try:
                 chunk = con.read(con.in_waiting or 1)
             except RttError as e:
@@ -832,19 +1042,15 @@ def main() -> int:
         # not raise on the final implicit flush.
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     finally:
-        if args.interactive and not forwarded.is_set():
-            # only claim what is true: the gate releases after 5 s and forwards anyway,
-            # so "never forwarded" must come from the forwarded flag, not the gate
-            print('rtt: -i stdin was never forwarded to the target (no input arrived, '
-                  'or the console closed first)', file=sys.stderr)
-        if args.interactive and not saw_output.is_set():
-            print('rtt: no target output within the window', file=sys.stderr)
-        # a late TERM landing during the up-to-12 s teardown must not skip the kill
-        # escalation and orphan the server -- cleanup is committed at this point
-        for _sig in _termination_signals():
-            with contextlib.suppress(ValueError, OSError):
-                signal.signal(_sig, signal.SIG_IGN)
-        con.close()
+        # from here on the cleanup is committed: a late TERM, or a second Ctrl-C, landing
+        # in the waits below (up to ~12 s each) must not skip the kill escalation and
+        # orphan the server
+        try:
+            _ignore_termination()
+            rc = _finish(rc)
+        finally:
+            _ignore_termination()   # again: a signal may have beaten the first call
+            con.close()
     return rc
 
 
