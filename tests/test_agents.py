@@ -154,6 +154,14 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('a device number alone establishes neither', skill)
         self.assertIn('attributable supplied evidence', flat(AGENTS / 'hw-validator.md'))
 
+    def test_review_findings_on_a_committed_fix_route_through_finalization_only(self):
+        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
+        self.assertIn('carries verified review findings on a committed supported fix', chief)
+        self.assertIn('The follow-up commit is a new HEAD: commit check, a fresh `hw-validator` and review again.', chief)
+        debugger = ' '.join((AGENTS / 'hw-debugger.md').read_text().split())
+        self.assertIn('a review follow-up checks the reviewed commit and its verified findings', debugger)
+        self.assertIn('zero new hardware use, and `n-a` for every hardware cleanup action it did not perform', debugger)
+
     def test_chief_quotes_unit_json_and_leaves_verdicts_to_the_role(self):
         body = (AGENTS / 'chief.md').read_text()
         self.assertIn("Every hardware dispatch requests the role's Output contract unchanged.", body)
