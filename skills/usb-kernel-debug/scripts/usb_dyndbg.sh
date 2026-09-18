@@ -14,6 +14,8 @@ help() {
   cat <<EOF
 usage: sudo usb_dyndbg.sh on  <module>...   enable the print flag (+p) at every site of each module
        sudo usb_dyndbg.sh off <module>...   disable it (-p); always do this when done, it is very noisy
+                                            both read the flags back and fail unless every site changed;
+                                            a module with no site at all (not loaded?) is an error
        sudo usb_dyndbg.sh status [module]   sites with the print flag set, for one module or every allowlisted one
 
 modules (host side, then a Linux gadget peer's device side):
@@ -27,13 +29,18 @@ allowed() { local m; for m in $ALLOW; do [ "$m" = "$1" ] && return 0; done; retu
 
 # Control lines are: file:line [module]function =flags "format"; `p` in flags
 # is the print flag, `=_` means none set.
-sites() {  # sites <module|-> : lines of the allowlisted module(s) with p set; empty when none
-  awk -v module="$1" -v allow=" $ALLOW " '
+sites() {  # sites <module|-> [all] : lines of the allowlisted module(s), with p set unless "all"
+  awk -v module="$1" -v every="${2:-}" -v allow=" $ALLOW " '
     {
       m = $2; sub(/\].*/, "", m); sub(/^\[/, "", m)
       if (module != "-" ? m != module : index(allow, " " m " ") == 0) next
-      if ($3 ~ /^=[a-z_]*p/) print
+      if (every == "all" || $3 ~ /^=[a-z_]*p/) print
     }' "$CTL"
+}
+count() {  # count <module> [all] : how many such sites; fails when the control file cannot be read
+  local out
+  out=$(sites "$@") || return 1
+  [ -z "$out" ] && echo 0 || printf '%s\n' "$out" | wc -l
 }
 require_ctl() {
   [ -e "$CTL" ] && return
@@ -42,6 +49,9 @@ require_ctl() {
 }
 
 action=${1:-}; shift || true
+case "$action" in -h|--help|help) ;; *)
+  [ "$(uname -s)" = Linux ] || die "Linux-only (kernel dynamic debug); this is $(uname -s)" ;;
+esac
 case "$action" in
   -h|--help|help)
     help
@@ -52,8 +62,14 @@ case "$action" in
     flag='+p'; [ "$action" = off ] && flag='-p'
     for m in "$@"; do allowed "$m" || die "module not allowlisted: $m"; done
     for m in "$@"; do
+      total=$(count "$m" all) || die "cannot read $CTL (run with sudo?)"
+      [ "$total" -gt 0 ] || die "module $m has no dynamic-debug site: not loaded (lsmod), or built without them"
       echo "module $m $flag" > "$CTL" || die "cannot write $CTL (run with sudo?)"
-      echo "dynamic debug $action: $m"
+      total=$(count "$m" all) && printing=$(count "$m") || die "cannot read $CTL back"
+      want=$total; [ "$action" = off ] && want=0
+      [ "$printing" -eq "$want" ] ||
+        die "wrote '$flag' for $m, but $printing of its $total sites print (expected $want)"
+      echo "dynamic debug $action: $m ($printing of $total sites print)"
     done
     ;;
   status)
@@ -63,10 +79,13 @@ case "$action" in
     require_ctl
     [ -r "$CTL" ] || die "cannot read $CTL (run with sudo?)"
     out=$(sites "$m") || die "cannot read $CTL"
+    total=1; [ "$m" = - ] || total=$(count "$m" all) || die "cannot read $CTL"
     if [ -n "$out" ]; then
       printf '%s\n' "$out"
     elif [ "$m" = - ]; then
       echo "(no print sites enabled in any allowlisted module)"
+    elif [ "$total" -eq 0 ]; then
+      echo "(module $m has no dynamic-debug site: not loaded, or built without them)"
     else
       echo "(no print sites enabled for $m)"
     fi

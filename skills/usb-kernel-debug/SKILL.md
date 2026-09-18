@@ -1,6 +1,6 @@
 ---
 name: usb-kernel-debug
-description: Use when the Linux end of a USB link has to explain itself on real hardware — enumeration failures, STALLed control transfers, missing/short bulk or interrupt transfers, isochronous dropouts, descriptor problems, port reset storms, repeated re-enumeration, address errors, xHCI ring/command errors, "device descriptor read error", babble. On a Linux PC host it captures the host-side URBs with usbmon + tshark into a Wireshark pcapng and turns on the kernel's dynamic debug for the host's reasoning; on a Linux gadget peer (e.g. a Raspberry Pi in device role) only dynamic debug applies, since no URBs traverse a gadget. Pair it with a wire sniffer and target-side debugging for what the kernel cannot see.
+description: Use when the Linux end of a USB link must explain itself — enumeration failures, "device descriptor read error", control STALLs, missing or short transfers, ISO dropouts, port-reset storms, xHCI errors. usbmon URB capture into pcapng on a Linux host, kernel dynamic debug on a host or a gadget peer.
 ---
 
 # usb-kernel-debug — what the Linux side of the link saw
@@ -27,7 +27,7 @@ S=<skill dir>/scripts
 $S/usbcap.py 1a86:55d4 10                    # the bus of that plugged-in device, 10 s; --help for selectors and defaults
 $S/usbcap.py 3 10 cap.pcapng --snaplen 64    # bus 3, URB headers only
 ```
-Capture the device's own bus. A selector matching devices on several buses (`1a86:` with two adapters plugged in) is refused with the matches listed: pass the bus, or `auto` when you really want every bus. Full payloads by default; `--snaplen 64` keeps only the 64-byte usbmon record (URB type, endpoint, status, lengths) for long or high-throughput captures, and `128` adds the first 64 bytes of payload, enough for setup packets and descriptor heads. An existing output file is refused, never overwritten. To catch enumeration, start the capture, then replug or reset the device.
+Capture the device's own bus. A selector matching devices on several buses (`1a86:` with two adapters plugged in) is refused with the matches listed: pass the bus, or `auto` when you really want every bus. Full payloads by default; `--snaplen 64` keeps only the 64-byte usbmon record (URB type, endpoint, status, lengths) for long or high-throughput captures, and `128` adds the first 64 bytes of payload, enough for setup packets and descriptor heads. An existing output file is refused, never overwritten. A capture with no packets exits 1 and keeps the file: wrong bus, or nothing happened. To catch enumeration, start the capture, then replug or reset the device.
 
 ## usbmon — analyze
 
@@ -70,14 +70,18 @@ sudo $S/usb_dyndbg.sh status                 # what is switched on right now
 sudo $S/usb_dyndbg.sh off usbcore xhci_hcd   # ALWAYS: left on, it floods the log and skews timing
 ```
 
+`on`/`off` read the flags back and say how many of the module's print sites took (`N of N sites print`); a module that is not loaded, or built without dynamic debug, is an error rather than a quiet success.
+
 Module choice by role: on a host, `usbcore` for enumeration/hub logic plus the controller driver `lsusb -t` shows for the bus; on a gadget peer, `dwc2` (or `dwc3`) + `udc_core` + `libcomposite`, run on the peer itself (the script is self-contained, copy it over). Best for **re-enumerates / enumeration stalls / port-reset storms**, where usbmon shows the resets but not the host's reason.
 
 ## Reading a capture
 
-- **Not recognized / re-enumerates:** is `GET DESCRIPTOR (DEVICE)` answered, `bMaxPacketSize0` sane? Repeated SET_ADDRESS or resets mean the device was too slow to respond; dynamic debug on `usbcore` and the controller driver gives the host's reset reason.
-- **Enumeration stalls:** find the last good control transfer; the next request, often CONFIG, a string, or the first class request, is what the device mishandled.
+Candidate causes and the check that tells them apart, not verdicts:
+
+- **Not recognized / re-enumerates:** is `GET DESCRIPTOR (DEVICE)` answered, `bMaxPacketSize0` sane? Repeated SET_ADDRESS or resets: a device too slow to respond is one candidate, a marginal link or power another; dynamic debug on `usbcore` and the controller driver gives the host's own reset reason.
+- **Enumeration stalls:** find the last good control transfer; the next request, often CONFIG, a string, or the first class request, is the first suspect: compare the device's answer to it (`-V`) with what it should return, or look at the wire when there is no answer at all.
 - **Control STALL:** a control URB completing `-32` (`-EPIPE`) is a STALL from the device's control handler, usually an unhandled `bRequest` (decode it with `-V`). `-71` is not a STALL, see the errno list.
 - **Bulk / interrupt missing or short:** on the endpoint, do Submits get Completes? An unexpected short (`usb.data_len < wMaxPacketSize`) suggests a length bug; no completions can be the device never writing, a stalled endpoint or a toggle desync, which usbmon cannot separate.
 - **A CDC read hangs with the IN endpoint idle:** check EP0 first. Did `SET_CONTROL_LINE_STATE` complete `0` or fail `-71`? If it failed, the device never saw DTR and may stop sourcing data by design.
-- **ISO / audio dropouts:** ISO URB cadence (~1/ms at full speed) and payload lengths; zero-length frames mean the device starved the endpoint.
+- **ISO / audio dropouts:** ISO URB cadence (~1/ms at full speed) and payload lengths; zero-length frames are consistent with the device starving the endpoint; confirm on the target (what the class fed, and when) before blaming it.
 - **Wrong descriptors:** `-V` decodes them; check `bLength` / `wTotalLength` against what the device is meant to return.

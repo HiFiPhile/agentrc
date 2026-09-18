@@ -9,12 +9,15 @@ usage: usbcap.py <bus|VID:PID|VID:|auto> [seconds] [outfile] [--snaplen N]
 
 A selector that matches devices on more than one bus is refused with the
 matches listed; pass the bus instead. An existing outfile is refused, never
-overwritten. Assumes usbmon is loaded and /dev/usbmon* is readable by the
-wireshark group (see SKILL.md), so tshark captures without sudo.
+overwritten. A capture with no URB in it fails and keeps the file: the bus
+was idle, or the selector named the wrong one. Linux only (usbmon). Assumes
+usbmon is loaded and /dev/usbmon* is readable by the wireshark group (see
+SKILL.md), so tshark captures without sudo.
 """
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -58,10 +61,16 @@ def main():
     parser.add_argument('outfile', nargs='?', default=f'/tmp/usbcap-{os.getpid()}.pcapng')
     parser.add_argument('--snaplen', type=int, help='bytes per packet: 64 keeps the URB header only, 128 adds 64 bytes of payload')
     args = parser.parse_args()
+    if not sys.platform.startswith('linux'):
+        sys.exit(f'usbcap.py is Linux-only (usbmon); this is {sys.platform}')
     if args.seconds <= 0:
         sys.exit('seconds must be positive')
     if args.snaplen is not None and args.snaplen <= 0:
         sys.exit('--snaplen must be positive')
+    needed = ['tshark', 'capinfos'] + ([] if args.target == 'auto' or args.target.isdigit() else ['lsusb'])
+    missing = [t for t in needed if not shutil.which(t)]
+    if missing:
+        sys.exit(f'{", ".join(missing)} not on PATH (SKILL.md, Setup)')
     try:
         os.close(os.open(args.outfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))  # reserved: nothing else can claim it now
     except FileExistsError:
@@ -77,7 +86,11 @@ def main():
     cmd = ['tshark', '-i', f'usbmon{bus}', '-a', f'duration:{args.seconds}', '-w', args.outfile]
     if args.snaplen:
         cmd += ['-s', str(args.snaplen)]
-    capture = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        capture = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        os.unlink(args.outfile)
+        sys.exit(f'cannot run tshark: {e}')
     if capture.returncode != 0:
         if os.path.getsize(args.outfile) == 0:
             os.unlink(args.outfile)
@@ -86,11 +99,19 @@ def main():
             kept = f'\npartial capture kept in {args.outfile}'
         sys.exit(f'tshark exited {capture.returncode}: {capture.stderr.strip()}\n'
                  f'(no /dev/usbmon{bus} access? see SKILL.md: wireshark group, or wrap in sg wireshark){kept}')
-    count = subprocess.run(['capinfos', '-c', '-M', args.outfile], capture_output=True, text=True)
+    try:
+        count = subprocess.run(['capinfos', '-c', '-M', args.outfile], capture_output=True, text=True)
+    except OSError as e:
+        sys.exit(f'capture written to {args.outfile}, but cannot run capinfos to check it: {e}')
     if count.returncode != 0:
         sys.exit(f'capture written but unreadable: {count.stderr.strip()}')
-    packets = count.stdout.rsplit(':', 1)[-1].strip()  # "Number of packets:   6"
-    print(f'saved {args.outfile}  ({packets} packets)')
+    m = re.search(r'^Number of packets:\s*(\d+)\s*$', count.stdout, re.M)
+    if not m:
+        sys.exit(f'capture written but capinfos gave no packet count: {count.stdout.strip()!r}')
+    if int(m[1]) == 0:
+        sys.exit(f'no URB on usbmon{bus} in {args.seconds}s: the bus was idle, or it is the wrong bus '
+                 f'({args.outfile} kept, empty)')
+    print(f'saved {args.outfile}  ({m[1]} packets)')
     print(f'analyze: tshark -r {args.outfile}   |   tshark -r {args.outfile} -V')
 
 

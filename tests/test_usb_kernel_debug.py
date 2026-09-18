@@ -3,9 +3,12 @@ to guess between buses and reports tshark failures explicitly; usb_dyndbg.sh
 reads the print flag from a fixture control file and helps without debugfs."""
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -58,8 +61,13 @@ class ResolveTest(unittest.TestCase):
                 usbcap.resolve(bad, lambda: LSUSB)
 
 
+DATA = Path(__file__).resolve().parent / 'data' / 'usb_kernel_debug'   # real usbmon captures, host metadata stripped
+
+
+@unittest.skipUnless(shutil.which('capinfos'), "needs Wireshark's capinfos")
 class CliTest(unittest.TestCase):
-    """lsusb and tshark are stubbed on PATH; tshark records its arguments."""
+    """lsusb and the capturing tshark are stubs on PATH; tshark records its arguments and
+    writes a real usbmon capture, which the real capinfos counts."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -73,8 +81,12 @@ class CliTest(unittest.TestCase):
                    f'echo "$@" >> {self.log}\n'
                    f'rc=$(cat {self.tshark_rc})\n'
                    '[ "$rc" = 0 ] || { echo "tshark: The capture session could not be initiated" >&2; exit $rc; }\n'
-                   'out=""; while [ $# -gt 0 ]; do [ "$1" = -w ] && out=$2; shift; done; : > "$out"\n')
-        self._stub('capinfos', '#!/bin/sh\necho "Number of packets:   2"\n')
+                   'out=""; while [ $# -gt 0 ]; do [ "$1" = -w ] && out=$2; shift; done\n'
+                   f'cat "$(cat {self.tmp.name}/wrote)" > "$out"\n')
+        self.wrote('usbmon_msc_poll.pcapng')
+
+    def wrote(self, fixture):
+        (Path(self.tmp.name) / 'wrote').write_text(str(DATA / fixture))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -93,9 +105,53 @@ class CliTest(unittest.TestCase):
         r = self._run('046d:c52b', '3', str(out), '--snaplen', '128')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('capturing usbmon1 for 3s', r.stdout)
-        self.assertIn('(2 packets)', r.stdout)
+        self.assertIn('(12 packets)', r.stdout)
         self.assertTrue(out.exists())
         self.assertIn(f'-i usbmon1 -a duration:3 -w {out} -s 128', self.log.read_text())
+
+    def test_an_idle_bus_fails_and_keeps_the_empty_capture(self):
+        self.wrote('usbmon_idle.pcapng')
+        out = Path(self.tmp.name) / 'cap.pcapng'
+        r = self._run('1', '3', str(out))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('no URB on usbmon1 in 3s', r.stderr)
+        self.assertNotIn('saved', r.stdout)
+        self.assertTrue(out.exists())
+
+    def test_a_count_that_cannot_be_read_is_not_a_success(self):
+        self._stub('capinfos', '#!/bin/sh\necho "File name: x"\n')
+        r = self._run('1', '3', str(Path(self.tmp.name) / 'cap.pcapng'))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('gave no packet count', r.stderr)
+
+    def test_missing_tools_are_named_before_the_outfile_is_reserved(self):
+        out = Path(self.tmp.name) / 'cap.pcapng'
+        (self.bin / 'tshark').unlink()
+        env = {**os.environ, 'PATH': str(self.bin)}
+        r = subprocess.run([sys.executable, str(SCRIPT), '046d:c52b', '3', str(out)], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('tshark, capinfos not on PATH', r.stderr)
+        self.assertNotIn('Traceback', r.stderr)
+        self.assertFalse(out.exists())
+
+    def test_a_tool_that_cannot_be_started_releases_the_outfile(self):
+        out = Path(self.tmp.name) / 'cap.pcapng'
+        self._stub('tshark', '#!/nonexistent/interpreter\n')
+        for tool in ('capinfos',):
+            (self.bin / tool).symlink_to(shutil.which(tool))
+        env = {**os.environ, 'PATH': str(self.bin)}     # nothing to fall through to
+        r = subprocess.run([sys.executable, str(SCRIPT), '1', '1', str(out)], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('cannot run tshark', r.stderr)
+        self.assertNotIn('Traceback', r.stderr)
+        self.assertFalse(out.exists())
+
+    def test_other_platforms_are_refused(self):
+        r = subprocess.run([sys.executable, '-c', 'import sys, runpy; sys.platform = "darwin"; '
+                            f'sys.argv = ["usbcap.py", "1"]; runpy.run_path({str(SCRIPT)!r}, run_name="__main__")'],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('Linux-only', r.stderr)
 
     def test_ambiguous_selector_captures_nothing(self):
         r = self._run('cafe:')
@@ -129,7 +185,7 @@ class CliTest(unittest.TestCase):
         self._stub('lsusb', f"#!/bin/sh\n[ -f '{out}' ] || exit 1\ncat <<'EOF'\n{LSUSB}EOF\n")
         r = self._run('046d:c52b', '1', str(out))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(out.read_text(), '', 'the capture is what tshark wrote')
+        self.assertEqual(out.read_bytes(), (DATA / 'usbmon_msc_poll.pcapng').read_bytes(), 'the capture is what tshark wrote')
         r = self._run('nope', '1', str(Path(self.tmp.name) / 'refused.pcapng'))
         self.assertEqual(r.returncode, 1)
         self.assertFalse((Path(self.tmp.name) / 'refused.pcapng').exists(), 'a refusal leaves no reserved file')
@@ -245,17 +301,100 @@ class DyndbgTest(unittest.TestCase):
         self.assertIn('cannot read', r.stderr)
         self.assertNotIn('no print sites', r.stdout)
 
-    def test_on_and_off_write_one_command_per_module_and_refuse_others(self):
-        r = self._run('on', 'usbcore', 'dwc2')
+    def kernel(self, order, obeys=True):
+        """Serve the control path like the kernel does: a read lists the sites, a write is a
+        command that changes their flags. A FIFO cannot tell which comes next, so the
+        script's opens are given in `order` ('r'/'w'); a mismatch times the script out."""
+        self.ctl.unlink()
+        os.mkfifo(self.ctl)
+        lines = CONTROL.splitlines(keepends=True)
+        self.commands = []
+
+        def apply(cmd):
+            _, module, flag = cmd.split()
+            for n, line in enumerate(lines):
+                head, _, fmt = line.partition(' "')
+                parts = head.split()
+                if len(parts) == 3 and parts[1].startswith(f'[{module}]'):
+                    flags = parts[2][1:].replace('_', '').replace('p', '')
+                    flags = ('p' if flag == '+p' else '') + flags or '_'
+                    lines[n] = f'{parts[0]} {parts[1]} ={flags} "{fmt}'
+
+        def held_by_others(path):
+            for fd in Path('/proc').glob('[0-9]*/fd/*'):
+                try:
+                    if fd.parts[2] != str(os.getpid()) and os.readlink(fd) == str(path):
+                        return True
+                except OSError:
+                    pass
+            return False
+
+        def serve():
+            for op in order:
+                if op == 'r':
+                    with open(self.ctl, 'w') as f:
+                        f.write(''.join(lines))
+                    while held_by_others(self.ctl):   # or the next listing lands in this reader
+                        time.sleep(0.005)
+                else:
+                    with open(self.ctl) as f:
+                        self.commands.append(f.read())
+                    if obeys:
+                        apply(self.commands[-1])
+        threading.Thread(target=serve, daemon=True).start()
+
+    def _run_served(self, *args):
+        env = {**os.environ, 'USB_DYNDBG_CTL': str(self.ctl)}
+        return subprocess.run(['bash', str(DYNDBG), *args], capture_output=True, text=True, env=env, timeout=20)
+
+    def test_on_and_off_change_every_site_and_say_how_many(self):
+        self.kernel('rwrr' * 2)
+        r = self._run_served('on', 'usbcore', 'xhci_hcd')
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout, 'dynamic debug on: usbcore\ndynamic debug on: dwc2\n')
-        self.assertEqual(self.ctl.read_text(), 'module dwc2 +p\n', 'each write replaces the file: the last command')
-        self._run('off', 'dwc2')
-        self.assertEqual(self.ctl.read_text(), 'module dwc2 -p\n')
+        self.assertEqual(r.stdout, 'dynamic debug on: usbcore (3 of 3 sites print)\n'
+                                   'dynamic debug on: xhci_hcd (2 of 2 sites print)\n')
+        self.assertEqual(self.commands, ['module usbcore +p\n', 'module xhci_hcd +p\n'])
+        self.kernel('rwrr')
+        r = self._run_served('off', 'usbcore')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, 'dynamic debug off: usbcore (0 of 3 sites print)\n')
+
+    def test_a_write_the_kernel_did_not_act_on_is_a_failure(self):
+        self.kernel('rwrr', obeys=False)
+        r = self._run_served('on', 'xhci_hcd')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("wrote '+p' for xhci_hcd, but 0 of its 2 sites print (expected 2)", r.stderr)
+        self.assertNotIn('dynamic debug on', r.stdout)
+
+    def test_a_status_whose_second_read_fails_is_an_error_not_a_quiet_module(self):
+        b = Path(self.tmp.name) / 'bin'
+        b.mkdir()
+        calls = Path(self.tmp.name) / 'awk.calls'
+        (b / 'awk').write_text(f'#!/bin/sh\necho x >> {calls}\n'
+                               f'[ "$(wc -l < {calls})" -ge 2 ] && {{ echo "awk: read error" >&2; exit 2; }}\n'
+                               f'exec {shutil.which("awk")} "$@"\n')
+        (b / 'awk').chmod(0o755)
+        env = {**os.environ, 'USB_DYNDBG_CTL': str(self.ctl), 'PATH': f'{b}:{os.environ["PATH"]}'}
+        r = subprocess.run(['bash', str(DYNDBG), 'status', 'xhci_hcd'], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('cannot read', r.stderr)
+        self.assertNotIn('no print sites enabled', r.stdout)
+        self.assertNotIn('integer expression', r.stderr)
+
+    def test_a_module_without_sites_is_not_loaded_not_disabled(self):
+        r = self._run('on', 'dwc2')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('module dwc2 has no dynamic-debug site: not loaded', r.stderr)
+        self.assertEqual(self.ctl.read_text(), CONTROL, 'nothing is written for a module that is not there')
+        r = self._run('status', 'dwc2')
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('module dwc2 has no dynamic-debug site', r.stdout)
+
+    def test_a_module_outside_the_allowlist_stops_everything(self):
         r = self._run('on', 'usbcore', 'ext4')
         self.assertEqual(r.returncode, 1)
         self.assertIn('not allowlisted: ext4', r.stderr)
-        self.assertEqual(self.ctl.read_text(), 'module dwc2 -p\n', 'nothing written when any module is refused')
+        self.assertEqual(self.ctl.read_text(), CONTROL, 'nothing written when any module is refused')
         self.assertEqual(self._run('on').returncode, 2)
 
 
