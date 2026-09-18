@@ -30,7 +30,7 @@ import time
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from search import DB, LIB, norm, resolve, tag_list  # noqa: E402
+from search import DB, LIB, log_lookup, norm, resolve, tag_list  # noqa: E402
 
 INDEX = os.path.join(LIB, ".read-doc")
 # pdftotext's output changes with its options; bump VERSION when either changes.
@@ -248,7 +248,7 @@ def score(line, term, following=()):
 
 
 def find(pages, term, context, limit, offset, max_chars):
-    """(distinct hits, page-numbered excerpts).
+    """(distinct hits, page-numbered excerpts, (page, matched line) per excerpt).
 
     The first excerpt is emitted even when it alone exceeds max_chars, then
     truncated: a caller paging with --offset must always make progress.
@@ -260,7 +260,7 @@ def find(pages, term, context, limit, offset, max_chars):
             if norm(term) in norm(line):
                 hits.append((-score(line, term, lines[i + 1:i + 4]), pno, i, lines))
     if not hits:
-        return 0, []
+        return 0, [], []
     hits.sort(key=lambda h: h[:3])
     # Two hits a line apart would print nearly the same window twice. Checking
     # only the lines already taken on that page keeps a common term like "EN"
@@ -271,7 +271,7 @@ def find(pages, term, context, limit, offset, max_chars):
         if not any(i in lines_taken for i in range(hit[2] - context, hit[2] + context + 1)):
             merged.append(hit)
             lines_taken.add(hit[2])
-    blocks, used = [], 0
+    blocks, matched, used = [], [], 0
     for _, pno, i, lines in merged[offset:offset + limit]:
         window = [l.rstrip() for l in lines[max(0, i - context):i + context + 1] if l.strip()]
         # -layout indents the whole page; drop the shared margin, keep relative columns.
@@ -284,8 +284,9 @@ def find(pages, term, context, limit, offset, max_chars):
             # page number leads it and MIN_CHARS keeps it inside the cap.
             text = text[:max_chars - len(TRUNCATED)] + TRUNCATED
         blocks.append(text)
+        matched.append([pno, lines[i].strip()])
         used += len(text)
-    return len(merged), blocks
+    return len(merged), blocks, matched
 
 
 def wanted(db, skip_tags):
@@ -368,6 +369,7 @@ def build(args):
 
 
 def find_cmd(args):
+    """Exit code; the lookup history's result is left in args.result."""
     if args.limit < 1:
         raise ValueError(f"--limit must be at least 1, got {args.limit}")
     if args.max_chars < MIN_CHARS:
@@ -378,9 +380,15 @@ def find_cmd(args):
     if not args.term.strip():
         raise ValueError("--term cannot be blank")
     meta, pages = ensure(args.book)
+    with contextlib.closing(open_db()) as db:
+        row = db.execute("SELECT title FROM books WHERE id = ?", (args.book,)).fetchone()
+    title = row[0] if row else None  # a label only: a row gone since ensure() costs the title, not the lookup
     if not meta:
         raise Unavailable(f"{args.book}: the index file is unreadable; delete it and retry")
-    total, blocks = find(pages, args.term, args.context, args.limit, args.offset, args.max_chars)
+    total, blocks, matched = find(pages, args.term, args.context, args.limit, args.offset, args.max_chars)
+    args.result = {"title": title,
+                   "source": {k: meta[k] for k in ("path", "size", "mtime_ns", "pages")},
+                   "total_hits": total, "hits": matched}
     if not total:
         print(f"{args.book}: {args.term!r} is not in the extracted text of any page "
               f"({meta['pages']} pages searched); a figure or scan holds none")
@@ -422,17 +430,22 @@ def parser():
 
 def main(argv):
     args = parser().parse_args(argv)
+    started, error, args.result = time.monotonic(), None, None
     try:
-        return args.run(args)
+        code = args.run(args)
     except ValueError as e:
-        print(e, file=sys.stderr)
-        return 2
+        code, error = 2, str(e)
     except Unavailable as e:
-        print(e, file=sys.stderr)
-        return 3
+        code, error = 3, str(e)
     except (OSError, sqlite3.Error) as e:
-        print(f"{type(e).__name__}: {e}", file=sys.stderr)
-        return 3
+        code, error = 3, f"{type(e).__name__}: {e}"
+    if error:
+        print(error, file=sys.stderr)
+    if args.command == "find":
+        log_lookup(LIB, "find", {k: getattr(args, k) for k in
+                                 ("book", "term", "context", "limit", "offset", "max_chars")},
+                   started, code, error, args.result if code in (0, 1) else None)
+    return code
 
 
 if __name__ == "__main__":

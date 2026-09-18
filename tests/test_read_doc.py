@@ -19,6 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'skills' / 'read-doc' / 'scripts'
 FIXTURE = ROOT / 'tests' / 'data' / 'three-pages.pdf'
 sys.path.insert(0, str(SCRIPTS))
+# Lookups from these tests, in process and in subprocesses, never reach the user's history.
+STATE = tempfile.TemporaryDirectory()
+os.environ['XDG_STATE_HOME'] = STATE.name
 import search  # noqa: E402
 import locate  # noqa: E402
 
@@ -78,7 +81,7 @@ class Find(unittest.TestCase):
              'see the SIE_CTRL register description']
 
     def find(self, term='SIE_CTRL', context=1, limit=5, offset=0, max_chars=4000):
-        return locate.find(self.PAGES, term, context, limit, offset, max_chars)
+        return locate.find(self.PAGES, term, context, limit, offset, max_chars)[:2]
 
     def test_the_definition_page_outranks_every_mention(self):
         total, blocks = self.find()
@@ -102,7 +105,7 @@ class Find(unittest.TestCase):
         # A reference manual's lines are wider than the smallest allowed cap.
         pages = ['SIE_CTRL Register. ' + 'the width of a real manual line. ' * 8]
         for cap in (locate.MIN_CHARS, 100, 200):
-            _, blocks = locate.find(pages, 'SIE_CTRL', 1, 5, 0, cap)
+            _, blocks, _ = locate.find(pages, 'SIE_CTRL', 1, 5, 0, cap)
             self.assertEqual(len(blocks), 1, f'cap {cap}: paging must make progress')
             self.assertLessEqual(len(blocks[0]), cap, f'cap {cap} exceeded')
             self.assertTrue(blocks[0].startswith('p1'), f'cap {cap} lost the page number')
@@ -133,7 +136,7 @@ class Find(unittest.TestCase):
         bit_row = '4           BUFF_STATUS: Raised when any bit in BUFF_STATUS is set. Clear by clearing      RO     0x0'
         self.assertGreater(locate.score(heading, 'BUFF_STATUS'), locate.score(bit_row, 'BUFF_STATUS'))
         pages = ['x', 'y', bit_row, 'z', heading]
-        _, blocks = locate.find(pages, 'BUFF_STATUS', 0, 2, 0, 4000)
+        _, blocks, _ = locate.find(pages, 'BUFF_STATUS', 0, 2, 0, 4000)
         self.assertTrue(blocks[0].startswith('p5'), blocks[0])
 
     def test_short_prose_does_not_collect_the_heading_bonus(self):
@@ -147,7 +150,7 @@ class Find(unittest.TestCase):
             ('FLASH_NSSR', 'the FLASH_NSSR register', '7.10.6          FLASH status register (FLASH_NSSR)'),
         ):
             self.assertGreater(locate.score(heading, term), locate.score(prose, term), term)
-            _, blocks = locate.find([prose, 'x', heading], term, 0, 2, 0, 4000)
+            _, blocks, _ = locate.find([prose, 'x', heading], term, 0, 2, 0, 4000)
             self.assertTrue(blocks[0].startswith('p3'), f'{term}: {blocks[0]}')
 
     def test_a_table_of_contents_line_is_demoted_below_the_section_it_points_at(self):
@@ -162,12 +165,12 @@ class Find(unittest.TestCase):
 
     def test_hits_within_one_context_window_are_reported_once(self):
         pages = ['SIE_CTRL here\nand SIE_CTRL again\n\n\n\nfar below SIE_CTRL']
-        total, blocks = locate.find(pages, 'SIE_CTRL', 1, 5, 0, 4000)
+        total, blocks, _ = locate.find(pages, 'SIE_CTRL', 1, 5, 0, 4000)
         self.assertEqual(total, 2, 'the adjacent pair merges, the distant one does not')
         self.assertEqual(len(blocks), 2)
 
     def test_context_at_a_page_edge_does_not_reach_into_another_page(self):
-        _, blocks = locate.find(['a\nSIE_CTRL', 'b'], 'SIE_CTRL', 5, 5, 0, 4000)
+        _, blocks, _ = locate.find(['a\nSIE_CTRL', 'b'], 'SIE_CTRL', 5, 5, 0, 4000)
         self.assertNotIn('b', blocks[0])
 
 
@@ -281,7 +284,7 @@ class Extract(unittest.TestCase):
         self.assertIn('SIE_CTRL Register', pages[0])
         self.assertEqual(pages[1].strip(), '', 'page 2 of the fixture is blank')
         self.assertIn('come from SIE_CTRL', pages[2])
-        total, blocks = locate.find(pages, 'SIE_CTRL', 1, 5, 0, 4000)
+        total, blocks, _ = locate.find(pages, 'SIE_CTRL', 1, 5, 0, 4000)
         self.assertEqual(total, 2, "page 3's two adjacent mentions are one excerpt")
         self.assertTrue(blocks[0].startswith('p1'), blocks[0])
 
@@ -641,6 +644,141 @@ class FindUsage(unittest.TestCase):
             with self.assertRaises(ValueError, msg=over):
                 locate.find_cmd(self.args(**over))
 
+
+
+class History(unittest.TestCase):
+    """Every lookup leaves one record a user can re-check later, without
+    changing what the lookup printed or returned."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lib = Path(self.tmp.name) / 'lib'
+        self.lib.mkdir()
+        for mod, name in ((locate, 'LIB'), (locate, 'DB'), (locate, 'INDEX'), (search, 'LIB'),
+                          (search, 'DB'), (search, 'HISTORY'), (search, '_authors')):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+        for mod in (locate, search):
+            mod.LIB, mod.DB = str(self.lib), str(self.lib / 'metadata.db')
+        locate.INDEX = str(self.lib / '.read-doc')
+        search.HISTORY = str(Path(self.tmp.name) / 'state' / 'read-doc' / 'lookups.jsonl')
+        search._authors = None
+        fake_library(str(self.lib), [(1, 'RM0001 reference manual', ['reference-manual'], True),
+                                     (2, 'ES0001 errata', ['errata'], True)]).close()
+        (self.lib / 'Vendor/RM0001 reference manual (1)/RM0001 reference manual.pdf').write_bytes(
+            FIXTURE.read_bytes())
+        env = unittest.mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': 'claude-1'})
+        env.start()
+        self.addCleanup(env.stop)
+        for var in ('CODEX_THREAD_ID', 'READ_DOC_HISTORY'):
+            os.environ.pop(var, None)
+
+    def call(self, main, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), unittest.mock.patch.object(sys, 'stderr', err):
+            code = main(list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def records(self):
+        with open(search.HISTORY) as f:
+            return [json.loads(line) for line in f]
+
+    def test_a_search_records_its_query_and_the_books_shown_in_rank_order(self):
+        code, out, err = self.call(search.main, 'rm0001', 'es0001', '--any')
+        rec, = self.records()
+        self.assertEqual((code, rec['exit'], rec['op'], rec['error']), (0, 0, 'search', None))
+        self.assertEqual(rec['query'], {'keywords': ['rm0001', 'es0001'], 'any': True,
+                                        'kind': None, 'limit': search.LIMIT})
+        self.assertEqual(rec['result']['books'], [[1, 'reference-manual', 'RM0001 reference manual'],
+                                                  [2, 'errata', 'ES0001 errata']])
+        self.assertEqual(rec['result']['kinds'], {'reference-manual': 1, 'errata': 1})
+        self.assertEqual((rec['v'], rec['library'], rec['session']),
+                         (1, str(self.lib), {'claude': 'claude-1', 'codex': None}))
+        self.assertEqual(err, f"lookup {rec['id']} logged\n")
+        os.environ['READ_DOC_HISTORY'] = '0'
+        self.assertEqual(self.call(search.main, 'rm0001', 'es0001', '--any')[:2], (code, out),
+                         'the lookup prints the same with the history off')
+        self.assertEqual(len(self.records()), 1, 'and records nothing')
+
+    def test_a_miss_records_an_empty_result_and_a_failure_records_none(self):
+        self.assertEqual(self.call(search.main, 'nonesuch')[0], 1)
+        self.assertEqual(self.call(search.main, '--limit', '-1', 'rm0001')[0], 2)
+        search.DB = str(self.lib / 'gone.db')
+        self.assertEqual(self.call(search.main, 'rm0001')[0], 3)
+        miss, usage, gone = self.records()
+        self.assertEqual(miss['result']['total'], 0)
+        self.assertEqual((usage['exit'], usage['result'], usage['error']),
+                         (2, None, '--limit cannot be negative'))
+        self.assertEqual((gone['exit'], gone['result']), (3, None))
+        self.assertIn('unavailable', gone['error'])
+
+    def test_a_find_records_the_pages_returned_and_the_source_it_searched(self):
+        code, out, _ = self.call(locate.main, 'find', '--book', '1', '--term', 'SIE_CTRL', '--limit', '2',
+                                 '--context', '0')
+        self.assertEqual(self.call(locate.main, 'find', '--book', '1', '--term', 'nonesuch')[0], 1)
+        self.assertEqual(self.call(locate.main, 'find', '--book', '9', '--term', 'x')[0], 3)
+        hit, miss, gone = self.records()[:3]
+        self.assertEqual((code, hit['op'], hit['query']['book'], hit['query']['limit']), (0, 'find', 1, 2))
+        self.assertEqual(hit['result']['hits'], [[1, 'USB: SIE_CTRL Register'],
+                                                 [3, 'See the SIE_CTRL register description.']])
+        self.assertEqual(hit['result']['total_hits'], 3, 'every excerpt, beyond those returned')
+        self.assertEqual(hit['result']['source']['pages'], 3)
+        self.assertEqual(hit['result']['title'], 'RM0001 reference manual')
+        self.call(locate.main, 'find', '--book', '1', '--term', 'SIE_CTRL')
+        self.assertEqual(self.records()[-1]['result']['total_hits'], 2,
+                         'adjacent matches on page 3 merge into one excerpt')
+        self.assertEqual((miss['exit'], miss['result']['hits']), (1, []))
+        self.assertEqual((gone['result'], gone['exit']), (None, 3))
+        self.assertIn('no such book', gone['error'])
+
+    def test_both_session_ids_are_kept_and_none_is_null(self):
+        os.environ['CODEX_THREAD_ID'] = 'codex-1'
+        self.call(search.main, 'rm0001')
+        del os.environ['CLAUDE_CODE_SESSION_ID'], os.environ['CODEX_THREAD_ID']
+        self.call(search.main, 'rm0001')
+        both, none = self.records()
+        self.assertEqual(both['session'], {'claude': 'claude-1', 'codex': 'codex-1'})
+        self.assertEqual(none['session'], {'claude': None, 'codex': None})
+
+    def test_the_history_is_private_to_its_user(self):
+        self.call(search.main, 'rm0001')
+        self.assertEqual(os.stat(search.HISTORY).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(search.HISTORY)).st_mode & 0o777, 0o700)
+
+    def test_a_history_that_cannot_be_written_warns_and_keeps_the_lookup_exit(self):
+        blocker = Path(self.tmp.name) / 'file'
+        blocker.write_text('')
+        search.HISTORY = str(blocker / 'lookups.jsonl')
+        code, out, err = self.call(search.main, 'rm0001')
+        self.assertEqual(code, 0)
+        self.assertIn('RM0001', out)
+        self.assertIn('lookup history not written', err)
+        self.assertNotIn('logged', err)
+
+    def test_a_partial_last_line_does_not_swallow_the_next_record(self):
+        os.makedirs(os.path.dirname(search.HISTORY))
+        Path(search.HISTORY).write_text('{"v": 1, "id": "cut')
+        self.call(search.main, 'rm0001')
+        lines = Path(search.HISTORY).read_text().splitlines()
+        self.assertEqual(lines[0], '{"v": 1, "id": "cut')
+        self.assertEqual(json.loads(lines[1])['op'], 'search')
+
+    def test_a_short_write_is_completed(self):
+        real = os.write
+        with unittest.mock.patch.object(search.os, 'write', lambda fd, b: real(fd, bytes(b[:7]))):
+            self.call(search.main, 'rm0001')
+        self.assertEqual(self.records()[0]['op'], 'search')
+
+    def test_concurrent_writers_leave_whole_lines(self):
+        code = ('import sys; sys.path.insert(0, sys.argv[1]); import search, time\n'
+                'search.HISTORY = sys.argv[2]\n'
+                'for i in range(40): search.log_lookup("L", "search", {"keywords": ["x" * 3000]},'
+                ' time.monotonic(), 0, None, None)')
+        procs = [subprocess.Popen([sys.executable, '-c', code, str(SCRIPTS), search.HISTORY],
+                                  stderr=subprocess.DEVNULL) for _ in range(6)]
+        for p in procs:
+            self.assertEqual(p.wait(), 0)
+        self.assertEqual(len(self.records()), 240)
 
 if __name__ == '__main__':
     unittest.main()

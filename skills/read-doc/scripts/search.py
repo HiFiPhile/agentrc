@@ -12,19 +12,30 @@ register question is answered from, before the errata that amend it and the
 application notes that use it.
 
 Exit 0 matched, 1 nothing matched, 2 bad usage, 3 the library is unavailable.
+
+Each lookup, here and in locate.py find, is appended to HISTORY and named on
+stderr by its id; history.py lists and shows them. READ_DOC_HISTORY=0 skips it.
 """
 import argparse
 import contextlib
+import fcntl
 import glob
+import json
 import os
 import re
+import socket
 import sqlite3
 import sys
+import time
 import unicodedata
 import urllib.parse
+import uuid
 
 LIB = os.path.realpath(os.path.expanduser(os.environ.get("CALIBRE_LIBRARY") or "~/Documents/calibre-library"))
 DB = os.path.join(LIB, "metadata.db")
+# Per machine, outside the library: the library syncs between machines.
+HISTORY = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                       "read-doc", "lookups.jsonl")
 LIMIT = 10
 
 # Display order: the document a register question is answered from comes first.
@@ -150,6 +161,38 @@ def resolve(bid, path, fmt, name):
     return None
 
 
+def log_lookup(library, op, query, started, code, error, result):
+    """Append one lookup record to HISTORY. Failing to is a warning: the lookup
+    already answered, and its exit code stays the lookup's."""
+    if os.environ.get("READ_DOC_HISTORY") == "0":
+        return
+    rid = uuid.uuid4().hex[:12]
+    record = {"v": 1, "id": rid, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "host": socket.gethostname(), "elapsed_ms": round((time.monotonic() - started) * 1000),
+              "library": library, "op": op,
+              "session": {"claude": os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
+                          "codex": os.environ.get("CODEX_THREAD_ID") or None},
+              "query": query, "exit": code, "error": error, "result": result}
+    line = (json.dumps(record) + "\n").encode()
+    try:
+        os.makedirs(os.path.dirname(HISTORY), mode=0o700, exist_ok=True)
+        fd = os.open(HISTORY, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            end = os.lseek(fd, 0, os.SEEK_END)
+            if end and os.pread(fd, 1, end - 1) != b"\n":
+                line = b"\n" + line  # a writer killed mid-line must not swallow this record
+            view = memoryview(line)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"lookup history not written: {e}", file=sys.stderr)
+        return
+    print(f"lookup {rid} logged", file=sys.stderr)
+
+
 def parser():
     p = argparse.ArgumentParser(prog="search.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -162,13 +205,14 @@ def parser():
 
 
 def run(args):
+    """(exit code, the result recorded in the lookup history)."""
     keywords = [norm(k) for k in args.keyword]
     if not keywords:
         parser().print_help(sys.stderr)
-        return 2
+        raise ValueError("no keyword given")
     if args.limit < 0:
-        print("--limit cannot be negative", file=sys.stderr)
-        return 2
+        raise ValueError("--limit cannot be negative")
+    db_mtime_ns = os.stat(DB).st_mtime_ns
     with contextlib.closing(sqlite3.connect("file:" + urllib.parse.quote(DB) + "?mode=ro",
                                             uri=True)) as db:
         rows = db.execute(QUERY).fetchall()
@@ -188,7 +232,7 @@ def run(args):
 
     if not hits:
         print("no match")
-        return 1
+        return 1, {"db_mtime_ns": db_mtime_ns, "total": 0, "kinds": {}, "books": []}
 
     hits.sort(key=lambda h: h[:4])  # tags/path are not comparable across rows
     counts = {}
@@ -208,18 +252,26 @@ def run(args):
         for fmt, name in entries if args.path else ():
             p = resolve(bid, path, fmt, name)
             print(f"  {fmt} {p}" if p else f"  {fmt} MISSING (library mid-sync or file deleted)")
-    return 0
+    return 0, {"db_mtime_ns": db_mtime_ns, "total": len(hits), "kinds": counts,
+               "books": [[bid, kind, title] for _, _, _, title, kind, bid, *_ in shown]}
 
 
 def main(argv):
     """Exit 3 covers the whole run, not just the query: --path walks the
     library tree, and a half-synced one must not read as "nothing matched"."""
     args = parser().parse_args(argv)
+    started, error, result = time.monotonic(), None, None
     try:
-        return run(args)
+        code, result = run(args)
+    except ValueError as e:
+        code, error = 2, str(e)
     except (OSError, sqlite3.Error) as e:
-        print(f"the Calibre library at {LIB} is unavailable: {e}", file=sys.stderr)
-        return 3
+        code, error = 3, f"the Calibre library at {LIB} is unavailable: {e}"
+    if error:
+        print(error, file=sys.stderr)
+    log_lookup(LIB, "search", {"keywords": args.keyword, "any": args.any, "kind": args.kind,
+                               "limit": args.limit}, started, code, error, result)
+    return code
 
 
 if __name__ == "__main__":

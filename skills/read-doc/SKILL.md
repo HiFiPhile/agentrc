@@ -162,6 +162,17 @@ extraction, so a claim about a bit's access type is checked on the page.
 Cite the book id, the page and the document title for anything you assert, so
 the next reader can reopen it.
 
+## Lookup history
+
+When stderr reports `lookup <id> logged`, cite that id beside the book and
+page. The commands below inspect previous lookups and give a command that
+repeats one.
+
+```bash
+python3 <skill dir>/scripts/history.py list [--session PREFIX] [--term TEXT] [--since YYYY-MM-DD]
+python3 <skill dir>/scripts/history.py show <id>   # the record, and a command that repeats it
+```
+
 ## Common mistakes
 
 - Searching with `find`/`grep` over the library tree. It sees only truncated
