@@ -14,6 +14,12 @@ here are as of the revision given, and one entry below was already stale when it
 arrived. Fix or date an entry when you find it wrong; a renamed symbol does not
 undo the observation behind it.
 
+For firmware built away from the probe host, take the rig's exact manual flash
+recipe from `test/hil/hil_flash.py`: `flash_openocd`, `flash_jlink` or
+`flash_esptool`; do not reconstruct the backend command elsewhere. verified
+2026-09-18 e595e7950 raspberry_pi_pico, frdm_k64f,
+espressif_p4_function_ev: all three probe-side flashes followed those functions.
+
 ## Inspecting state in GDB
 
 - Device stack, per endpoint: `p/x _usbd_dev.ep_status` — `[epnum][dir]`, dir 1 =
@@ -77,10 +83,12 @@ callback names checked in fad6bd546.
 - **CI-flashed rig firmware has logging off**: a capture shows the J-Link banner
   and nothing else. Build a logging variant first. verified 2026-09-16 ea4088
   (ci.lan).
-- Keep unattended console builds at level 2: reset-then-attach only preserves what
-  fits the 1 KB up-buffer, and a chatty boot burst truncates at the ring boundary
-  before the drain attaches (1022–1023 B captures on ea4088 with level 3,
-  enumeration lines lost). `BUFFER_SIZE_UP` is the knob. carried over.
+- Keep unattended console builds at level 2, and size reset-then-attach captures
+  for the 2 s undrained settle: even level 2 overflowed the stock 1 KB up-buffer
+  before SET_CONFIGURATION; `BUFFER_SIZE_UP=8192` preserved the complete boot and
+  enumeration. verified 2026-09-18 e595e7950 raspberry_pi_pico: 1 KB capture
+  ended during the configuration descriptor, while the 8 KB run reached
+  SET_CONFIGURATION, CDC open and MSC open.
 - **Which example proves console INPUT**: `board_test` polls `board_getchar()`
   (RTT-aware) but echoes through `board_putchar` → `board_uart_write`, which is
   not logger-aware: on a UART-less board the echo vanishes (measured on ea4088).
@@ -113,6 +121,17 @@ callback names checked in fad6bd546.
   branch in a tight loop: a 1000-iteration empty `volatile` loop takes 2.2 ms at
   150 MHz. Size calibration loops by measurement. verified 2026-09-18 fad6bd546
   pico2_etm_trace: DWT CYCCNT 329,423 cycles, `time_us_32` 2198 µs.
+
+## RP2040 flash verification
+
+- Verify an RP2040 image through the uncached XIP alias `0x13000000`, with the
+  core halted in flash-resident code. An attach commonly stops in the
+  RAM-resident `get_bootsel_button`, where flash access is off and every read
+  returns `0x00`; `verify_image` then reports false mismatches at both
+  `0x10000000` and `0x13000000`. Break once in flash (for example
+  `hbreak tud_task_ext` + `continue`) before verifying. verified 2026-09-18
+  e595e7950 raspberry_pi_pico: the flash-resident halt verified 31,136 bytes at
+  `0x13000000`; RAM-resident halts returned zeroes.
 
 ## ETM trace
 

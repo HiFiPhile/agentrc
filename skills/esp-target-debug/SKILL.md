@@ -20,7 +20,7 @@ facts, not the wiring. Project specifics (symbols, which uid is which):
 
 | Board                    | USB-SJ vs OTG                                        | JTAG while USB device runs? |
 |--------------------------|------------------------------------------------------|-----------------------------|
-| espressif_p4_function_ev | separate pins: USB-SJ GPIO24/25 (FS), OTG own HS PHY | **yes — coexist** (verified: 303a:1001 + cafe:4008 simultaneously, gdb attach during live CDC traffic) |
+| espressif_p4_function_ev | separate pins: USB-SJ GPIO24/25 (FS), OTG own HS PHY | **yes — coexist** (verified: 303a:1001 + cafe:4008 simultaneously; attach remains available but resets the app, below) |
 | espressif_s3_devkitm     | ONE shared PHY/port                                  | **no** — the same hub port flips 303a:1001 → cafe:4008 as the app boots; openocd fails `esp_usb_jtag: could not find or open device!` |
 
 Flashing works in ANY PHY state: the rig flashes via the boards' CP2102N UART
@@ -68,15 +68,22 @@ riscv32-esp-elf-gdb -batch -ex 'target extended-remote :3333' \
 - `set ESP_RTOS FreeRTOS` must precede the board cfg: with it, `info threads`
   lists every task with name/state/CPU (verified: usbd Running @CPU0, IDLE1
   @CPU1, ...); without it, one bare "Remote target".
+- On ci.lan, `export.sh` does not put the RISC-V GDB on PATH. The verified
+  2026-09-18 executable is
+  `/home/hathach/.espressif/tools/riscv32-esp-elf-gdb/17.1_20260402/riscv32-esp-elf-gdb/bin/riscv32-esp-elf-gdb`;
+  re-resolve the version directory after an ESP-IDF tool update.
 - The ELF: the firmware's own build output (an `idf.py` build directory) —
   symbolized app backtraces verified.
-- **Attach may reset the target** (a boot-fresh FreeRTOS tick observed on a
-  minutes-old session). Until pinned down, do NOT trust built-in-JTAG attach
-  for post-mortem autopsy of a wedged board (`target-debug`'s
-  attach-and-halt-only rule); capture state via console or treat the reset
-  as part of the reproduce cycle.
+- **P4 attach resets the target** in the measured rig configuration: openocd
+  reports memory protection enabled, resets to disable it, then reports a JTAG
+  CPU reset. The initial `tud_task_ext` breakpoint therefore observed a fresh
+  boot (`xTickCount = 2`, `cfg_num = 0`), not the pre-attach enumerated state;
+  observing steady state reached after that reset was not established. Other
+  built-in-JTAG targets may reset too; do not use this route to preserve a
+  wedged board's pre-attach state (`target-debug`'s attach-and-halt-only rule).
 - Halting still stops USB service: the host may drop the DUT during long
-  halts; after detach the device may need the UART reset to re-enumerate.
+  halts. On P4 the DUT did not return to the bus after detach; use the UART
+  hard reset above before expecting it to re-enumerate.
 
 ## Scripted-session gotchas (verified)
 
@@ -84,7 +91,11 @@ riscv32-esp-elf-gdb -batch -ex 'target extended-remote :3333' \
   state reads, halt via openocd telnet :4444 first, then attach gdb to the
   stopped target. Interactive sessions are unaffected.
 - cpu1 debug-logic examination can fail (`OCD_ID = 00000000`) —
-  `-c 'set ESP_ONLYCPU 1'` degrades to cpu0-only debugging.
+  `-c 'set ESP_ONLYCPU 1'` degrades to cpu0-only debugging, but a breakpoint
+  in a task scheduled on the other hart then stays silently unreachable.
+- openocd-esp32 v0.12.0-esp32-20251215 asserted at `riscv.c:2150` when a
+  second breakpoint was armed after the first hit in the two-hart P4 setup.
+  Budget one breakpoint per session on that version.
 - ROM-frame backtraces (`0x4004xxxx` on S3, `0x4fc0xxxx` on P4, all `??`)
   mean the core idles in ROM — break in app code (`tbreak <app symbol>`) for symbolized frames.
 

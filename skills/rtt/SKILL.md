@@ -111,6 +111,10 @@ python3 <skill dir>/scripts/rtt.py --backend openocd --probe <serial> \
 #   leaves the core held) or WCH SDI.
 ```
 
+No reader drains the up-buffer during that 2 s settle. Size the ring for the
+whole boot burst, including moderate logs; the project's notes carry the
+measured value where one is known.
+
 Attach WITHOUT reset when the flash step already reset the board (on SAMD5x,
 an in-session `reset run` goes through the DSU CPU Reset Extension and leaves
 the core held). After any reset the target's offsets restart at zero while

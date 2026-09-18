@@ -12,6 +12,24 @@ openocd -f interface/stlink.cfg -f target/stm32h7x.cfg -c 'adapter serial <uid>'
 openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg -c 'adapter serial <uid>' -c 'adapter speed 5000'
 ```
 
+## OpenOCD batch sessions
+
+OpenOCD 0.12 does not emit `mdw` output from a `-c` script. Print a scripted
+memory read explicitly; for example, the Cortex-M validity anchor is:
+
+```bash
+openocd ... -c 'init; echo [format 0x%08x [read_memory 0xE000EDF0 32 1]]; shutdown'
+```
+
+A failed command stops the rest of that `-c` script. Put a flash or
+`verify_image` operation that may fail in its own session: a following
+`reset run` or `shutdown` will not execute, and the target can be left halted.
+
+RP2040 needs the roster's explicit `adapter speed` (5000 on the measured
+CMSIS-DAP rigs); the 100 kHz default failed to connect the multidrop DAP.
+Before `program`, run `init; reset halt`: without that state preparation the
+flash algorithm failed to allocate its bounce buffer and left the core halted.
+
 Connect with the matching toolchain's GDB (`arm-none-eabi-gdb <flashed.elf>`
 for ARM), then `target remote :2331` for J-Link or `target remote :3333`
 for OpenOCD. For an autopsy, use `monitor halt`; for a fresh start only,

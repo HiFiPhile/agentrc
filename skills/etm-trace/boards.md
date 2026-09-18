@@ -34,7 +34,7 @@ reference.
 | mimxrt1170_evkb    | 996 MHz              | 50 MHz (root/2)       | 1     | 0       | weld 0 Ω R1881-R1886; JP4 shorted; J58 (populated) | re-weld R1884 (D3 open; D1/D2 meter-verified good) → width 4 |
 | ra6m5_ek (M33)     | 200 MHz              | 25 MHz (TRCLK/4 /2)   | 4     | 0 (unset) | J9 closed; native J20 trace | —                                           |
 | ra8m1_ek (M85)     | 480 MHz              | 60 MHz (TRCLK/4 /2)   | 4     | 0 (unset) | J9 closed + Table 7 jumpers | —                                           |
-| pico2_etm_trace (RP2350 M33)    | 150 MHz | 75 MHz (clk_sys/2)    | 4     | +1 ns   | Pico 2 on the trace-carrier PCB (MIPI-20) | —                                           |
+| pico2_etm_trace (RP2350 M33)    | 150 MHz | 75 MHz (clk_sys/2)    | 4     | +1 ns   | Pico 2 on the trace-carrier PCB (MIPI-20) | revalidate 150 MHz mid-stream deaths        |
 | same54_xplained (E54 M4F) | 120 MHz       | 60 MHz (CPU/2)        | 4     | 0 (unset) | none — populated 20-pin ETM header | —                                      |
 | same70_xplained (E70 M7) | 300 MHz         | 37.5 MHz (PCK3/2)     | 1     | 0 (unset) | solder 20-pin header on J403 (bottom) | width 4 blocked: D1 (J403.16) dead at speed — probe-channel crosscheck pending |
 | SEGGER H7/F407 ref | demo defaults        | demo                  | 4     | demo    | probe-powered: add `--power`  | —                                           |
@@ -125,7 +125,11 @@ Board caveats (beyond the table):
   +1 ns** (committed in the reference; idle eye -1000..+2000 ps, +3000 dead;
   TD aliases modulo the 6.67 ns UI); soak: cdc_msc_throughput under a live
   host CDC+MSC bulk pump, 3/3 x 15 s, zero overflow, 53.7M fetches (DCD hot
-  path at 9% load).
+  path at 9% load). **Regressed 2026-09-18 at TinyUSB e595e7950**: after one
+  arm-phase death at 0.107 s, two captures died mid-stream at 3.273 s and
+  3.543 s; `--no-timestamps` did not help. The August soak is historical,
+  not proof of a currently clean 150 MHz link; lower the core clock if a
+  retry still dies mid-stream.
   **Other rates need a hand-built clock** (the compile definitions: the project's
   notes). Measured: 180000 = 90 MHz TRACECLK, loaded eye
   +4000..+5000 ps (3/3); 240000 = **the J-Trace PRO V2 ceiling** (120 MHz

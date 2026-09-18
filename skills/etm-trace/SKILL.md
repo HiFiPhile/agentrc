@@ -83,8 +83,9 @@ hand-roll Ozone drivers.
 
 Choosing capture flags (semantics in `--help`):
 - fresh-boot profile/coverage: defaults (flash + reset + trace from startup)
-- narrowing debug on a LIVE target: `--attach` — no reflash/reset (flashed
-  firmware must match `--elf` and have trace init built in)
+- a LIVE state established first (for example flash, wait for enumeration,
+  then capture): `--attach` — no reflash/reset (flashed firmware must match
+  `--elf` and have trace init built in); the default would erase that state
 - raw history: `--trace-csv` (~80 MB/1M instructions) — when sequence/timing
   matters, e.g. feeding `--isr`
 - stream dies (overflow/unknown-packet): `--no-timestamps`, then reduce the
