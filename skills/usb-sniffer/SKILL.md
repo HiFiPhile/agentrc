@@ -1,6 +1,6 @@
 ---
 name: usb-sniffer
-description: Use when you need wire-level USB evidence that host-side capture can't provide — a device that never enumerates (usbmon shows nothing or only Submits), suspected NAK storms/STALL/babble/bad handshakes, bus-reset or enumeration timing, split-transaction issues, a usbmon-vs-device-log disagreement the wire must arbitrate, or any link with no Linux PC host to run usbmon on (an MCU host, a Linux gadget peer). Captures LS/FS/HS packets (PIDs, tokens, handshakes, SE0/line states) with the ataradov usb-sniffer hardware into Wireshark pcapng.
+description: Use when you need wire-level USB evidence that host-side capture cannot give: a device that never enumerates, usbmon showing only Submits, NAK storms, STALL, babble, bus-reset or enumeration timing, or a link with no Linux host (an MCU host, a gadget peer). LS/FS/HS packets into pcapng with the ataradov usb-sniffer.
 ---
 
 # usb-sniffer — wire-level capture with the ataradov hardware analyzer
@@ -35,18 +35,21 @@ capturing alone perturbs nothing and the sniffer itself needs no lock.
 
 ```bash
 S=<skill dir>/scripts/sniff.py
-$S capture raw.pcapng --port 3-2.7 --limit 3000000 --fold    # speed from the tapped port's sysfs entry
-$S capture raw.pcapng --speed hs --seconds 15                # explicit speed, time bound
+$S capture raw.pcapng --port 3-2.7 --seconds 30 --limit 3000000 --fold   # speed from the tapped port's sysfs entry
+$S capture raw.pcapng --speed hs --seconds 15                            # explicit speed
 ```
 
 - The speed must be the tapped **segment's**: an FS device behind an HS hub
   is HS on the hub's upstream cable (you will see SPLIT transactions, not
   native FS packets — tap the device's own cable at `fs` for those). Wrong
-  speed = no USB packets, only Syslog pseudo-packets ("Line state: SE0",
-  "VBUS ON"); fix the speed before doubting the hardware.
-- Every capture is bounded (`--limit` packets or `--seconds`); the script
-  refuses otherwise, because HS runs 15–20 MB/s even with `--fold` whenever
-  any device on the bus is busy (`--fold` collapses only truly empty frames).
+  speed = no USB packets, only the sniffer's own records ("Line state: SE0",
+  "VBUS ON", "Detected speed: Full-Speed"): the script fails such a capture,
+  keeps the file and prints the records; fix the speed before doubting the
+  hardware.
+- Every capture takes `--seconds`, a wall-clock bound: `--limit` alone never
+  ends on an idle bus or an unfired trigger, and HS runs 15–20 MB/s even with
+  `--fold` whenever any device on the bus is busy (`--fold` collapses only
+  truly empty frames). `--limit` on top ends it earlier, at N packets.
   It also refuses an existing output file, so a tool killed at the time
   bound can never pass off an older capture as this one. `--seconds` kills
   the tool, which closes its file on no signal, so the script runs the cut
@@ -55,7 +58,13 @@ $S capture raw.pcapng --speed hs --seconds 15                # explicit speed, t
   shorter windows have provably missed the ladder when the trigger's latency
   varied (a debug-probe connect takes 0.5–4 s run to run); longer ones only
   make every later tshark pass slower. `--trigger low|high|falling|rising`
-  arms on the external trigger pin instead of starting at once.
+  arms on the external trigger pin instead of starting at once; a trigger that
+  never fired within `--seconds` fails the capture ("never fired").
+  The pin is the pad pair J4 "IN" / J5 "GND" (FPGA pin 41, 3.3 V LVCMOS, pulled
+  up), unpopulated as shipped: with nothing soldered it reads high, so `high`
+  fires at once and `low`/`falling`/`rising` end "never fired" (all four seen
+  2026-09-18). The only trigger ever seen to FIRE is `high` on the bare pad; the
+  edge and `low` modes firing needs a wire on J4.
 - Start the capture FIRST, then the event. Triggers: a debug-probe reset of
   the DUT gives the full ladder including SET_ADDRESS; `USBDEVFS_RESET`
   (`usbreset`, or the ioctl from Python) makes the host re-address the device,
