@@ -124,14 +124,38 @@ callback names checked in fad6bd546.
 
 ## RP2040 flash verification
 
-- Verify an RP2040 image through the uncached XIP alias `0x13000000`, with the
-  core halted in flash-resident code. An attach commonly stops in the
-  RAM-resident `get_bootsel_button`, where flash access is off and every read
-  returns `0x00`; `verify_image` then reports false mismatches at both
-  `0x10000000` and `0x13000000`. Break once in flash (for example
-  `hbreak tud_task_ext` + `continue`) before verifying. verified 2026-09-18
-  e595e7950 raspberry_pi_pico: the flash-resident halt verified 31,136 bytes at
-  `0x13000000`; RAM-resident halts returned zeroes.
+- Before any RP2040 flash read or `verify_image`, stop at a hardware
+  breakpoint in flash-resident code of the matching ELF and confirm the PC is
+  there; a stop in the RAM-resident `get_bootsel_button` does not qualify. In
+  `get_bootsel_button` flash access is off and every read returns `0x00`;
+  `verify_image` reports false mismatches at both `0x10000000` and
+  `0x13000000`. `scripts/rp2040_verify.py` (beside `target-debug`'s SKILL.md)
+  does it on OpenOCD: breakpoint, PC check, verification through the uncached
+  XIP alias, then it removes its breakpoint, resumes and reads DHCSR; `--help`
+  gives its outcomes and exit codes:
+
+  ```bash
+  python3 <skill dir>/scripts/rp2040_verify.py --probe <serial> --interface-cfg interface/cmsis-dap.cfg \
+    --speed 5000 --elf <flashed.elf> --symbol tud_task_ext
+  ```
+
+  verified 2026-09-18 81a25eb5d raspberry_pi_pico (htpc, CMSIS-DAP): the
+  matching ELF verified 31,136 bytes, exit 0; `--symbol board_init` (never
+  reached again) gave `not-at-breakpoint pc=0x20000230`, exit 1; the pre-fix
+  ELF gave `mismatch` with diffs from `0x13004112`, exit 1. DHCSR read
+  `0x01000001` each time, the CDC echo still worked and dmesg logged no new
+  enumeration. An earlier run of the script's first version did coincide with
+  one disconnect and re-enumeration (14:46:42), and the next session logged
+  "external reset detected"; cause not established, so the script now fails
+  on a detected reset. OpenOCD's default SMP pair failed `resume` with "core1
+  not halted" and left core 0 halted; the script sets `USE_CORE 0`.
+- A single opcode read (`mdh <addr> 1`) at an address where two builds differ
+  supports a narrow identity claim between them, not a verified image.
+- Observed 2026-09-18 bdb6b90fc raspberry_pi_pico (htpc, CMSIS-DAP): a bare
+  `halt` that stopped in `get_bootsel_button`, then `verify_image` (all
+  zeroes), then `reset` left the board failing enumeration ("device not
+  accepting address") until a `program` reflash recovered it. Mechanism not
+  established.
 
 ## ETM trace
 

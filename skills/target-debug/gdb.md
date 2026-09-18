@@ -14,16 +14,24 @@ openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg -c 'adapter serial <uid>
 
 ## OpenOCD batch sessions
 
-OpenOCD 0.12 does not emit `mdw` output from a `-c` script. Print a scripted
-memory read explicitly; for example, the Cortex-M validity anchor is:
+OpenOCD 0.12 does not emit `mdw` output from a `-c` script, nor `reg` or
+`verify_image` output from inside a compound `-c` string (seen 2026-09-18).
+Print it explicitly with `echo [capture "<command>"]`, or read memory with
+`read_memory`; for example, the Cortex-M validity anchor is:
 
 ```bash
 openocd ... -c 'init; echo [format 0x%08x [read_memory 0xE000EDF0 32 1]]; shutdown'
 ```
 
-A failed command stops the rest of that `-c` script. Put a flash or
-`verify_image` operation that may fail in its own session: a following
-`reset run` or `shutdown` will not execute, and the target can be left halted.
+A failed command stops the whole batch, including every later `-c`
+argument: a following `reset run`, `resume` or `shutdown` will not execute,
+and the target can be left halted. Put a flash or `verify_image` that may fail
+in its own session, or wrap it in `catch` and run the restoring commands
+unconditionally before `shutdown error`.
+
+On RP2040, reach a flash-resident halt before any flash read or
+`verify_image`: the tinyusb project note "RP2040 flash verification" has the
+precondition and the failure it prevents.
 
 RP2040 needs the roster's explicit `adapter speed` (5000 on the measured
 CMSIS-DAP rigs); the 100 kHz default failed to connect the multidrop DAP.

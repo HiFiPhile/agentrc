@@ -141,6 +141,19 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('costs time, not a repetition', body)
         self.assertIn('Observation window per attempt (ceiling)', (AGENTS / 'chief.md').read_text())
 
+    def test_rp2040_verification_precondition_is_reachable_and_usb_run_state_needs_function(self):
+        flat = lambda path: ' '.join(path.read_text().split())
+        td = SKILLS / 'target-debug'
+        note = flat(td / 'projects' / 'tinyusb.md')
+        self.assertIn('Before any RP2040 flash read or `verify_image`, stop at a hardware breakpoint in flash-resident code', note)
+        self.assertIn('scripts/rp2040_verify.py', note)
+        self.assertIn('Mechanism not established.', note)
+        self.assertIn('"RP2040 flash verification"', flat(td / 'gdb.md'))
+        skill = flat(td / 'SKILL.md')
+        self.assertIn('RP2040: a flash-resident halt', skill)
+        self.assertIn('a device number alone establishes neither', skill)
+        self.assertIn('attributable supplied evidence', flat(AGENTS / 'hw-validator.md'))
+
     def test_chief_quotes_unit_json_and_leaves_verdicts_to_the_role(self):
         body = (AGENTS / 'chief.md').read_text()
         self.assertIn("Every hardware dispatch requests the role's Output contract unchanged.", body)

@@ -124,16 +124,19 @@ adds only what it may edit and when it stops.
   pinned artifact and verify its programmed contents, the artifact hash
   recorded apart from that result), remove owned breakpoints and watchpoints,
   restore the firmware's expected run state and record an observation that
-  establishes it (a verified flash alone does not), close the flasher, restore
-  host settings, release the lock. `restorationFlashes` counts actual
-  programming attempts. Run state not established is a failed cleanup. Do only
-  the cleanup your own actions or the explicitly assigned recovery state call
-  for, establishing ownership before restoring a predecessor's state. Blocked
-  before touching hardware with no recovery state assigned, the untouched
-  actions are `n-a`, nothing is flashed and another holder's lock stays. If
-  restoration cannot complete, keep the lock where you can, report the exact
-  remaining source, firmware, process and lock state, and do not call the
-  board ready.
+  establishes it (a verified flash alone does not; for a USB device, the
+  expected function, such as an application exchange; a claim that needs
+  re-enumeration records the enumeration events, and a device number alone
+  establishes neither, since the host may reuse it across a reset), close the
+  flasher, restore host settings, release the lock. `restorationFlashes`
+  counts actual programming attempts. Run state not established is a failed
+  cleanup. Do only the cleanup your own actions or the explicitly assigned
+  recovery state call for, establishing ownership before restoring a
+  predecessor's state. Blocked before touching hardware with no recovery state
+  assigned, the untouched actions are `n-a`, nothing is flashed and another
+  holder's lock stays. If restoration cannot complete, keep the lock where you
+  can, report the exact remaining source, firmware, process and lock state,
+  and do not call the board ready.
 - **Return.** The tested firmware identity, decisive observations, artifact
   locations, cleanup state and budget used; sampling done by hand on a native
   probe comes back with its command, and the limits name only what was
@@ -310,6 +313,8 @@ the wire itself: `usb-sniffer` skill (hardware tap, PID-level).
   behavior contradicts the flashed code: `objcopy -O binary fw.elf
   /tmp/fw.bin`, then `verifybin /tmp/fw.bin,<flash-base>` (J-Link, verified)
   or `verify_image` (OpenOCD); on mismatch reflash before debugging further.
+  Some targets need a particular halt state before flash reads (RP2040: a
+  flash-resident halt); check the project note first.
 - **A marginal link can fake a deterministic firmware bug** — down to failing
   the same test at the same iteration twice. "USB disconnect" in dmesg on a
   freshly re-cabled port (high devnum = churn) means the plug, not the code:

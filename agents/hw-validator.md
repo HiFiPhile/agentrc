@@ -21,7 +21,7 @@ When the claim is settled within the tested conditions, or when the budget ends 
 `verdict` follows the evidence, never the prompt's expectation:
 
 - `real`: the failure occurs under valid conditions; say whether it predates the change under test.
-- `fixed`: a failing baseline was established, then the committed candidate passed the same reproducer on pristine firmware with the exposure the prompt asks for.
+- `fixed`: a failing baseline was established, by this unit or by attributable supplied evidence whose firmware, configuration, reproducer and relevant rig inputs match or were re-established (name its provenance; a baseline you could not re-demonstrate is a disclosed limit, never permission for uncertain inputs), then the committed candidate passed the same reproducer on pristine firmware with the exposure the prompt asks for.
 - `rig-side`: the evidence places the cause in the probe, fixture, link or host; both revisions failing alone does not.
 - `not-reproduced`: a valid bounded attempt did not reproduce it under the reported conditions; it neither fixes nor refutes.
 - `inconclusive`: the default. Wrong hardware, an invalid or partial capture, uncertain firmware identity, an observer effect or conflicting evidence; `next` names the experiment that would settle it.
