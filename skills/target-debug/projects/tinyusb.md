@@ -173,6 +173,11 @@ carried over, as pointers to the technique rather than to the fix:
 
 ## Espressif boards
 
+- Resolve the board's family from `hw/bsp/*/boards/<board>` before selecting the
+  debug backend; `ls -d hw/bsp/*/boards/<board>` must identify one board
+  directory. For an Espressif board, read `esp-target-debug` first; `target-debug`
+  still supplies the methodology. carried over from TinyUSB's `target-debugger`
+  agent.
 - The HIL config's `esptool` uids are the CP2102N **flasher** serials (the UART
   bridge), never the USB-Serial-JTAG device: do not pass them to openocd, whose
   `adapter serial` is the chip MAC with colons. carried over.

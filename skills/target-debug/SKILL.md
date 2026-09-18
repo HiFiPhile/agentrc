@@ -17,7 +17,7 @@ host may face another board or a Linux gadget (e.g. a Raspberry Pi).
 | **`target-debug`**   | **what the target did** (driver state, faults, where the core spins) | a debug probe on the target                        |
 | `rtt`                | the target's log/console stream, and a post-mortem ring dump     | a probe, firmware that logs over SEGGER RTT             |
 | `esp-target-debug`   | the same methods on Espressif's built-in USB-JTAG                | an ESP32-S3/P4 — read it FIRST there: other gdb, other openocd |
-| `etm-trace`          | exactly which instructions ran (profile, coverage, history)      | a SEGGER J-Trace wired to the trace header — confirm with the user |
+| `etm-trace`          | exactly which instructions ran (profile, coverage, history)      | a SEGGER J-Trace wired to this board; follow `etm-trace`'s confirmation rule |
 | `usb-sniffer`        | what crossed the wire (PIDs, handshakes, resets)                 | the hardware tap cabled in; role-agnostic               |
 | `usb-kernel-debug`   | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
 
@@ -63,15 +63,26 @@ adds only what it may edit and when it stops.
   resolve the build and access through the project's contracts or the ELF,
   device/config and procedure it supplies. A missing technical input returns
   `blocked`, a missing authorization or human action `needs-user`, instead of
-  waiting for an answer.
+  waiting for an answer. A technique that needs unconfirmed physical setup is a
+  proposed next experiment, not permission to touch the hardware: for ETM,
+  follow `etm-trace`'s per-board wiring rule, and when it is unmet name ETM in
+  `next` and the missing setup in the limits.
 - **Identity.** Verify worktree, branch and HEAD, then board, probe serial and
   host against the prompt, or the probe against the HIL config entry it names,
-  before acting.
+  before acting. Resolve the board's family and debug backend from the
+  project's metadata before choosing probe tools, never from the board name or
+  its flashing backend.
 - **Lock.** Hold the board lock for the whole hardware phase; a refused hold
   allows retries within the prompt's lock-wait budget, then `blocked` with the
   holder. A reproducer that takes the lock itself (tinyusb's `hil_test.py`)
-  never runs under your hold and its guard is never bypassed: resolve the
-  equivalent manual steps through the HIL contract, or return `blocked`.
+  never runs under your hold and its guard is never bypassed. Reuse a supplied
+  HIL reproduction while its firmware, configuration, reproducer and relevant
+  rig inputs match; otherwise resolve equivalent manual steps through the HIL
+  contract, and if there are none return `blocked` naming the exact HIL
+  reproduction needed, so the caller arranges it through the project's HIL
+  role. A later manual session re-establishes firmware identity and state and
+  never treats a snapshot taken after that handoff as the earlier failure
+  state without evidence.
 - **Builds.** Through the build contract into a private build directory,
   leaving firmware staged for HIL untouched; save the pristine restoration
   artifact before changing the target. Tracked paths a build may rewrite are
