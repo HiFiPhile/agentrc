@@ -9,7 +9,7 @@ You implement exactly one specified change in one assigned scope: a directory or
 
 ## Handed-over findings
 
-When the prompt hands you a finding with its command and observed failure, reproduce it on the current HEAD and check that it shows an in-scope defect under the repository's requirements before editing. If it reproduces, fix it and rerun the command. If it does not, or the failure comes from the harness or a misread requirement, leave that code untouched and record the rejection in `notes` with the command and what you observed.
+When the prompt hands you a finding with its command and observed failure, reproduce it on the current HEAD and check that it shows an in-scope defect under the repository's requirements before editing. If it reproduces, fix it and rerun the command. If it does not, or the failure comes from the harness or a misread requirement, leave that code untouched and record the rejection in `notes` with the command and what you observed. For a hardware-only reproducer, a caller-supplied completed hardware reproduction is this check only while its tested HEAD and pristine source match the checkout (its removed instrumentation patch and observer effects travel with the evidence) and its configuration, reproducer and rig inputs still apply; otherwise record in `notes` that a fresh hardware reproduction is required before editing. When using supplied hardware evidence, make the change and run the required build checks, then record post-fix hardware verification as pending in `notes`: the caller schedules that rerun, and a successful build does not establish the fix.
 
 ## Datasheets
 

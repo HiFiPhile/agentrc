@@ -43,6 +43,28 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(verdict, body)
         self.assertNotIn('rigSide', body)
 
+    def test_hw_debugger_example_carries_what_chief_adjudicates_on(self):
+        """chief reads status apart from verdict and trusts a board only on a cleanup receipt."""
+        body = (AGENTS / 'hw-debugger.md').read_text()
+        example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
+        self.assertIn(example['status'], ('complete', 'blocked', 'needs-user'))
+        self.assertIn(example['verdict'], ('real', 'fixed', 'rig-side', 'not-reproduced', 'inconclusive'))
+        for key in ('question', 'criterion', 'reason', 'worktree', 'branch', 'head', 'host', 'board', 'probe', 'example', 'peer',
+                    'runs', 'cleanup', 'limits', 'blocker', 'next'):
+            self.assertIn(key, example)
+        run = example['runs'][0]
+        for key in ('revision', 'configuration', 'firmware', 'instrument', 'technique', 'command', 'repetitions', 'duration',
+                    'observed', 'evidence', 'artifacts'):
+            self.assertIn(key, run)
+        self.assertIsInstance(run['technique'], list)
+        cleanup = example['cleanup']
+        self.assertIn('pristine', cleanup)
+        self.assertEqual(sorted(cleanup['flashVerify']), ['command', 'result'], 'a hash alone does not verify a flash')
+        for key in ('sourceRestored', 'clientsStopped', 'hostRestored', 'lockReleased'):
+            self.assertIn(cleanup[key], ('done', 'failed', 'n-a'))
+        for verdict in ('`real`', '`fixed`', '`rig-side`', '`not-reproduced`', '`inconclusive`'):
+            self.assertIn(verdict, body)
+
 
 if __name__ == '__main__':
     unittest.main()

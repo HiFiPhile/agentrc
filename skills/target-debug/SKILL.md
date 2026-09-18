@@ -53,6 +53,17 @@ A J-Link entry supplies neither interface nor speed. On the J-Link route `--inte
 flags are refused. `pc_sample.py` takes J-Link entries only. `etm_capture.py` does not read it — a J-Trace is one probe moved
 between boards, named with `--probe`.
 
+## Delegated sessions
+
+When an agent dispatches this work, its prompt is the scope: stay within its
+board, operations and source paths, and resolve the build and access through
+the project's contracts or the ELF, device/config and procedure it supplies.
+Return a missing technical input as blocked and a missing authorization or
+human action as needs-user instead of waiting for an answer. Return the tested
+firmware identity, the decisive observations, the artifact locations and the
+cleanup state; sampling done by hand on a native probe comes back with its
+command, and the limits name only what was actually unavailable.
+
 ## Rig discipline — lock first, always
 
 On a shared rig, hold the project's board lock for the WHOLE manual session
@@ -211,7 +222,8 @@ the wire itself: `usb-sniffer` skill (hardware tap, PID-level).
   mid-test on that board means wait, don't force.
 - **Instrumentation is temporary**: before `release`, reflash pristine
   firmware (the next CI run must not inherit a debug build) and revert the
-  instrumentation diff — or hand it over explicitly with the diagnosis.
+  instrumentation diff. Handing the diff over with the diagnosis preserves the
+  evidence; it does not count as cleanup.
 - **A register snapshot without a validity anchor lies**: J-Link tool sessions
   can reset or briefly halt the DUT as a side effect, and a snapshot of a
   freshly-reset chip (e.g. NVIC ISER = 0) reads like a smoking gun. Read DHCSR
