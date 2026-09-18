@@ -193,6 +193,12 @@ class GateTest(unittest.TestCase):
         self.assertIn('-a\n+in worktree\n', patch, 'an edit, not a creation')
         self.assertIn('-c\n', patch, 'the deletion is kept')
 
+    def test_a_worktree_outside_the_checkout_is_another_sessions(self):
+        wt = Path(self.tmp.name) / 'sibling'
+        sh(self.root, 'git', 'worktree', 'add', '-q', str(wt), '-b', 'sibling')
+        (wt / 'a.txt').write_text('elsewhere\n')
+        self.assertEqual(self.s.stop(), {})
+
     def test_a_worktree_removed_after_its_edit_keeps_the_edit(self):
         wt = self.root / '.worktrees' / 'task'
         sh(self.root, 'git', 'worktree', 'add', '-q', str(wt), '-b', 'task')

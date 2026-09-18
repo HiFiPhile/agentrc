@@ -11,7 +11,7 @@ below.
 
     /simplify-gate [on [--model M] [--effort E] | off]
 
-Scope is the turn: every worktree of the repository (index blob ids, with
+Scope is the turn: the checkout and the worktrees nested in it (index blob ids, with
 dirty and untracked files hashed into the object store as git would store
 them) is snapshotted when a prompt arrives and again at Stop, and the diff of
 the two is queued as a batch. A peer sharing the checkout may have made some
@@ -142,11 +142,12 @@ def snapshot_tree(tree, blobs):
 
 
 def snapshot(root, blobs):
-    """Every worktree of the repository, keyed relative to `root`: a task
+    """`root` and the worktrees nested in it, keyed relative to `root`: a task
     worktree under `.worktrees/` is where the session's edits often land while
-    the project directory still names the primary checkout."""
+    the project directory still names the primary checkout. A worktree outside
+    `root` is another session's checkout."""
     snap = {'files': {}, 'trees': []}
-    for tree in worktrees(root):
+    for tree in (t for t in worktrees(root) if t.is_relative_to(root)):
         prefix = os.path.relpath(tree, root)
         prefix = '' if prefix == '.' else prefix + '/'
         snap['trees'].append(prefix)

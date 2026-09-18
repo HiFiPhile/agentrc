@@ -42,7 +42,7 @@ install.
 
 ## Simplify gate (per repository)
 
-`hooks/simplify-gate` snapshots the checkout and its worktrees when a prompt
+`hooks/simplify-gate` snapshots the checkout and the worktrees nested in it when a prompt
 arrives and when the session stops, then sends the diff to a read-only
 `codex exec` YAGNI challenge at Stop: at most two rounds per user turn, one
 retry on Codex failure, then the stop goes through with a notice. One review
