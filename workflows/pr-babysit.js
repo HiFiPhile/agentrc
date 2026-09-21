@@ -816,8 +816,17 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // somebody else's doing. The snapshots below then show it stayed put across
   // the hooks; they say nothing about which process wrote it.
   const ownedSet = new Set(owned.map(canon))
-  const pathOf = (line) => line.length > 3 ? canon(line.slice(3)) : ''
-  const modified = (lines) => new Set(lines.filter(l => l.startsWith(' M ')).map(pathOf))
+  // Status lines arrive through an agent's JSON, which has dropped the leading blank of an
+  // unstaged entry (' M path' -> 'M path') before: a fixed offset then shaved the path's
+  // first character and refused an in-scope edit as outside the scope. Read the two status
+  // columns by pattern; a lone column is the unstaged form with its blank lost.
+  const STATUS_LINE = /^(?:([ MADRCUT?!])([ MADRCUT?!]) |([MADRCUT?!]) )(.+)$/
+  const statusOf = (line) => {
+    const m = STATUS_LINE.exec(line)
+    return m ? { x: m[1] ?? ' ', y: m[2] ?? m[3], path: canon(m[4]) } : null
+  }
+  const pathOf = (line) => (statusOf(line) || {}).path || ''
+  const modified = (lines) => new Set(lines.map(statusOf).filter(t => t && t.x === ' ' && t.y === 'M').map(t => t.path))
   const regenerated = generatedRe ? [...modified(now.status)].filter(f => f && !ownedSet.has(f) && generatedRe.test(f)) : []
   const regeneratedProtected = protectedRe ? regenerated.filter(f => protectedRe.test(f)) : []
   if (regeneratedProtected.length) {
@@ -853,7 +862,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
   const generated = hooks.after.filter(l => !beforePaths.includes(pathOf(l)))
   // Anything staged after the hooks (X not blank) was staged by a hook: an
   // addition the tree never held, or a rename. Untracked (`??`) is new too.
-  const created = generated.filter(l => l[0] !== ' ' || l.includes(' -> '))
+  const created = generated.filter(l => (statusOf(l) || { x: '?' }).x !== ' ' || l.includes(' -> '))
   const hookPaths = generated.map(pathOf)
   const generatedProtected = protectedRe ? hookPaths.filter(f => protectedRe.test(f)) : []
   // Evidence must be complete before it says anything: one snapshot entry per
