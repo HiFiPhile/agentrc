@@ -12,6 +12,8 @@ export const meta = {
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
 //          protected?: string (regex over canonical repo-relative paths; matches are
 //            dropped from a fix scope and never committed),
+//          (dirty .idea/ paths, IDE metadata, are ignored by the dirty checks and never
+//            committed; every other pre-existing edit refuses the start)
 //          generated?: string (regex over canonical repo-relative paths a fixer's build
 //            regenerates, a tracked catalog say; a modification to one is admitted into
 //            the commit on the caller's word that the repository hooks validate it),
@@ -553,6 +555,25 @@ const canon = (p) => {
   return out.join('/')
 }
 
+// Status lines arrive through an agent's JSON, which has dropped the leading blank of an
+// unstaged entry (' M path' -> 'M path') before: a fixed offset then shaved the path's
+// first character and refused an in-scope edit as outside the scope. Read the two status
+// columns by pattern; a lone column is the unstaged form with its blank lost.
+const STATUS_LINE = /^(?:([ MADRCUT?!])([ MADRCUT?!]) |([MADRCUT?!]) )(.+)$/
+const statusOf = (line) => {
+  const m = STATUS_LINE.exec(line)
+  return m ? { x: m[1] ?? ' ', y: m[2] ?? m[3], path: canon(m[4]) } : null
+}
+const pathOf = (line) => (statusOf(line) || {}).path || ''
+const modified = (lines) => new Set(lines.map(statusOf).filter(t => t && t.x === ' ' && t.y === 'M').map(t => t.path))
+// IDE metadata is the one drift this workflow tolerates: an open CLion project rewrites
+// .idea/ in every checkout it touches, and blocking on it stopped every launch on such a
+// tree. It is ignored by the dirty checks, never admitted into a fix scope or a commit,
+// and nothing else is tolerated: a second exception would need its own reason here.
+const IDE_DRIFT = /^(?:.*\/)?\.idea\//
+const ideDrift = (path) => IDE_DRIFT.test(path)
+const withoutIdeDrift = (lines) => lines.filter(l => !ideDrift(pathOf(l)))
+
 // Group actionable notes by top-level scope (plain JS — no model tokens).
 // A note keeps its id alongside its text so the cycle summary can still map a
 // finding to the fix that handled it after grouping and merging.
@@ -619,10 +640,13 @@ const fixAndVerify = async (workIn) => {
   // that needed nothing else stays red for the user.
   const withheld = []
   for (const w of work) {
-    if (protectedRe) {
-      for (const f of [...w.files]) if (protectedRe.test(f)) {
+    for (const f of [...w.files]) {
+      if (protectedRe && protectedRe.test(f)) {
         w.files.delete(f)
         log(`fix for ${w.key}: ${f} is protected — dropped from scope`)
+      } else if (ideDrift(f)) {
+        w.files.delete(f)
+        log(`fix for ${w.key}: ${f} is IDE metadata — dropped from scope`)
       }
     }
     if (w.files.size === 0) {
@@ -816,18 +840,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // somebody else's doing. The snapshots below then show it stayed put across
   // the hooks; they say nothing about which process wrote it.
   const ownedSet = new Set(owned.map(canon))
-  // Status lines arrive through an agent's JSON, which has dropped the leading blank of an
-  // unstaged entry (' M path' -> 'M path') before: a fixed offset then shaved the path's
-  // first character and refused an in-scope edit as outside the scope. Read the two status
-  // columns by pattern; a lone column is the unstaged form with its blank lost.
-  const STATUS_LINE = /^(?:([ MADRCUT?!])([ MADRCUT?!]) |([MADRCUT?!]) )(.+)$/
-  const statusOf = (line) => {
-    const m = STATUS_LINE.exec(line)
-    return m ? { x: m[1] ?? ' ', y: m[2] ?? m[3], path: canon(m[4]) } : null
-  }
-  const pathOf = (line) => (statusOf(line) || {}).path || ''
-  const modified = (lines) => new Set(lines.map(statusOf).filter(t => t && t.x === ' ' && t.y === 'M').map(t => t.path))
-  const regenerated = generatedRe ? [...modified(now.status)].filter(f => f && !ownedSet.has(f) && generatedRe.test(f)) : []
+  const regenerated = generatedRe ? [...modified(now.status)].filter(f => f && !ownedSet.has(f) && !ideDrift(f) && generatedRe.test(f)) : []
   const regeneratedProtected = protectedRe ? regenerated.filter(f => protectedRe.test(f)) : []
   if (regeneratedProtected.length) {
     log(`push#${cycle}-${what}: refusing to publish — the build regenerated a protected path: ${regeneratedProtected.join(', ')}`)
@@ -853,13 +866,13 @@ const commitAndPush = async (cycle, what, owned = []) => {
   ).catch(e => { log(`hooks#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
   const checkedSet = new Set(checked.map(canon))
-  const beforePaths = hooks.before.map(pathOf)
+  const beforePaths = withoutIdeDrift(hooks.before).map(pathOf)
   const outside = beforePaths.filter(f => !checkedSet.has(f))
   // The recheck's status is a moment older than the hooks' own: a candidate
   // that is no longer a plain modification by then is not the one admitted.
   const beforeModified = modified(hooks.before)
   const unsteady = regenerated.filter(f => !beforeModified.has(f))
-  const generated = hooks.after.filter(l => !beforePaths.includes(pathOf(l)))
+  const generated = withoutIdeDrift(hooks.after).filter(l => !beforePaths.includes(pathOf(l)))
   // Anything staged after the hooks (X not blank) was staged by a hook: an
   // addition the tree never held, or a rename. Untracked (`??`) is new too.
   const created = generated.filter(l => (statusOf(l) || { x: '?' }).x !== ' ' || l.includes(' -> '))
@@ -1458,9 +1471,11 @@ const pinned = await agent(
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 ).catch(e => { log(`preflight errored — ${e && e.message}`); return null })
 if (!pinned) return finish({ pass: false, cycles: cyclesUsed, history, reason: 'preflight-died' })
-if (pinned.dirty.length) {
-  log(`preflight: the checkout is dirty — ${pinned.dirty.length} path(s); commit or stash before babysitting`)
-  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'dirty-start', dirty: pinned.dirty })
+const dirty = withoutIdeDrift(pinned.dirty)
+if (dirty.length !== pinned.dirty.length) log(`preflight: ignoring ${pinned.dirty.length - dirty.length} dirty .idea/ path(s) (IDE metadata)`)
+if (dirty.length) {
+  log(`preflight: the checkout is dirty — ${dirty.length} path(s); commit or stash before babysitting`)
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'dirty-start', dirty })
 }
 if (pinned.prBranch.trim() !== pinned.branch.trim()) {
   log(`preflight: checked out ${pinned.branch}, but PR #${args.pr} heads ${pinned.prBranch}`)

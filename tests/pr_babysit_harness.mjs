@@ -458,6 +458,32 @@ test('a dirty start refuses before any writer runs', async () => {
   assert.ok(logs.some(l => /the checkout is dirty — 2 path\(s\)/.test(l)))
 })
 
+test('.idea/ drift is the one dirt a start tolerates, and it never enters a commit', async () => {
+  const idea = [' M .idea/misc.xml', '?? .idea/workspace.xml', 'M  .idea/vcs.xml', ' M sub/.idea/x.xml']
+  const tolerated = await run({ reviews: oneValid, preflight: { dirty: idea } })
+  assert.notEqual(tolerated.result.reason, 'dirty-start')
+  assert.ok(tolerated.labels.some(l => l.startsWith('fix:')), 'the run went on to its writers')
+  assert.ok(tolerated.logs.some(l => /ignoring 4 dirty \.idea\/ path\(s\)/.test(l)))
+  // anything else still blocks, and the report names only what blocked
+  const { result, labels } = await run({ reviews: oneValid, preflight: { dirty: [...idea, ' M src/a.c'] } })
+  assert.equal(result.reason, 'dirty-start')
+  assert.deepEqual(result.dirty, [' M src/a.c'])
+  assert.ok(!labels.some(l => l.startsWith('fix:')))
+  // a look-alike is not IDE metadata
+  const alike = await run({ reviews: oneValid, preflight: { dirty: [' M idea/x', ' M .ideas/x', ' M src/.idea.c'] } })
+  assert.equal(alike.result.reason, 'dirty-start')
+  // a finding on an .idea/ path gets no writer, like a protected one
+  const scoped = await run({ reviews: { findings: [finding({ file: '.idea/misc.xml' })], replies: [], bots: 'reviewed' } })
+  assert.equal(scoped.labels.some(l => l.startsWith('fix:')), false)
+  assert.ok(scoped.logs.some(l => /\.idea\/misc\.xml is IDE metadata — dropped from scope/.test(l)))
+  // .idea/ drift around the hooks neither blocks the publish nor rides into the commit
+  const drifting = await run({ ...publishing,
+    hooks: b => ({ before: [...b.before, ' M .idea/misc.xml'], after: [...b.after, ' M .idea/misc.xml', '?? .idea/workspace.xml'] }) })
+  assert.equal((drifting.result.history[0].reviewPush || {}).pass, true, JSON.stringify(drifting.result.history[0].reviewPushFailed))
+  const commit = drifting.calls.find(c => c.label === 'commit#1-review')
+  assert.deepEqual(pathLine(commit.prompt), ['src/a.c'])
+})
+
 test('a checkout on the wrong branch refuses before any writer runs', async () => {
   const { result, labels, logs } = await run({
     reviews: oneValid, preflight: { branch: 'main', prBranch: 'claude/foo' },
