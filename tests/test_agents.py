@@ -204,6 +204,13 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('marked it wedged is rig-side: this run never ran it', watcher)
         self.assertIn('A wedge this run confirmed is not rig-side by being a wedge', watcher)
 
+    def test_chief_owns_what_follows_a_hil_run(self):
+        """The operator reports; the caller rules live in the HIL contract, which chief cannot read itself."""
+        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
+        self.assertIn('You own what follows a run\'s result and the verdict of a retry sequence', chief)
+        self.assertIn('It also returns the HIL contract\'s path and its caller rules for a run\'s result', chief)
+        self.assertIn('reporting rules it cannot find as a blocker', chief)
+
     def test_hil_operator_resolves_the_project_contract_and_refuses_without_it(self):
         """The rig procedure lives in the project's HIL contract; the role only knows how to find and obey it."""
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
