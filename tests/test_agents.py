@@ -193,6 +193,17 @@ class AgentFiles(unittest.TestCase):
         for role in ('hw-debugger.md', 'hw-validator.md'):
             self.assertIn('a permission still required under the shared Scope rule', (AGENTS / role).read_text())
 
+    def test_a_board_left_wedged_gets_one_dispatched_recovery_action(self):
+        """Recovery past a HIL run's own paths is chief's dispatch, bounded, and never a reboot headless."""
+        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
+        self.assertIn('gets one `hil-operator` dispatch for one recovery action on that board', chief)
+        self.assertIn('a controller-level rung only on its dead-controller signature', chief)
+        self.assertIn('Rungs that reboot the host or its VM need the user in a headless session.', chief)
+        self.assertIn('follows only a reported verified recovery with the marker cleared', chief)
+        watcher = ' '.join((AGENTS / 'pr-ci-watcher.md').read_text().split())
+        self.assertIn('marked it wedged is rig-side: this run never ran it', watcher)
+        self.assertIn('A wedge this run confirmed is not rig-side by being a wedge', watcher)
+
     def test_hil_operator_resolves_the_project_contract_and_refuses_without_it(self):
         """The rig procedure lives in the project's HIL contract; the role only knows how to find and obey it."""
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
