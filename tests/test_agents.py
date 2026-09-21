@@ -193,6 +193,16 @@ class AgentFiles(unittest.TestCase):
         for role in ('hw-debugger.md', 'hw-validator.md'):
             self.assertIn('a permission still required under the shared Scope rule', (AGENTS / role).read_text())
 
+    def test_hil_operator_resolves_the_project_contract_and_refuses_without_it(self):
+        """The rig procedure lives in the project's HIL contract; the role only knows how to find and obey it."""
+        body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
+        self.assertIn('find its `HIL contract:` line', body)
+        self.assertIn('perform no hardware action and return the blocker', body)
+        self.assertIn('Never invent a command, choose another rig, bypass a lock, or report unexecuted work as passing.', body)
+        self.assertIn('copied verbatim, never retyped, reworded or re-ordered', body)
+        for project_detail in ('hil_test.py', 'hil_lock.py', 'tinyusb', 'ci.lan', 'cmake-build'):
+            self.assertNotIn(project_detail, body, 'a project mechanic belongs in that project\'s contract')
+
     def test_chief_quotes_unit_json_and_leaves_verdicts_to_the_role(self):
         body = (AGENTS / 'chief.md').read_text()
         self.assertIn("Every hardware dispatch requests the role's Output contract unchanged.", body)
