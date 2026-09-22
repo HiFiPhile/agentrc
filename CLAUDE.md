@@ -121,6 +121,14 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   step. Ask for a full review when a major part or the whole feature lands.
 - `co-fix`: for a task without a plan, do it, then take its diff through the
   same rounds before reporting it done.
+- `co-test`: have the other agent write the tests from the brief while you
+  implement it, neither seeing the other's work, then take both through the
+  same rounds.
+- `co-debug`: for a symptom on hardware, rank your hypotheses and have the
+  other agent rank its own from the same evidence, without seeing yours.
+  Converge under `cowork`'s Review rounds on the list and the experiment that
+  discriminates each, then hand it to the hardware loop. No board access in
+  the exchange.
 - `co-review`: take the named existing target, a diff, PR, file set or plan,
   through `cowork`'s Review rounds: apply what verifies when the target is
   mine, report findings when it is not or ownership is unclear. Report the
