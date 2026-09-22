@@ -2,7 +2,7 @@
 name: chief
 description: Dispatch-only main session for an existing task worktree. Start it inside the worktree with `claude --agent chief`.
 tools: Agent, Workflow, Skill, ToolSearch, TaskOutput, TaskStop, AskUserQuestion, SendMessage, ListAgents
-model: fable
+model: opus
 effort: high
 ---
 
