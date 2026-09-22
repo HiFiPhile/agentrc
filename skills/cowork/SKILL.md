@@ -154,9 +154,11 @@ For each finding, say whether you reproduced it or only read the code.
 
 ## Review rounds
 
-For a review ask, the loop is: send with `--no-edit`, apply what verifies,
-say in the next task what you applied and what you rejected and why, ask
-again. Stop when the coworker reports nothing left and you agree, or when a
-round turns into re-litigating documented behaviour. Do not automate that
-loop: a reply establishes neither agreement nor correctness, which is why
-the script has no `converge` subcommand and should not grow one.
+For any reply you act on, including a review, proposal or answer, apply
+what verifies, then send a follow-up with `--no-edit`: say what you applied
+and what you rejected and why, and ask again. A lookup with nothing to apply
+needs no follow-up. Stop when the coworker reports nothing left and you
+agree, or when a round turns into re-litigating documented behaviour. Do not
+automate that loop: a reply establishes neither agreement nor correctness,
+which is why the script has no `converge` subcommand and should not grow
+one.
