@@ -105,8 +105,12 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   unavailable, report review and simplification as pending rather than
   substituting the skill under edit.
 - The agent leading my task owns the exchanges below; a coworker answering
-  one returns its result rather than commissioning its own. A keyword holds
-  for the task it is said in.
+  one returns its result rather than commissioning its own. When I say one
+  of the words below, it holds for that task.
+- `co-ask`: form your answer and have the other agent form its own from the
+  same brief, without seeing yours. Converge under `cowork`'s Review rounds.
+  Bring me the agreed answer, the disagreement that remains and what neither
+  side could verify. Opinion only: no plan, no edits.
 - `co-plan`: write your plan and have the other agent draft its own from the
   same brief, without seeing yours. Compare and combine the drafts, then
   review the combined plan together under `cowork`'s Review rounds. Bring me
@@ -115,9 +119,12 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 - After each implementation step of a plan, send the other agent that step's
   diff for review and suggestions, and address them before starting the next
   step. Ask for a full review when a major part or the whole feature lands.
-- `co-review`: take the named target, a diff, PR, file set, plan or the task's
-  own change, through `cowork`'s Review rounds. Report the outcome and any
-  disagreement that remains for me.
+- `co-fix`: for a task without a plan, do it, then take its diff through the
+  same rounds before reporting it done.
+- `co-review`: take the named existing target, a diff, PR, file set or plan,
+  through `cowork`'s Review rounds: apply what verifies when the target is
+  mine, report findings when it is not or ownership is unclear. Report the
+  outcome and any disagreement that remains for me.
 
 # Pull requests
 - Right after opening a PR, always ask me whether to launch a headless
