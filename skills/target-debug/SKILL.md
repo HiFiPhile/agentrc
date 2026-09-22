@@ -19,6 +19,7 @@ host may face another board or a Linux gadget (e.g. a Raspberry Pi).
 | `esp-target-debug`   | the same methods on Espressif's built-in USB-JTAG                | an ESP32-S3/P4 — read it FIRST there: other gdb, other openocd |
 | `etm-trace`          | exactly which instructions ran (profile, coverage, history)      | a SEGGER J-Trace wired to this board; follow `etm-trace`'s confirmation rule |
 | `usb-sniffer`        | what crossed the wire (PIDs, handshakes, resets)                 | the hardware tap cabled in; role-agnostic               |
+| a project's `sysview` | where CPU time goes: task/ISR schedule, per-context load, switch and ready→run timing, or what ran right before a crash/hang | the project ships the skill; a J-Link/J-Trace for live capture, or an OpenOCD probe for raw RTT capture |
 | `usb-kernel-debug`   | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
 
 ## What the project supplies
@@ -177,6 +178,7 @@ that IS a finding (timing-sensitive): move down in intrusiveness, not up.
 | DWT data trace                     | none — needs SWO pin wired     | stream one address's accesses: value + accessor PC      |
 | Vector catch                       | none until a fault fires       | crash-shaped wedges — autopsy AT the faulting pc        |
 | RAM ring-buffer                    | ~tens of cycles per event      | ISR ordering/timing bugs                                |
+| SystemView (project's `sysview`)   | recorder in the firmware, per event | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
 | Log lines (RTT)                    | µs per line                    | logic bugs that survive logging (J-Link or OpenOCD rtt) |
 | Log lines (UART)                   | ms per line — blocking write   | same, when no debug-probe RTT path                      |
 | dprintf / conditional breakpoint   | halt+resume per hit (~ms)      | low-rate probes post-wedge; never ISR-rate events       |
@@ -262,7 +264,10 @@ applies unchanged.
 A wedged RTT build holds a log tail in RAM only if a live drain was running
 (the default mode drops writes once the ring fills): the drain model, the
 headless-proven server and the manual ring read are the **rtt** skill's
-post-mortem section. Otherwise instrument with the RAM ring above.
+post-mortem section. Otherwise instrument with the RAM ring above. The
+exemption is a SystemView post-mortem build (the project's `sysview` skill says
+how): its channel is an overwrite ring that holds the most recent events with
+no drain, which answers "what ran right before this hang".
 
 ## USB: dual-side capture — the default for enumeration/transfer bugs
 
