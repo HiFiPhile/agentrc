@@ -118,7 +118,10 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   remains. Without the word, plan alone.
 - After each implementation step of a plan, send the other agent that step's
   diff for review and suggestions, and address them before starting the next
-  step. Ask for a full review when a major part or the whole feature lands.
+  step. When a major part or the whole feature lands, simplify the task's
+  whole diff against its base, uncommitted changes included (`/simplify` in
+  Claude Code, by inspection elsewhere), check it still builds and passes,
+  then ask for a full review.
 - `co-fix`: for a task without a plan, do it, then take its diff through the
   same rounds before reporting it done.
 - `co-test`: have the other agent write the tests from the brief while you
