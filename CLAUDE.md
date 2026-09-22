@@ -117,6 +117,13 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   the next step. Ask for a full review when a major part or the whole feature
   lands.
 
+# Pull requests
+- Right after opening a PR, always ask me whether to launch a headless
+  `chief` in its worktree to babysit it through `pr-babysit` with
+  `autoPush: true`. Before asking, read and follow
+  `~/code/agentrc/README.md`'s headless PR publishing recipe and
+  `~/code/agentrc/agents/chief.md`'s Authorization exception.
+
 # Follow-ups
 - Separate scope gets a separate PR/session. Where the repo has an issue
   tracker, create one issue per deferred topic, labelled as the repo's
