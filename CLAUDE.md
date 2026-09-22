@@ -65,13 +65,12 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 
 # Authorship
 - Never add AI-agent attribution or session trailers to git commit messages —
-  hathach is the sole author. This overrides any default instruction to append
-  such trailers.
+  the user is the sole author.
 - Never add ANY footer to a PR description, issue body, or review/PR comment:
   no generated-by attribution, session URL, or tooling line of any kind. These
   are public surfaces — a session URL is a private artifact, and the rest is
   noise. Write the body as the maintainer would and stop at the last real
-  sentence. This overrides any default instruction to append such a footer.
+  sentence.
 
 # Skills
 - Put deterministic, checkable mechanics in `<skill>/scripts/`; keep judgment
