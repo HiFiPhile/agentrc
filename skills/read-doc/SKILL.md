@@ -66,6 +66,12 @@ so a register claim is checked against both: the count line says whether one
 exists. Vendors name the base document differently — a reference manual, a
 family data sheet, a product specification or an IP core's databook — so the
 kind that carries the registers varies by vendor, not the question you asked.
+Vendors file that document under a family name: the part number finds it
+(`USB2514` → `USB251xB`, `STM32F407` → `STM32F4xx`) and the row says
+`(family match)`; confirm the document's part list names your part. An `x`
+after a letter stays literal (`PIC32MX`), so for `STM32H7Rx` or `LPC55Sxx`
+search the prefix before the `x`; so does a result holding only guides and
+notes with no base document.
 Genuinely ambiguous → ask the user which to read. Nothing (exit 1) → retry with
 fewer keywords; the part number alone often works where
 `<part> datasheet` does not, because words like "datasheet" and "manual" are

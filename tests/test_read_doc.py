@@ -476,6 +476,11 @@ class Search(unittest.TestCase):
             (3, 'ES0392 STM32H7 device errata', ['errata'], True),
             (4, 'DS12110 STM32F4 datasheet', ['datasheet'], True),
             (5, 'ES0182 STM32F4 device errata', ['errata'], True),
+            (6, 'USB251xB xBi Data Sheet DS00001692', ['datasheet', 'USB251xB'], True),
+            (7, "RX65N Group User's Manual: Hardware", ['user-manual'], True),
+            (8, 'UM10360 LPC17xx User manual', ['user-manual'], True),
+            (9, 'AN12149 Ethernet on i.MX RT1xxx', ['application-note'], True),
+            (10, 'PIC32MX5XX6XX7XX Family Data Sheet', ['datasheet'], True),
         ]).close()
 
     def run_search(self, *args):
@@ -509,6 +514,40 @@ class Search(unittest.TestCase):
         self.assertEqual(self.ids(out), ['3'])
         self.assertEqual(self.run_search('stm32h7', 'stm32f4')[0], 1, 'AND finds neither')
         self.assertEqual(self.run_search('stm32h7', 'stm32f4', '--any')[0], 0)
+
+    def test_a_member_part_number_finds_the_document_filed_under_its_family(self):
+        # Microchip files the USB2514B datasheet as USB251xB; an exact-part
+        # search used to find only its eval board guide and checklist.
+        for part in ('usb2514', 'USB2514B', '2514b'):
+            self.assertEqual(self.ids(self.run_search(part)[1]), ['6'], part)
+
+    def test_x_is_literal_unless_it_follows_a_digit_or_another_wildcard(self):
+        self.assertEqual(self.run_search('usb2514c')[0], 1, 'the B after the wildcard is literal')
+        self.assertEqual(self.ids(self.run_search('rx65n')[1]), ['7'])
+        self.assertEqual(self.run_search('pic32mz')[0], 1, 'the X in PIC32MX is part of the name')
+
+    def test_consecutive_and_interior_wildcards_each_stand_for_one_character(self):
+        self.assertEqual(self.ids(self.run_search('lpc1769')[1]), ['8'])
+        self.assertEqual(self.ids(self.run_search('rt1064')[1]), ['9'])
+        self.assertEqual(self.ids(self.run_search('pic32mx575')[1]), ['10'])
+
+    def test_a_keyword_must_hold_the_family_literals_not_just_fill_its_wildcards(self):
+        # adc fits the three wildcards of RT1xxx and ra65n straddles XX6XX;
+        # neither names the family, so neither may narrow a search onto it.
+        self.assertEqual(self.run_search('rt1064', 'adc')[0], 1)
+        self.assertEqual(self.run_search('ra65n')[0], 1, 'the x in RX65N is part of the name')
+        self.assertEqual(self.run_search('dma')[0], 1)
+
+    def test_a_wildcard_stands_for_a_letter_or_digit_never_a_separator(self):
+        for keyword in ('usb251 b', 'usb251-b'):
+            self.assertEqual(self.run_search(keyword)[0], 1, keyword)
+
+    def test_a_row_found_only_through_the_wildcard_says_so(self):
+        self.assertIn('(family match)', self.run_search('usb2514')[1])
+        self.assertNotIn('(family match)', self.run_search('usb251xb')[1])
+        _, out = self.run_search('lpc1769', 'user')
+        self.assertEqual(self.ids(out), ['8'])
+        self.assertIn('(family match)', out, 'one keyword through the wildcard is enough to say so')
 
     def test_no_match_exits_one_so_a_caller_can_tell_it_from_a_bad_invocation(self):
         code, out = self.run_search('nosuchpart')

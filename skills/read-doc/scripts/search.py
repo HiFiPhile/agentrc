@@ -6,8 +6,10 @@ Usage: search.py KEYWORD [KEYWORD...]        all keywords must match (AND)
        search.py --kind reference-manual --limit 20 stm32h7
 
 Matches title, authors, tags, series, publisher, description and stored
-filename. Prints the book id to pass to locate.py, a count per document kind,
-and the base documentation first: the manual, specification or datasheet a
+filename; a part number also matches the family name a vendor filed it under
+(STM32F407 finds STM32F4xx), and such a row says "(family match)". Prints the
+book id to pass to locate.py, a count per document kind, and the base
+documentation first: the manual, specification or datasheet a
 register question is answered from, before the errata that amend it and the
 application notes that use it.
 
@@ -89,6 +91,14 @@ DOC_WORDS = tuple(
 # ("Mentor MUSBMHDRC USB 2.0 Multi-Point Dual-Role Controller").
 CORE_TAGS = ("dwc2", "dwc3", "chipidea", "musb")
 
+# Vendors file documents under a family name that stands for its members:
+# STM32F4xx covers STM32F407, LPC55S6x LPC55S69, USB251xB USB2514B. An x is a
+# wildcard only after a digit or another wildcard x, so RX65N, MAX32690 and
+# PIC32MX stay literal; a literal one in that position (CH32X035) still reads
+# as a wildcard, so such a row is marked rather than passed off as exact.
+FAMILY_TOKEN = re.compile(r"[0-9a-z]*\dx[0-9a-z]*")
+PART_CHARS = frozenset("0123456789abcdefghijklmnopqrstuvwxyz")
+
 QUERY = """
 SELECT b.id, b.title, b.path,
        (SELECT group_concat(a.name, ', ') FROM authors a
@@ -137,6 +147,28 @@ def kind_of(title, tags):
         if pattern.search(t):
             return kind
     return "reference-manual" if set(CORE_TAGS) & set(named) else "other"
+
+
+def family_covers(token, keyword):
+    """Whether keyword is part of some member of the family token names.
+
+    The keyword must carry the family's own characters, starting on one and
+    at least half of it, so a short word like "adc" cannot hide in RT1xxx.
+    """
+    wild = [False] * len(token)
+    for i, c in enumerate(token):
+        wild[i] = c == "x" and i > 0 and (token[i - 1].isdigit() or wild[i - 1])
+    for i in range(len(token) - len(keyword) + 1):
+        window = range(i, i + len(keyword))
+        if wild[i] or 2 * sum(not wild[w] for w in window) < len(keyword):
+            continue
+        if all(token[w] == c or (wild[w] and c in PART_CHARS) for w, c in zip(window, keyword)):
+            return True
+    return False
+
+
+def contains(hay, keyword):
+    return keyword in hay or any(family_covers(t, keyword) for t in FAMILY_TOKEN.findall(hay))
 
 
 def resolve(bid, path, fmt, name):
@@ -221,14 +253,16 @@ def run(args):
         entries = [e.split("/", 1) for e in (files or "").split("\n") if e]
         hay = norm(" ".join(x for x in (title, authors, tags, series, publisher, comments) if x)
                    + " " + " ".join(n for _, n in entries))
-        found = sum(k in hay for k in keywords)
+        matched = [k for k in keywords if contains(hay, k)]
+        found = len(matched)
         if not found or (not args.any and found < len(keywords)):
             continue
         kind = kind_of(title, tags)
         if args.kind and kind != args.kind:
             continue
-        in_title = sum(k in norm(title) for k in keywords)
-        hits.append((KINDS.index(kind), -found, -in_title, title, kind, bid, tags, path, entries))
+        in_title = sum(contains(norm(title), k) for k in keywords)
+        family = any(k not in hay for k in matched)
+        hits.append((KINDS.index(kind), -found, -in_title, title, kind, bid, tags, path, entries, family))
 
     if not hits:
         print("no match")
@@ -243,10 +277,11 @@ def run(args):
                                                sorted(counts.items(), key=lambda c: KINDS.index(c[0]))))
     if len(shown) < len(hits):
         print(f"showing {len(shown)}; --limit N for more, --kind K to filter, or add a keyword")
-    for _, _, _, title, kind, bid, tags, path, entries in shown:
+    for _, _, _, title, kind, bid, tags, path, entries, family in shown:
         # Some books carry a whole abstract as one "tag"; the line is a label, not the metadata.
         label = (tags or "")[:60].rstrip(", ")
-        print(f"{bid}  {title[:96]}  [{kind}]" + (f"  {label}" if label else ""))
+        print(f"{bid}  {title[:96]}  [{kind}]" + ("  (family match)" if family else "")
+              + (f"  {label}" if label else ""))
         if args.path and not entries:
             print("  (no file in this library)")
         for fmt, name in entries if args.path else ():
