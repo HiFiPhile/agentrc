@@ -227,5 +227,19 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('quoted verbatim in a fenced block labelled with the unit', body)
 
 
+    def test_chief_status_lines_are_what_the_headless_launcher_forwards(self):
+        """chief_run.py forwards a message's first line when it starts with its MARKER; chief.md must teach both."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'chief_run', SKILLS / 'headless-chief' / 'scripts' / 'chief_run.py')
+        chief_run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chief_run)
+        body = (AGENTS / 'chief.md').read_text()
+        self.assertIn(f'`{chief_run.MARKER}<event> · <fields>`', body)
+        for event in ('stage', 'launch', 'cycle', 'attention'):
+            self.assertIn(f'`{event}`', body)
+        self.assertIn('one status line, its first line', body)
+
+
 if __name__ == '__main__':
     unittest.main()

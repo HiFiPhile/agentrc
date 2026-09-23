@@ -51,6 +51,7 @@ Agent collaboration and PRs:
 | [`simplify-gate`](skills/simplify-gate/SKILL.md) | switch the per-repository Codex YAGNI check at Stop (below) | `/simplify-gate status\|on\|off` |
 | [`pr-reply`](skills/pr-reply/SKILL.md) | post PR review replies from a manifest, read each back, resolve verified review threads | `reply.py --pr N --manifest f.json` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's log, rerun its failed jobs once after an infra failure | `circleci.py log <job>`, `rerun <job>...` |
+| [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
 
 Hardware documentation, from the Calibre library at `~/Documents/calibre-library`
 (`CALIBRE_LIBRARY` overrides):
@@ -108,22 +109,19 @@ per directory x dimension, then `finding-verifier` on every finding
 worktree:
 
 ```sh
-~/code/agentrc/install.py install --agent --workflow
+~/code/agentrc/install.py install --agent --workflow --skill
 git worktree add .worktrees/<branch> -b <branch> <base> && cd .worktrees/<branch> && claude --agent chief
 ```
 
-Headless (`claude -p --agent chief`), set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`,
-or `-p` kills units still running ten minutes after the chief's turn ends.
+Headless, launch it through the [`headless-chief`](skills/headless-chief/SKILL.md)
+skill, which runs `claude -p --agent chief` and gives the caller chief's status
+lines while it runs and its report when it exits.
 
 For headless PR publishing, follow `agents/chief.md`'s Authorization exception
 before launching. Include the named PR, head repository and branch, expected
 HEAD, worktree, task scope, and the verbatim authorization exchange in the
 task. Leave the checkout to chief until it exits. Each new chief invocation
 requires a fresh exchange.
-
-```sh
-CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 claude -p --agent chief "$task"
-```
 
 ## Tests
 
