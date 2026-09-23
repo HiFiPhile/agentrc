@@ -138,10 +138,10 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   outcome and any disagreement that remains for me.
 
 # Pull requests
-- Right after opening a PR, always ask me whether to launch a headless
-  `chief` in its worktree to babysit it through `pr-babysit` with
-  `autoPush: true`. Before asking, read and follow
-  `~/code/agentrc/README.md`'s headless PR publishing recipe and
+- Right after opening a PR, or pushing to one that no chief is babysitting,
+  always ask me whether to launch a headless `chief` in its worktree to
+  babysit it through `pr-babysit` with `autoPush: true`. Before asking, read
+  and follow `~/code/agentrc/README.md`'s headless PR publishing recipe and
   `~/code/agentrc/agents/chief.md`'s Authorization exception.
 
 # Follow-ups
