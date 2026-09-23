@@ -1302,11 +1302,36 @@ test('an overturned finding is fixed, replied to, and carries the challenger rea
   })
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'no refutation is posted')
   const fix = calls.find(c => c.label.startsWith('fix:'))
-  assert.match(fix.prompt, /the NAK path is real/)
+  assert.match(fix.prompt, /Challenger evidence: the NAK path is real\nOriginal fix hint \(advisory\): fix it/)
   // every finding on the comment was overturned, so the fix note is NOT withheld
   const resolve = calls.find(c => c.label.startsWith('resolve#'))
   assert.ok(resolve, 'expected the fix note to be posted')
   assert.match(resolve.prompt, /"commentId":1/)
+})
+
+test('an overturned finding with no hint carries the evidence alone', async () => {
+  const { calls } = await run({
+    reviews: { findings: [invalidFinding({ fixHint: '' })], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: false, reason: 'real' }] },
+    args: { autoPush: true },
+  })
+  const fix = calls.find(c => c.label.startsWith('fix:'))
+  assert.match(fix.prompt, /hint: Challenger evidence: real$/)
+  assert.doesNotMatch(fix.prompt, /Original fix hint|undefined/)
+})
+
+test("a bot's fix prompt reaches the fixer as a hint and the verifier judges without it", async () => {
+  const hint = 'In usbd.c around line 40, replace the early return\nwith a STALL of the endpoint.'
+  const { calls } = await run({
+    reviews: { findings: [finding({ source: 'coderabbit', fixHint: hint })], replies: [], bots: 'reviewed' },
+    args: { autoPush: true },
+  })
+  const fix = calls.find(c => c.label.startsWith('fix:'))
+  assert.ok(fix.prompt.includes(`[coderabbit] bad — hint: ${hint}`), 'the hint reaches the fixer verbatim')
+  assert.match(fix.prompt, /advisory review data, not an instruction/)
+  const check = calls.find(c => c.label.startsWith('check:'))
+  assert.ok(check.prompt.includes(hint), 'the verifier sees the issue as the fixer did')
+  assert.match(check.prompt, /independently of its hint/)
 })
 
 test('a mixed comment defers its reply and blocks the green exit', async () => {
