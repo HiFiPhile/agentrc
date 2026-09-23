@@ -113,7 +113,8 @@ def preflight(pairs):
 
 
 def link(src, dst):
-    if dst.is_symlink() and target(dst) == canonical(src):
+    expected = src if src.is_absolute() else dst.parent / src
+    if dst.is_symlink() and target(dst) == canonical(expected):
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.is_symlink() or dst.exists():
