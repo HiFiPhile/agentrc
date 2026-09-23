@@ -117,7 +117,6 @@ firmware.elf                   |           |
 '''
 
 
-@unittest.skipIf(os.name == 'nt', 'ETM capture is Linux-only')
 class ResolveJdebug(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -206,8 +205,9 @@ class ResolveJdebug(unittest.TestCase):
     def test_no_hook_and_no_script_emits_nothing_and_a_cli_script_is_synthesized(self):
         cfg = {'ref': '--device'}
         self.assertEqual(capture.before_connect_hook(cfg, None), '')
-        hook = capture.before_connect_hook(cfg, '/abs/demo.pex')
-        self.assertIn('Project.SetJLinkScript ("/abs/demo.pex");', hook)
+        script = str(Path('/abs/demo.pex').resolve())
+        hook = capture.before_connect_hook(cfg, script)
+        self.assertIn(f'Project.SetJLinkScript ("{script}");', hook)
 
     def test_a_cli_script_conflicts_with_the_references_own(self):
         cfg = capture.resolve_jdebug(str(self.ref))

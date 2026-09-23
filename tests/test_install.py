@@ -70,6 +70,7 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(os.path.samefile(self.claude / 'CLAUDE.md', ROOT / 'CLAUDE.md'))
         self.assertTrue(os.path.samefile(self.codex / 'AGENTS.md', ROOT / 'CLAUDE.md'))
         self.assertEqual((self.codex / 'AGENTS.md').read_text(), (ROOT / 'CLAUDE.md').read_text())
+        self.assertEqual(self.ok('install', '--claude-md'), '', 'relative Codex link is idempotent outside HOME')
 
     def test_a_skill_hook_is_registered_once_with_absolute_quoted_commands_and_older_entries_replaced(self):
         old = str(ROOT / 'hooks' / 'simplify-gate')  # the pre-folder install pointed straight into the repo
