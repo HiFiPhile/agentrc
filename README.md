@@ -40,6 +40,39 @@ are pruned.
 Project repos such as tinyusb call these skills by bare name and expect this
 install.
 
+## Skills
+
+Agent collaboration and PRs:
+
+| Skill | Use it to | Start with |
+|---|---|---|
+| [`cowork`](skills/cowork/SKILL.md) | hand the other agent (Codex or Claude) a task, question or review headless, in resumed lanes | `cowork.py send --lane L --task -` |
+| [`herdr-peer`](skills/herdr-peer/SKILL.md) | the same with the agent in the neighbouring Herdr pane, watched live; needs `HERDR_ENV=1` | `peer.py peers`, `send --to <pane> --files none --task -`, `read --from <pane> --for <id>` |
+| [`simplify-gate`](skills/simplify-gate/SKILL.md) | switch the per-repository Codex YAGNI check at Stop (below) | `/simplify-gate status\|on\|off` |
+| [`pr-reply`](skills/pr-reply/SKILL.md) | post PR review replies from a manifest, read each back, resolve verified review threads | `reply.py --pr N --manifest f.json` |
+| [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's log, rerun its failed jobs once after an infra failure | `circleci.py log <job>`, `rerun <job>...` |
+
+Hardware documentation, from the Calibre library at `~/Documents/calibre-library`
+(`CALIBRE_LIBRARY` overrides):
+
+| Skill | Use it to | Start with |
+|---|---|---|
+| [`read-doc`](skills/read-doc/SKILL.md) | look up hardware manuals, specs and errata in Calibre instead of answering from memory | `search.py --kind reference-manual stm32h7` |
+| [`download-doc`](skills/download-doc/SKILL.md) | fetch vendor datasheets, manuals and errata into the library, refresh stale revisions | `sync.py st --family STM32H7 --types datasheet,errata` (dry run; `--apply` imports) |
+
+Firmware and USB debugging on real hardware; `target-debug` maps which one
+answers what, and the project supplies the build variant and board locks
+through its `Build contract:` and `HIL contract:` lines:
+
+| Skill | Use it to | Start with |
+|---|---|---|
+| [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
+| [`esp-target-debug`](skills/esp-target-debug/SKILL.md) | the same on ESP32-S3/P4 built-in USB-Serial-JTAG (other gdb, openocd fork) | read its PHY map first |
+| [`rtt`](skills/rtt/SKILL.md) | console or log over a debug probe (SEGGER RTT), live or post-mortem | `rtt.py --backend jlink --probe <serial> --device <dev> --interface swd --speed auto --seconds 20` |
+| [`etm-trace`](skills/etm-trace/SKILL.md) | instruction-level trace through a J-Trace and Ozone: hot functions, coverage, history before a fault | `etm_capture.py --jdebug <ref.jdebug> --elf <elf> --probe jtrace --duration-ms 10000 --out <dir>`, then `etm_profile.py <dir> --elf <elf>` |
+| [`usb-kernel-debug`](skills/usb-kernel-debug/SKILL.md) | capture Linux host URBs (usbmon); kernel dynamic debug on a host or gadget | `usbcap.py <vid:pid> 10`; `sudo usb_dyndbg.sh on\|off usbcore xhci_hcd` |
+| [`usb-sniffer`](skills/usb-sniffer/SKILL.md) | what crossed D+/D- with the ataradov sniffer, where usbmon cannot see | `sniff.py capture raw.pcapng --port <port> --seconds 30` |
+
 ## Simplify gate (per repository)
 
 `hooks/simplify-gate` snapshots the checkout and the worktrees nested in it when a prompt
