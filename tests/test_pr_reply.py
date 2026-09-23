@@ -201,6 +201,47 @@ class ReplyTest(unittest.TestCase):
         self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['posted']), (0, 901, False), 'the retry reuses the reply')
         self.assertEqual(len(self.gh.mutations), 1)
 
+    def test_quoted_reply_of_the_same_kind_in_other_words_is_left_to_a_human(self):
+        self.gh.add_review(30)
+        quote = f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\n'
+        self.gh.issue_comment(60, quote + 'Not applying this: the old wording.', ME)
+        rc, receipts = self.run_script([{'commentId': 30, 'body': 'Not applying this: a fresh draft.'}])
+        self.assertEqual(rc, 1)
+        r = receipts[0]
+        self.assertEqual((r['replyId'], r['sent'], r['posted'], r['verified']), (60, False, False, False))
+        self.assertIn('reconcile', r['error'])
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_identical_quoted_reply_wins_over_a_reworded_one(self):
+        self.gh.issue_comment(20)
+        quote = f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\n'
+        self.gh.issue_comment(60, quote + 'Not so: an older draft.', ME)
+        self.gh.issue_comment(61, quote + 'Not so: see line 3.', ME)
+        rc, receipts = self.run_script([{'commentId': 20, 'body': 'Not so: see line 3.'}])
+        self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['posted'], receipts[0]['verified']), (0, 61, False, True))
+
+    def test_a_fix_note_and_a_refutation_of_one_comment_are_both_posted(self):
+        self.gh.add_review(30)
+        quote = f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\n'
+        self.gh.issue_comment(60, quote + 'Fixed in abc1234.\n\n- a.c:3: x', ME)
+        rc, receipts = self.run_script([{'commentId': 30, 'body': 'Not applying the second point: y.'}])
+        self.assertEqual((rc, receipts[0]['posted']), (0, True))
+        self.gh.issue_comment(20)
+        quote = f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\n'
+        self.gh.issue_comment(61, quote + 'Not applying the first point: y.', ME)
+        rc, receipts = self.run_script([{'commentId': 20, 'body': 'Fixed in def5678.'}])
+        self.assertEqual((rc, receipts[0]['posted']), (0, True))
+
+    def test_other_quotes_and_inline_rewordings_are_not_reused(self):
+        self.gh.add_review(3)
+        self.gh.issue_comment(60, f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\nNot so.', ME)
+        self.gh.issue_comment(61, f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-3\n\nNot so.', 'someone')
+        self.gh.review_comment(10)
+        self.gh.review_comment(55, 'said differently', ME, thread='T10', parent=10)
+        rc, receipts = self.run_script([{'commentId': 3, 'body': 'Not so either.'}, {'commentId': 10, 'body': 'said again'}])
+        self.assertEqual(rc, 0)
+        self.assertEqual([r['posted'] for r in receipts], [True, True])
+
     def test_an_id_in_two_spaces_is_refused(self):
         self.gh.review_comment(40)
         self.gh.add_review(40)

@@ -12,8 +12,11 @@ a review whose body carries the finding), reuses an identical reply of ours if
 one is already there, otherwise posts the body once, reads the posted comment
 back, and resolves the review thread only when body, parent, author and PR all
 match. An issue comment and a review body have no thread: the reply is a PR
-comment quoting the original's URL, and nothing is resolved. Its receipts are
-the evidence; a `201` from GitHub is not.
+comment quoting the original's URL, and nothing is resolved, so a reply of ours
+quoting it that gives the same kind of answer (a `Fixed in ` note, or anything
+else) in other words blocks the post: its receipt names that reply with
+`verified: false`, for a human to reconcile. Its receipts are the evidence; a
+`201` from GitHub is not.
 
 ```bash
 R=~/.claude/skills/pr-reply/scripts/reply.py

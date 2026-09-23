@@ -8,11 +8,16 @@ digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
 which the body must match before anything is posted. Each commentId names one
 of three things on the PR: a review comment (an inline thread), an issue comment,
 or a review whose body carries the finding (a bot's summary, or a point GitHub
-would not anchor inline). A reply of ours with the identical body already under
-the comment is reused, never posted twice. A review reply is read back and must
-match the body, the parent, our login and the PR before its thread is resolved;
-the other two have no thread: the reply is an issue comment whose body is the
-original's URL as a quote line plus the text. Nothing is ever edited or deleted.
+would not anchor inline). A review reply is read back and must match the body,
+the parent, our login and the PR before its thread is resolved; the other two
+have no thread: the reply is an issue comment whose body is the original's URL
+as a quote line plus the text. A reply of ours with the identical body already
+there is reused, never posted twice. That thread is never resolved, so a run
+that lost its state would answer it again in new words: a reply of ours quoting
+it with the same kind of answer (a fix note, which starts with "Fixed in ", or
+anything else) in other words is not posted over and not verified; its receipt
+names it with verified false, for a human to reconcile. Nothing is ever edited
+or deleted.
 
 stdout ends with one JSON line {"receipts": [{"commentId", "kind", "replyId",
 "digest", "sent", "posted", "verified", "resolved", "error"}]}: kind is
@@ -122,13 +127,14 @@ class Poster:
         return found[0] if found else ('none', None)
 
     def existing(self, kind, comment_id, body):
-        pool = self.review_comments() if kind == 'review' else self.issue_comments()
-        for c in pool:
-            if c['user']['login'] != self.me or c['body'] != body:
-                continue
-            if kind != 'review' or c.get('in_reply_to_id') == comment_id:
-                return c['id']
-        return None
+        """The (id, body) of our identical reply, else of our quoting reply giving the same kind of answer, or None."""
+        if kind == 'review':
+            return next(((c['id'], c['body']) for c in self.review_comments() if c['user']['login'] == self.me
+                         and c.get('in_reply_to_id') == comment_id and c['body'] == body), None)
+        quote = body.partition('\n\n')[0] + '\n\n'
+        ours = [c for c in self.issue_comments() if c['user']['login'] == self.me and c['body'].startswith(quote)]
+        same = [c for c in ours if c['body'] == body] or [c for c in ours if is_fix_note(c['body']) == is_fix_note(body)]
+        return (same[0]['id'], same[0]['body']) if same else None
 
     def post(self, kind, comment_id, body):
         if kind == 'review':
@@ -178,6 +184,11 @@ def issue_body(original, body):
     return f"> {original['html_url']}\n\n{body}"
 
 
+def is_fix_note(body):
+    """pr-babysit's note for a landed fix, a different answer from a refutation of the same comment."""
+    return body.partition('\n\n')[2].startswith('Fixed in ')
+
+
 def handle(poster, item):
     rc = {'commentId': item['commentId'], 'kind': None, 'replyId': None, 'digest': fnv1a(item['body']),
           'sent': False, 'posted': False, 'verified': False, 'resolved': None, 'error': None}
@@ -191,8 +202,14 @@ def handle(poster, item):
             rc['error'] = f'comment {item["commentId"]} is not on PR #{poster.pr}'
             return rc
         body = item['body'] if kind == 'review' else issue_body(original, item['body'])
-        reply_id = poster.existing(kind, item['commentId'], body)
-        if reply_id is None:
+        found = poster.existing(kind, item['commentId'], body)
+        if found and found[1] != body:
+            rc['replyId'] = found[0]
+            rc['error'] = f'reply {found[0]} of ours already answers this in other words; reconcile by hand'
+            return rc
+        if found:
+            reply_id = found[0]
+        else:
             rc['sent'] = True
             reply_id = poster.post(kind, item['commentId'], body)
             rc['posted'] = True
