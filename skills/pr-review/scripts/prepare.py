@@ -38,7 +38,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import ONLINE, last, ledger_dir, ledger_path, load, locked, refuse_unsettled, repo_of, store  # noqa: E402
+from ledger import ONLINE, last, ledger_dir, ledger_path, load, locked, publications, refuse_unsettled, repo_of, store  # noqa: E402
 from post import sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
@@ -170,7 +170,7 @@ def prepare(a):
         synced = sync(repo, a.pr, led, lambda: store(path, led))
     # A partial review is on the PR, so its threads can still be discussed; save refuses a second draft.
     refuse_unsettled(led, head, ('pending',))
-    online = [r for r in led['reviews'] if r['status'] in ONLINE]
+    online = [r for r, _ in publications(led) if r['status'] in ONLINE]
     if online and online[-1]['status'] == 'drafted':
         raise Unusable(f"your pending review of {online[-1]['head']} is still open on the PR: submit or delete it on GitHub first")
     if online:

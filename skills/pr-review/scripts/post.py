@@ -23,43 +23,45 @@ Text over its length limit, measured here (a comment moved into the body as the 
 pending review names it in overLength for the human to shorten, and --auto refuses to submit it, or a draft saved
 before the check; an answer counts only where it is published, never under --auto.
 
---auto submits the review with its draft's event, refusing APPROVE, posts the fix notes through pr-reply's
-reply.py, which reads each back and resolves its thread, and resolves the threads deferred to it. Thread answers
-are never submitted: the review's are put in an answer record of the head (ledger.py's mode discussion) stored
-with the review's send intent, and the same run publishes that record as a pending review for the human.
+--auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then,
+while the head is still the draft's and every note reads back, a submit with the draft's event (its intent stored
+first, never sent twice) and the same settling as a human's submit. A moved head, an unconfirmed note, a pending
+review an earlier run left (only the human sees it, so it may have changed) or a submit whose outcome cannot be
+read hands the pending review to the human instead (handedOver, exit 1), who finishes it like any draft; a later
+post.py run then publishes its answers. Thread answers are never submitted: the review's are put in an answer publication on it (ledger.py's add_answers), stored with
+the review's send intent, and the same run publishes that as a pending review for the human.
 
 --sync, run by prepare.py first, settles each drafted or uncertain review from GitHub. Deleted: declined. Still
-pending: left, and prepare refuses to start another. Submitted: posted, with the event the human chose. There:
+pending: left, and prepare refuses to start another; a verified auto one is handed to the human (an unverified one is
+left for --auto to recover by its marker). Submitted: posted, with the event the human chose. There:
 - a deleted inline comment drops its finding, and an edited one keeps it with the text published;
 - a reply is published, edited, rejected (deleted before submitting) or lost (never confirmed);
 - a concession withdraws its finding only when published unedited (ledger.py holds the withdrawal until then);
-- the threads of published concessions and fix notes, and those deferred to the review, are resolved while the PR
-  head is the review's, nobody has pushed back since and the thread is open; otherwise the finding keeps
-  resolveDeferred for the next review's recheck.
+- the threads of published concessions and fix notes, and those its recheck found still due (ledger.py's
+  resolve_due), are resolved while the PR head is the review's, a published reply of ours is on the thread, nobody
+  has pushed back since and the thread is open; otherwise the next review finds the resolve due again. Each resolve is marked sent before the mutation, then
+  resolved, deferred or observed (already resolved): one left sent (its answer unconfirmed), or resolved and
+  reopened since, is never resolved again by itself.
 
 A write is stored as sent before it is sent, so a run that dies in it only looks for it afterwards (a review by
 its marker, a reply by its thread and body digest), never sends it twice. --decline records that the human
 declined a draft never created. stdout ends with one JSON line; exit 0 when drafted, posted, declined or synced,
-1 when partial or uncertain, 2 with {"error": ...} when nothing was attempted.
+1 when partial, uncertain or handed over, 2 with {"error": ...} when nothing was attempted.
 """
 
 import json
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import (DRAFTS, ONLINE, UNSETTLED, answer_record, answered_ids, findings_of, open_answers,  # noqa: E402
-                    open_disputes, pushback, reached, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
+from ledger import (DRAFTS, ONLINE, UNSETTLED, add_answers, answered_ids, answers_of, open_answers,  # noqa: E402
+                    owner_of, publications, pushback, reached, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, attempt  # noqa: E402
 from harvest import digest, gh_json, pages  # noqa: E402
 from threads import record, threads  # noqa: E402
-from state_transfer import fnv1a  # noqa: E402
 
-REPLY = Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts' / 'reply.py'
 STATE = {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED', 'COMMENT': 'COMMENTED', None: 'PENDING'}
 EVENT = {v: k for k, v in STATE.items()}
 ADD_REPLY = ('mutation($r:ID!,$t:ID!,$b:String!){addPullRequestReviewThreadReply('
@@ -84,7 +86,7 @@ def pr_head(repo, pr):
     return gh_json('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid')['headRefOid']
 
 
-def read_back(repo, pr, rid, review, event):
+def read_back(repo, pr, rid, review):
     """(True, comment ids by draft position, node id) on a match, (False, why, None) on a mismatch, (None, why, None)
     unread. A pending review's replies on earlier threads are among its comments: only its own threads count."""
     try:
@@ -92,10 +94,10 @@ def read_back(repo, pr, rid, review, event):
         comments = [c for c in review_comments(repo, pr, rid).values() if not c.get('in_reply_to_id')]
     except (Unusable, ValueError):
         return None, 'read-back failed', None
-    if got.get('state') != STATE[event] or digest(got.get('body')) != digest(body_of(review)):
+    if got.get('state') != 'PENDING' or digest(got.get('body')) != digest(body_of(review)):
         return False, f"read back state {got.get('state')}, body digest {digest(got.get('body'))}", None
     # GitHub gives a pending review's comments no line until it is submitted.
-    key = lambda c: (c.get('path'), c.get('line') if event else None, digest(c.get('body')))  # noqa: E731
+    key = lambda c: (c.get('path'), digest(c.get('body')))  # noqa: E731
     want = [key(c) for c in review['draft']['comments']]
     if sorted(want) != sorted(key(c) for c in comments):
         return False, f'inline comments differ: {len(comments)} read back, {len(want)} drafted', None
@@ -116,31 +118,31 @@ def find_ours(repo, pr, review, login):
             [r for r in mine if r.get('state') == 'PENDING' and tag not in (r.get('body') or '')])
 
 
-def settled(repo, pr, rid, review, event, sent, recovered):
-    ok, got, node = read_back(repo, pr, rid, review, event)
-    return {'sent': sent, 'reviewId': rid, 'nodeId': node, 'verified': ok, 'recovered': recovered, 'event': event,
+def settled(repo, pr, rid, review, sent, recovered):
+    ok, got, node = read_back(repo, pr, rid, review)
+    return {'sent': sent, 'reviewId': rid, 'nodeId': node, 'verified': ok, 'recovered': recovered,
             'error': None if ok else got, 'commentIds': got if ok else None}
 
 
-def post_review(repo, pr, review, event, login, recover_only, persist):
-    """Create the review, PENDING when event is None, or find the one an earlier run created."""
+def post_review(repo, pr, review, login, recover_only, persist):
+    """Create the review PENDING, or find the one an earlier run created."""
     found, others = find_ours(repo, pr, review, login)
     if len(found) > 1:
         return {'sent': False, 'reviewId': None, 'verified': None, 'recovered': False,
                 'error': f'{len(found)} reviews carry this draft\'s marker; reconcile by hand'}
     if found:
-        return settled(repo, pr, found[0]['id'], review, event, sent=False, recovered=True)
+        return settled(repo, pr, found[0]['id'], review, sent=False, recovered=True)
     if recover_only:
         # An earlier POST may have landed unseen: posting again could duplicate it.
-        return {'sent': True, 'reviewId': None, 'verified': None, 'recovered': False, 'event': event,
+        return {'sent': True, 'reviewId': None, 'verified': None, 'recovered': False,
                 'error': 'an earlier POST was sent unverified and no review carries its marker yet; reconcile by hand'}
     if others:
         raise Unusable(f"your pending review {others[0]['id']} is open on the PR: submit or delete it on GitHub first")
     payload = {'commit_id': review['head'], 'body': body_of(review),
                'comments': [{'path': c['path'], 'line': c['line'], 'side': 'RIGHT', 'body': c['body']}
-                            for c in review['draft']['comments']], **({'event': event} if event else {})}
+                            for c in review['draft']['comments']]}
     # Stored before the POST, so a run that dies in it only recovers by the marker.
-    persist({'sent': True, 'reviewId': None, 'verified': None, 'recovered': False, 'event': event, 'error': 'sent; not confirmed'})
+    persist({'sent': True, 'reviewId': None, 'verified': None, 'recovered': False, 'error': 'sent; not confirmed'})
     code, out, err = attempt('gh', 'api', '--method', 'POST', f'repos/{repo}/pulls/{pr}/reviews', '--input', '-',
                              input=json.dumps(payload))
     try:
@@ -149,20 +151,22 @@ def post_review(repo, pr, review, event, login, recover_only, persist):
         rid = None
     if rid is None:
         # A lost answer may still have posted: the marker settles it on the next run.
-        return {'sent': True, 'reviewId': None, 'verified': None, 'recovered': False, 'event': event,
+        return {'sent': True, 'reviewId': None, 'verified': None, 'recovered': False,
                 'error': (err or out).strip()[:300] or 'no review id in the answer'}
-    return settled(repo, pr, rid, review, event, sent=True, recovered=False)
+    return settled(repo, pr, rid, review, sent=True, recovered=False)
 
 
-def publish_review(repo, pr, review, event, login, recover_only, persist_all):
+def publish_review(repo, pr, review, login, recover_only, persist_all):
     """post_review with its receipt kept on the ledger; the review's comment ids go to its findings once verified."""
     rec = review['receipts']
     sent = bool((rec.get('review') or {}).get('sent'))
     if not (rec.get('review') or {}).get('verified'):
         def persist(intent):
             rec['review'] = intent
+            # From its send intent on, the review may be on GitHub, whatever head the PR has moved to.
+            review['status'] = 'uncertain' if review['status'] == 'pending' else review['status']
             persist_all()
-        got = post_review(repo, pr, review, event, login, sent or recover_only, persist)
+        got = post_review(repo, pr, review, login, sent or recover_only, persist)
         # Once sent, always sent: no later receipt may clear it, or a run would POST again.
         rec['review'] = {**got, 'sent': got['sent'] or sent}
         persist_all()
@@ -172,36 +176,6 @@ def publish_review(repo, pr, review, event, login, recover_only, persist_all):
 def own_comments(led):
     """Inline comment ids our reviews on the PR posted, as read back: the only threads we answer."""
     return {i for r in reached(led) for i in ((r.get('receipts') or {}).get('review') or {}).get('commentIds') or [] if i}
-
-
-def run_reply(repo, pr, replies):
-    manifest = {'replies': [{'commentId': r['commentId'], 'body': r['body'], 'digest': fnv1a(r['body']),
-                             **({'resolve': r['resolve']} if 'resolve' in r else {})} for r in replies]}
-    with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
-        json.dump(manifest, f)
-    got = reply_json('--manifest', f.name, repo=repo, pr=pr)
-    Path(f.name).unlink(missing_ok=True)
-    return got.get('receipts') or [{'commentId': r['commentId'], 'sent': None, 'verified': None,
-                                    'error': f"reply.py gave no receipts: {got.get('error')}"} for r in replies]
-
-
-def reply_json(*argv, repo, pr):
-    done = subprocess.run([sys.executable, str(REPLY), '--pr', str(pr), '--repo', repo, *argv], capture_output=True, text=True)
-    try:
-        return json.loads(done.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return {'error': done.stderr.strip()[:200]}
-
-
-def post_replies(repo, pr, review, own):
-    replies = review['draft']['replies']
-    if not replies:
-        return []
-    foreign = [r['commentId'] for r in replies if r['commentId'] not in own]
-    if foreign:
-        return [{'commentId': c, 'sent': False, 'verified': None, 'error': 'not a comment our reviews posted; not answered'}
-                for c in foreign]
-    return run_reply(repo, pr, replies)
 
 
 def live_thread(comments, root):
@@ -224,12 +198,12 @@ def graphql(query, **fields):
     return got.get('data'), '; '.join(e.get('message', '?') for e in got.get('errors') or [])[:300] or None
 
 
-def replies_of(led, review):
+def replies_of(led, review, answers=True):
     """What a review publishes on our earlier threads: its fix notes, then each unpublished answer of its findings."""
     out = [{'kind': 'fixnote', 'findingId': r['findingId'], 'commentId': r['commentId'], 'body': r['body'], 'resolve': True}
            for r in review['draft']['replies']]
     return out + [{'kind': 'answer', 'findingId': f['id'], 'commentId': f.get('commentId'), 'body': d['answer']['body'],
-                   'resolve': d['answer']['resolve'], 'dispute': d} for f, d in open_disputes(findings_of(led, review), review['head'])]
+                   'resolve': d['answer']['resolve'], 'dispute': d} for f, d in (answers_of(led, review) if answers else [])]
 
 
 def refresh(e, comments, final):
@@ -255,11 +229,11 @@ def refresh(e, comments, final):
         e.update(state='edited', published=c.get('body'))
 
 
-def stage(repo, pr, led, review, login, persist):
+def stage(repo, pr, led, review, login, persist, answers=True):
     """Add the review's replies to its pending review, once each; returns the staged entries."""
     rid, node = review['receipts']['review']['reviewId'], review['receipts']['review']['nodeId']
     staged = review['receipts'].setdefault('staged', [])
-    todo = replies_of(led, review)
+    todo = replies_of(led, review, answers)
     if staged:
         comments = review_comments(repo, pr, rid)
         for e in staged:
@@ -276,14 +250,10 @@ def stage(repo, pr, led, review, login, persist):
         staged.append(e)
         added.append(e)
         d = r.get('dispute')
-        # A note an earlier run sent unconfirmed may be on the thread already: that one is the reply.
-        there = [c for c in live_thread(public, r['commentId']) if c['author'] == login and ledger_digest(c['body']) == e['digest']]
         if r['commentId'] not in own:
             e.update(state='skipped', error='not a comment our reviews posted; not answered')
         elif not e['threadId']:
             e.update(state='skipped', error='no review thread holds the comment')
-        elif there and not d:
-            e.update(state='landed', replyId=there[0]['id'], error=None)
         elif d and live_key(live_thread(public, r['commentId']), login, known) != d['key']:
             e.update(state='skipped', error='the thread changed since it was judged; review again')
         elif d and d['answer']['digest'] != e['digest']:
@@ -303,46 +273,48 @@ def stage(repo, pr, led, review, login, persist):
     return staged
 
 
-def deferred(review):
-    """(finding, root comment) for the deferred resolves the review's recheck reconfirmed."""
-    by_id = {f['id']: f for f in review['findings']}
+def due_resolves(review):
+    """(finding, root comment) for the due resolves the review's recheck reconfirmed."""
+    by_id = {f['id']: f for f in review.get('findings', [])}
     return [(by_id[x['findingId']], x['commentId']) for x in review['draft'].get('resolves', []) if x['findingId'] in by_id]
 
 
-def resolve_threads(repo, pr, led, review, want, login):
-    """Resolve each (finding, root comment) thread while the PR head is the review's and nobody pushed back after
-    our last published reply there; a finding whose resolve cannot happen now keeps resolveDeferred."""
+def resolve_threads(repo, pr, led, review, want, login, persist):
+    """Resolve each (finding, root comment) thread while the PR head is the review's, a published reply of ours is on
+    it and nobody pushed back after the last one, marking each in receipts.resolved."""
     if not want:
-        return []
+        return
     head = pr_head(repo, pr)
     public = pages(f'repos/{repo}/pulls/{pr}/comments')
     by_root = {t['commentIds'][0]: t for t in threads(repo, pr) if t['commentIds']}
-    known, out = answered_ids(led), []
+    known, marks = answered_ids(led), review['receipts'].setdefault('resolved', [])
     for f, root in want:
         t = by_root.get(root)
+        replies = live_thread(public, root)
         why = ('no review thread holds the comment' if not t else None if t['resolved'] else
                f"the PR head moved to {head} since the review" if head != review['head'] else
-               'new replies since our last one' if pushback(live_thread(public, root), known, login) else None)
+               'no published reply of ours on the thread' if not any(c['id'] in known for c in replies) else
+               'new replies since our last one' if pushback(replies, known, login) else None)
+        mark = {'findingId': f['id'], 'commentId': root, 'state': 'deferred' if why else 'observed', 'error': why}
+        marks.append(mark)
         if t and not why and not t['resolved']:
+            # Stored before the mutation: a resolve not confirmed resolved is never tried again.
+            mark.update(state='sent')
+            persist()
             data, err = graphql(RESOLVE, t=t['threadId'])
-            if not (((data or {}).get('resolveReviewThread') or {}).get('thread') or {}).get('isResolved'):
-                why = f'resolve failed: {err}'
-        if why:
-            f['resolveDeferred'] = {'commentId': root, 'head': review['head'], 'why': why,
-                                    'replied': (f.get('resolveDeferred') or {}).get('replied', True)}
-        else:
-            f.pop('resolveDeferred', None)
-        out.append({'findingId': f['id'], 'commentId': root, 'resolved': not why, 'error': why})
-    return out
+            if (((data or {}).get('resolveReviewThread') or {}).get('thread') or {}).get('isResolved'):
+                mark.update(state='resolved')
+            else:
+                mark.update(error=f'resolve unconfirmed: {err}')
 
 
 def declined(led, review, reason):
     review.update(status='declined', declineReason=reason)
     try:
-        findings = findings_of(led, review) if review.get('mode') == 'discussion' else []
+        answers = answers_of(led, review) if 'answers' in review else []
     except Unusable:
-        findings = []  # the review they answer never reached the PR: nothing of theirs stands on it
-    for _, d in open_disputes(findings):
+        answers = []  # the review they answer never reached the PR: nothing of theirs stands on it
+    for _, d in answers:
         d['answer']['outcome'] = 'rejected'
 
 
@@ -363,12 +335,12 @@ def match_roots(drafted, roots):
     return ids, unsure
 
 
-def submitted(repo, pr, led, review, state, login):
+def submitted(repo, pr, led, review, state, login, persist):
     """A pending review the human submitted: what survived of it becomes the record, then its threads resolve."""
     rec = review['receipts']
     got = rec['review']
     comments = review_comments(repo, pr, got['reviewId'])
-    by_id = {f['id']: f for f in review['findings']}
+    by_id = {f['id']: f for f in owner_of(led, review)['findings']}
     unsure = set()
     if got.get('commentIds') is None:
         got['commentIds'], unsure = match_roots(review['draft']['comments'], [c for c in comments.values() if not c.get('in_reply_to_id')])
@@ -386,18 +358,10 @@ def submitted(repo, pr, led, review, state, login):
         ids.append(live and cid)
     got.update(commentIds=ids, submitted=state, event=EVENT.get(state))
     review['status'] = 'posted'
-    targets = {f['id']: f for f in findings_of(led, review)}
     want = []
-    landed = [e for e in rec.get('staged', []) if e['state'] == 'landed']
-    public = {c['id']: c for c in pages(f'repos/{repo}/pulls/{pr}/comments')} if landed else {}
-    for e in landed:
-        # Found on the thread when staged, it counts only while it is still there as it was.
-        c = public.get(e['replyId'])
-        if not c or c.get('in_reply_to_id') != e['commentId'] or ledger_digest(c.get('body') or '') != e['digest']:
-            e.update(state='rejected', error='no longer on the thread as found')
     for e in rec.get('staged', []):
         refresh(e, comments, final=True)
-        f = targets.get(e['findingId']) if e['kind'] == 'answer' else by_id.get(e['findingId'])
+        f = by_id.get(e['findingId'])
         if e['kind'] == 'answer' and f:
             a = next((d['answer'] for d in reversed(f.get('disputes', [])) if (d.get('answer') or {}).get('digest') == e['digest']), None)
             if a and e['state'] in ('published', 'edited', 'rejected', 'lost', 'skipped'):
@@ -407,14 +371,9 @@ def submitted(repo, pr, led, review, state, login):
                 elif e['state'] == 'published' and a.get('status'):
                     # Only a concession the PR shows as drafted withdraws its finding.
                     f['status'] = a['status']
-        if f and e['state'] in ('published', 'landed') and e['resolve']:
-            f.pop('resolveDeferred', None)  # this reply is on the thread now, whatever an earlier one did
+        if f and e['state'] == 'published' and e['resolve']:
             want.append((f, e['commentId']))
-        elif f and e['kind'] == 'fixnote':
-            # Its thread stays open: the next review rechecks it, resolving it, or drafting the note again if it is gone.
-            f['resolveDeferred'] = {'commentId': e['commentId'], 'head': review['head'], 'why': f"the fix note was {e['state']}",
-                                    'replied': e['state'] == 'edited'}
-    rec['resolved'] = resolve_threads(repo, pr, led, review, want + deferred(review), login)
+    resolve_threads(repo, pr, led, review, want + due_resolves(review), login, persist)
 
 
 def sync(repo, pr, led, persist):
@@ -426,10 +385,10 @@ def sync(repo, pr, led, persist):
         login = login or gh_json('api', 'user')['login']
         return login
 
-    for review in led['reviews']:
-        if review.get('publish') != 'draft' or review['status'] not in ONLINE:
+    for review, _ in list(publications(led)):
+        got = review['receipts'].get('review') or {}
+        if review['status'] not in ONLINE:
             continue
-        got = review['receipts'].setdefault('review', {})
         if not got.get('reviewId'):
             found, _ = find_ours(repo, pr, review, me())
             if len(found) != 1:
@@ -437,57 +396,96 @@ def sync(repo, pr, led, persist):
                 continue
             got.update(reviewId=found[0]['id'], nodeId=found[0].get('node_id'))
             persist()
-        code, text, err = attempt('gh', 'api', f"repos/{repo}/pulls/{pr}/reviews/{got['reviewId']}")
+        code, state, err = review_state(repo, pr, got['reviewId'])
         if code != 0 and 'HTTP 404' in err:
             declined(led, review, 'deleted on GitHub before it was submitted')
             persist()
-        elif code != 0:
+        elif state is None:
             raise Unusable(f"review {got['reviewId']} unreadable: {err.strip()[:200]}")
-        elif json.loads(text).get('state') != 'PENDING':
-            submitted(repo, pr, led, review, json.loads(text)['state'], me())
+        elif state != 'PENDING':
+            submitted(repo, pr, led, review, state, me(), persist)
+            persist()
+        elif review.get('publish') == 'auto' and got.get('verified'):
+            # The run that made it pending is gone: only the human may submit it now; an unverified one is left for
+            # --auto to recover by its marker.
+            hand_over(review, "the submit's outcome is unknown" if got.get('submitIntent') else EARLIER)
             persist()
         out.append({'head': review['head'], 'status': review['status'], 'event': got.get('event') if review['status'] == 'posted' else None})
     return out
 
 
+EARLIER = 'an earlier run left it pending, open to changes since'
+
+
+def review_state(repo, pr, rid):
+    """(exit code, state or None when unread, stderr) of one of our reviews on GitHub."""
+    code, text, err = attempt('gh', 'api', f"repos/{repo}/pulls/{pr}/reviews/{rid}")
+    try:
+        return code, json.loads(text).get('state') if code == 0 else None, err
+    except ValueError:
+        return code, None, err
+
+
+def hand_over(review, why):
+    """Leave an auto review pending on GitHub for the human, who finishes it like any draft: nothing is sent again."""
+    review.update(publish='draft', status='drafted')
+    review['receipts']['review']['handedOver'] = why
+
+
+def submit(repo, pr, review, event, persist):
+    """Submit the pending review with its event, once: the intent is stored first, and only a read-back no longer
+    PENDING shows it went through. Returns that state, or None."""
+    got = review['receipts']['review']
+    got['submitIntent'] = event
+    persist()
+    attempt('gh', 'api', '--method', 'POST', f"repos/{repo}/pulls/{pr}/reviews/{got['reviewId']}/events", '--input', '-',
+            input=json.dumps({'event': event}))
+    state = review_state(repo, pr, got['reviewId'])[1]
+    return state if state not in (None, 'PENDING') else None
+
+
 def publish_auto(repo, pr, led, review, event, login, recovering, persist):
+    """The draft's pending review with its fix notes, submitted with its event; handed to the human instead when the
+    head moved, a note is unconfirmed or an earlier run left it pending before the submit, or when the submit's outcome
+    cannot be read."""
     rec = review['receipts']
     review['publish'] = 'auto'
     answers = open_answers(review['findings'])
-    if answers and not any(r.get('origin') == review['draft']['digest'] for r in led['reviews']):
+    if answers and not any(a.get('auto') for a in review.get('answerPublications', [])):
         # Stored with the review's send intent, so a relaunch after it lands never appends a second bundle.
-        answer_record(led, review['head'], answers, origin=review['draft']['digest'])
-    ok = publish_review(repo, pr, review, event, login, recovering, persist)
-    if ok:
-        ids = dict(zip((c.get('findingId') for c in review['draft']['comments']), rec['review']['commentIds']))
-        for f in review['findings']:
-            if f['id'] in ids:
-                f['commentId'] = ids[f['id']]
-    replies = rec.get('replies', [])
-    if ok and not recovering:
-        replies = rec['replies'] = post_replies(repo, pr, review, own_comments(led))
-        by_id, got = {f['id']: f for f in review['findings']}, {r.get('commentId'): r for r in replies}
-        for r in review['draft']['replies']:
-            rc, f = got.get(r['commentId']) or {}, by_id.get(r['findingId'])
-            if f and not (rc.get('verified') and rc.get('resolved', True) is not False):
-                # Left for the next review. Only a verified note counts as replied, so a thread is never resolved
-                # bare; an unconfirmed one is drafted again word for word, so the one that did land is found, not doubled.
-                f['resolveDeferred'] = {'commentId': r['commentId'], 'head': review['head'],
-                                        'why': rc.get('error') or 'the fix note was not confirmed', 'replied': rc.get('verified') is True,
-                                        **({'note': r['body']} if rc.get('sent') and not rc.get('verified') else {})}
-            elif f:
-                f.pop('resolveDeferred', None)
-        rec['resolved'] = resolve_threads(repo, pr, led, review, deferred(review), login)
-    done = all(r.get('verified') and r.get('resolved', True) is not False for r in replies)
-    review['status'] = 'posted' if ok and done else 'partial' if ok else 'uncertain'
+        add_answers(review, review['head'], answers, auto=True)
+    # Only the human sees a pending review: one an earlier run left may have been changed since.
+    earlier = bool((rec.get('review') or {}).get('sent'))
+    if not publish_review(repo, pr, review, login, recovering, persist):
+        review['status'] = 'uncertain'
+        persist()
+        return {'status': 'uncertain', 'review': rec['review'], 'staged': rec.get('staged', [])}
+    review['status'] = 'drafted'
     persist()
-    return {'status': review['status'], 'review': rec['review'], 'replies': replies, 'resolved': rec.get('resolved', [])}
+    moved = 'the PR head moved before the submit'
+    why = (moved if recovering or pr_head(repo, pr) != review['head'] else
+           EARLIER if earlier else None)
+    if not why:
+        staged = stage(repo, pr, led, review, login, persist, answers=False)
+        why = ('a fix note was not confirmed on the pending review' if any(e['state'] in ('sent', 'uncertain') for e in staged)
+               else moved if pr_head(repo, pr) != review['head'] else None)
+    if not why:
+        state = submit(repo, pr, review, event, persist)
+        if state:
+            submitted(repo, pr, led, review, state, login, persist)
+        else:
+            why = "the submit's outcome is unknown"
+    if why:
+        hand_over(review, why)
+    persist()
+    return {'status': review['status'], 'review': rec['review'], 'staged': rec.get('staged', []),
+            'resolved': rec.get('resolved', []), **({'handedOver': why} if why else {})}
 
 
 def publish_draft(repo, pr, led, review, login, recovering, persist):
     rec = review['receipts']
     review['publish'] = 'draft'
-    ok = publish_review(repo, pr, review, None, login, recovering, persist)
+    ok = publish_review(repo, pr, review, login, recovering, persist)
     # After a push the review is only found again: answers judged on the old head are not added to it.
     staged = stage(repo, pr, led, review, login, persist) if ok and not recovering else rec.get('staged', [])
     review['status'] = 'drafted' if ok else 'uncertain'
@@ -513,7 +511,7 @@ def over_length(led, review, answers=True):
     long = [f"{c['path']}:{c['line']}" for c in d['comments'] + d.get('moved', []) if too_long(c['body'], COMMENT_WORDS)]
     long += [f"fix note on {r['findingId']}" for r in d['replies'] if too_long(r['body'], REPLY_WORDS)]
     if answers:
-        long += [f"answer on {f['id']}" for f, x in open_disputes(findings_of(led, review), review['head'])
+        long += [f"answer on {f['id']}" for f, x in answers_of(led, review)
                  if too_long(x['answer']['body'], REPLY_WORDS)]
     return list(dict.fromkeys(long))
 
@@ -543,9 +541,8 @@ def collect(argv):
             return {'status': 'synced', 'reviews': sync(repo, a.pr, led, persist)}
         # What the human already submitted or deleted on GitHub is recorded first: it is no longer a draft.
         sync(repo, a.pr, led, persist)
-        todo = [r for r in led['reviews'] if r['head'] == a.expected_head and r['status'] in UNSETTLED]
-        if a.auto:
-            todo = [r for r in todo if r.get('mode') != 'discussion']
+        todo = [p for p, r in publications(led) if p['head'] == a.expected_head and p['status'] in UNSETTLED
+                and (p is r or not a.auto)]
         if not todo:
             raise Unusable(f'no pending draft for {a.expected_head} on the ledger')
         review = todo[-1]
@@ -555,6 +552,9 @@ def collect(argv):
             declined(led, review, a.reason)
             persist()
             return {'status': 'declined', 'review': None}
+        handed = (review['receipts'].get('review') or {}).get('handedOver')
+        if a.auto and handed:
+            return {'status': review['status'], 'review': review['receipts']['review'], 'handedOver': handed}
         mode = 'auto' if a.auto else 'draft'
         if review.get('publish', mode) != mode:
             raise Unusable(f"the draft was published {'with' if review['publish'] == 'auto' else 'without'} --auto: finish it the same way")
@@ -578,8 +578,8 @@ def collect(argv):
         if not a.auto:
             return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'overLength': long}
         out = publish_auto(repo, a.pr, led, review, event, login, recovering, persist)
-        answers = [r for r in led['reviews'] if r.get('origin') == review['draft']['digest'] and r['status'] in DRAFTS]
-        if answers and review['status'] in ('posted', 'partial') and not recovering:
+        answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
+        if answers and review['status'] == 'posted' and not recovering:
             out['answers'] = {**publish_draft(repo, a.pr, led, answers[-1], login, False, persist),
                               'overLength': over_length(led, answers[-1])}
         return out
@@ -592,7 +592,7 @@ def main(argv):
         print(json.dumps({'error': str(e)}))
         return 2
     print(json.dumps(out))
-    done = out['status'] in ('posted', 'declined', 'drafted', 'synced')
+    done = out['status'] in ('posted', 'declined', 'drafted', 'synced') and 'handedOver' not in out
     return 0 if done and ('answers' not in out or out['answers']['status'] == 'drafted') else 1
 
 

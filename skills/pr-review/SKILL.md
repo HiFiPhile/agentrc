@@ -83,8 +83,10 @@ the human submitted, is the standing grant in the user's instructions: no
 question is asked, and nothing is ever submitted for them.
 Auto-post: the review is submitted without a question, as `COMMENT` or
 `REQUEST_CHANGES`, never `APPROVE`, with fix notes and resolves on our own
-threads whose fix a recheck verified. Answers to pushback (a concession or a
-rebuttal) are never submitted: they go into a pending review for the human.
+threads whose fix a recheck verified. It is the same pending review, submitted
+by `post.py` once its head and fix notes check out; otherwise it is handed to
+the human as a pending review (`handedOver`). Answers to pushback (a concession
+or a rebuttal) are never submitted: they go into a pending review for the human.
 Pushback is a human's reply on one of our threads; a bot's reply there is not
 judged. For a headless chief, auto-post needs the exchange `agents/chief.md`
 names under its PR review exception: ask it with the repository, the PR URL,
@@ -118,7 +120,8 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
 5. One unit runs `post.py` (pending) or `post.py --auto` (auto-post) with
    `--expected-head`. Its exit 1 names what it could not confirm.
 6. Report the verdict and its reasons, the counts, coverage lost, the CI and
-   HIL rows, the receipts and `post.py`'s `overLength`; never the draft's text.
+   HIL rows, the receipts, `post.py`'s `overLength` and the result's
+   `heldThreads`; never the draft's text.
 
 ## 5. After the launch
 
@@ -136,7 +139,11 @@ notes are resolved unless the head moved or someone replied since, in which
 case the next review rechecks them first (`post.py`'s docstring has the
 rules). `post.py` reports `uncertain` or `partial` when it cannot prove what landed:
 it never sends again blind, and the next run looks for it; reconcile by hand
-what it names.
+what it names. A `handedOver` auto review is the human's pending review, with
+its reason; once they submit it, `post.py --pr N --expected-head SHA` publishes
+its answers. A thread in `heldThreads` is one we resolved and someone reopened,
+or whose resolve is unconfirmed: it is never resolved again by itself, so name
+it for the human.
 
 A later push is a new `/pr-review N`: prepare picks the mode and the ledger
 carries the earlier findings, replies and receipts.

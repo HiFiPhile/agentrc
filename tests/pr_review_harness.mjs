@@ -97,6 +97,10 @@ test('a clean full review approves only with green CI, full coverage and hardwar
   assert.equal(audits[0].dimensions.length, 4)
   assert.ok(calls.filter(c => ['check', 'threads', 'ledger'].includes(c.label)).every(c => c.options.model === 'haiku'))
   assert.match(calls.find(c => c.label === 'check').prompt, /prepare\.py --check --pr 7 --repo o\/r --expected-head b{40}/)
+  const at = (l) => calls.findIndex(c => c.label === l)
+  assert.ok(at('threads') < at('ledger'), 'show reads the snapshot threads.py wrote')
+  assert.match(calls[at('ledger')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json'/)
+  assert.deepEqual(result.heldThreads, [])
   assert.doesNotMatch(result.draft.body, /agentrc|Claude|generated/i)
 
   const auto = await run({ ...BASE, autoPost: true })
@@ -227,20 +231,19 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.equal(fixed.result.verdict.event, 'APPROVE')
   assert.match(fixed.result.draft.body, /the changes since cccccccccccc/)
   assert.deepEqual(fixed.result.draft.resolves, [])
-  const deferred = { reviews: 1, open: [{ ...ledger.open[0], status: 'fixed', resolveDeferred: { commentId: 901, head: OLD, why: 'moved' } }, ledger.open[1]] }
+  const deferred = { reviews: 1, open: [{ ...ledger.open[0], status: 'fixed', resolveDue: { replied: true } }, ledger.open[1]] }
   const again = await run(inc, { ledger: deferred, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
-  assert.deepEqual(again.result.draft.replies.map(r => r.commentId), [902], 'a deferred resolve already has its fix note')
+  assert.deepEqual(again.result.draft.replies.map(r => r.commentId), [902], 'a due resolve with our reply on the thread needs no new note')
   assert.deepEqual(again.result.draft.resolves, [{ findingId: 'pr7-f1', commentId: 901 }])
   assert.match(again.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /judge that text, not the draft/)
   const reopened = await run(inc, { ledger: deferred, recheck: () => ({ state: 'open', reason: 'back' }), check: pinned(inc) })
   assert.deepEqual(reopened.result.draft.resolves, [], 'standing again: nothing to resolve')
-  const noted = { reviews: 1, open: [{ ...deferred.open[0], resolveDeferred: { ...deferred.open[0].resolveDeferred, replied: false } }] }
+  const noted = { reviews: 1, open: [{ ...deferred.open[0], resolveDue: { replied: false } }] }
   const renote = await run(inc, { ledger: noted, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
   assert.deepEqual([renote.result.draft.replies.map(r => r.commentId), renote.result.draft.resolves], [[901], []],
-    'a deleted fix note is drafted again; the thread resolves once that one is published')
-  const unsent = { reviews: 1, open: [{ ...noted.open[0], resolveDeferred: { ...noted.open[0].resolveDeferred, note: 'Fixed in 0123456789ab.' } }] }
-  const same = await run(inc, { ledger: unsent, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
-  assert.deepEqual(same.result.draft.replies.map(r => r.body), ['Fixed in 0123456789ab.'], 'an unconfirmed note is drafted again word for word')
+    'with no reply of ours there, the note is drafted; the thread resolves once it is published')
+  const held = [{ findingId: 'pr7-f3', commentId: 903, why: 'resolve unconfirmed' }]
+  assert.deepEqual((await run(inc, { ledger: { ...deferred, heldThreads: held }, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })).result.heldThreads, held)
   const unjudged = await run(inc, { ledger: deferred, recheck: () => null, check: pinned(inc) })
   assert.deepEqual(unjudged.result.draft.resolves, [], 'no recheck on this head, no resolve')
   const conceded = { reviews: 1, open: [{ ...deferred.open[0], status: 'withdrawn' }] }

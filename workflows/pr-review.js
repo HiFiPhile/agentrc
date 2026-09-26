@@ -89,18 +89,19 @@ const ci = check.ci
 
 phase('Context')
 const threadsFile = `${args.factsDir}/threads-${head}.json`
-const [threadsOut, prior] = await parallel([
-  () => relay('threads', 'Context', `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`,
-    { type: 'object', properties: { file: { type: 'string' }, count: { type: 'integer' }, error: { type: 'string' } } }),
-  () => relay('ledger', 'Context', `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo}`,
-    { type: 'object', properties: { reviews: { type: 'integer' }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, resolveDeferred: { type: ['object', 'null'] } }, required: ['id'] } }, error: { type: 'string' } } }),
-])
+const threadsOut = await relay('threads', 'Context', `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`,
+  { type: 'object', properties: { file: { type: 'string' }, count: { type: 'integer' }, error: { type: 'string' } } })
 if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return blocked('threads-failed', threadsOut ? threadsOut.error || 'wrong file' : 'the threads relay died')
-if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
 const DISPUTES = { type: 'object', properties: { error: { type: 'string' }, disputes: { type: 'array', items: { type: 'object', required: ['findingId', 'key', 'replies'],
   properties: { findingId: { type: 'string' }, key: { type: 'string' }, rootCommentId: { type: 'integer' }, outdated: { type: 'boolean' },
     replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } } } }
-const pushback = await relay('disputes', 'Context', `python3 ${S}/ledger.py disputes --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`, DISPUTES)
+const [prior, pushback] = await parallel([
+  () => relay('ledger', 'Context', `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}'`,
+    { type: 'object', properties: { reviews: { type: 'integer' }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } } }, required: ['id'] } },
+      heldThreads: { type: 'array', items: { type: 'object', properties: { findingId: { type: 'string' }, commentId: { type: 'integer' }, why: { type: 'string' } } } }, error: { type: 'string' } } }),
+  () => relay('disputes', 'Context', `python3 ${S}/ledger.py disputes --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`, DISPUTES),
+])
+if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
 if (!pushback || pushback.error || !Array.isArray(pushback.disputes)) return blocked('disputes-failed', pushback ? pushback.error : 'the disputes relay died')
 const disputeOf = Object.fromEntries(pushback.disputes.map(d => [d.findingId, d]))
 // A discussion run judges only the findings someone answered; any other run rechecks every standing one.
@@ -310,13 +311,13 @@ const comments = toPost.map((f, i) => ({
 }))
 const long = [...comments.filter(c => overLength(c.body, LIMIT.comment)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`)]
 if (long.length) log(`over length, for the human to shorten: ${long.join(', ')}`)
-// A deferred resolve whose reply is on the thread is only resolved once reconfirmed; one whose fix note the
-// human deleted (replied: false) gets the note again, and the thread resolves once that is published.
+// A due resolve whose reply is on the thread is only resolved once reconfirmed; one with no reply of ours there
+// (replied: false) gets the fix note, and the thread resolves once that is published.
 const settledAway = (i) => rechecked[i] && ['fixed', 'na', 'withdrawn'].includes(carriedOut[i].status)
-const noteDue = (f, i) => carriedOut[i].status === 'fixed' && (!f.resolveDeferred || f.resolveDeferred.replied === false)
+const noteDue = (f, i) => carriedOut[i].status === 'fixed' && !(f.resolveDue && f.resolveDue.replied)
 const fixedReplies = carried.filter((f, i) => noteDue(f, i) && Number.isInteger(f.commentId))
-  .map(f => ({ commentId: f.commentId, findingId: f.id, body: (f.resolveDeferred && f.resolveDeferred.note) || `Fixed in ${head.slice(0, 12)}.` }))
-const resolves = carried.filter((f, i) => f.resolveDeferred && settledAway(i) && !noteDue(f, i) && Number.isInteger(f.commentId))
+  .map(f => ({ commentId: f.commentId, findingId: f.id, body: `Fixed in ${head.slice(0, 12)}.` }))
+const resolves = carried.filter((f, i) => f.resolveDue && f.resolveDue.replied && settledAway(i) && Number.isInteger(f.commentId))
   .map(f => ({ findingId: f.id, commentId: f.commentId }))
 
 const row = (cells) => `| ${cells.join(' | ')} |`
@@ -346,5 +347,6 @@ return {
   claims: claimsOut,
   coverage: { dropped: audit.dropped, unverified: audit.unverified, unjudged },
   ci, hil,
+  heldThreads: prior.heldThreads || [],
   draft: { event, body: lines.join('\n'), comments, replies: fixedReplies, resolves },
 }

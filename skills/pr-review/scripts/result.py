@@ -6,7 +6,7 @@
 Counts, never bodies: the status and reason, the head and mode, the proposed
 event and why, findings by status and severity, coverage lost (dropped scan
 units, unverified findings, claims left unjudged), the CI and HIL evidence the
-verdict used, and the draft's size. Every count is labelled with the finding
+verdict used, the threads held from resolving (ids and why), and the draft's size. Every count is labelled with the finding
 statuses the workflow uses (open, fixed, covered, withdrawn, na) and the
 verdicts of the thread claims (confirmed, refuted, stale). The draft's text
 stays in the file for the human, and on the ledger once saved.
@@ -37,7 +37,7 @@ def condense(r):
         'openBySeverity': dict(Counter(f.get('severity') for f in open_)),
         'claims': dict(Counter(c.get('verdict') for c in r.get('claims', []))),
         'coverage': {k: len((r.get('coverage') or {}).get(k, [])) for k in ('dropped', 'unverified', 'unjudged')},
-        'ci': (r.get('ci') or {}).get('state'), 'hil': r.get('hil'),
+        'ci': (r.get('ci') or {}).get('state'), 'hil': r.get('hil'), 'heldThreads': r.get('heldThreads', []),
         'draft': {'inline': len(draft.get('comments', [])), 'replies': len(draft.get('replies', [])),
                   'bodyChars': len(draft.get('body', ''))},
     }
