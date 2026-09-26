@@ -308,7 +308,7 @@ const comments = toPost.map((f, i) => ({
   path: f.file, line: f.line, finding: carriedOut.length + ours.indexOf(f),
   body: bodies[i] && checked && !checked.bad.includes(i) && !offFormat(bodies[i].body, f.severity) ? bodies[i].body : template(f),
 }))
-const long = [...comments.filter(c => overLength(c.body, LIMIT.comment)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`), ...(written && written.summary && !summary ? ['summary (left out)'] : [])]
+const long = [...comments.filter(c => overLength(c.body, LIMIT.comment)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`)]
 if (long.length) log(`over length, for the human to shorten: ${long.join(', ')}`)
 // A deferred resolve whose reply is on the thread is only resolved once reconfirmed; one whose fix note the
 // human deleted (replied: false) gets the note again, and the thread resolves once that is published.
@@ -321,7 +321,10 @@ const resolves = carried.filter((f, i) => f.resolveDeferred && settledAway(i) &&
 
 const row = (cells) => `| ${cells.join(' | ')} |`
 const lines = []
-if (summary && checked && !checked.summaryBad) lines.push(summary, '')
+const summaryDropped = written && written.summary ? (!summary ? 'still over its format after shortening'
+  : !checked ? 'no check ran' : checked.summaryBad ? 'the check found a claim no finding states' : null) : null
+if (summaryDropped) log(`summary left out: ${summaryDropped}`)
+else if (summary) lines.push(summary, '')
 const tally = (xs, key) => Object.entries(xs.reduce((m, x) => ({ ...m, [x[key]]: (m[x[key]] || 0) + 1 }), {})).map(([k, v]) => `${v} ${k}`).join(', ')
 lines.push(`Reviewed ${args.mode === 'incremental' ? `the changes since ${scopeBase.slice(0, 12)}` : 'the whole change'} at ${head.slice(0, 12)}: ` +
   `${ours.length} new finding(s)${ours.length ? ` (${tally(ours, 'status')})` : ''}` +

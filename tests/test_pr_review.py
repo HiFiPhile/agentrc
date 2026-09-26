@@ -386,7 +386,10 @@ class Ledger(Case):
         self.assertIn('**src/core/a.c:1**: far from the diff', rev['draft']['body'])
         self.assertEqual(rev['draft']['digest'], out['draftDigest'])
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['open'], [], 'a pending draft carries nothing')
-        self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--draft'])['status'], 'pending')
+        shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--draft'])
+        self.assertEqual(shown['status'], 'pending')
+        self.assertEqual([(c['findingId'], c['severity']) for c in shown['draft']['comments']], [(f'pr{PR}-f1', 'high')],
+                         'each comment names the severity its heading must match')
         self.mark_posted(self.p)
         shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])
         self.assertEqual([f['id'] for f in shown['open']], [f'pr{PR}-f1'])

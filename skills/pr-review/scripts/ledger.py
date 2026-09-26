@@ -180,7 +180,10 @@ def show(led, finding=None, draft=False):
         if not revs:
             raise Unusable('no review on the ledger')
         rev = revs[-1]
-        return {'head': rev['head'], 'status': rev['status'], 'draft': rev['draft']}
+        # Each comment names its finding's severity, which the comment's heading must match.
+        sev = {f['id']: f.get('severity') for f in rev['findings']}
+        draft = {**rev['draft'], 'comments': [{**c, 'severity': sev.get(c.get('findingId'))} for c in rev['draft']['comments']]}
+        return {'head': rev['head'], 'status': rev['status'], 'draft': draft}
     rev = last(led)
     if finding:
         for r in reversed(reached(led)):
