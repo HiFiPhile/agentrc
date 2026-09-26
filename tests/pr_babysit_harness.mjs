@@ -138,6 +138,9 @@ const receiptOf = (head, prHead, detail, pushed = true) => ({
 const hookQuoted = quotedAfter(/hooks\.py/)
 // reply.py's printed receipts leave out a null resolved or error.
 const printed = (receipts) => receipts.map(r => Object.fromEntries(Object.entries(r).filter(([k, v]) => v !== null || !['resolved', 'error'].includes(k))))
+// A relay that dropped every null its schema lets it leave out.
+const dropped = (v) => Array.isArray(v) ? v.map(dropped)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, dropped(x)])) : v
 const lsTreeOf = (paths) => paths.map(f => `100644 blob ${blobOf(f)}\t${f}`)
 
 // Drive the workflow against stub agents. Every cycle gets the same `reviews`
@@ -194,7 +197,7 @@ async function run(opts = {}) {
         : opts.adoptPush === undefined ? receiptOf(to, to, 'pushed adopted head') : opts.adoptPush
       if (answer instanceof Error) throw answer
       if (answer === null) return null
-      const push = conforms(options.schema, structuredClone(answer), label)
+      const push = conforms(options.schema, dropped(structuredClone(answer)), label)
       if (push.pushed) prHead = to
       return push
     }
@@ -230,7 +233,7 @@ async function run(opts = {}) {
         if (opts.evidence) await opts.evidence(calls)
         answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', error: null }
       }
-      return answer === null ? null : conforms(options.schema, answer, label)
+      return answer === null ? null : conforms(options.schema, dropped(answer), label)
     }
     if (label.startsWith('ci:judge#')) {
       // The rest of each failure is the plain case: one run, every failure of a job listed.
@@ -332,7 +335,7 @@ async function run(opts = {}) {
     if (label.startsWith('push#')) {
       // push.py's receipt; the workflow supplies committed and sha.
       if (opts.push === null) return receiptOf(head, undefined, 'push rejected', false)
-      const push = conforms(options.schema, { ...receiptOf(made, undefined, 'pushed to claude/foo'), ...opts.push }, label)
+      const push = conforms(options.schema, dropped({ ...receiptOf(made, undefined, 'pushed to claude/foo'), ...opts.push }), label)
       if (push.pushed) head = made // the pushed commit is where the checkout now sits
       return push
     }
@@ -379,7 +382,7 @@ async function run(opts = {}) {
         commentId, replyId, kind: 'review', body, bodyDigest: fnv1a(body), originalDigest: `d${commentId}`, error: null,
         ...(opts.inspect ? opts.inspect(commentId) : {}),
       }))
-      return conforms(options.schema, { inspected: got }, label)
+      return conforms(options.schema, dropped({ inspected: got }), label)
     }
     if (label.startsWith('reconcile#')) {
       assert.equal(options.agentType, 'finding-verifier')
@@ -419,14 +422,14 @@ async function run(opts = {}) {
       if (over === null) return null
       // What the prompt asked build_compare.py for, each value shell-quoted as --flag='value'.
       const asked = (flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
-      return conforms(options.schema, {
+      return conforms(options.schema, dropped({
         side: name, revision: name === 'base' ? String(prompt).match(/--rev=([0-9a-f]{40})/)[1] : head,
         snapshot: name === 'base' ? null : 'snap', snapshotAfter: name === 'base' ? null : 'snap',
         command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? null,
         buildDir: '/tmp/b', setupExit: null, exit,
         log: `/tmp/${name}.log`, cleanup: { ok: true, retained: [], error: null },
         ...(typeof over === 'function' ? over(label, String(prompt)) : over),
-      }, label)
+      }), label)
     }
     if (label.startsWith('build:compare#')) {
       assert.equal(options.agentType, 'finding-verifier')

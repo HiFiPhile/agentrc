@@ -619,11 +619,35 @@ const relayed = (schema) => {
   return 'and return the JSON object on its last stdout line unchanged. ' +
     `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty.join(', ')}.`
 }
+// A model copying JSON drops a trailing null (#3968), so a relay's schema requires
+// no nullable field, and each one the copy left out comes back as null.
+const nullable = (p) => !!p && Array.isArray(p.type) && p.type.includes('null')
+const lenient = (s) => {
+  if (!s || typeof s !== 'object') return s
+  const out = { ...s }
+  if (s.properties) {
+    out.properties = Object.fromEntries(Object.entries(s.properties).map(([k, p]) => [k, lenient(p)]))
+    if (s.required) out.required = s.required.filter(k => !nullable(s.properties[k]))
+  }
+  if (s.items) out.items = lenient(s.items)
+  return out
+}
+const withNulls = (s, v) => {
+  if (Array.isArray(v)) return s && s.items ? v.map(x => withNulls(s.items, x)) : v
+  if (!v || typeof v !== 'object' || !s || !s.properties) return v
+  const out = { ...v }
+  for (const [k, p] of Object.entries(s.properties)) {
+    if (k in out) out[k] = withNulls(p, out[k])
+    else if (nullable(p) && (s.required || []).includes(k)) out[k] = null
+  }
+  return out
+}
+const relayAgent = (prompt, opts) => agent(prompt, { ...opts, schema: lenient(opts.schema) }).then(v => v && withNulls(opts.schema, v))
 // A relay that died, or copied a value `valid` rejects (a live one cut a SHA to
 // 35 characters), gets one fresh agent; an error the script reported is its
 // answer. Only for a script that is safe to run twice.
 const relayOnce = async (prompt, opts, valid = () => true, retryPrompt = prompt) => {
-  const run = (p, label) => agent(p, { ...opts, label }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  const run = (p, label) => relayAgent(p, { ...opts, label }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   const first = await run(prompt, opts.label)
   if (first && (first.error || valid(first))) return first
   if (first) log(`${opts.label}: the relayed answer is impossible, asking a fresh agent`)
@@ -634,13 +658,12 @@ const isSha = (s) => FULL_SHA.test(String(s).trim())
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
 // One reply.py run relayed by an agent; `rules` says what it must leave to the script.
-const runReplyScript = (label, mode, task, rules, payload) => agent(
+const runReplyScript = (label, mode, task, rules, payload) => relayAgent(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file and run ` +
   `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file>\`, then return the receipts from its last stdout line unchanged. ` +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
-).then(r => r && { ...r, receipts: r.receipts.map(x => ({ resolved: null, error: null, ...x })) })
-  .catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
 // Standard base64 to a string of byte values, or null for anything else.
 function fromBase64 (text) {
   if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
@@ -668,8 +691,7 @@ const RECEIPTS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        // reply.py leaves out a null resolved or error; runReplyScript puts it back.
-        required: ['commentId', 'kind', 'replyId', 'digest', 'sent', 'posted', 'verified'],
+        required: ['commentId', 'kind', 'replyId', 'digest', 'sent', 'posted', 'verified', 'resolved', 'error'],
         properties: {
           commentId: { type: 'integer' }, kind: { type: ['string', 'null'] }, replyId: { type: ['integer', 'null'] },
           digest: { type: 'string' }, sent: { type: 'boolean' }, posted: { type: 'boolean' }, verified: { type: ['boolean', 'null'] }, resolved: { type: ['boolean', 'null'] },
@@ -1109,7 +1131,7 @@ const buildCheck = async (tag, owned) => {
   }
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return { note: null } }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
-  const side = (name, extra) => agent(
+  const side = (name, extra) => relayAgent(
     `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${BUILD_SCRIPT} ${name}${extra} --command=${shq(plan.command)}\` ` +
     relayed(BUILD_RUN),
     { label: `build:${name}#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
@@ -1622,7 +1644,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
 // URL answered without it; anything else is unknown, never "not pushed".
 // null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
-  const r = await agent(
+  const r = await relayAgent(
     `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
     `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.branch.trim()}' --sha ${sha} ` +
     `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
@@ -1759,7 +1781,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
 // inspection, before the comment is paid and its repair cleared. A dry run
 // inspects and judges, and settles nothing.
 const reconcileReplies = async (cycle, stuck, pointsOf, digestOf) => {
-  const got = await agent(
+  const got = await relayAgent(
     `${IN_CHECKOUT}Posting and editing nothing, run exactly \`python3 ${REPLY_SCRIPT} --pr ${args.pr} --inspect ${stuck.map(s => `${s.commentId}:${s.replyId}`).join(' ')}\` ` +
     'and return the inspected list from its last stdout line unchanged; if there is no such line, return inspected = [].',
     { label: `inspect#${cycle}`, phase: 'Push', model: 'haiku', effort: 'low', schema: INSPECTED },
