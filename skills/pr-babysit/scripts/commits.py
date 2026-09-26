@@ -18,7 +18,8 @@ Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
 read as an option or as pathspec magic.
 
 stdout ends with one JSON line: `head` prints {sha, parents, paths, leftover,
-entries, message}, `chain` {commits: [...]}. Exit 0 with that line; exit 2
+entries, message}, `chain` {commits: [...]}, each line but an error one with its
+`seal` (facts.sealed). Exit 0 with that line; exit 2
 with {"error": ...} when git cannot answer or the arguments are wrong.
 """
 
@@ -90,4 +91,4 @@ def collect(argv):
 
 
 if __name__ == '__main__':
-    sys.exit(report(collect, sys.argv[1:]))
+    sys.exit(report(collect, sys.argv[1:], seal=True))

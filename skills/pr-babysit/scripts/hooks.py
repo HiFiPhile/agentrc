@@ -10,7 +10,7 @@ status and snapshot again. Status lines are `git status --porcelain -z`
 records; snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
 
 stdout ends with one JSON line {ran, passed, modifiedBy, before, after,
-snapshotBefore, snapshotAfter}: passed is the last run's exit status,
+snapshotBefore, snapshotAfter, seal} (seal: facts.sealed): passed is the last run's exit status,
 modifiedBy the ids, across both runs, of the hooks pre-commit itself said
 modified files. Without a config: ran false, passed true, modifiedBy [].
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
@@ -118,4 +118,4 @@ def collect(paths):
 
 
 if __name__ == '__main__':
-    sys.exit(report(collect, sys.argv[1:]))
+    sys.exit(report(collect, sys.argv[1:], seal=True))

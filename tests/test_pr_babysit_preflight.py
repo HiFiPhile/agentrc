@@ -4,6 +4,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -53,8 +54,13 @@ class PreflightTest(unittest.TestCase):
     def pin(self, *argv):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = preflight.report(preflight.collect, list(argv) or ['--pr', '7'])
-        return code, json.loads(out.getvalue().splitlines()[-1])
+            code = preflight.report(preflight.collect, list(argv) or ['--pr', '7'], seal=True)
+        line = json.loads(out.getvalue().splitlines()[-1])
+        if 'error' in line:
+            return code, line
+        rest = {k: v for k, v in line.items() if k != 'seal'}
+        self.assertEqual(line['seal'], sys.modules['facts'].sealed(rest)['seal'])
+        return code, rest
 
     def test_pins_the_checkout_and_the_pr_in_the_flat_shape(self):
         self.git('remote', 'set-url', '--push', 'origin', 'git@github.com:someone/tinyusb.git')

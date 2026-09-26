@@ -45,6 +45,10 @@ const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const seal = ({ digest, ...st }) => ({ ...st, digest: fnv1a(canonical(JSON.parse(JSON.stringify(st)))) })
+// A copy without the null members, which is also what facts.py's seal is taken over.
+const bare = (v) => Array.isArray(v) ? v.map(bare)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
+const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
 // The JSON a prompt ends with after `key: `, or its trailing list on a line of its own.
 const payloadOf = (prompt, key) => JSON.parse(String(prompt).match(new RegExp(`${key}: (\\{.*\\})$`))[1])
 const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
@@ -138,9 +142,6 @@ const receiptOf = (head, prHead, detail, pushed = true) => ({
 const hookQuoted = quotedAfter(/hooks\.py/)
 // reply.py's printed receipts leave out a null resolved or error.
 const printed = (receipts) => receipts.map(r => Object.fromEntries(Object.entries(r).filter(([k, v]) => v !== null || !['resolved', 'error'].includes(k))))
-// A relay that dropped every null its schema lets it leave out.
-const dropped = (v) => Array.isArray(v) ? v.map(dropped)
-  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, dropped(x)])) : v
 const lsTreeOf = (paths) => paths.map(f => `100644 blob ${blobOf(f)}\t${f}`)
 
 // Drive the workflow against stub agents. Every cycle gets the same `reviews`
@@ -180,8 +181,7 @@ async function run(opts = {}) {
       return answer === null ? null : conforms(options.schema, answer, label)
     }
     if (label === 'preflight' || label === 'preflight.retry') {
-      const over = typeof opts.preflight === 'function' ? opts.preflight(label) : opts.preflight
-      return patch({ ...PIN, head, prHead }, over)
+      return patch({ ...PIN, head, prHead }, opts.preflight)
     }
     if (label === 'adopt:audit' || label === 'adopt:audit.retry') {
       const fallback = { commits: [adoptCommit(opts.args?.adoptHead, [opts.args?.state?.expectedHead ?? HEAD])] }
@@ -197,7 +197,7 @@ async function run(opts = {}) {
         : opts.adoptPush === undefined ? receiptOf(to, to, 'pushed adopted head') : opts.adoptPush
       if (answer instanceof Error) throw answer
       if (answer === null) return null
-      const push = conforms(options.schema, dropped(structuredClone(answer)), label)
+      const push = conforms(options.schema, bare(structuredClone(answer)), label)
       if (push.pushed) prHead = to
       return push
     }
@@ -228,12 +228,11 @@ async function run(opts = {}) {
         if (opts.remember) answer = opts.remember(answer, store)
       } else if (/ inventory /.test(text)) {
         answer = { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed, error: null }
-        if (opts.inventory) answer = opts.inventory(answer, label)
       } else {
         if (opts.evidence) await opts.evidence(calls)
         answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', error: null }
       }
-      return answer === null ? null : conforms(options.schema, dropped(answer), label)
+      return answer === null ? null : conforms(options.schema, bare(answer), label)
     }
     if (label.startsWith('ci:judge#')) {
       // The rest of each failure is the plain case: one run, every failure of a job listed.
@@ -326,16 +325,15 @@ async function run(opts = {}) {
       return { committed: true, detail: 'committed', ...opts.commit }
     }
     if (label.startsWith('audit#')) {
-      const over = typeof opts.audit === 'function' ? opts.audit(label) : opts.audit
-      if (over === null) return null // a dead read-back agent
+      if (opts.audit === null) return null // a dead read-back agent
       // ls-tree of the commit: what the stub committed is what the tree held.
       const entries = staged.map(f => `100644 blob ${blobOf(f)}\t${f}`)
-      return { sha: made, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...over }
+      return { sha: made, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...opts.audit }
     }
     if (label.startsWith('push#')) {
       // push.py's receipt; the workflow supplies committed and sha.
       if (opts.push === null) return receiptOf(head, undefined, 'push rejected', false)
-      const push = conforms(options.schema, dropped({ ...receiptOf(made, undefined, 'pushed to claude/foo'), ...opts.push }), label)
+      const push = conforms(options.schema, bare({ ...receiptOf(made, undefined, 'pushed to claude/foo'), ...opts.push }), label)
       if (push.pushed) head = made // the pushed commit is where the checkout now sits
       return push
     }
@@ -382,7 +380,7 @@ async function run(opts = {}) {
         commentId, replyId, kind: 'review', body, bodyDigest: fnv1a(body), originalDigest: `d${commentId}`, error: null,
         ...(opts.inspect ? opts.inspect(commentId) : {}),
       }))
-      return conforms(options.schema, dropped({ inspected: got }), label)
+      return conforms(options.schema, bare({ inspected: got }), label)
     }
     if (label.startsWith('reconcile#')) {
       assert.equal(options.agentType, 'finding-verifier')
@@ -422,7 +420,7 @@ async function run(opts = {}) {
       if (over === null) return null
       // What the prompt asked build_compare.py for, each value shell-quoted as --flag='value'.
       const asked = (flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
-      return conforms(options.schema, dropped({
+      return conforms(options.schema, bare({
         side: name, revision: name === 'base' ? String(prompt).match(/--rev=([0-9a-f]{40})/)[1] : head,
         snapshot: name === 'base' ? null : 'snap', snapshotAfter: name === 'base' ? null : 'snap',
         command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? null,
@@ -467,7 +465,15 @@ async function run(opts = {}) {
       ...ABSENT, body)
     const result = await fn(
       opts.rawArgs ?? { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['codex'], ...opts.args },
-      agent, pipeline, parallel, () => {}, (m) => logs.push(String(m)), workflow, null,
+      // Each stub answers as its script before facts.py seals the line; the seal goes on
+      // here (an error line's relay fills it with ''), then opts.garble is the relay's copy.
+      async (prompt, options) => {
+        const sealing = !!options.schema?.properties?.seal
+        const schema = sealing ? { ...options.schema, required: options.schema.required.filter(k => k !== 'seal') } : options.schema
+        const line = await agent(prompt, { ...options, schema })
+        const sealed = !line || !sealing || 'seal' in line ? line : line.error ? { ...line, seal: '' } : sealLine(line)
+        return opts.garble ? opts.garble(options.label, sealed) : sealed
+      }, pipeline, parallel, () => {}, (m) => logs.push(String(m)), workflow, null,
       ...ABSENT.map(() => undefined))
     return { result, logs, labels: calls.map(c => c.label), calls, napPoints }
   } finally {
@@ -754,28 +760,50 @@ test('a dead preflight stops the run with nothing else dispatched', async () => 
   }
 })
 
-test('a relay that copies an impossible SHA gets one fresh agent; a second bad copy is refused as before', async () => {
+test('a relayed copy that does not match its seal gets one fresh agent; a second bad copy is a dead relay', async () => {
   // #3986: the preflight relay cut adoptHead to 35 characters and the launch was lost.
-  const cut = (sha) => sha.slice(0, 35)
-  const adopting = await run({ args: adoptionArgs(adoptionState()), preflight: (l) => ({ head: l === 'preflight' ? cut(ADOPT) : ADOPT, prHead: HEAD }) })
+  const cut = (field, only) => (l, a) => a && (only === undefined || l === only) ? { ...a, [field]: a[field].slice(0, 35) } : a
+  const adopting = await run({ args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD }, garble: cut('head', 'preflight') })
   assert.deepEqual(adopting.labels.slice(0, 3), ['preflight', 'preflight.retry', 'adopt:audit'])
   assert.notEqual(adopting.result.reason, 'adopt-head-mismatch')
 
-  const plain = await run({ preflight: (l) => l === 'preflight' ? { head: cut(HEAD) } : undefined })
+  const plain = await run({ garble: cut('head', 'preflight') })
   assert.equal(plain.result.pass, true)
   assert.deepEqual(plain.labels.slice(0, 2), ['preflight', 'preflight.retry'])
 
-  const twice = await run({ preflight: () => ({ head: cut(HEAD) }) })
-  assert.equal(twice.result.reason, 'wrong-head')
+  const twice = await run({ garble: (l, a) => l.startsWith('preflight') ? cut('head')(l, a) : a })
+  assert.equal(twice.result.reason, 'preflight-died', 'a second bad copy is a dead relay')
   assert.deepEqual(twice.labels, ['preflight', 'preflight.retry'])
 
-  for (const [name, over] of [['recheck', { recheck: (l) => l.endsWith('.retry') ? undefined : { head: cut(HEAD) } }],
-    ['audit', { audit: (l) => l.endsWith('.retry') ? undefined : { sha: cut(SHA) } }]]) {
-    const { labels, result } = await run({ reviews: oneValid, ...over })
+  // What the script itself printed is its answer, however odd: the seal matches it.
+  const printed = await run({ preflight: { head: HEAD.slice(0, 35) } })
+  assert.equal(printed.result.reason, 'wrong-head')
+  assert.deepEqual(printed.labels, ['preflight'])
+
+  for (const [name, field] of [['recheck', 'head'], ['audit', 'sha']]) {
+    const { labels, result } = await run({ reviews: oneValid, garble: (l, a) => l.startsWith(`${name}#`) && !l.endsWith('.retry') ? cut(field)(l, a) : a })
     assert.ok(labels.some(l => l.startsWith(`${name}#`) && l.endsWith('.retry')), name)
     assert.ok(labels.some(l => l.startsWith('push#')), `${name}: the push went ahead`)
     assert.notEqual(result.reason, 'push-failed', name)
   }
+})
+
+test("facts.py's seal is the one the workflow checks, on text JSON escapes", async () => {
+  const odd = 'claude/naïve-✓ "q" \\ \t\u0001 \ud800 é'
+  const line = { ...PIN, branch: odd, prBranch: odd, error: null }
+  const done = spawnSync('python3', ['-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(json.dumps(sealed(json.loads(sys.stdin.read()))))',
+    join(STATE_TRANSFER, '..')], { input: JSON.stringify(line), encoding: 'utf8' })
+  assert.equal(done.status, 0, done.stderr)
+  const printed = JSON.parse(done.stdout)
+  const kept = await run({ preflight: printed })
+  assert.equal(kept.labels.includes('preflight.retry'), false, 'the seal matched: no retry')
+  assert.equal(kept.result.pass, true)
+  // Keys JavaScript and a code-point sort order differently.
+  const keyed = spawnSync('python3', ['-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(sealed(json.loads(sys.stdin.read()))["seal"])',
+    join(STATE_TRANSFER, '..')], { input: JSON.stringify({ '\u{1F600}': 1, '\ue000': 2, '\ud800': 3, a: null }), encoding: 'utf8' })
+  assert.equal(keyed.stdout.trim(), sealLine({ '\u{1F600}': 1, '\ue000': 2, '\ud800': 3 }).seal, keyed.stderr)
+  const copied = await run({ preflight: printed, garble: (l, a) => l === 'preflight' ? { ...a, branch: a.branch.replace('é', 'e'), prBranch: a.prBranch.replace('é', 'e') } : a })
+  assert.deepEqual(copied.labels.slice(0, 2), ['preflight', 'preflight.retry'])
 })
 
 test('a clean green PR passes and still logs a summary', async () => {
@@ -1598,8 +1626,11 @@ test('a collector that dies gets one fresh agent; a second death leaves the cycl
   assert.deepEqual(ciLabels(dead.labels).slice(0, 2), ['ci:collect#1.1', 'ci:collect#1.1.retry'])
   assert.ok(dead.logs.some(l => /cycle 1: CI inventory failed — the collector died/.test(l)), dead.logs.join('\n'))
   assert.equal(dead.labels.includes('ci:judge#1'), false)
-  const cut = await run({ reviews: WAITING, ci: redWith(RIG).ci, inventory: (a, l) => l.endsWith('.retry') ? a : { ...a, head: a.head.slice(0, 35) } })
+  const cut = await run({ reviews: WAITING, ci: redWith(RIG).ci, garble: (l, a) => l === 'ci:collect#1.1' ? { ...a, head: a.head.slice(0, 35) } : a })
   assert.deepEqual(ciLabels(cut.labels).slice(0, 3), ['ci:collect#1.1', 'ci:collect#1.1.retry', 'ci:collect#1.f'], 'a cut head is asked once more')
+  // Both copies turn red to green with the head intact: nothing downstream would notice.
+  const green = await run({ reviews: WAITING, ci: redWith(RIG).ci, garble: (l, a) => l.startsWith('ci:collect#1.1') ? { ...a, status: 'green', checks: [] } : a })
+  assert.ok(green.logs.some(l => /cycle 1: CI inventory failed — the collector died/.test(l)), green.logs.join('\n'))
 })
 
 test('a verdict the store lost or garbled is reused by its launch, then judged again', async () => {
@@ -2034,6 +2065,22 @@ test('a publisher agent that throws is a failed push, not a crash', async () => 
     assert.equal(result.history[0].reviewPushFailed.committed, committed)
     assert.match(rowsOf(summaries(logs)[0])[0][3], row, throwOn)
     if (throwOn === 'push#') assert.equal(result.state.pending.stage, 'publication-unknown')
+  }
+})
+
+test('a publisher receipt whose copy does not match its seal is no answer, never a definite outcome', async () => {
+  // A push receipt with a cut head would otherwise read as "not pushed" when the push may have landed.
+  const cutHead = (a) => ({ ...a, heads: a.heads.map(h => ({ ...h, head: h.head.slice(0, 35) })) })
+  for (const [label, garble, detail, committed] of [
+    ['hooks#', (a) => ({ ...a, passed: !a.passed }), 'hook agent died', false],
+    ['commit#', (a) => ({ ...a, detail: `${a.detail}.` }), 'commit agent died', null],
+    ['push#', cutHead, 'push agent died after the commit landed', true],
+  ]) {
+    const { result, logs } = await run({ reviews: oneValid, garble: (l, a) => l.startsWith(label) ? garble(a) : a })
+    assert.equal(result.history[0].reviewPushFailed.detail, detail, label)
+    assert.equal(result.history[0].reviewPushFailed.committed, committed, label)
+    assert.ok(logs.some(l => l.startsWith(label) && l.endsWith('the relayed copy does not match its seal')), label)
+    if (label === 'push#') assert.equal(result.state.pending.stage, 'publication-unknown')
   }
 })
 
@@ -4271,9 +4318,9 @@ test('an audit that dies, throws, or omits required evidence is refused without 
 })
 
 test('empty, malformed, duplicate, or pathless audit commits are refused', async () => {
-  for (const [name, commits, retried] of [
+  for (const [name, commits] of [
     ['empty chain', []],
-    ['malformed SHA', [adoptCommit('bad', [HEAD]), adoptCommit(ADOPT, ['bad'])], true],
+    ['malformed SHA', [adoptCommit('bad', [HEAD]), adoptCommit(ADOPT, ['bad'])]],
     ['duplicate SHA', [adoptCommit(ADOPT, [HEAD]), adoptCommit(ADOPT, [ADOPT])]],
     ['empty paths', [adoptCommit(ADOPT, [HEAD], [])]],
   ]) {
@@ -4282,7 +4329,7 @@ test('empty, malformed, duplicate, or pathless audit commits are refused', async
       args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: { commits },
     })
     assert.equal(result.reason, 'adopt-audit-failed', name)
-    assert.deepEqual(labels, ['preflight', 'adopt:audit', ...(retried ? ['adopt:audit.retry'] : [])], name)
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'], name)
     assert.equal(result.state.cyclesUsed, state.cyclesUsed)
   }
 })
@@ -4664,7 +4711,7 @@ test('a commit the audit script cannot read back is not pushed', async () => {
 test('a hook script that reports no evidence stops publication with its error', async () => {
   const { result, labels, calls } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
   assert.match(calls.find(c => c.label === 'hooks#1-review').prompt,
-    /as error, with ran = false, passed = false, modifiedBy = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\]\.$/,
+    /as error, with ran = false, passed = false, modifiedBy = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\], seal = ''\.$/,
     'the error-case values come from the schema')
   assert.match(result.history[0].reviewPushFailed.detail, /^no hook evidence: pre-commit exited 0/)
   assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')

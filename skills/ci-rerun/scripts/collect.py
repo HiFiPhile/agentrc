@@ -8,7 +8,8 @@
 
 inventory: waits up to S seconds (default 0) while any check is pending, then
 prints one JSON object {head, status, pending, checks}, plus `error` when set
-(a relaying agent can drop a trailing null, so no line carries a null error). `status` is
+(a relaying agent can drop a trailing null, so no line carries a null error); every
+line but an error one also carries `seal`, pr-babysit's facts.py seal. `status` is
 green, red (a check failed or was cancelled) or running (still pending, or no
 checks registered yet); `pending` counts the pending checks. `checks` lists
 the failed and cancelled ones, each {name, workflow, bucket, link, attempt}:
@@ -160,6 +161,30 @@ def inventory(repo, pr, head, wait):
         raise Failed(f'PR #{pr} head moved to {after} while collecting')
     listed = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
     return {'head': head, 'baseRef': before['baseRefName'], 'status': status, 'counts': counts, 'checks': listed}
+
+
+def fnv1a(text):
+    """The workflow's fnv1a: 32-bit FNV-1a over code points, 8 hex digits."""
+    h = 0x811c9dc5
+    for ch in text:
+        h = ((h ^ ord(ch)) * 0x01000193) & 0xffffffff
+    return f'{h:08x}'
+
+
+def sealed(facts):
+    """facts plus the seal pr-babysit checks a relayed copy against: fnv1a over the
+    canonical JSON with null members left out, so a copy that drops one still matches.
+    A copy of facts.py's, so ci-rerun stays usable without pr-babysit; test_ci_collect holds them equal."""
+    def bare(v):
+        # Keys in UTF-16 code-unit order, as JavaScript's sort() compares them.
+        if isinstance(v, dict):
+            return {k: bare(v[k]) for k in sorted(v, key=lambda k: k.encode('utf-16-be', 'surrogatepass')) if v[k] is not None}
+        if isinstance(v, list):
+            return [bare(x) for x in v]
+        return v
+    text = json.dumps(bare(facts), separators=(',', ':'), ensure_ascii=False)
+    # JSON.stringify escapes a lone surrogate; ensure_ascii=False would hash it raw.
+    return {**facts, 'seal': fnv1a(re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text))}
 
 
 def printed(inv):
@@ -459,7 +484,7 @@ def main(argv=None):
             out = remember(a.repo, a.pr, a.head, sys.stdin.read())
         else:
             out = recall(a.repo, a.pr, a.head, a.check)
-        rc = 0
+        out, rc = sealed(out), 0
     except Failed as e:
         out, rc = {'head': a.head, 'error': str(e)}, 1
     print(json.dumps(out))

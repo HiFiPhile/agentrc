@@ -68,6 +68,13 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(len(out['entries']), 4)
         blob = self.git('rev-parse', f'{sha}:src/quote"name.c').strip()
         self.assertIn(f'100644 blob {blob}\tsrc/quote"name.c', out['entries'])
+        rest = {k: v for k, v in out.items() if k != 'seal'}
+        self.assertEqual(out['seal'], sys.modules['facts'].sealed(rest)['seal'], 'the line is sealed over what it says')
+
+    def test_the_seal_leaves_null_members_out_and_ignores_key_order(self):
+        sealed = sys.modules['facts'].sealed
+        self.assertEqual(sealed({'a': 1, 'b': None, 'c': [{'d': None, 'e': 'é'}]})['seal'], sealed({'c': [{'e': 'é'}], 'a': 1})['seal'])
+        self.assertNotEqual(sealed({'a': 'x' * 40})['seal'], sealed({'a': 'x' * 35})['seal'])
 
     def test_head_reports_a_deletion_by_its_absence_and_every_parent_of_a_merge(self):
         self.git('rm', '-q', 'a.c')

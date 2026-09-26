@@ -11,7 +11,7 @@ U with `git ls-remote`, never through R, whose fetch URL may differ. With
 since GitHub takes a moment to see a push.
 
 stdout ends with one JSON line {pushed, detail, heads: [{url, head}],
-prHead?}: pushed is git push's exit status, detail git's refusal line or else
+prHead?, seal} (seal: facts.sealed): pushed is git push's exit status, detail git's refusal line or else
 its last stderr line, head the SHA the branch holds at that URL, "" when the
 branch is absent there, null when it could not be read; prHead is null when
 unreadable. A failed read is never a sign that nothing was pushed. Exit 0 with
@@ -76,4 +76,4 @@ def publish(argv):
 
 
 if __name__ == '__main__':
-    sys.exit(report(publish, sys.argv[1:]))
+    sys.exit(report(publish, sys.argv[1:], seal=True))

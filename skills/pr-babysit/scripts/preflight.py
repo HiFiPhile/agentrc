@@ -15,7 +15,8 @@ head; and dirty, the lines of `git status --porcelain`.
 branch, pushUrls and head as above, staged (`git diff --cached --name-only -z`
 records) and status (`git status --porcelain -z` records).
 
-stdout ends with one JSON line with exactly those keys. Exit 0 with it; exit 2
+stdout ends with one JSON line with exactly those keys, plus `seal` (facts.sealed),
+which pr-babysit checks its relayed copy against. Exit 0 with it; exit 2
 with {"error": ...} when git or gh cannot answer; the caller then pins nothing.
 """
 
@@ -74,4 +75,4 @@ def collect(argv):
 
 
 if __name__ == '__main__':
-    sys.exit(report(collect, sys.argv[1:]))
+    sys.exit(report(collect, sys.argv[1:], seal=True))

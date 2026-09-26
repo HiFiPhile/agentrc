@@ -149,6 +149,8 @@ const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const sealOf = ({ digest, ...st }) => fnv1a(canonical(JSON.parse(JSON.stringify(st))))
+// The schema of a script line facts.py seals; relayAgent checks the copy against it.
+const withSeal = (schema) => ({ ...schema, required: [...schema.required, 'seal'], properties: { ...schema.properties, seal: { type: 'string' } } })
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 if (args.stateRef != null) {
   const ref = args.stateRef
@@ -309,30 +311,30 @@ const COLLECT_CHECK = {
     link: { type: 'string' }, attempt: { type: ['string', 'null'] },
   },
 }
-const INVENTORY = {
+const INVENTORY = withSeal({
   type: 'object', required: ['head', 'status', 'pending', 'checks'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' },
     pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
   },
-}
-const EVIDENCE = {
+})
+const EVIDENCE = withSeal({
   type: 'object', required: ['head', 'detail'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, detail: { type: 'string' } },
-}
+})
 // A judged check's verdict as collect.py stores it, and its stored digests.
 const VERDICT = {
   type: 'object', additionalProperties: false, required: ['link', 'bucket', 'failures'],
   properties: { link: { type: 'string' }, bucket: { type: 'string' }, failures: { type: 'array', items: CI_FAILURE } },
 }
-const RECALLED = {
+const RECALLED = withSeal({
   type: 'object', required: ['head', 'verdicts'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT } },
-}
-const REMEMBERED = {
+})
+const REMEMBERED = withSeal({
   type: 'object', required: ['head'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' } },
-}
+})
 // pr-ci-watcher, as the judge: one entry per check it was given, holding every
 // failure it read in that check, and the re-runs it started.
 const JUDGED = {
@@ -452,7 +454,7 @@ const BUILD_PLAN = {
   },
 }
 // BUILD_SCRIPT's receipt for one side, or its error.
-const BUILD_RUN = {
+const BUILD_RUN = withSeal({
   type: 'object', additionalProperties: false,
   required: ['side'],
   properties: {
@@ -465,7 +467,7 @@ const BUILD_RUN = {
     },
     error: { type: 'string' },
   },
-}
+})
 // The dependency preparation a fresh checkout needs for the caller's build.
 const BUILD_SETUP = {
   type: 'object', additionalProperties: false,
@@ -483,7 +485,7 @@ const BUILD_VERDICT = {
 }
 // PUSH_SCRIPT's receipt: whether git push succeeded, and what the branch holds
 // at each pinned push URL afterwards (and the PR head, for an adoption).
-const PUSH = {
+const PUSH = withSeal({
   type: 'object', additionalProperties: false,
   required: ['pushed', 'detail', 'heads'],
   properties: {
@@ -496,10 +498,10 @@ const PUSH = {
     },
     prHead: { type: ['string', 'null'] },
   },
-}
+})
 // The chain a caller asks this run to adopt, oldest first, read back commit by
 // commit so every one is audited, not only the tip.
-const ADOPT_AUDIT = {
+const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['commits'],
   properties: {
@@ -516,16 +518,16 @@ const ADOPT_AUDIT = {
       },
     },
   },
-}
+})
 // The agent that makes the commit says only that it made one; what the commit
 // actually contains is read back in a separate turn that is asked not to edit.
-const COMMIT = {
+const COMMIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['committed', 'detail'],
   properties: { error: { type: 'string' }, committed: { type: 'boolean' }, detail: { type: 'string' } },
-}
+})
 // What the pin must still match before a commit, as PREFLIGHT_SCRIPT --recheck reports it.
-const RECHECK = {
+const RECHECK = withSeal({
   type: 'object', additionalProperties: false,
   required: ['branch', 'pushUrls', 'head', 'staged', 'status'],
   properties: {
@@ -533,12 +535,12 @@ const RECHECK = {
     branch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } }, head: { type: 'string' },
     staged: { type: 'array', items: { type: 'string' } }, status: { type: 'array', items: { type: 'string' } },
   },
-}
+})
 // What running the repository's hooks on the owned paths did, as HOOKS_SCRIPT
 // reports it: the tree before and after, the owned files' blob hashes before and
 // after, and which hooks said they modified files. The workflow decides from
 // these what a hook regenerated.
-const HOOKS = {
+const HOOKS = withSeal({
   type: 'object', additionalProperties: false,
   required: ['ran', 'passed', 'modifiedBy', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
   properties: {
@@ -548,7 +550,7 @@ const HOOKS = {
     before: { type: 'array', items: { type: 'string' } }, after: { type: 'array', items: { type: 'string' } },
     snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
   },
-}
+})
 // One `<mode> <blob> <path>` line per path, as HOOKS_SCRIPT reports the
 // working tree and COMMITS_SCRIPT the commit (`git ls-tree` spells it
 // `<mode> blob <sha>\t<path>`). The working-tree mode is git's, 644 or 755 by
@@ -564,7 +566,7 @@ const snapshotOf = (lines) => {
   }
   return out
 }
-const AUDIT = {
+const AUDIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['sha', 'parents', 'paths', 'leftover', 'entries', 'message'],
   properties: {
@@ -575,7 +577,7 @@ const AUDIT = {
     entries: { type: 'array', items: { type: 'string' } },
     message: { type: 'string' },
   },
-}
+})
 // The human is the sole author of what this workflow pushes: no line of a commit
 // message may credit an agent, a model, a tool or a session. These are the
 // recognized forms, anchored so a subject that talks about attribution is not
@@ -642,18 +644,27 @@ const withNulls = (s, v) => {
   }
   return out
 }
-const relayAgent = (prompt, opts) => agent(prompt, { ...opts, schema: lenient(opts.schema) }).then(v => v && withNulls(opts.schema, v))
-// A relay that died, or copied a value `valid` rejects (a live one cut a SHA to
-// 35 characters), gets one fresh agent; an error the script reported is its
-// answer. Only for a script that is safe to run twice.
-const relayOnce = async (prompt, opts, valid = () => true, retryPrompt = prompt) => {
-  const run = (p, label) => relayAgent(p, { ...opts, label }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
-  const first = await run(prompt, opts.label)
-  if (first && (first.error || valid(first))) return first
-  if (first) log(`${opts.label}: the relayed answer is impossible, asking a fresh agent`)
-  return run(retryPrompt, `${opts.label}.retry`)
+// A copy that does not match the seal its script put on the line is no answer: the
+// caller's dead-relay path, never a value a relay changed (a live one cut a SHA to 35
+// characters). An error line carries no seal.
+const relayAgent = async (prompt, opts) => {
+  const v = await agent(prompt, { ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
+  if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
+    log(`${opts.label}: the relayed copy does not match its seal`)
+    return null
+  }
+  return v
 }
-const isSha = (s) => FULL_SHA.test(String(s).trim())
+// A relay that died or did not match its seal gets one fresh agent; an error the
+// script reported is its answer. Only for a script that is safe to run twice.
+const relayOnce = async (prompt, opts, retryPrompt = prompt) => {
+  const run = (p, label) => relayAgent(p, { ...opts, label }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  return (await run(prompt, opts.label)) ?? run(retryPrompt, `${opts.label}.retry`)
+}
+// facts.py's seal: fnv1a over the canonical JSON with null members left out.
+const bare = (v) => Array.isArray(v) ? v.map(bare)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
+const sealMatches = ({ seal, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 // A verified reply that settles its comment: a review thread only once resolved.
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
@@ -1461,7 +1472,6 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   const now = await relayOnce(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: RECHECK },
-    r => isSha(r.head),
   )
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
   if (now.error) return { pass: false, committed: false, detail: `recheck could not read the checkout: ${now.error}`, sha: '' }
@@ -1499,7 +1509,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   // stayed what the fix verifier saw. The committer is then handed the widened
   // list and never chooses a path itself.
   const quoted = checked.map(shq).join(' ')
-  const hooks = await agent(
+  const hooks = await relayAgent(
     `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
     relayed(HOOKS),
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
@@ -1565,7 +1575,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   // Commit and push are separate turns so the commit can be audited before it
   // leaves the machine: what a `git commit` picks up is not what `git add`
   // staged if anything ran in between.
-  const made = await agent(
+  const made = await relayAgent(
     `${IN_CHECKOUT}On branch ${pinned.branch}, write a commit message with your file tool to a new temporary file outside the checkout: an imperative subject summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, ` +
     'in the style `git log -5 --format=%s` shows, and a body only for a why the diff cannot show; ' +
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
@@ -1589,7 +1599,6 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head ${scope.map(shq).join(' ')}\` ` +
     relayed(AUDIT),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
-    a => isSha(a.sha) && a.parents.every(isSha),
   )
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
 
@@ -1854,7 +1863,7 @@ const ciLaneRun = async (cycle, lanes) => {
       'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
       (payload ? `\n${JSON.stringify(payload)}` : '')
     return relayOnce(prompt(command), { label, phase: 'Triage', model: 'haiku', effort: 'low', schema },
-      x => isSha(x.head), prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')))
+      prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')))
   }
   // What went wrong with a collector's answer for `head`, or null when nothing did.
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
@@ -2502,7 +2511,7 @@ const runCycle = async (cycle, entry) => {
 // Pin what every later step must still be true of, and refuse to start on a
 // dirty tree: the publisher commits by path, so a pre-existing edit would be
 // indistinguishable from a writer's and could be swept into the PR.
-const PIN = {
+const PIN = withSeal({
   type: 'object', additionalProperties: false,
   required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'pushUrls', 'head', 'dirty'],
   properties: {
@@ -2513,7 +2522,7 @@ const PIN = {
     head: { type: 'string' },
     dirty: { type: 'array', items: { type: 'string' } },
   },
-}
+})
 if (cyclesUsed >= maxCycles) {
   log(`state: ${cyclesUsed} of ${maxCycles} cycles already used — nothing left to run`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'budget-exhausted' })
@@ -2522,7 +2531,6 @@ const pinned = await relayOnce(
   `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --pr ${args.pr}\` ` +
   relayed(PIN),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
-  p => isSha(p.head) && isSha(p.prHead),
 )
 if (!pinned) return finish({ pass: false, cycles: cyclesUsed, history, reason: 'preflight-died' })
 if (pinned.error) {
@@ -2599,7 +2607,6 @@ if (adoptHead !== null) {
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead}\` ` +
     relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
-    a => a.commits.every(c => isSha(c.sha) && c.parents.every(isSha)),
   )
   const commits = audit ? audit.commits : []
   const shas = commits.map(c => String(c.sha).trim())

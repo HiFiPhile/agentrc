@@ -13,12 +13,27 @@ spec = importlib.util.spec_from_file_location(
     'ci_collect', Path(__file__).resolve().parents[1] / 'skills' / 'ci-rerun' / 'scripts' / 'collect.py')
 collect = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(collect)
+_facts_spec = importlib.util.spec_from_file_location(
+    'pr_babysit_facts', Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'facts.py')
+FACTS = importlib.util.module_from_spec(_facts_spec)
+_facts_spec.loader.exec_module(FACTS)
 
 HEAD, OTHER, BASE = 'a' * 40, 'b' * 40, 'c' * 40
 JOB = 'https://github.com/o/r/actions/runs/7/job/{}'
 RTD = 'https://app.readthedocs.org/projects/p/builds/{}/'
 CIRCLE = 'https://circleci.com/gh/o/r/{}'
 
+
+
+def unsealed(text):
+    """The printed line without its seal, which must be facts.py's over the rest; an error line has none."""
+    line = json.loads(text)
+    if 'error' in line:
+        assert 'seal' not in line, line
+        return line
+    rest = {k: v for k, v in line.items() if k != 'seal'}
+    assert line['seal'] == FACTS.sealed(rest)['seal'], line
+    return rest
 
 class InventoryTest(unittest.TestCase):
     def setUp(self):
@@ -48,7 +63,7 @@ class InventoryTest(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             rc = collect.main(['inventory', '--repo', 'o/r', '--pr', '5', '--head', HEAD, *extra])
-        return rc, json.loads(out.getvalue())
+        return rc, unsealed(out.getvalue())
 
     @staticmethod
     def check(name, bucket, link):
@@ -203,7 +218,7 @@ class FailuresTest(unittest.TestCase):
             argv += ['--check', link]
         with redirect_stdout(out):
             rc = collect.main(argv)
-        return rc, json.loads(out.getvalue())
+        return rc, unsealed(out.getvalue())
 
     def entries(self, *links):
         rc, r = self.main(*links)
@@ -426,7 +441,7 @@ class VerdictsTest(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out), mock.patch('sys.stdin', io.StringIO(stdin)):
             rc = collect.main([command, '--repo', 'o/r', '--pr', '5', '--head', HEAD, *argv])
-        return rc, json.loads(out.getvalue())
+        return rc, unsealed(out.getvalue())
 
     def test_recall_returns_what_was_remembered_unchanged_and_skips_unknown_links(self):
         self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY])), (0, {'head': HEAD}))

@@ -18,7 +18,7 @@ afterwards; the log of both commands is kept.
 
 stdout ends with one JSON line {side, revision, snapshot, snapshotAfter,
 command, setup, buildDir, setupExit, exit, log, cleanup: {ok, retained,
-error}}: revision is HEAD or SHA, both snapshots null for the base,
+error}, seal} (seal: facts.sealed): revision is HEAD or SHA, both snapshots null for the base,
 command and setup with <BUILD> expanded, setupExit null without SETUP, exit the build's status or
 null when the setup failed and the build never ran. Exit 0 with that line,
 whatever the build did; exit 2 with {"error": ...} when the side could not be
@@ -126,4 +126,4 @@ def collect(argv):
 
 
 if __name__ == '__main__':
-    sys.exit(report(collect, sys.argv[1:]))
+    sys.exit(report(collect, sys.argv[1:], seal=True))

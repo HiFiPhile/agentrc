@@ -23,20 +23,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Parser, Unusable, report  # noqa: E402
+from facts import Parser, Unusable, fnv1a, report  # noqa: E402
 
 VERSION = 1
 SIZE = 512
 PER_CALL = 4
 MAX = 64 * 1024
-
-
-def fnv1a(text):
-    """The workflow's fnv1a: 32-bit FNV-1a over code points, 8 hex digits."""
-    h = 0x811c9dc5
-    for ch in text:
-        h = ((h ^ ord(ch)) * 0x01000193) & 0xffffffff
-    return f'{h:08x}'
 
 
 def load(path):
