@@ -60,7 +60,8 @@ def sealed(facts):
         if isinstance(v, list):
             return [bare(x) for x in v]
         return v
-    text = json.dumps(bare(facts), separators=(',', ':'), ensure_ascii=False)
+    # Top-level error stays out: a checked line has none, and a relay may fill in error: ''.
+    text = json.dumps(bare({k: v for k, v in facts.items() if k != 'error'}), separators=(',', ':'), ensure_ascii=False)
     # JSON.stringify escapes a lone surrogate; ensure_ascii=False would hash it raw.
     return {**facts, 'seal': fnv1a(re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text))}
 

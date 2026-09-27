@@ -661,10 +661,11 @@ const relayOnce = async (prompt, opts, retryPrompt = prompt) => {
   const run = (p, label) => relayAgent(p, { ...opts, label }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   return (await run(prompt, opts.label)) ?? run(retryPrompt, `${opts.label}.retry`)
 }
-// facts.py's seal: fnv1a over the canonical JSON with null members left out.
+// facts.py's seal: fnv1a over the canonical JSON with null members left out. A
+// checked line has no error, so one a relay filled in (error: '') is not hashed.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
-const sealMatches = ({ seal, ...facts }) => seal === fnv1a(canonical(bare(facts)))
+const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 // A verified reply that settles its comment: a review thread only once resolved.
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))

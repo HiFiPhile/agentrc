@@ -2084,6 +2084,14 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
   }
 })
 
+test("a relay that fills in error: '' on a sealed line still matches its seal", async () => {
+  // Live on tinyusb #3988: the commit relay added error: '' and the landed commit went unpushed.
+  const { result, labels, logs } = await run({ reviews: oneValid, garble: (l, a) => a && 'seal' in a && !a.error ? { ...a, error: '' } : a })
+  assert.equal(logs.some(l => l.endsWith('does not match its seal')), false)
+  assert.ok(labels.some(l => l.startsWith('push#')), 'the push went ahead')
+  assert.equal(result.history[0].reviewPushFailed, undefined)
+})
+
 test('the pending-bot backoff is taken after the cycle summary', async () => {
   const { result, logs, napPoints } = await run({
     args: { maxCycles: 2 },
