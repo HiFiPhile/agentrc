@@ -190,7 +190,7 @@ async function run(opts = {}) {
       if (answer instanceof Error) throw answer
       return answer === null ? null : conforms(options.schema, structuredClone(answer), label)
     }
-    if (label === 'adopt:push') {
+    if (label === 'adopt:push' || label === 'adopt:push.retry') {
       // push.py's receipt: by default the push landed on every pinned URL and the PR.
       const to = opts.args.adoptHead
       const answer = typeof opts.adoptPush === 'function' ? await opts.adoptPush(label)
@@ -328,7 +328,8 @@ async function run(opts = {}) {
       if (opts.audit === null) return null // a dead read-back agent
       // ls-tree of the commit: what the stub committed is what the tree held.
       const entries = staged.map(f => `100644 blob ${blobOf(f)}\t${f}`)
-      return { sha: made, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...opts.audit }
+      // Before any commit, HEAD is where the run started.
+      return { sha: commits ? made : head, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...opts.audit }
     }
     if (label.startsWith('push#')) {
       // push.py's receipt; the workflow supplies committed and sha.
@@ -928,11 +929,21 @@ test('a build plan resolved for one path set is reused by a later cycle, and a n
     'a plan read from a file the fixes change is resolved again')
 })
 
-test('a commit script error is an unknown commit outcome, named', async () => {
-  const { result } = await run({ reviews: oneValid, commit: { error: 'the message on stdin is not UTF-8', committed: false, detail: '' } })
-  assert.equal(result.reason, 'push-failed')
-  assert.equal(result.history[0].reviewPushFailed.committed, null, 'an error proves no outcome: the relay may not have seen git run')
-  assert.equal(result.history[0].reviewPushFailed.detail, 'the message on stdin is not UTF-8')
+test('a lost commit receipt is settled by a HEAD that moved, and stays unknown otherwise', async () => {
+  // An error proves no outcome, since the relay may not have seen git run; HEAD does.
+  const commit = { error: 'the message on stdin is not UTF-8', committed: false, detail: '' }
+  const still = await run({ reviews: oneValid, commit, audit: { sha: HEAD } })
+  assert.equal(still.result.reason, 'push-failed')
+  // An unmoved HEAD proves nothing: the relay may report an error while git still runs.
+  assert.equal(still.result.history[0].reviewPushFailed.committed, null)
+  assert.equal(still.result.history[0].reviewPushFailed.detail, 'the message on stdin is not UTF-8; HEAD is still 0f1e2d3, but the committer may not have finished')
+  const moved = await run({ reviews: oneValid, commit })
+  assert.ok(moved.labels.some(l => l.startsWith('push#')), 'the commit HEAD moved to is audited and pushed')
+  assert.equal(moved.result.history[0].reviewPushFailed, undefined)
+  assert.ok(moved.logs.some(l => l.endsWith(`the message on stdin is not UTF-8, but HEAD moved to ${shaFor(1).slice(0, 7)}; auditing it as this cycle's commit`)), moved.logs.join('\n'))
+  const unread = await run({ reviews: oneValid, commit, audit: null })
+  assert.equal(unread.result.history[0].reviewPushFailed.committed, null)
+  assert.equal(unread.result.history[0].reviewPushFailed.detail, 'the message on stdin is not UTF-8; the audit agent died too')
 })
 
 test('the committer gets the claims without their hints, and the message on stdin', async () => {
@@ -2055,7 +2066,7 @@ test('a publisher agent that throws is a failed push, not a crash', async () => 
   // the summary can report rather than an unexplained dead cycle.
   for (const [throwOn, detail, committed, row] of [
     ['recheck#', 'recheck agent died', false, /fixed, COMMIT FAILED/],
-    ['commit#', 'commit agent died', null, /fixed, COMMIT OUTCOME UNKNOWN: commit agent died/], // no receipt either way: neither true nor false is earned
+    ['commit#', 'commit agent died; HEAD is still 0f1e2d3, but the committer may not have finished', null, /fixed, COMMIT OUTCOME UNKNOWN: commit agent died/], // an unmoved HEAD proves nothing while git may still run
     // It may have pushed before it died: the outcome is unknown, not a failure.
     ['push#', 'push agent died after the commit landed', true, /fixed \+ committed [0-9a-f]{7}, PUBLICATION UNKNOWN/],
   ]) {
@@ -2073,7 +2084,6 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
   const cutHead = (a) => ({ ...a, heads: a.heads.map(h => ({ ...h, head: h.head.slice(0, 35) })) })
   for (const [label, garble, detail, committed] of [
     ['hooks#', (a) => ({ ...a, passed: !a.passed }), 'hook agent died', false],
-    ['commit#', (a) => ({ ...a, detail: `${a.detail}.` }), 'commit agent died', null],
     ['push#', cutHead, 'push agent died after the commit landed', true],
   ]) {
     const { result, logs } = await run({ reviews: oneValid, garble: (l, a) => l.startsWith(label) ? garble(a) : a })
@@ -2082,6 +2092,20 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
     assert.ok(logs.some(l => l.startsWith(label) && l.endsWith('the relayed copy does not match its seal')), label)
     if (label === 'push#') assert.equal(result.state.pending.stage, 'publication-unknown')
   }
+  // A push relay gets one fresh agent: push.py reads back a push that landed.
+  const pushed = await run({ reviews: oneValid, garble: (l, a) => l === 'push#1-review' ? cutHead(a) : a })
+  assert.ok(pushed.labels.includes('push#1-review.retry'))
+  assert.equal(pushed.result.history[0].reviewPushFailed, undefined)
+  // A retry that finds the branch elsewhere cannot prove the lost first attempt missed.
+  const rejected = ({ seal, ...a }) => sealLine({ ...a, pushed: false, detail: ' ! [rejected] non-fast-forward', heads: a.heads.map(h => ({ ...h, head: FOREIGN })) })
+  const moved = await run({ reviews: oneValid, garble: (l, a) => l === 'push#1-review' ? null : l === 'push#1-review.retry' ? rejected(a) : a })
+  assert.equal(moved.result.state.pending.stage, 'publication-unknown')
+  assert.match(moved.result.history[0].reviewPushFailed.detail, /non-fast-forward, after an earlier attempt lost its receipt$/)
+  // A commit receipt is settled by the read-back instead: the commit that landed is audited and pushed.
+  const commit = await run({ reviews: oneValid, garble: (l, a) => l.startsWith('commit#') ? { ...a, detail: `${a.detail}.` } : a })
+  assert.ok(commit.logs.some(l => l.startsWith('commit#') && l.endsWith('the relayed copy does not match its seal')))
+  assert.ok(commit.labels.some(l => l.startsWith('push#')), 'the push went ahead')
+  assert.equal(commit.result.history[0].reviewPushFailed, undefined)
 })
 
 test("a relay that fills in error: '' on a sealed line still matches its seal", async () => {
@@ -4158,6 +4182,17 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --pr 3888\``), push.prompt)
 })
 
+test('a lost adoption push receipt gets one fresh agent, which reads the push back', async () => {
+  const state = adoptionState()
+  const { result, labels } = await run({
+    args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+    adoptPush: (label) => label === 'adopt:push' ? null : receiptOf(ADOPT, ADOPT, 'Everything up-to-date'),
+  })
+  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:push', 'adopt:push.retry'])
+  assert.equal(result.history[1].adoption.publication, 'pushed')
+  assert.equal(result.state.pending, null)
+})
+
 test('an already-published adopted head needs no push even in a dry-run launch', async () => {
   for (const autoPush of [true, false]) {
     const state = adoptionState()
@@ -4667,8 +4702,11 @@ test('a commit that landed but was not pushed is a pending candidate in the stat
   assert.equal(blocked.result.state.expectedHead, HEAD)
   const rejected = await run({ ...publishing, push: null })
   assert.equal(rejected.result.state.pending.stage, 'push-failed')
-  const unknown = await run({ ...publishing, commit: null })
+  const unknown = await run({ ...publishing, audit: null, garble: (l, a) => l.startsWith('commit#') ? null : a })
   assert.deepEqual(unknown.result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'push-unknown' })
+  const recovered = await run({ ...publishing, garble: (l, a) => l.startsWith('commit#') ? null : a })
+  assert.equal(recovered.result.state.pending, null, 'the read-back found the commit, which was audited and pushed')
+  assert.equal(recovered.result.state.expectedHead, shaFor(1))
   const unread = await run({ ...publishing, push: { heads: [{ url: PIN.pushUrls[0], head: null }] } })
   assert.deepEqual(unread.result.state.pending, { sha: shaFor(1), parent: HEAD, lane: 'review', stage: 'publication-unknown' })
   assert.equal(unread.result.history[0].reviewPushFailed.detail, `no read-back from ${PIN.pushUrls[0]}`)

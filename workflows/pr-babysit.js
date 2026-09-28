@@ -1589,11 +1589,11 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     relayed(COMMIT),
     { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT },
   ).catch(e => { log(`commit#${cycle}-${what} errored — ${e && e.message}`); return null })
-  // A dead commit agent leaves no receipt either way: null, never a guess. Nor
-  // does an error: the relay reports one for output it never saw, after git may have run.
-  if (!made) return { pass: false, committed: null, detail: 'commit agent died', sha: '' }
-  if (made.error) return { pass: false, committed: null, detail: made.error, sha: '' }
-  if (!made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
+  // A dead commit agent leaves no receipt either way, nor does an error: the
+  // relay reports one for output it never saw, after git may have run. The
+  // read-back below settles it, and without one the outcome stays null.
+  const lost = made ? made.error : 'commit agent died'
+  if (!lost && !made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
 
   // Read the commit back in a separate turn: a committer reporting on its own
   // work is the one report most likely to be wrong about it. This catches
@@ -1603,13 +1603,22 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     relayed(AUDIT),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   )
+  const sha = seen ? seen.sha.trim() : ''
+  if (lost) {
+    const unread = !seen ? 'the audit agent died too'
+      : seen.error ? `the read-back failed: ${seen.error}`
+      : !FULL_SHA.test(sha) ? 'the read-back named no full SHA' : null
+    if (unread) return { pass: false, committed: null, detail: `${lost}; ${unread}`, sha: '' }
+    // Unmoved proves nothing: the relay may write an error for output it never saw, while git still runs.
+    if (sha === expectedHead) return { pass: false, committed: null, detail: `${lost}; HEAD is still ${expectedHead.slice(0, 7)}, but the committer may not have finished`, sha: '' }
+    log(`push#${cycle}-${what}: ${lost}, but HEAD moved to ${sha.slice(0, 7)}; auditing it as this cycle's commit`)
+  }
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
 
   // Audit the commit itself, not the intent: its parent must be where this run
   // left HEAD, it must carry nothing beyond the paths we owned, and nothing the
   // writers changed in those paths may be left behind — a partial commit would
   // otherwise be pushed and every finding announced fixed.
-  const sha = seen.sha.trim()
   const strays = seen.paths.map(canon).filter(f => !scopeSet.has(f))
   // What the commit holds for each path must be what the hooks left: the fix
   // the verifier saw and the regeneration the hook made, byte for byte and mode
@@ -1656,13 +1665,18 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
 // URL answered without it; anything else is unknown, never "not pushed".
 // null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
-  const r = await relayAgent(
+  const attempt = (l) => relayAgent(
     `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
     `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.branch.trim()}' --sha ${sha} ` +
     `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
     relayed(PUSH),
-    { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH },
-  ).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+    { label: l, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH },
+  ).catch(e => { log(`${l} errored — ${e && e.message}`); return null })
+  // push.py pushes one exact SHA without force and reads it back, so a retry
+  // finds a push that landed; it cannot prove one did not, since the branch may
+  // have moved on since.
+  const first = await attempt(label)
+  const r = first ?? await attempt(`${label}.retry`)
   if (!r) return null
   const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
   if (r.error) return unknown(r.error)
@@ -1671,7 +1685,8 @@ const pushExact = async (sha, label, prToo = false) => {
   const prHead = !prToo ? sha : typeof r.prHead === 'string' ? r.prHead.trim() : null
   if (heads.every(h => h === sha) && prHead === sha) return { pass: true, detail: r.detail }
   if (heads.every(h => h !== null && h !== sha)) {
-    return { pass: false, detail: (!r.pushed && r.detail) || `${r.heads[0].url} heads ${heads[0].slice(0, 7) || 'nothing'} after the push, not ${sha.slice(0, 7)}` }
+    const detail = (!r.pushed && r.detail) || `${r.heads[0].url} heads ${heads[0].slice(0, 7) || 'nothing'} after the push, not ${sha.slice(0, 7)}`
+    return first ? { pass: false, detail } : unknown(`${detail}, after an earlier attempt lost its receipt`)
   }
   const unread = r.heads.filter((h, i) => heads[i] === null).map(h => h.url)
   return unknown(unread.length ? `no read-back from ${unread.join(', ')}`
