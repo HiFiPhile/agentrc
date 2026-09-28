@@ -131,10 +131,11 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   suspects does, gets a `read-doc` review of every affected variant before
   the co-review, run or assigned by the lead; it verifies only with a
   verified outcome in `read-doc`'s claim record. `co-review` the findings and
-  their records, a no-findings result included, and apply only what verifies
-  and is worth applying; run the applicable checks, including hardware
-  validation under Working rules; `co-review` the diff that applying them
-  made, if any, which needs no new Phase 1; then ask for a full review.
+  their records, a no-findings result included, with a correctness review of
+  the task's whole diff unless a step review already covered all of it, and
+  apply only what verifies and is worth applying; run the applicable checks,
+  including hardware validation under Working rules; `co-review` the diff
+  from those fixes, if any, which needs no new Phase 1.
   Coverage of unchanged content carries over to later triggers; a later change
   gets this sequence again for what changed, with the whole task as context,
   and any checks its changed inputs require. State its outcome in the
