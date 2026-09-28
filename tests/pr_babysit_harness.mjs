@@ -847,14 +847,14 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
   assert.deepEqual(result.rollup, {
     cycles: [1], findings: { total: 3, fixed: 1, open: 0, refuted: 1, stale: 1, deferred: 0, held: 0 },
-    ci: { total: 0, fixed: 0, open: 0, accepted: 0, rigSide: 0, unclassified: 0 }, reran: 0, pushed: [shaFor(1).slice(0, 8)], replies: 3,
+    ci: { total: 0, fixed: 0, open: 0, accepted: 0, sonarGate: 0, rigSide: 0, unclassified: 0 }, reran: 0, pushed: [shaFor(1).slice(0, 8)], replies: 3,
   })
 })
 
 test('a launch rollup counts its own cycles, each finding and CI failure once', async () => {
   const red = redWith(RIG, PVS, UNPLACED).ci
   const first = await run({ args: { ...YIELD, acceptedFailures: [accept()] }, reviews: WAITING, ci: red })
-  assert.deepEqual(first.result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 1, rigSide: 1, unclassified: 1 })
+  assert.deepEqual(first.result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 1, sonarGate: 0, rigSide: 1, unclassified: 1 })
   const dry = await run({ args: { autoPush: false, maxCycles: 3 }, reviews: { findings: [finding()], replies: [], bots: 'reviewed' } })
   assert.deepEqual(dry.result.rollup.findings, { total: 1, fixed: 0, open: 1, refuted: 0, stale: 0, deferred: 0, held: 0 }, 'a dry run fixes nothing')
   const twice = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
@@ -5457,4 +5457,32 @@ test('a fixed code-scanning finding still flagged is marked once CI settles, and
   assert.ok(logs.some(l => /cycle 2: 1 SonarCloud issue\(s\) marked false positive — re-arming/.test(l)), logs.join('\n'))
   assert.equal(calls.some(c => c.label.startsWith('fix:ci')), false, 'the SonarCloud check is not a CI fix')
   assert.equal(result.pass, false)
+})
+
+test('a SonarCloud gate is never a CI-lane fix: it stops the run on its own reason, rig-side failures beside it', async () => {
+  const gate = { check: 'SonarCloud Code Analysis', workflow: '', firstError: 'condition failed: new_security_rating 3 > 1', files: ['tools/code_size.py'], verdict: 'real' }
+  const rig = { check: 'hil / pico', workflow: 'Build', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }
+  const { calls, result, logs } = await run({
+    reviews: { findings: [], replies: [], bots: 'reviewed' },
+    ci: { status: 'red', infraRerun: [], realFailures: [gate, rig] },
+    args: { autoPush: true, maxCycles: 2 },
+  })
+  assert.equal(calls.some(c => c.label.startsWith('fix:')), false, 'nothing is fixed')
+  assert.equal(result.reason, 'ci-red-sonar-gate')
+  assert.equal(result.cycles, 1, 'another cycle would meet the same gate')
+  assert.ok(logs.some(l => /CI red from the SonarCloud gate \(condition failed: new_security_rating 3 > 1\) and 1 rig-side failure\(s\) — its failing condition needs resolving/.test(l)), logs.join('\n'))
+  assert.deepEqual(result.rollup.ci, { total: 2, fixed: 0, open: 0, accepted: 0, sonarGate: 1, rigSide: 1, unclassified: 0 })
+  assert.ok(logs.some(l => /\| left red: a SonarCloud gate, not a CI-lane fix +\| - /.test(l)), 'the cycle table names it, with no commit')
+  // An Actions job running the scanner is an ordinary CI failure.
+  const job = await run({ ci: { status: 'red', infraRerun: [], realFailures: [{ ...gate, check: 'SonarQube (stm32h743eval)', workflow: 'static_analysis' }] }, args: { autoPush: false, maxCycles: 1 } })
+  assert.ok(job.calls.some(c => c.label.startsWith('fix:')), 'the scanner job is fixed')
+  assert.deepEqual(result.observation.ci.realFailures.map(rf => rf.state), ['sonarGate', 'rigSide'], 'each failure carries its state for the caller')
+})
+
+test('an unplaced failure beside a SonarCloud gate still stops as unclassified', async () => {
+  const gate = { check: 'SonarCloud', workflow: '', firstError: 'Quality Gate failed', files: [], verdict: 'real' }
+  const both = await run({ ci: { status: 'red', infraRerun: [], realFailures: [gate, UNPLACED] }, args: { autoPush: true, maxCycles: 2 } })
+  assert.equal(both.result.reason, 'ci-red-unclassified')
+  const judged = await run({ ci: { status: 'red', infraRerun: [], realFailures: [{ ...gate, verdict: 'unclassified' }] }, reviews: { findings: [], replies: [], bots: 'reviewed' }, args: { autoPush: true, maxCycles: 2 } })
+  assert.equal(judged.result.reason, 'ci-red-sonar-gate', 'the gate is its own class whatever the watcher called it')
 })

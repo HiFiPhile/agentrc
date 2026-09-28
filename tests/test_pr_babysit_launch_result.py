@@ -96,6 +96,16 @@ class LaunchResultTest(unittest.TestCase):
         self.assertIn('rig-side "not fixing" lines', s['logs'][-1])
         self.assertTrue(s['logs'][1].endswith('whole line in the output\'s logs)'))
 
+    def test_a_failure_is_settled_by_the_state_the_workflow_gave_it_not_its_verdict(self):
+        gate = {**failure('gate', verdict='rig-side'), 'check': 'SonarCloud Code Analysis', 'workflow': '', 'cell': None, 'state': 'sonarGate'}
+        o = output()
+        o['result']['observation']['ci']['realFailures'] = [gate, failure('f072 cdc')]
+        rc, s = self.run_it(o)
+        ci = s['observation']['ci']
+        self.assertEqual(ci['verdicts'], {'sonarGate': 1, 'rig-side': 1})
+        self.assertEqual(list(ci['settledCells']), ['hil-tinyusb (tinyusb.json)'])
+        self.assertEqual([f['check'] for f in ci['attention']], ['SonarCloud Code Analysis'], 'the gate needs attention')
+
     def test_a_launch_that_threw_keeps_the_state_it_was_given(self):
         rc, s = self.run_it('', '--state-ref', '/t/w1.output:4841042f', '--checkout', self.repo())
         self.assertEqual(rc, 0)

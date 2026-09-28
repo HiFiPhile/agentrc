@@ -27,7 +27,9 @@ one file per call, and prints {head, detail, error}. Each check's entry holds
 its saved `log` and the diagnostic lines of every step that reported an error.
 The log is the job's whole log without ANSI codes, NULs and timestamps for an
 Actions job, but only tails for the others: the last 150 lines of each failed
-CircleCI step, and Read the Docs' notes with 40-line tails of failed commands.
+CircleCI step, Read the Docs' notes with 40-line tails of failed commands, and
+for a sonarcloud.io link naming the project and the PR, its quality gate's
+status and failing conditions (SONAR_TOKEN when set, sent to sonarcloud.io only).
 For an Actions job the entry also holds the newest run on the base branch in
 which the same job ran, with its conclusion and the diagnostic lines both
 share, and `cells`. Cells are an adapter for tinyusb's test/hil/hil_test.py:
@@ -59,12 +61,17 @@ for is left out. The caller checks what comes back against its own digests.
 """
 
 import argparse
+import base64
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -89,6 +96,8 @@ SHA = re.compile(r'[0-9a-f]{40}')
 HIL_ROW = re.compile(r'^(?:\d+\.\d{3} )?(\S+)\s+(\S+)\s+\.\.\.\s+(\S.*)$')  # HIL_PROFILE=1 prefixes epoch seconds
 HIL_FAILED = ('Failed:', 'Flash Failed:')
 LINE = 500
+SONARCLOUD = 'https://sonarcloud.io'
+COMPARATOR = {'GT': '>', 'LT': '<'}
 
 
 class Failed(Exception):
@@ -387,6 +396,39 @@ def readthedocs(link, folder, cache):
             'firstError': first, 'signature': signature(first), 'files': [], 'diagnostics': lines[:KEEP]}
 
 
+def sonarcloud(link, pr, folder):
+    """The PR's quality gate on SonarCloud: its status and each failing condition."""
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+    if len(q.get('id', [])) != 1 or q.get('pullRequest') != [str(pr)]:
+        raise Failed(f'not a SonarCloud link naming one project and PR #{pr}: {link}')
+    project = q['id'][0]
+    query = urllib.parse.urlencode({'projectKey': project, 'pullRequest': pr})
+    req = urllib.request.Request(f'{SONARCLOUD}/api/qualitygates/project_status?{query}')
+    token = os.environ.get('SONAR_TOKEN', '').strip()
+    if token:
+        req.add_header('Authorization', 'Basic ' + base64.b64encode(f'{token}:'.encode()).decode())
+    try:
+        with rtd.OPENER.open(req, timeout=30) as r:
+            gate = json.loads(r.read().decode())['projectStatus']
+    except urllib.error.HTTPError as e:
+        raise Failed(f'SonarCloud quality gate of {project} PR #{pr}: HTTP {e.code} {e.msg}: {e.read().decode(errors="replace")[:200]}')
+    except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+        raise Failed(f'SonarCloud quality gate of {project} PR #{pr}: {e}')
+    failing = [c for c in gate.get('conditions') or [] if c.get('status') == 'ERROR']
+    status = gate.get('status')
+    lines = [f'quality gate {status}'] + [
+        f'condition failed: {c.get("metricKey")} {c.get("actualValue")} {COMPARATOR.get(c.get("comparator"), c.get("comparator"))} {c.get("errorThreshold")}'
+        for c in failing]
+    if failing:
+        first = lines[1]
+    elif status == 'ERROR':
+        first = 'quality gate ERROR with no failing condition listed'
+    else:  # the gate is read now; the check reported an earlier analysis
+        first = f'quality gate {status} now, though its check failed: SonarCloud may have analysed again since'
+    return {'log': save(folder, f'sonarcloud-{project}-{pr}.log', lines), 'base': None,
+            'firstError': first, 'signature': signature(first), 'files': [], 'diagnostics': lines[:KEEP]}
+
+
 def circle(repo, number, folder):
     lines = []
     for name, tail in circleci.failed_steps(repo, number, 150):
@@ -430,6 +472,8 @@ def failures(repo, pr, head, links, prior_head=None):
     for link in links:
         check = failing[link]
         kind, _, ident = (check['attempt'] or 'other:').partition(':')
+        if kind == 'other' and link.startswith(f'{SONARCLOUD}/'):
+            kind = 'sonarcloud'
         entry = {'link': link, 'attempt': check['attempt'], 'bucket': check['bucket'], 'provider': kind,
                  'name': check['name'], 'error': None}
         try:
@@ -439,6 +483,8 @@ def failures(repo, pr, head, links, prior_head=None):
                 entry.update(readthedocs(link, folder, cache))
             elif kind == 'circleci':
                 entry.update(circle(repo, ident, folder))
+            elif kind == 'sonarcloud':
+                entry.update(sonarcloud(link, pr, folder))
             else:
                 entry['error'] = 'no reader for this check: its link names no run'
         except (Failed, rtd.Failed, circleci.Failed) as e:

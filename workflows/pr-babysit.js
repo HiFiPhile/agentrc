@@ -925,7 +925,10 @@ const stateOut = () => {
 // What became of a finding or a CI failure, for the per-cycle table and the launch
 // rollup alike; each words a `valid` finding or a `real` failure its own way.
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
-const ciState = (rf) => rf.accepted ? 'accepted' : rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real'
+// SonarCloud's own check, not an Actions job that runs the scanner: its gate is
+// SonarCloud's verdict on the PR, never a CI-lane fix.
+const sonarGate = (rf) => !rf.workflow && /^SonarCloud\b/.test(rf.check)
+const ciState = (rf) => rf.accepted ? 'accepted' : sonarGate(rf) ? 'sonarGate' : rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real'
 // This launch in counts a caller can table across launches: each finding and
 // CI failure once, as its last cycle here left it, except that a fix this launch
 // pushed is not recounted as stale.
@@ -955,7 +958,7 @@ const launchRollup = () => {
   return {
     cycles: history.slice(launchFrom).map(e => e.cycle),
     findings: tally(findings, ['fixed', 'open', 'refuted', 'stale', 'deferred', 'held']),
-    ci: tally(ci, ['fixed', 'open', 'accepted', 'rigSide', 'unclassified']),
+    ci: tally(ci, ['fixed', 'open', 'accepted', 'sonarGate', 'rigSide', 'unclassified']),
     reran: reran.size, pushed, replies,
   }
 }
@@ -963,7 +966,8 @@ const finish = (verdict, status) => {
   const last = history[history.length - 1] || null
   const observation = {
     reviewedHead: last ? last.head : expectedHead, lane: last ? last.lane || lane : lane,
-    reviews: last ? last.reviews || null : null, ci: last ? last.ci || null : null,
+    reviews: last ? last.reviews || null : null,
+    ci: last && last.ci ? { ...last.ci, realFailures: (last.ci.realFailures || []).map(rf => ({ ...rf, state: ciState(rf) })) } : null,
     actions: last ? {
       reviewFixes: last.reviewFixes || null, ciFixes: last.ciFixes || null,
       reviewPush: last.reviewPush || last.reviewPushFailed || null, ciPush: last.ciPush || last.ciPushFailed || null,
@@ -1472,10 +1476,11 @@ const cycleSummary = (entry) => {
       cell(rf.firstError),
       rf.verdict === 'real' ? 'ci-real' : rf.verdict,
       state === 'accepted' ? cell(`accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`, 60)
-      : state === 'rigSide' ? 'left red for the rig'
-        : state === 'unclassified' ? 'left red: not placed by its evidence'
-          : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
-      rf.verdict === 'real' && !rf.accepted ? shaOf(entry.ciPush) : '-',
+      : state === 'sonarGate' ? 'left red: a SonarCloud gate, not a CI-lane fix'
+        : state === 'rigSide' ? 'left red for the rig'
+          : state === 'unclassified' ? 'left red: not placed by its evidence'
+            : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
+      state === 'real' ? shaOf(entry.ciPush) : '-',
     ])
   }
   const head = `cycle ${entry.cycle} summary — CI ${entry.ci && acceptedOnly(entry.ci) ? 'red, accepted failures only' : entry.ci ? entry.ci.status : entry.lane === 'reviews' ? 'not observed this launch' : 'unknown'}, ` +
@@ -2485,8 +2490,7 @@ const runCycle = async (cycle, entry) => {
     // A mark this cycle may clear the SonarCloud gate this CI run failed on:
     // the next cycle reads CI again rather than fixing a check that may be passing.
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry)
-    // SonarCloud's own check, not an Actions job that runs the scanner.
-    if (marked > 0 && c.realFailures.some(rf => !rf.workflow && /^SonarCloud\b/.test(rf.check))) {
+    if (marked > 0 && c.realFailures.some(sonarGate)) {
       log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
       return null
     }
@@ -2506,11 +2510,11 @@ const runCycle = async (cycle, entry) => {
     for (const a of acceptedArg) {
       if (!c.realFailures.some(rf => rf.key === acceptedKey(a))) log(`cycle ${cycle}: accepted failure ${acceptedKey(a)} matches no failure on this head`)
     }
-    // Only a failure the watcher placed on the PR is fixed; the rig's and the
-    // ones its evidence could not place are reported and left red.
-    const unfixable = c.realFailures.filter(rf => rf.verdict !== 'real' && !rf.accepted)
-    for (const rf of unfixable) log(`cycle ${cycle}: ${rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
-    const fixable = c.realFailures.filter(rf => rf.verdict === 'real' && !rf.accepted)
+    // Only a failure the watcher placed on the PR is fixed; the rig's, the ones
+    // its evidence could not place and a SonarCloud gate are reported and left red.
+    const unfixable = c.realFailures.filter(rf => !['real', 'accepted'].includes(ciState(rf)))
+    for (const rf of unfixable) log(`cycle ${cycle}: ${sonarGate(rf) ? 'SonarCloud gate' : rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
+    const fixable = c.realFailures.filter(rf => ciState(rf) === 'real')
     if (fixable.length > 0) {
       const work = groupWork(fixable.map(rf => ({
         id: rf.id, scopeFile: rf.files[0] || rf.check, files: rf.files,
@@ -2570,10 +2574,17 @@ const runCycle = async (cycle, entry) => {
       // not: another cycle would only meet the same unexplained exit, and the
       // reply debt rides along in the state. The rig's failures wait for the
       // reviews first, then need the rig.
-      const unclassified = unfixable.filter(rf => rf.verdict === 'unclassified')
+      const unclassified = unfixable.filter(rf => ciState(rf) === 'unclassified')
       if (unclassified.length > 0) {
         log(`cycle ${cycle}: CI red with ${unclassified.length} failure(s) the watcher could not place — no justified fix; investigate before relaunching`)
         return { pass: false, cycles: cycle, history, reason: 'ci-red-unclassified', deferred: outstanding() }
+      }
+      const gates = unfixable.filter(sonarGate)
+      if (reviewsSettled && gates.length > 0) {
+        const rig = unfixable.length - gates.length
+        log(`cycle ${cycle}: CI red from the SonarCloud gate (${gates.map(rf => rf.firstError.slice(0, 80)).join('; ')})${rig ? ` and ${rig} rig-side failure(s)` : ''} — ` +
+          'its failing condition needs resolving (a rating or issue count clears when the answered issues are marked, by markSonar or a human; coverage or duplication needs its own change), or the caller accepts the gate')
+        return { pass: false, cycles: cycle, history, reason: 'ci-red-sonar-gate', deferred: outstanding() }
       }
       if (reviewsSettled) {
         log(`cycle ${cycle}: CI red only from rig-side failures — rig attention needed (chief or a human), nothing to fix in the PR`)

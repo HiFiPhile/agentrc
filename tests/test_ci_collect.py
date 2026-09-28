@@ -412,6 +412,46 @@ class FailuresTest(unittest.TestCase):
             self.jobs['3']['workflow_name'] = key
             self.assertEqual(self.entries(RTD.format(9), JOB.format(3))[1]['base']['runId'], 70, key)
 
+    def sonar_gate(self, gate, token=''):
+        link = 'https://sonarcloud.io/dashboard?id=o_r&pullRequest=5'
+        self.checks.append({'name': 'SonarCloud Code Analysis', 'workflow': '', 'bucket': 'fail', 'link': link})
+        sent = []
+
+        class Opener:
+            def open(self, req, timeout):
+                sent.append(req)
+                return mock.MagicMock(**{'__enter__.return_value.read.return_value': json.dumps({'projectStatus': gate}).encode()})
+        with mock.patch.object(collect.rtd, 'OPENER', Opener()), \
+                mock.patch.dict(collect.os.environ, {'SONAR_TOKEN': token}):
+            entry = self.entries(link)[0]
+        return entry, sent
+
+    def test_a_sonarcloud_gate_is_read_as_its_failing_conditions_under_the_checks_own_name(self):
+        entry, sent = self.sonar_gate({'status': 'ERROR', 'conditions': [
+            {'status': 'OK', 'metricKey': 'new_coverage', 'comparator': 'LT', 'errorThreshold': '80', 'actualValue': '90'},
+            {'status': 'ERROR', 'metricKey': 'new_security_rating', 'comparator': 'GT', 'errorThreshold': '1', 'actualValue': '3'}]})
+        self.assertEqual((entry['provider'], entry['name'], entry['error']), ('sonarcloud', 'SonarCloud Code Analysis', None))
+        self.assertEqual(entry['firstError'], 'condition failed: new_security_rating 3 > 1')
+        self.assertEqual(entry['diagnostics'], ['quality gate ERROR', 'condition failed: new_security_rating 3 > 1'])
+        self.assertEqual(Path(entry['log']).read_text().splitlines(), entry['diagnostics'])
+        self.assertEqual(sent[0].full_url, 'https://sonarcloud.io/api/qualitygates/project_status?projectKey=o_r&pullRequest=5')
+        self.assertIsNone(sent[0].get_header('Authorization'), 'no token, no header')
+
+    def test_a_gate_read_passing_while_its_check_failed_says_so(self):
+        entry, _ = self.sonar_gate({'status': 'OK', 'conditions': []})
+        self.assertEqual(entry['firstError'], 'quality gate OK now, though its check failed: SonarCloud may have analysed again since')
+        self.assertEqual(entry['diagnostics'], ['quality gate OK'])
+
+    def test_the_sonar_token_goes_only_to_sonarcloud_and_a_link_for_another_pr_is_not_read(self):
+        entry, sent = self.sonar_gate({'status': 'ERROR', 'conditions': []}, token='t')
+        self.assertEqual(sent[0].get_header('Authorization'), 'Basic dDo=')
+        self.assertEqual(entry['firstError'], 'quality gate ERROR with no failing condition listed')
+        self.checks = [{'name': 'SonarCloud Code Analysis', 'workflow': '', 'bucket': 'fail',
+                        'link': 'https://sonarcloud.io/dashboard?id=o_r&pullRequest=6'}]
+        entry = self.entries(self.checks[0]['link'])[0]
+        self.assertEqual(entry['provider'], 'sonarcloud')
+        self.assertRegex(entry['error'], r'^not a SonarCloud link naming one project and PR #5')
+
     def test_the_read_the_docs_token_is_read_once_and_only_when_needed(self):
         with mock.patch.object(collect.rtd, 'token', side_effect=lambda: 'k') as token:
             self.entries(JOB.format(3))
