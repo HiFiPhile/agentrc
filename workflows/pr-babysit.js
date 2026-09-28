@@ -6,7 +6,7 @@ export const meta = {
 }
 
 // args: { pr: number, reviewers?: string[] (of codex, copilot, coderabbit, greptile, code-scanning; default
-//            ['copilot', 'coderabbit', 'greptile', 'code-scanning']; [] runs no review lane),
+//            ['coderabbit', 'greptile', 'code-scanning']; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default:
 //            reviewers but code-scanning, which is harvested only and never named here),
 //          maxCycles?: number (ceiling on review/fix/CI cycles, default 5; a resumed launch
@@ -40,7 +40,9 @@ export const meta = {
 //            and a copy that fails the stateDigest is asked for again or refused),
 //          adoptHead?: string (full SHA of commits the caller made and audited on top of the
 //            state's expectedHead, a hardware repair say: this launch audits the chain, publishes
-//            it under autoPush and continues from it with the same state; per launch, never saved) }
+//            it under autoPush and continues from it with the same state; while the PR still heads
+//            expectedHead it also decides an unpublished candidate the state holds, unless this
+//            run's audit refused it; per launch, never saved) }
 if (typeof args === 'string') {
   // A caller that retyped a large state here most likely truncated it: say where the parse broke.
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
@@ -64,7 +66,7 @@ if (args.maxCycles != null && (!Number.isInteger(args.maxCycles) || args.maxCycl
 // The validator knows these bots and nothing else, so an unknown name would
 // silently review nothing; fail before dispatch instead.
 const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit', 'greptile', 'code-scanning']
-const DEFAULT_REVIEWERS = ['copilot', 'coderabbit', 'greptile', 'code-scanning']
+const DEFAULT_REVIEWERS = ['coderabbit', 'greptile', 'code-scanning']
 // Code-scanning comments arrive with the analysis workflow, a CI check with no
 // review verdict to wait for: they are harvested, never waited on.
 const HARVEST_ONLY = ['code-scanning']
@@ -1705,7 +1707,9 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   const repair = (commentId, replyId, error) => {
     const d = debt.get(commentId) || (debt.set(commentId, { dismissals: new Set(), notes: new Set() }), debt.get(commentId))
     d.repair = { replyId, error }
-    log(`cycle ${cycle}: reply ${replyId} to comment ${commentId} exists with the wrong content (${error}) — needs a human repair, not another reply`)
+    log(replyId
+      ? `cycle ${cycle}: reply ${replyId} to comment ${commentId} exists with the wrong content (${error}) — needs a human repair, not another reply`
+      : `cycle ${cycle}: no reply posted to comment ${commentId} (${error}) — a human answers it, checking the thread for an earlier attempt`)
   }
   // The body first offered is kept in the debt as an attempt (body, digest,
   // answer type) until the comment is paid: no receipt proves an earlier
@@ -2596,14 +2600,17 @@ if (adoptHead !== null) {
     log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor ${adoptHead.slice(0, 7)}`)
     return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-head', head: prHead, expected: [X, adoptHead] })
   }
-  // An unpublished candidate of this run's own is the caller's decision, and a
-  // chain on top of it would publish it unasked; only a retry of this same
-  // adoption may pass.
+  // An unpublished candidate of this run's own is the caller's decision, made by a
+  // retry of the same adoption or, while the PR heads the state's head, by a chain
+  // from it: the audit below names every commit that may publish, and the push only
+  // fast-forwards. A commit this run's own audit refused is not overridden that way.
   const p = restored.pending
-  if (p && !(p.lane === 'adopt' && p.sha === adoptHead && p.parent === X)) {
+  const retry = !!p && p.lane === 'adopt' && p.sha === adoptHead
+  if (p && !retry && (prHead !== X || p.stage === 'audit-blocked')) {
     log(`preflight: the state holds an unpublished candidate (${p.stage}); resolve it before adopting`)
     return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-pending', pending: p })
   }
+  if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
   const audit = await relayOnce(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead}\` ` +
     relayed(ADOPT_AUDIT),

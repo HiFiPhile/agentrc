@@ -553,13 +553,13 @@ test('an unknown reviewer or a malformed protected pattern throws before any age
   assert.equal(none.result.pass, true)
 })
 
-test('omitted reviewers default to copilot, coderabbit and greptile auto-running, and code-scanning harvested only', async () => {
+test('omitted reviewers default to coderabbit and greptile auto-running, and code-scanning harvested only', async () => {
   for (const reviewers of [undefined, null]) {
     const { calls, result } = await run({ args: { reviewers } })
     assert.equal(result.pass, true)
     const prompt = calls.find(c => c.label.startsWith('reviews#')).prompt
-    assert.match(prompt, /harvest on this PR are copilot, coderabbit, greptile, code-scanning, and no others; of those, copilot, coderabbit, greptile auto-run on every push/)
-    assert.deepEqual(result.state.config.autoRun, ['copilot', 'coderabbit', 'greptile'])
+    assert.match(prompt, /harvest on this PR are coderabbit, greptile, code-scanning, and no others; of those, coderabbit, greptile auto-run on every push/)
+    assert.deepEqual(result.state.config.autoRun, ['coderabbit', 'greptile'])
   }
 })
 
@@ -3637,6 +3637,8 @@ test('a reply with a point over the length limit is a repair, never posted or cu
   })
   assert.equal(long.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'nothing is posted')
   assert.match(long.result.state.debt.find(([id]) => id === 2)[1].repair.error, /^over length: a point exceeds 60 words/)
+  assert.ok(long.logs.some(l => /no reply posted to comment 2 \(over length: .*\) — a human answers it/.test(l)), long.logs.join('\n'))
+  assert.equal(long.logs.some(l => /exists with the wrong content/.test(l)), false, 'no reply exists to be wrong')
   const points = await run({
     args: { autoPush: true, maxCycles: 1 },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: `${'w '.repeat(60).trim()}\n\n- ${'w '.repeat(60).trim()}` }], bots: 'reviewed' },
@@ -4393,15 +4395,36 @@ test('an uncanonicalizable adopted path or an attributed message fails the audit
   assert.match(attributed.result.detail, /attribution/i)
 })
 
-test('unrelated or unknown pending publication blocks adoption before the audit', async () => {
+test('an adoption decides an unpublished candidate while the PR still heads the state\'s head', async () => {
+  // Live on tinyusb #3988: a push-unknown with no SHA left no way to publish the chain on top.
   for (const pending of [
     { sha: FOREIGN, parent: HEAD, lane: 'review', stage: 'push-failed' },
     { sha: null, parent: HEAD, lane: 'review', stage: 'push-unknown' },
     { sha: ADOPT, parent: HEAD, lane: 'review', stage: 'push-failed' },
+    { sha: FOREIGN, parent: HEAD, lane: 'adopt', stage: 'adopt-push-unknown' },
+  ]) {
+    const state = adoptionState({ pending })
+    const { result, labels, logs } = await run({
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+    })
+    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], JSON.stringify(pending))
+    assert.ok(logs.some(l => l.includes(`the unpublished candidate (${pending.stage}) is left to this adoption`)), JSON.stringify(pending))
+    assert.equal(result.history[1].adoption.publication, 'pushed')
+    assert.equal(result.state.pending, null)
+    assert.equal(result.state.expectedHead, ADOPT)
+  }
+})
+
+test('an unpublished candidate blocks any other adoption once the PR has moved, or when this run\'s audit refused it', async () => {
+  for (const [pending, prHead] of [
+    [{ sha: FOREIGN, parent: HEAD, lane: 'review', stage: 'push-failed' }, ADOPT],
+    [{ sha: null, parent: HEAD, lane: 'review', stage: 'push-unknown' }, ADOPT],
+    [{ sha: FOREIGN, parent: HEAD, lane: 'adopt', stage: 'adopt-push-unknown' }, ADOPT],
+    [{ sha: ADOPT, parent: HEAD, lane: 'review', stage: 'audit-blocked' }, HEAD],
   ]) {
     const state = adoptionState({ pending })
     const { result, labels } = await run({
-      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead },
     })
     assert.equal(result.reason, 'adopt-pending', JSON.stringify(pending))
     assert.deepEqual(result.pending, pending)
