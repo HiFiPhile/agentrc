@@ -13,7 +13,12 @@ const BASE = {
   factsDir: '/tmp/ledger/7', hil: { choice: 'boards', boards: [{ board: 'b1', verdict: 'pass', regression: 'none', testedHead: 'b'.repeat(40), report: '/r/b1.json' }] },
   hardwareRelevant: true, autoPost: false,
 }
-const finding = (why, severity = 'high', line = 10) => ({ file: 'src/core/a.c', line, snippet: 'x', why, severity, confidence: 'high', verdict: { real: true, reason: `holds: ${why}` } })
+const IMP = { consequence: 'wrong data', path: 'every OUT transfer', variants: 'all', recovery: 'reset' }
+// A finding as code-audit returns it: the verifier's level with the facts behind it.
+const finding = (why, severity = 'high', line = 10, impact = IMP) => ({ file: 'src/core/a.c', line, snippet: 'x', why, severity, confidence: 'high',
+  impact, severityReason: `graded: ${why}`, verdict: { real: true, reason: `holds: ${why}` } })
+const confirmedAs = (severity, over = {}) => ({ verdict: 'confirmed', reason: 'yes', severity, impact: IMP, severityReason: 'graded', confidence: 'high', ...over })
+const REFUTED = { verdict: 'refuted', reason: 'no', severity: null, impact: null, severityReason: null, confidence: null }
 
 // Stub agents keyed by label; `stubs.<label>` is the value, or a function of the prompt.
 async function run(args, stubs = {}) {
@@ -139,13 +144,10 @@ test('a blocking finding or a verified regression requests changes; minor ones o
   assert.equal(medium.result.verdict.event, 'COMMENT')
   const abs = await run(BASE, { audit: audited({ ...finding('overrun'), file: '/w/src/core/a.c' }) })
   assert.equal(abs.result.draft.comments[0].path, 'src/core/a.c', 'an absolute path under the checkout is made repository-relative')
-  const major = await run(BASE, { audit: audited(finding('use after free', 'Major')) })
-  assert.equal(major.result.verdict.event, 'REQUEST_CHANGES', "code-verifier's major blocks, whatever its case")
-  assert.equal(major.result.findings[0].severity, 'high', 'stored on the one scale')
-  const old = await run(BASE, { audit: audited(finding('overrun', 'blocker')) })
-  assert.equal(old.result.verdict.event, 'REQUEST_CHANGES', 'a historical blocker still blocks')
-  const minor = await run(BASE, { audit: audited(finding('naming', 'minor')) })
-  assert.equal(minor.result.verdict.event, 'COMMENT', "code-verifier's minor is above a nit")
+  const variant = await run(BASE, { audit: audited(finding('EP0 reserve missed', 'high', 10, { ...IMP, variants: 'STM32F4 OTG_FS only' })) })
+  assert.equal(variant.result.verdict.event, 'REQUEST_CHANGES', 'a high on one supported variant blocks like any high')
+  const graded = variant.result.findings[0]
+  assert.deepEqual([graded.confidence, graded.impact.variants, graded.severityReason], ['high', 'STM32F4 OTG_FS only', 'graded: EP0 reserve missed'], 'the grading travels with the finding')
   const reg = await run({ ...BASE, hil: { choice: 'boards', boards: [board('fail', 'verified')] } })
   assert.equal(reg.result.verdict.event, 'REQUEST_CHANGES')
   assert.ok(reg.result.verdict.reasons.includes('verified HIL regression on b1'))
@@ -201,7 +203,7 @@ test('text over its limit is shortened once, then marked long for the human, nev
 test('open thread claims are judged; a confirmed one covers our same finding and counts once', async () => {
   const claims = { claims: [{ commentId: 55, threadId: 'T', author: 'coderabbitai[bot]', bot: true, path: 'src/core/a.c', line: 10, claim: 'overrun' },
     { commentId: 56, threadId: 'U', author: 'maint', bot: false, path: null, line: null, claim: 'rename it' }] }
-  const judge = (p) => /overrun/.test(p) ? { verdict: 'confirmed', severity: 'nit', reason: 'yes' } : { verdict: 'refuted', severity: 'nit', reason: 'no' }
+  const judge = (p) => /overrun/.test(p) ? confirmedAs('nit') : REFUTED
   const { result, labels, calls } = await run(BASE, { audit: audited(finding('buffer overrun', 'nit')), claims, judge, covered: { matches: [{ finding: 0, commentId: 55 }] } })
   assert.equal(labels.filter(l => l.startsWith('judge:')).length, 2)
   assert.ok(calls.filter(c => c.label.startsWith('judge:')).every(c => c.options.agentType === 'finding-verifier'))
@@ -214,7 +216,7 @@ test('open thread claims are judged; a confirmed one covers our same finding and
   const mis = await run(BASE, { claims, judge: () => ({ verdict: 'misattributed', severity: 'high', reason: 'not said' }) })
   assert.deepEqual(mis.result.claims, [])
   assert.equal(mis.result.verdict.event, 'APPROVE', 'a misattributed claim neither blocks nor is attributed')
-  const blocking = await run(BASE, { claims, judge: () => ({ verdict: 'confirmed', severity: 'high', reason: 'yes' }) })
+  const blocking = await run(BASE, { claims, judge: () => confirmedAs('high') })
   assert.equal(blocking.result.verdict.event, 'REQUEST_CHANGES')
   const lost = await run(BASE, { claims, judge: () => null })
   assert.equal(lost.result.coverage.unjudged.length, 2)
@@ -305,7 +307,7 @@ test('upheld keeps its severity and leaves the thread open; disputed only blocks
   assert.doesNotMatch(upheld.result.draft.body, /Disputed/, 'no dispute, no label')
   const bodyClaim = { claims: [{ commentId: 56, threadId: null, author: 'greptile[bot]', bot: true, path: null, line: null, claim: 'race' }] }
   const pathless = await run(inc, { ...base, recheck: () => ({ state: 'disputed', reason: 'x' }), claims: bodyClaim,
-    judge: () => ({ verdict: 'confirmed', severity: 'high', reason: 'yes' }) })
+    judge: () => confirmedAs('high') })
   assert.match(pathless.result.draft.body, /Blocking: @greptile\[bot\]'s comment; disputed/, 'a claim with no path is named by its author')
   const dead = await run(inc, { ...base, recheck: () => null })
   assert.equal(dead.result.findings[0].disputes, undefined)
@@ -344,4 +346,35 @@ test('a thread answer over its limit is shortened, then marked long; the answer 
   const dead = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
     shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands.' }] }, 'check-draft': null })
   assert.equal(dead.result.findings[0].disputes[0].answer.body, wordy, 'an unchecked shortening is undone')
+})
+
+test('a reviewer\'s label never sets our level, and a confirmed claim without its grading is unjudged, never a blocker', async () => {
+  const claims = { claims: [{ commentId: 55, threadId: 'T', author: 'coderabbitai[bot]', bot: true, path: 'src/core/a.c', line: 10, claim: 'Critical: overrun' }] }
+  const low = await run(BASE, { claims, judge: () => confirmedAs('low') })
+  assert.equal(low.result.claims[0].severity, 'low')
+  assert.equal(low.result.verdict.event, 'COMMENT')
+  assert.match(low.calls.find(c => c.label === 'judge:0').prompt, /Severity section of your role.*never your level/)
+  for (const k of ['severity', 'impact', 'severityReason', 'confidence']) assert.ok(low.calls.find(c => c.label === 'judge:0').options.schema.required.includes(k), k)
+  const ungraded = await run(BASE, { claims, judge: () => confirmedAs('high', { impact: null }) })
+  assert.deepEqual(ungraded.result.claims, [])
+  assert.deepEqual(ungraded.result.coverage.unjudged, [{ kind: 'claim', commentId: 55 }])
+  assert.equal(ungraded.result.verdict.event, 'COMMENT', 'lost coverage, not a blocker')
+})
+
+test('a recheck regrades only with the facts behind it; without them the old level stands and coverage is lost', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const base = { check: pinned(inc), ledger: { reviews: 1, open: [{ ...LEDGER.open[0], confidence: 'high', impact: IMP, severityReason: 'old' }] } }
+  const facts = { impact: { ...IMP, recovery: 'a retry' }, severityReason: 'the host retries', confidence: 'medium' }
+  const down = await run(inc, { ...base, recheck: () => ({ state: 'open', reason: 'still', severity: 'medium', ...facts }) })
+  const f = down.result.findings[0]
+  assert.deepEqual([f.id, f.severity, f.impact.recovery, f.severityReason, f.confidence], ['pr7-f1', 'medium', 'a retry', 'the host retries', 'medium'])
+  assert.equal(down.result.verdict.event, 'COMMENT', 'the regraded level decides the verdict')
+  assert.match(down.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /Its level is high\. Only when new evidence changes its facts/)
+  const bare = await run(inc, { ...base, recheck: () => ({ state: 'open', reason: 'still', severity: 'medium' }) })
+  assert.equal(bare.result.findings[0].severity, 'high')
+  assert.equal(bare.result.findings[0].severityReason, 'old', 'the old grading is kept with its level')
+  assert.deepEqual(bare.result.coverage.unjudged, [{ kind: 'regrade', id: 'pr7-f1' }])
+  assert.equal(bare.result.verdict.event, 'REQUEST_CHANGES', 'the standing high still blocks')
+  const same = await run(inc, { ...base, recheck: () => ({ state: 'open', reason: 'still' }) })
+  assert.deepEqual([same.result.findings[0].severity, same.result.coverage.unjudged], ['high', []])
 })

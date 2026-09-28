@@ -22,9 +22,18 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message})`) }
 }
 const SHA = /^[0-9a-f]{40}$/
-// One scale, the claim judge's (critical|high|medium|low|nit): code-verifier's major and minor map onto it.
-const SCALE = { major: 'high', minor: 'low', blocker: 'critical', info: 'nit' }
-const sev = (s) => { const v = String(s || '').toLowerCase(); return SCALE[v] || v }
+// The one scale, defined in finding-verifier.md's Severity section; ledger.py reads older words onto it.
+const LEVELS = ['critical', 'high', 'medium', 'low', 'nit']
+const CONFIDENCE = ['high', 'medium', 'low']
+const IMPACT = {
+  type: ['object', 'null'], required: ['consequence', 'path', 'variants', 'recovery'],
+  properties: { consequence: { type: 'string' }, path: { type: 'string' }, variants: { type: 'string' }, recovery: { type: 'string' } },
+}
+const GRADE = { severity: { enum: [...LEVELS, null] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, confidence: { enum: [...CONFIDENCE, null] } }
+// A level counts only with the facts and the reason behind it.
+const graded = v => LEVELS.includes(v.severity) && CONFIDENCE.includes(v.confidence) &&
+  !!v.severityReason && !!v.impact && ['consequence', 'path', 'variants', 'recovery'].every(k => v.impact[k])
+const GRADING = 'Grade by the Severity section of your role: severity, impact, severityReason and confidence.'
 const fail = (msg) => { throw new Error(`${msg}; args is { pr, repo, head, mergeBase, scopeBase, mode, groups, factsDir, hil, hardwareRelevant, autoPost, dimensions? }`) }
 if (!args || typeof args !== 'object') fail('args must be an object')
 const pr = Number(args.pr)
@@ -97,7 +106,7 @@ const DISPUTES = { type: 'object', properties: { error: { type: 'string' }, disp
     replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } } } }
 const [prior, pushback] = await parallel([
   () => relay('ledger', 'Context', `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}'`,
-    { type: 'object', properties: { reviews: { type: 'integer' }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } } }, required: ['id'] } },
+    { type: 'object', properties: { reviews: { type: 'integer' }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } } }, required: ['id'] } },
       heldThreads: { type: 'array', items: { type: 'object', properties: { findingId: { type: 'string' }, commentId: { type: 'integer' }, why: { type: 'string' } } } }, error: { type: 'string' } } }),
   () => relay('disputes', 'Context', `python3 ${S}/ledger.py disputes --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`, DISPUTES),
 ])
@@ -115,7 +124,7 @@ const CLAIMS = {
     properties: { commentId: { type: 'integer' }, threadId: { type: ['string', 'null'] }, author: { type: 'string' }, bot: { type: 'boolean' },
       path: { type: ['string', 'null'] }, line: { type: ['integer', 'null'] }, claim: { type: 'string' } } } } },
 }
-const RECHECK = { type: 'object', required: ['state', 'reason'], properties: { state: { enum: ['open', 'fixed', 'na', 'withdrawn', 'upheld', 'disputed'] }, reason: { type: 'string' }, answer: { type: 'string' } } }
+const RECHECK = { type: 'object', required: ['state', 'reason'], properties: { state: { enum: ['open', 'fixed', 'na', 'withdrawn', 'upheld', 'disputed'] }, reason: { type: 'string' }, answer: { type: 'string' }, ...GRADE } }
 const NONE = { confirmed: [], dropped: [], unverified: [] }
 // Public text is measured, never cut: over a limit it is shortened once, a comment then falls back to its
 // finding's words, and what is still over is logged; post.py measures it again and names it for the human, and
@@ -130,7 +139,8 @@ const STYLE = 'Lead with the fact: no greeting, preamble, filler or recap. '
 const recheckPrompt = (f) => {
   const d = disputeOf[f.id]
   const ask = `${IN}Adversarially recheck ONE earlier review finding of this PR on head ${head}. Read it with: python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --finding ${f.id}\n` +
-    'Where the record has `published`, on the finding or on an answer, that is what the PR shows, as the maintainer edited it: judge that text, not the draft.\n'
+    'Where the record has `published`, on the finding or on an answer, that is what the PR shows, as the maintainer edited it: judge that text, not the draft.\n' +
+    `Its level is ${f.severity || 'unset'}. Only when new evidence changes its facts, return a new severity with the revised impact, severityReason and confidence by the Severity section of your role; otherwise leave them out.\n`
   if (!d) {
     return ask + `Then read the code at ${head}. state=open if the problem is still there, fixed if the change since removed it (say which code does), na if the code it named is gone or the claim no longer applies` +
       `${f.status === 'withdrawn' ? ', withdrawn if it was withdrawn earlier and the code still shows the finding was wrong' : ''}. ${DATA}`
@@ -141,19 +151,20 @@ const recheckPrompt = (f) => {
     'upheld if the problem still stands despite the replies (cite the code); disputed if it turns on intent, project policy or hardware behaviour no document settles. ' +
     `For withdrawn or upheld, \`answer\` is what a maintainer would post in that thread to its author: the evidence and nothing else, at most ${LIMIT.answer} words, bullets for more than one point. ${STYLE}`
 }
-const JUDGE = { type: 'object', required: ['verdict', 'severity', 'reason'], properties: { verdict: { enum: ['confirmed', 'refuted', 'stale', 'misattributed'] }, severity: { enum: ['critical', 'high', 'medium', 'low', 'nit'] }, reason: { type: 'string' } } }
+const JUDGE = { type: 'object', required: ['verdict', 'reason', 'severity', 'impact', 'severityReason', 'confidence'], properties: { verdict: { enum: ['confirmed', 'refuted', 'stale', 'misattributed'] }, reason: { type: 'string' }, ...GRADE } }
 const shellPath = (p) => `'${String(p).replace(/'/g, `'\\''`)}'`
 // One finding-verifier per claim, started as soon as the claims are read, alongside the audit.
 const judge = (c, i) => agent(
   `${IN}Adversarially verify ONE claim a reviewer made on PR #${pr}, against the code at ${head}.\nClaim: ${JSON.stringify(c)}\n` +
   `First find comment ${c.commentId} in ${threadsFile}: if no such comment exists, its author is not ${c.author}, or it does not make this claim, the verdict is misattributed. ` +
-  `The PR's change is \`git diff ${mergeBase} ${head}${c.path ? ` -- ${shellPath(c.path)}` : ''}\`. confirmed only if the code at ${head} truly has the problem the change introduced or kept; stale if the current code already fixed it; refuted otherwise, with the code that refutes it. severity is your own, whatever label the reviewer used: high for a defect that breaks behaviour or safety, low or nit for style. ${DATA}`,
-  { label: `judge:${i}`, phase: 'Judge', agentType: 'finding-verifier', schema: JUDGE },).then(v => v && { ...c, ...v })
+  `The PR's change is \`git diff ${mergeBase} ${head}${c.path ? ` -- ${shellPath(c.path)}` : ''}\`. confirmed only if the code at ${head} truly has the problem the change introduced or kept; stale if the current code already fixed it; refuted otherwise, with the code that refutes it. If confirmed: ${GRADING} The reviewer's own label is their wording, never your level. Otherwise set them null. ${DATA}`,
+  // A confirmed claim without its grading is unjudged, like a dead judge.
+  { label: `judge:${i}`, phase: 'Judge', agentType: 'finding-verifier', schema: JUDGE },).then(v => v && (v.verdict !== 'confirmed' || graded(v)) ? { ...c, ...v } : null)
 const [audit, rechecked, claims] = await parallel([
   () => discussion ? NONE : workflow('code-audit', { dirs: args.groups, dimensions, diff: { base: scopeBase, head } }),
   () => parallel(carried.map(f => () => agent(recheckPrompt(f),
     { label: `recheck:${f.id}`, phase: 'Review', agentType: 'finding-verifier', schema: RECHECK },
-  ).then(v => v && { ...f, ...v }))),
+  ))),
   () => (discussion ? Promise.resolve({ claims: [] }) : agent(
     `${IN}Read ${threadsFile} (every comment on PR #${pr}). List the review claims still open that are not ours: each point raised in an unresolved, not outdated thread, and each finding in a bot's review body or summary comment (split multi-point comments; split a bot's comments into findings as the bot rules in ~/.claude/agents/pr-review-validator.md do, a CodeRabbit nitpick or a Greptile summary item included). ` +
     'Skip comments with ours=true, replies that only acknowledge, questions with no claim about the code, and threads marked resolved. One record per claim, its claim in one sentence. ' + DATA,
@@ -164,8 +175,10 @@ if (!audit) return blocked('audit-failed', 'code-audit returned nothing')
 if (!claims) return blocked('claims-failed', 'the claims reader died')
 const { judged } = claims
 
+// A regrade without the facts behind it keeps the old level and loses coverage.
 const unjudged = [
   ...carried.filter((_, i) => !rechecked[i]).map(f => ({ kind: 'recheck', id: f.id })),
+  ...carried.filter((f, i) => { const v = rechecked[i]; return v && v.severity && v.severity !== f.severity && !graded(v) }).map(f => ({ kind: 'regrade', id: f.id })),
   ...claims.claims.filter((_, i) => !judged[i]).map(c => ({ kind: 'claim', commentId: c.commentId })),
 ]
 const misattributed = judged.filter(v => v && v.verdict === 'misattributed').length
@@ -174,7 +187,8 @@ const claimsOut = judged.filter(v => v && v.verdict !== 'misattributed')
 
 phase('Judge')
 const ours = audit.confirmed.flatMap(u => u.findings.map(f => ({
-  source: 'review', file: repoPath(f.file), line: f.line, dimension: u.dim, severity: sev(f.severity),
+  source: 'review', file: repoPath(f.file), line: f.line, dimension: u.dim,
+  severity: f.severity, confidence: f.confidence, impact: f.impact, severityReason: f.severityReason,
   why: f.why, snippet: f.snippet, verdictReason: f.verdict.reason, status: 'open',
 })))
 const confirmedClaims = claimsOut.filter(c => c.verdict === 'confirmed')
@@ -199,7 +213,10 @@ const answerOf = (f, v) => {
 // A dead verifier records no dispute, so the same replies are judged on the next run.
 const carriedOut = carried.map((f, i) => {
   const v = rechecked[i]
-  const base = { id: f.id, severity: sev(f.severity), file: f.file, line: f.line }
+  const kept = { severity: f.severity, confidence: f.confidence, impact: f.impact, severityReason: f.severityReason }
+  const regraded = v && v.severity && v.severity !== f.severity
+  const base = { id: f.id, file: f.file, line: f.line,
+    ...(regraded && graded(v) ? { severity: v.severity, confidence: v.confidence, impact: v.impact, severityReason: v.severityReason } : kept) }
   if (!v) return { ...base, status: f.status || 'open', recheckReason: 'unjudged' }
   const d = disputeOf[f.id]
   const out = { ...base, status: statusOf(f, v), recheckReason: v.reason }
