@@ -1519,6 +1519,16 @@ class Severity(unittest.TestCase):
         with self.assertRaisesRegex(facts.Unusable, "severity 'severe' is on no known scale"):
             ledger.show(self.led({'id': 'f1', 'severity': 'severe'}))
 
+    def test_fixed_and_withdrawn_ids_stay_on_their_record_and_are_never_recycled(self):
+        led = self.led({'id': f'pr{PR}-f1', 'status': 'fixed', 'severity': 'high'}, {'id': f'pr{PR}-f2', 'status': 'withdrawn', 'severity': 'low'},
+                       {'id': f'pr{PR}-f3', 'severity': 'medium'})
+        self.assertEqual([f['id'] for f in ledger.show(led)['open']], [f'pr{PR}-f3'])
+        again = {'status': 'open', 'file': 'src/a.c', 'line': 1, 'why': 'w', 'severity': 'high'}
+        out = ledger.number(led, {'findings': [{'id': f'pr{PR}-f3', 'status': 'open'}, again]})
+        self.assertEqual([f['id'] for f in out], [f'pr{PR}-f3', f'pr{PR}-f4'], 'a closed id is never recycled')
+        self.assertEqual({f['id']: f['status'] for f in led['reviews'][0]['findings']},
+                         {f'pr{PR}-f1': 'fixed', f'pr{PR}-f2': 'withdrawn', f'pr{PR}-f3': 'open'})
+
     def test_reports_order_by_severity_then_confidence_then_place_and_ids_never_move(self):
         led = self.led({'id': 'pr7-f1', 'severity': 'low', 'confidence': 'high'}, {'id': 'pr7-f2', 'severity': 'high', 'confidence': 'low'},
                        {'id': 'pr7-f3', 'severity': 'high', 'confidence': 'high', 'line': 9}, {'id': 'pr7-f4', 'severity': 'high', 'confidence': 'high', 'line': 2},
