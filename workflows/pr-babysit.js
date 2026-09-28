@@ -326,9 +326,25 @@ const INVENTORY = withSeal({
     pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
   },
 })
+// A --gate's failures come ready for the record the workflow builds around them.
+const GATE = {
+  type: 'object', required: ['link', 'failures'],
+  properties: {
+    link: { type: 'string' },
+    failures: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object', additionalProperties: false, required: ['firstError', 'signature', 'complete'],
+        properties: { firstError: CI_FAILURE.properties.firstError, signature: CI_FAILURE.properties.signature, complete: CI_FAILURE.properties.complete },
+      },
+    },
+  },
+}
 const EVIDENCE = withSeal({
-  type: 'object', required: ['head', 'detail'],
-  properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, detail: { type: 'string' } },
+  type: 'object', required: ['head', 'detail', 'gates'],
+  properties: {
+    error: { type: ['string', 'null'] }, head: { type: 'string' }, detail: { type: 'string' }, gates: { type: 'array', items: GATE },
+  },
 })
 // A judged check's verdict as collect.py stores it, and its stored digests.
 const VERDICT = {
@@ -1936,6 +1952,7 @@ const reconcileReplies = async (cycle, stuck, pointsOf, digestOf) => {
 
 // The CI lane: collect.py waits and lists without a model (ci:collect, one Haiku
 // call per wait slice), and the judge reads only the failing checks' evidence.
+// A SonarCloud gate is never judged: collect.py reads its failing conditions.
 // It composes the report the rest of the cycle reads, or returns null to re-arm.
 // Waits are short while the review lane may still push (its push supersedes this
 // run) and stop once it has pushed or the cycle has ended.
@@ -1958,6 +1975,8 @@ const ciLaneRun = async (cycle, lanes) => {
   // What went wrong with a collector's answer for `head`, or null when nothing did.
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
+  // An answer covers the asked links (distinct) when it names each exactly once.
+  const sameLinks = (got, want) => got.length === want.length && want.every(l => got.includes(l))
   // collect.py polls every 30 s, so a slice shorter than that would only list.
   let inv = null
   let left = ciWait * 60
@@ -1978,10 +1997,11 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)
     return null
   }
+  const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
   const reruns = ciReruns.filter(r => r.head === inv.head)
   const settling = failing.filter(c => reruns.some(r => r.sure && r.link === c.link))
   // A run's conclusion can still be updated under the same link, so the bucket must match too.
-  const reusable = (c) => !settling.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
+  const reusable = (c) => !settling.includes(c) && !gated.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
     ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket
   const unread = failing.filter(c => reusable(c) && !ciVerdicts.get(c.link).failures)
   if (unread.length) {
@@ -1999,18 +2019,18 @@ const ciLaneRun = async (cycle, lanes) => {
     }
   }
   const cached = failing.filter(reusable)
-  const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c))
+  const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c) && !gated.includes(c))
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
     realFailures: cached.flatMap(c => JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures))),
   }
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
-  if (judging.length === 0 || lanes.reviewPushed || lanes.ended) return report
+  if ((judging.length === 0 && gated.length === 0) || lanes.reviewPushed || lanes.ended) return report
   const links = judging.map(c => c.link)
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
   const prior = ciJudgedHead && ciJudgedHead !== inv.head ? ` --prior-head ${ciJudgedHead}` : ''
-  const ev = await collect(`ci:collect#${cycle}.f`, `failures ${links.map(l => `--check ${shq(l)}`).join(' ')}${prior}`, EVIDENCE)
+  const ev = await collect(`ci:collect#${cycle}.f`, `failures ${[...links.map(l => `--check ${shq(l)}`), ...gated.map(c => `--gate ${shq(c.link)}`)].join(' ')}${prior}`, EVIDENCE)
   // A push while the evidence was read restarted CI: judging it could re-run a superseded run.
   if (lanes.reviewPushed || lanes.ended) return report
   const evFault = faultOf(ev, inv.head)
@@ -2018,6 +2038,13 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: CI evidence not collected — ${evFault}`)
     return null
   }
+  if (!sameLinks(ev.gates.map(g => g.link), gated.map(c => c.link))) {
+    log(`cycle ${cycle}: SonarCloud gate evidence came back for ${JSON.stringify(ev.gates.map(g => g.link))}, asked for ${JSON.stringify(gated.map(c => c.link))} — re-arming`)
+    return null
+  }
+  report.realFailures.push(...gated.flatMap(c => ev.gates.find(g => g.link === c.link).failures
+    .map(f => ({ check: c.name, workflow: '', job: c.name, cell: null, runId: null, files: [], verdict: 'real', ...f }))))
+  if (judging.length === 0) return report
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} at head ${report.headSha} per your procedure. ` +
     `The collector's evidence for them is in ${ev.detail}. The checks, each needing exactly one entry in your reply: ` +
@@ -2028,7 +2055,7 @@ const ciLaneRun = async (cycle, lanes) => {
     { label: `ci:judge#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: JUDGED },
   ).catch(e => { log(`cycle ${cycle}: CI judge errored — ${e && e.message}`); return null })
   const answered = judged ? judged.checks.map(j => j.link) : []
-  if (!judged || answered.length !== links.length || links.some(l => !answered.includes(l))) {
+  if (!judged || !sameLinks(answered, links)) {
     if (judged) log(`cycle ${cycle}: CI judge answered ${JSON.stringify(answered)} for ${JSON.stringify(links)} — re-arming`)
     // It may have re-run any of them: none is re-run again on this head.
     for (const c of judging) noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: false })
@@ -2583,7 +2610,9 @@ const runCycle = async (cycle, entry) => {
       if (reviewsSettled && gates.length > 0) {
         const rig = unfixable.length - gates.length
         log(`cycle ${cycle}: CI red from the SonarCloud gate (${gates.map(rf => rf.firstError.slice(0, 80)).join('; ')})${rig ? ` and ${rig} rig-side failure(s)` : ''} — ` +
-          'its failing condition needs resolving (a rating or issue count clears when the answered issues are marked, by markSonar or a human; coverage or duplication needs its own change), or the caller accepts the gate')
+          (gates.some(rf => rf.complete)
+            ? 'its failing condition needs resolving (a rating or issue count clears when the answered issues are marked, by markSonar or a human; coverage or duplication needs its own change), or the caller accepts the gate'
+            : 'no failing condition was read: inspect the gate on SonarCloud, or relaunch once its check reports again'))
         return { pass: false, cycles: cycle, history, reason: 'ci-red-sonar-gate', deferred: outstanding() }
       }
       if (reviewsSettled) {

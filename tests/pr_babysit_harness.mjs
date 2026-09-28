@@ -136,6 +136,12 @@ const pathLine = quotedAfter(/commits\.py commit/)
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
 // push.py's receipt: what the pinned push URL holds after the push, and the PR
 // head when the workflow asked for it.
+// The failing checks collect.py lists for a CI fixture: a failure with no
+// workflow is a SonarCloud-style check whose link names no run (its own `link`
+// when the fixture gives one); every other one is an Actions job.
+const failedChecks = (ci) => (ci.realFailures || []).map((rf, i) => rf.workflow === ''
+  ? { name: rf.check, workflow: '', bucket: ci.bucket ?? 'fail', link: rf.link ?? `https://sonarcloud.io/dashboard?id=o_r&pullRequest=${i + 1}`, attempt: null }
+  : { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link: `https://github.com/o/r/actions/runs/1/job/${i + 1}`, attempt: `actions:${i + 1}` })
 const receiptOf = (head, prHead, detail, pushed = true) => ({
   pushed, detail, heads: PIN.pushUrls.map(url => ({ url, head })), ...(prHead === undefined ? {} : { prHead }),
 })
@@ -207,11 +213,8 @@ async function run(opts = {}) {
     }
     if (label.startsWith('ci:collect#')) {
       // A fixture names the report the CI lane should compose; collect.py's
-      // answers follow from it: each listed failure is one failing Actions job
-      // whose link names its run; a running fixture also counts one pending check.
-      const failed = (ci.realFailures || []).map((rf, i) => ({
-        name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link: `https://github.com/o/r/actions/runs/1/job/${i + 1}`, attempt: `actions:${i + 1}`,
-      }))
+      // answers follow from it (failedChecks); a running fixture also counts one pending check.
+      const failed = failedChecks(ci)
       // recall and remember use opts.store, collect.py's verdict store: a Map by
       // head and link that a relaunch shares with the launch before it.
       const text = String(prompt)
@@ -230,7 +233,13 @@ async function run(opts = {}) {
         answer = { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed, error: null }
       } else {
         if (opts.evidence) await opts.evidence(calls)
-        answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', error: null }
+        // A --gate's answer is its fixture's gate, by default one complete failure per fixture.
+        const gates = [...text.matchAll(/--gate '([^']*)'/g)].map(m => {
+          const rf = ci.realFailures[failed.findIndex(c => c.link === m[1])]
+          return { link: m[1], failures: [{ firstError: rf.firstError, signature: rf.firstError, complete: true }], ...rf.gate }
+        })
+        answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', gates, error: null }
+        if (opts.gates) answer = opts.gates(answer)
       }
       return answer === null ? null : conforms(options.schema, bare(answer), label)
     }
@@ -239,7 +248,8 @@ async function run(opts = {}) {
       const links = JSON.parse(String(prompt).match(/each needing exactly one entry in your reply: (\[.*\])\./)[1]).map(x => x.link)
       const failures = structuredClone(ci.realFailures)
         .map(rf => ({ workflow: 'ci', job: rf.check, cell: null, signature: rf.firstError, runId: 1, complete: true, ...rf }))
-      const judged = { checks: links.map((link, i) => ({ link, failures: [failures[i]] })), infraRerun: ci.infraRerun }
+      const failed = failedChecks(ci)
+      const judged = { checks: links.map(link => ({ link, failures: [failures[failed.findIndex(c => c.link === link)]] })), infraRerun: ci.infraRerun }
       return conforms(options.schema, opts.judge ? opts.judge(judged) : judged, label)
     }
     if (label.startsWith('reviews#')) {
@@ -5483,6 +5493,63 @@ test('an unplaced failure beside a SonarCloud gate still stops as unclassified',
   const gate = { check: 'SonarCloud', workflow: '', firstError: 'Quality Gate failed', files: [], verdict: 'real' }
   const both = await run({ ci: { status: 'red', infraRerun: [], realFailures: [gate, UNPLACED] }, args: { autoPush: true, maxCycles: 2 } })
   assert.equal(both.result.reason, 'ci-red-unclassified')
-  const judged = await run({ ci: { status: 'red', infraRerun: [], realFailures: [{ ...gate, verdict: 'unclassified' }] }, reviews: { findings: [], replies: [], bots: 'reviewed' }, args: { autoPush: true, maxCycles: 2 } })
-  assert.equal(judged.result.reason, 'ci-red-sonar-gate', 'the gate is its own class whatever the watcher called it')
+})
+
+const GATE = { check: 'SonarCloud Code Analysis', workflow: '', firstError: 'condition failed: new_security_rating 3 > 1', files: [] }
+const gateRun = (realFailures, extra = {}) => run({ ci: { status: 'red', infraRerun: [], realFailures }, args: { autoPush: true, maxCycles: 2 }, ...extra })
+
+test('a SonarCloud gate alone is read by collect.py and never judged', async () => {
+  const { calls, labels, result, logs } = await gateRun([GATE])
+  assert.deepEqual(ciLabels(labels), ['ci:collect#1.1', 'ci:collect#1.f'], 'no judge, nothing remembered')
+  const f = calls.find(c => c.label === 'ci:collect#1.f').prompt
+  assert.match(f, / failures --gate 'https:\/\/sonarcloud\.io\/dashboard\?id=o_r&pullRequest=1' --repo /)
+  assert.doesNotMatch(f, /--check/)
+  assert.equal(result.reason, 'ci-red-sonar-gate')
+  assert.ok(logs.some(l => /SonarCloud gate \(condition failed: new_security_rating 3 > 1\) — its failing condition needs resolving/.test(l)), logs.join('\n'))
+  assert.deepEqual(result.observation.ci.realFailures.map(({ check, workflow, job, cell, runId, complete, signature, verdict, state }) => ({ check, workflow, job, cell, runId, complete, signature, verdict, state })),
+    [{ check: GATE.check, workflow: '', job: GATE.check, cell: null, runId: null, complete: true, signature: GATE.firstError, verdict: 'real', state: 'sonarGate' }])
+})
+
+test('beside a SonarCloud gate the judge gets only the other checks, and a scanner Actions job is judged', async () => {
+  const actions = { check: 'build (pico)', workflow: 'Build', firstError: 'src/a.c:1: error: x', files: ['src/a.c'], verdict: 'real' }
+  const { calls } = await gateRun([GATE, actions], { args: { autoPush: false, maxCycles: 1 } })
+  const judge = calls.find(c => c.label === 'ci:judge#1').prompt
+  assert.match(judge, /job\/2/)
+  assert.doesNotMatch(judge, /sonarcloud/)
+  assert.match(calls.find(c => c.label === 'ci:collect#1.f').prompt, / failures --check '[^']*job\/2' --gate '[^']*sonarcloud[^']*' --repo /)
+  assert.ok(calls.some(c => c.label.startsWith('fix:')), 'the Actions failure is fixed')
+  const scanner = await gateRun([{ ...GATE, check: 'SonarQube (stm32h743eval)', workflow: 'static_analysis', verdict: 'real' }], { args: { autoPush: false, maxCycles: 1 } })
+  assert.ok(scanner.labels.includes('ci:judge#1'), 'a job with a workflow is judged')
+})
+
+test('each failing gate condition is its own complete failure', async () => {
+  const two = [
+    { firstError: 'condition failed: new_security_rating 3 > 1', signature: 'condition failed: new_security_rating 3 > 1', complete: true },
+    { firstError: 'condition failed: new_coverage 40 < 80', signature: 'condition failed: new_coverage 40 < 80', complete: true },
+  ]
+  const { result, logs } = await gateRun([{ ...GATE, gate: { failures: two } }])
+  assert.deepEqual(result.observation.ci.realFailures.map(rf => [rf.signature, rf.complete, rf.state]),
+    [[two[0].signature, true, 'sonarGate'], [two[1].signature, true, 'sonarGate']])
+  assert.ok(logs.some(l => /SonarCloud gate \(condition failed: new_security_rating 3 > 1; condition failed: new_coverage 40 < 80\)/.test(l)), logs.join('\n'))
+})
+
+test('a gate with no condition read stops without claiming one, and a mixed pair quotes both checks', async () => {
+  const unread = { failures: [{ firstError: 'SonarCloud gate not read: x', signature: 'SonarCloud gate not read: x', complete: false }] }
+  const okNow = { failures: [{ firstError: 'quality gate OK now, though its check failed', signature: 'quality gate OK now, though its check failed', complete: false }] }
+  for (const gate of [unread, okNow]) {
+    const { result, logs } = await gateRun([{ ...GATE, check: 'SonarCloud', link: 'https://github.com/o/r/runs/8', gate }])
+    assert.equal(result.reason, 'ci-red-sonar-gate')
+    assert.ok(logs.some(l => new RegExp(`SonarCloud gate \\(${gate.failures[0].firstError}\\) — no failing condition was read: inspect the gate on SonarCloud`).test(l)), logs.join('\n'))
+    assert.equal(result.observation.ci.realFailures[0].complete, false)
+  }
+  const { logs } = await gateRun([GATE, { ...GATE, check: 'SonarCloud', link: 'https://github.com/o/r/runs/8', gate: unread }])
+  assert.ok(logs.some(l => /SonarCloud gate \(condition failed: new_security_rating 3 > 1; SonarCloud gate not read: x\) — its failing condition needs resolving/.test(l)), logs.join('\n'))
+})
+
+test('gate evidence missing or doubled for a requested link re-arms', async () => {
+  for (const gates of [(a) => ({ ...a, gates: [] }), (a) => ({ ...a, gates: [a.gates[0], a.gates[0]] })]) {
+    const { labels, logs } = await gateRun([GATE], { gates, args: { autoPush: true, maxCycles: 1 } })
+    assert.ok(logs.some(l => /SonarCloud gate evidence came back for .*, asked for \["https:\/\/sonarcloud\.io[^"]*"\] — re-arming/.test(l)), logs.join('\n'))
+    assert.equal(labels.some(l => l.startsWith('ci:judge')), false)
+  }
 })

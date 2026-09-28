@@ -2,7 +2,7 @@
 """Collect a PR's CI state for a watcher, so no model spends turns waiting or listing.
 
   collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S]
-  collect.py failures --repo OWNER/NAME --pr N --head SHA --check LINK... [--prior-head SHA]
+  collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...] [--prior-head SHA]
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK...
 
@@ -27,9 +27,7 @@ one file per call, and prints {head, detail, error}. Each check's entry holds
 its saved `log` and the diagnostic lines of every step that reported an error.
 The log is the job's whole log without ANSI codes, NULs and timestamps for an
 Actions job, but only tails for the others: the last 150 lines of each failed
-CircleCI step, Read the Docs' notes with 40-line tails of failed commands, and
-for a sonarcloud.io link naming the project and the PR, its quality gate's
-status and failing conditions (SONAR_TOKEN when set, sent to sonarcloud.io only).
+CircleCI step and Read the Docs' notes with 40-line tails of failed commands.
 For an Actions job the entry also holds the newest run on the base branch in
 which the same job ran, with its conclusion and the diagnostic lines both
 share, and `cells`. Cells are an adapter for tinyusb's test/hil/hil_test.py:
@@ -51,6 +49,17 @@ When any check was read, the detail file lists the PR's `changed`
 paths (null with `changedError` when they could not be read or may be
 incomplete), and the PR head is read again after them. A --check that is no longer a failing check of the head is a stale
 snapshot: exit 1, before anything is read. Read the Docs needs RTD_TOKEN (see rtd.py).
+
+A --gate (a red SonarCloud gate check; failures needs a --check or a --gate,
+no link twice) is stale the same way, stays out of the detail file and is
+printed in `gates` (always present), one {link, failures} each: its
+sonarcloud.io link naming the project and the PR is read for the quality
+gate's status (SONAR_TOKEN when set, sent to sonarcloud.io only), and
+`failures` is [{firstError, signature, complete}], one complete entry per
+failing condition of an ERROR gate that names its metric, value, comparator
+and threshold, or else one incomplete entry, its firstError saying why: the
+gate lists none, reads passing now, or could not be read. The PR head is read
+again after the gates too.
 
 remember: stores a judge's verdicts for the head beside its evidence, so a
 later launch recalls them instead of carrying them in its state. It reads a
@@ -98,6 +107,7 @@ HIL_FAILED = ('Failed:', 'Flash Failed:')
 LINE = 500
 SONARCLOUD = 'https://sonarcloud.io'
 COMPARATOR = {'GT': '>', 'LT': '<'}
+CONDITION = ('metricKey', 'actualValue', 'comparator', 'errorThreshold')
 
 
 class Failed(Exception):
@@ -396,10 +406,10 @@ def readthedocs(link, folder, cache):
             'firstError': first, 'signature': signature(first), 'files': [], 'diagnostics': lines[:KEEP]}
 
 
-def sonarcloud(link, pr, folder):
-    """The PR's quality gate on SonarCloud: its status and each failing condition."""
+def gate_conditions(link, pr):
+    """The PR's quality gate on SonarCloud: its status and a line for each failing condition."""
     q = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
-    if len(q.get('id', [])) != 1 or q.get('pullRequest') != [str(pr)]:
+    if not link.startswith(f'{SONARCLOUD}/') or len(q.get('id', [])) != 1 or q.get('pullRequest') != [str(pr)]:
         raise Failed(f'not a SonarCloud link naming one project and PR #{pr}: {link}')
     project = q['id'][0]
     query = urllib.parse.urlencode({'projectKey': project, 'pullRequest': pr})
@@ -414,19 +424,32 @@ def sonarcloud(link, pr, folder):
         raise Failed(f'SonarCloud quality gate of {project} PR #{pr}: HTTP {e.code} {e.msg}: {e.read().decode(errors="replace")[:200]}')
     except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
         raise Failed(f'SonarCloud quality gate of {project} PR #{pr}: {e}')
-    failing = [c for c in gate.get('conditions') or [] if c.get('status') == 'ERROR']
+    conditions = gate.get('conditions') or [] if isinstance(gate, dict) else None
+    if not isinstance(conditions, list) or not all(isinstance(c, dict) for c in conditions):
+        raise Failed(f'SonarCloud quality gate of {project} PR #{pr}: unexpected answer {json.dumps(gate)[:200]}')
     status = gate.get('status')
-    lines = [f'quality gate {status}'] + [
-        f'condition failed: {c.get("metricKey")} {c.get("actualValue")} {COMPARATOR.get(c.get("comparator"), c.get("comparator"))} {c.get("errorThreshold")}'
+    failing = [c for c in conditions if c.get('status') == 'ERROR']
+    if status != 'ERROR' and failing:
+        raise Failed(f'SonarCloud quality gate of {project} PR #{pr} is {status} with failing conditions listed')
+    if any(c.get(k) in (None, '') for c in failing for k in CONDITION):
+        raise Failed(f'SonarCloud quality gate of {project} PR #{pr} lists a failing condition without its {", ".join(CONDITION)}')
+    return status, [
+        f'condition failed: {c["metricKey"]} {c["actualValue"]} {COMPARATOR.get(c["comparator"], c["comparator"])} {c["errorThreshold"]}'
         for c in failing]
-    if failing:
-        first = lines[1]
-    elif status == 'ERROR':
-        first = 'quality gate ERROR with no failing condition listed'
-    else:  # the gate is read now; the check reported an earlier analysis
-        first = f'quality gate {status} now, though its check failed: SonarCloud may have analysed again since'
-    return {'log': save(folder, f'sonarcloud-{project}-{pr}.log', lines), 'base': None,
-            'firstError': first, 'signature': signature(first), 'files': [], 'diagnostics': lines[:KEEP]}
+
+
+def gate(link, pr):
+    """A red gate check's failures for the caller's records: one per failing condition, complete,
+    or one incomplete when the gate lists none or could not be read."""
+    try:
+        status, lines = gate_conditions(link, pr)
+    except Failed as e:
+        lines, first = [], f'SonarCloud gate not read: {e}'
+    else:  # a gate read passing now had its check report an earlier analysis
+        first = ('quality gate ERROR with no failing condition listed' if status == 'ERROR' else
+                 f'quality gate {status} now, though its check failed: SonarCloud may have analysed again since')
+    failures = [{'firstError': line, 'signature': signature(line), 'complete': True} for line in lines]
+    return {'link': link, 'failures': failures or [{'firstError': first, 'signature': signature(first), 'complete': False}]}
 
 
 def circle(repo, number, folder):
@@ -461,10 +484,10 @@ def changed_paths(repo, pr):
     return names, None
 
 
-def failures(repo, pr, head, links, prior_head=None):
+def failures(repo, pr, head, links, prior_head=None, gates=()):
     now = inventory(repo, pr, head, 0)
     failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
-    stale = [link for link in links if link not in failing]
+    stale = [link for link in (*links, *gates) if link not in failing]
     if stale:
         raise Failed('stale snapshot: no longer failing checks of the head: ' + ', '.join(stale))
     folder = evidence_dir(repo, pr, head)
@@ -472,8 +495,6 @@ def failures(repo, pr, head, links, prior_head=None):
     for link in links:
         check = failing[link]
         kind, _, ident = (check['attempt'] or 'other:').partition(':')
-        if kind == 'other' and link.startswith(f'{SONARCLOUD}/'):
-            kind = 'sonarcloud'
         entry = {'link': link, 'attempt': check['attempt'], 'bucket': check['bucket'], 'provider': kind,
                  'name': check['name'], 'error': None}
         try:
@@ -483,8 +504,6 @@ def failures(repo, pr, head, links, prior_head=None):
                 entry.update(readthedocs(link, folder, cache))
             elif kind == 'circleci':
                 entry.update(circle(repo, ident, folder))
-            elif kind == 'sonarcloud':
-                entry.update(sonarcloud(link, pr, folder))
             else:
                 entry['error'] = 'no reader for this check: its link names no run'
         except (Failed, rtd.Failed, circleci.Failed) as e:
@@ -492,18 +511,20 @@ def failures(repo, pr, head, links, prior_head=None):
         checks.append(entry)
     if prior_head:
         prior_verdicts(repo, pr, prior_head, checks)
+    read = [gate(link, pr) for link in gates]
     out = {'head': head, 'baseRef': now['baseRef']}
     if any(c['error'] is None for c in checks):
         out['changed'], why = changed_paths(repo, pr)
         if why:
             out['changedError'] = why
-        # The paths must be this head's, like every log above.
+    # The paths and gates must be this head's, like every log above.
+    if read or 'changed' in out:
         after = pull(repo, pr)['headRefOid']
         if after != head:
             raise Failed(f'PR #{pr} head moved to {after} while collecting')
     detail = folder / f'failures-{time.time_ns()}.json'
     detail.write_text(json.dumps({**out, 'checks': checks}, indent=1))
-    return {'head': head, 'detail': str(detail)}
+    return {'head': head, 'detail': str(detail), 'gates': read}
 
 
 def main(argv=None):
@@ -514,19 +535,24 @@ def main(argv=None):
     p.add_argument('--head', required=True, help='the head SHA the caller expects')
     p.add_argument('--wait-seconds', type=int, default=0)
     p.add_argument('--check', action='append', default=[], metavar='LINK')
+    p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate check, read for the caller')
     p.add_argument('--prior-head', help='failures: the head whose stored verdicts to show beside matching cells')
     a = p.parse_args(argv)
     if a.prior_head and (a.command != 'failures' or not SHA.fullmatch(a.prior_head) or a.prior_head == a.head):
         p.error('--prior-head is for failures: a full 40-hex SHA other than --head')
-    if (a.command in ('failures', 'recall')) != bool(a.check):
-        p.error('--check is for failures and recall, which need at least one')
+    if a.gate and a.command != 'failures':
+        p.error('--gate is for failures')
+    if (a.command in ('failures', 'recall')) != bool(a.check or a.gate):
+        p.error('--check is for failures and recall, which need at least one (failures: a --check or a --gate)')
+    if len({*a.check, *a.gate}) != len(a.check) + len(a.gate):
+        p.error('a link is given more than once')
     if not SHA.fullmatch(a.head):
         p.error('--head must be a full 40-hex SHA')
     try:
         if a.command == 'inventory':
             out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)))
         elif a.command == 'failures':
-            out = failures(a.repo, a.pr, a.head, a.check, a.prior_head)
+            out = failures(a.repo, a.pr, a.head, a.check, a.prior_head, a.gate)
         elif a.command == 'remember':
             out = remember(a.repo, a.pr, a.head, sys.stdin.read())
         else:
