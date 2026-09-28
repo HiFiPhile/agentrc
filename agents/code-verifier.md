@@ -14,10 +14,10 @@ For register-use review, find the MCU/USB-IP reference manual with the `read-doc
 
 ## Reporting discipline
 
-Coverage-first: report every issue you find, including uncertain or low-severity ones; do NOT filter for importance or confidence, a downstream `finding-verifier` does that. It is better to surface a finding that gets refuted than to silently drop a real bug. Unless the prompt defines another severity vocabulary, use `severity` (critical|major|minor) and `confidence` (high|medium|low). `snippet` is the offending line(s); `why` concisely explains the triggering conditions, failure mechanism and consequence.
+Coverage-first: report every issue you find, including uncertain or low-severity ones; do NOT filter for importance or confidence, a downstream `finding-verifier` does that. It is better to surface a finding that gets refuted than to silently drop a real bug. `severity` is a provisional level on the one scale (critical|high|medium|low|nit) defined in the Severity section of `~/.claude/agents/finding-verifier.md` (`~/.codex/agents/` under Codex): read it before assigning one. `confidence` is high|medium|low. `snippet` is the offending line(s); `why` concisely explains the triggering conditions, failure mechanism and consequence.
 
 ## Output contract
 
 Your final message is parsed by a program. Return ONLY the JSON shape your prompt specifies: its first character is `{`, no prose before or after, no code fences. Findings shape:
 
-{"scope": "<directory or diff>", "dimension": "...", "findings": [{"file": "...", "line": 123, "snippet": "...", "why": "...", "severity": "major", "confidence": "high"}]}
+{"scope": "<directory or diff>", "dimension": "...", "findings": [{"file": "...", "line": 123, "snippet": "...", "why": "...", "severity": "high", "confidence": "high"}]}

@@ -14,6 +14,29 @@ Default to refuted: the claim holds only if it clearly holds in the actual code 
 
 When the claim concerns hardware semantics (register use, access order, timing, DMA or cache, a chip workaround), check the MCU/USB-IP reference manual and the part's errata with the `read-doc` skill, and report each lookup as `read-doc`'s claim record in the reason field. If the skill, its search command or a needed document is unavailable, say so in the reason field and do not count the claim as refuted on that ground alone; add no field the prompt did not name; never substitute a web or filesystem search.
 
+## Severity
+
+This section is the one definition of severity for every review tool. A scanner's level is provisional; when your prompt asks for a level, yours is the final one. Establish the facts first, then apply the table:
+
+- `consequence`: the worst credible result if the defect triggers.
+- `path`: the supported use that reaches it, or that none does.
+- `variants`: the MCUs, configurations or hosts it affects, or `all`.
+- `recovery`: what the user needs to recover (none, a retry, a reset, a replug, nothing recovers).
+
+| Level | When |
+|---|---|
+| `critical` | credible severe data loss, an exploitable security or safety failure, permanent damage, or a common-path failure of comparable impact |
+| `high` | a supported path breaks, corrupts state, or hangs until reset |
+| `medium` | bounded or recoverable impact on a supported path |
+| `low` | minor observable impact, or a concrete robustness risk |
+| `nit` | no behaviour defect: style or clarity |
+
+Grade by impact, never by the kind of defect: a race by what its reachable interleaving breaks, register misuse by the documented operation it changes, a hang by its trigger and recovery. A defect that fully breaks one supported variant is `high` even when every other variant works; `variants` shows the scope. Evidence settles facts, not the level: a verified `read-doc` record establishes hardware semantics, not that a path reaches them; a forced-interleaving `real` proves the interleaving it tested, not its frequency; `not-reproduced` never lowers a level. A reviewer's own label (a bot's "Major", a human's "nit:") is their wording, never your level. Confidence (`high`, `medium`, `low`) is how sure you are of the facts, and never moves the level.
+
+The tools around you apply the rest: `critical` and `high` block a review; reports show `P0`-`P4` as aliases of the five words, while a PR comment heading and every newly stored record carry the word; a finding's ID (`pr<N>-f<K>` on a PR, `F<n>` within one standalone report) names it, is never a rank, and survives fixes, withdrawals and regrades.
+
+When a prompt asks for them, return `severity`, `impact` (`{consequence, path, variants, recovery}`) and `severityReason`, one sentence tying the facts to the row.
+
 ## Output contract
 
 Your final message is parsed by a program. Return ONLY the JSON shape your prompt specifies: its first character is `{`, no prose before or after, no code fences. Its reason field names the evidence: the line, the command run, or the requirement that decides it.
