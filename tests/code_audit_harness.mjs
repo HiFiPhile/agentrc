@@ -13,9 +13,20 @@ const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer'
 const finding = (line, why) =>
   ({ file: 'src/a.c', line, snippet: 'x = y;', why, severity: 'high', confidence: 'medium' })
 
+const IMPACT = { consequence: 'wrong data', path: 'every OUT transfer', variants: 'all', recovery: 'reset' }
+// A verifier's graded verdict; `over` replaces fields, e.g. a regrade or a missing level.
+const graded = (real, over = {}) => real
+  ? { real, reason: 'holds', severity: 'high', impact: IMPACT, severityReason: 'breaks a supported path', confidence: 'high', ...over }
+  : { real, reason: 'refuted', severity: null, impact: null, severityReason: null, confidence: null }
+// The finding a confirmed verdict yields: the verifier's level and facts replace the scanner's.
+const confirmedAs = (f, id, over = {}) => {
+  const v = graded(true, over)
+  return { ...f, severity: v.severity, confidence: v.confidence, impact: v.impact, severityReason: v.severityReason, verdict: { real: true, reason: 'holds' }, id }
+}
+
 // Drive the workflow against stub agents keyed by label prefix. `scans` maps
 // "<dir>|<dim>" to a findings array (null = dead scanner); `verdicts` maps a
-// finding's `why` to real (null = dead verifier). `reverse` makes later
+// finding's `why` to real, or to a full verdict object (null = dead verifier). `reverse` makes later
 // verifiers of a batch resolve before earlier ones; `finished` records the
 // order in which verifiers actually returned.
 async function run(args, { scans = {}, verdicts = {}, reverse = false } = {}) {
@@ -38,7 +49,7 @@ async function run(args, { scans = {}, verdicts = {}, reverse = false } = {}) {
       const real = verdicts[f.why]
       if (reverse) await new Promise(r => setTimeout(r, 20 - 5 * Number(options.label.split(':')[2])))
       finished.push(f.why)
-      return real === null ? null : { real, reason: real ? 'holds' : 'refuted' }
+      return real === null ? null : typeof real === 'object' ? real : graded(real)
     }
     throw new Error(`unexpected label ${options.label}`)
   }
@@ -102,16 +113,13 @@ test('mixed verdicts keep only confirmed findings, each verified once by finding
   assert.ok(verifies.every(c => c.agentType === 'finding-verifier'))
   assert.ok(verifies.every(c => c.schema.required.includes('real')))
   assert.match(verifies[0].prompt, /^Adversarially verify ONE review finding about src\/portable\/x\.\nDimension: correctness\nFinding: \{/)
-  assert.match(verifies[0].prompt, /Try to REFUTE it; real=true only if it survives your best attempt\.$/)
+  assert.match(verifies[0].prompt, /Try to REFUTE it; real=true only if it survives your best attempt\. If real, set severity/)
   assert.doesNotMatch(verifies[0].prompt, /ISR|datasheet|macros/)
   assert.deepEqual(result.dropped, [])
   assert.deepEqual(result.unverified, [])
   assert.deepEqual(result.confirmed, [{
     dir: 'src/portable/x', dim: 'correctness',
-    findings: [
-      { ...finding(10, 'real bug'), verdict: { real: true, reason: 'holds' } },
-      { ...finding(10, 'another real'), verdict: { real: true, reason: 'holds' } },
-    ],
+    findings: [confirmedAs(finding(10, 'real bug'), 'F1'), confirmedAs(finding(10, 'another real'), 'F2')],
   }])
 })
 
@@ -120,10 +128,10 @@ test('a dead scanner is reported as dropped, a dead verifier as unverified, neve
   const scans = { 'src/a|correctness': null, 'src/b|correctness': [finding(5, 'lost'), finding(6, 'kept')] }
   const { result, logs } = await run(args, { scans, verdicts: { lost: null, kept: true } })
   assert.deepEqual(result.dropped, [{ dir: 'src/a', dim: 'correctness' }])
-  assert.deepEqual(result.unverified, [{ dir: 'src/b', dim: 'correctness', findings: [finding(5, 'lost')] }])
-  assert.deepEqual(result.confirmed, [{ dir: 'src/b', dim: 'correctness', findings: [{ ...finding(6, 'kept'), verdict: { real: true, reason: 'holds' } }] }])
+  assert.deepEqual(result.unverified, [{ dir: 'src/b', dim: 'correctness', findings: [{ ...finding(5, 'lost'), id: 'F1' }] }])
+  assert.deepEqual(result.confirmed, [{ dir: 'src/b', dim: 'correctness', findings: [confirmedAs(finding(6, 'kept'), 'F2')] }])
   assert.ok(logs.some(l => /1 scan unit\(s\) dropped/.test(l)), logs.join('\n'))
-  assert.ok(logs.some(l => /src\/b: 1 finding\(s\) lost to dead verifiers/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /src\/b: 1 finding\(s\) unverified \(1 dead verifier\(s\), 0 confirmed without complete grading\)/.test(l)), logs.join('\n'))
 })
 
 test('verdicts stay attached to their finding when verifiers finish in reverse order', async () => {
@@ -166,4 +174,50 @@ test('a dir that looks like pathspec magic stays a literal path', async () => {
   const base = 'a'.repeat(40), head = 'b'.repeat(40)
   const { calls } = await run({ dirs: [':(exclude)src'], dimensions: ['correctness'], diff: { base, head } }, { scans: { ':(exclude)src|correctness': [] } })
   assert.ok(calls[0].prompt.includes("-- ':(literal,top):(exclude)src'`"), calls[0].prompt)
+})
+
+test('the verifier sets the final level and facts; the scanner\'s level is only a guess', async () => {
+  const scans = { 'src/portable/x|correctness': [finding(10, 'regraded')] }
+  const verdicts = { regraded: graded(true, { severity: 'medium', confidence: 'low' }) }
+  const { result, calls } = await run(ONE, { scans, verdicts })
+  const f = result.confirmed[0].findings[0]
+  assert.equal(f.severity, 'medium')
+  assert.equal(f.confidence, 'low')
+  assert.deepEqual(f.impact, IMPACT)
+  const verify = calls.find(c => c.label.startsWith('verify:'))
+  for (const k of ['severity', 'impact', 'severityReason', 'confidence']) assert.ok(verify.schema.required.includes(k), k)
+  assert.match(verify.prompt, /Severity section of your role/)
+})
+
+test('a confirmed verdict without its level or facts is unverified, never silently kept', async () => {
+  const scans = { 'src/portable/x|correctness': [finding(1, 'no level'), finding(2, 'no facts'), finding(3, 'blank fact'), finding(4, 'ok')] }
+  const verdicts = {
+    'no level': graded(true, { severity: null }),
+    'no facts': graded(true, { impact: null }),
+    'blank fact': graded(true, { impact: { ...IMPACT, recovery: '' } }),
+    ok: true,
+  }
+  const { result, logs } = await run(ONE, { scans, verdicts })
+  assert.deepEqual(result.confirmed[0].findings.map(f => f.why), ['ok'])
+  assert.deepEqual(result.unverified[0].findings.map(f => f.why), ['no level', 'no facts', 'blank fact'])
+  assert.ok(logs.some(l => /3 finding\(s\) unverified \(0 dead verifier\(s\), 3 confirmed without complete grading\)/.test(l)), logs.join('\n'))
+})
+
+test('F<n> is contiguous over confirmed and unverified findings, in unit then file and line order; refuted takes none', async () => {
+  const args = { dirs: ['src/a', 'src/b'], dimensions: ['correctness'] }
+  const scans = {
+    'src/a|correctness': [{ ...finding(30, 'a30'), file: 'src/a/z.c' }, { ...finding(9, 'a9'), file: 'src/a/y.c' }, { ...finding(5, 'a5-refuted'), file: 'src/a/y.c' }],
+    'src/b|correctness': [{ ...finding(2, 'b2-lost'), file: 'src/b/x.c' }, { ...finding(1, 'b1'), file: 'src/b/x.c' }],
+  }
+  const verdicts = { a30: true, a9: true, 'a5-refuted': false, 'b2-lost': null, b1: true }
+  const { result } = await run(args, { scans, verdicts, reverse: true })
+  const ids = Object.fromEntries([...result.confirmed, ...result.unverified].flatMap(r => r.findings).map(f => [f.why, f.id]))
+  assert.deepEqual(ids, { a9: 'F1', a30: 'F2', b1: 'F3', 'b2-lost': 'F4' })
+})
+
+test('the scan schema takes only the one scale', async () => {
+  const { calls } = await run(ONE, { scans: { 'src/portable/x|correctness': [] } })
+  const item = calls[0].schema.properties.findings.items.properties
+  assert.deepEqual(item.severity.enum, ['critical', 'high', 'medium', 'low', 'nit'])
+  assert.deepEqual(item.confidence.enum, ['high', 'medium', 'low'])
 })

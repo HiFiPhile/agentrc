@@ -35,6 +35,9 @@ const scopeOf = dir => args.diff
   ? ` The checkout is at ${args.diff.head}. Judge only what \`git diff ${args.diff.base} ${args.diff.head}${pathspec(dir)}\` introduces or breaks, reading the surrounding code for context.`
   : ''
 
+// The one scale, defined in finding-verifier.md's Severity section.
+const LEVELS = ['critical', 'high', 'medium', 'low', 'nit']
+const CONFIDENCE = ['high', 'medium', 'low']
 const FINDINGS = {
   type: 'object', additionalProperties: false,
   required: ['scope', 'dimension', 'findings'],
@@ -47,17 +50,29 @@ const FINDINGS = {
         required: ['file', 'line', 'snippet', 'why', 'severity', 'confidence'],
         properties: {
           file: { type: 'string' }, line: { type: 'integer' }, snippet: { type: 'string' },
-          why: { type: 'string' }, severity: { type: 'string' }, confidence: { type: 'string' },
+          why: { type: 'string' }, severity: { enum: LEVELS }, confidence: { enum: CONFIDENCE },
         },
       },
     },
   },
 }
+const IMPACT = {
+  type: ['object', 'null'], additionalProperties: false,
+  required: ['consequence', 'path', 'variants', 'recovery'],
+  properties: { consequence: { type: 'string' }, path: { type: 'string' }, variants: { type: 'string' }, recovery: { type: 'string' } },
+}
 const VERDICT = {
   type: 'object', additionalProperties: false,
-  required: ['real', 'reason'],
-  properties: { real: { type: 'boolean' }, reason: { type: 'string' } },
+  required: ['real', 'reason', 'severity', 'impact', 'severityReason', 'confidence'],
+  properties: {
+    real: { type: 'boolean' }, reason: { type: 'string' },
+    severity: { enum: [...LEVELS, null] }, impact: IMPACT,
+    severityReason: { type: ['string', 'null'] }, confidence: { enum: [...CONFIDENCE, null] },
+  },
 }
+// A confirmed finding without its level and the facts behind it is not a verified one.
+const graded = v => LEVELS.includes(v.severity) && CONFIDENCE.includes(v.confidence) &&
+  !!v.severityReason && !!v.impact && ['consequence', 'path', 'variants', 'recovery'].every(k => v.impact[k])
 
 const pairs = dirs.flatMap((dir, i) => dims.map((dim, j) => ({ dir, dim, id: `d${i}x${j}` })))
 log(`${pairs.length} scan units (${dirs.length} dirs x ${dims.length} dimensions)`)
@@ -76,15 +91,21 @@ const results = await pipeline(
     return parallel(scan.findings.map((f, k) => () =>
       agent(
         `Adversarially verify ONE review finding about ${p.dir}.\nDimension: ${p.dim}\nFinding: ${JSON.stringify(f)}\n` +
-        `Read the cited code and enough surrounding context to judge.${scopeOf(p.dir)} Try to REFUTE it; real=true only if it survives your best attempt.`,
+        `Read the cited code and enough surrounding context to judge.${scopeOf(p.dir)} Try to REFUTE it; real=true only if it survives your best attempt. ` +
+        `If real, set severity, impact, severityReason and confidence by the Severity section of your role; the finding's own severity is the scanner's guess. If refuted, set them null.`,
         { label: `verify:${p.id}:${k}`, phase: 'Verify', agentType: 'finding-verifier', schema: VERDICT },
-      ).then(v => v && { ...f, verdict: v })
+      ).then(v => v && { f, v })
     )).then(vs => {
-      const unverified = scan.findings.filter((_, k) => !vs[k])
+      const ungraded = vs.filter(x => x && x.v.real && !graded(x.v)).length
+      const unverified = scan.findings.filter((_, k) => !vs[k] || (vs[k].v.real && !graded(vs[k].v)))
       if (unverified.length > 0) {
-        log(`${p.dir}: ${unverified.length} finding(s) lost to dead verifiers — treat as unverified, re-run if needed`)
+        log(`${p.dir}: ${unverified.length} finding(s) unverified (${unverified.length - ungraded} dead verifier(s), ${ungraded} confirmed without complete grading) — re-run if needed`)
       }
-      return { dir: p.dir, dim: p.dim, findings: vs.filter(x => x && x.verdict.real), unverified }
+      const findings = vs.filter(x => x && x.v.real && graded(x.v)).map(({ f, v }) => ({
+        ...f, severity: v.severity, confidence: v.confidence, impact: v.impact, severityReason: v.severityReason,
+        verdict: { real: true, reason: v.reason },
+      }))
+      return { dir: p.dir, dim: p.dim, findings, unverified }
     })
   },
 )
@@ -97,5 +118,12 @@ const unverified = results.filter(r => r.unverified.length > 0)
   .map(r => ({ dir: r.dir, dim: r.dim, findings: r.unverified }))
 const confirmed = results.filter(r => r.findings.length > 0)
   .map(r => ({ dir: r.dir, dim: r.dim, findings: r.findings }))
+// F<n> names a finding within this one report: assigned after verification, so a
+// refuted claim takes no number, in unit order and then file and line.
+const byPlace = (a, b) => a.file.localeCompare(b.file) || a.line - b.line
+let n = 0
+for (const r of results) {
+  for (const f of [...r.findings, ...r.unverified].sort(byPlace)) f.id = `F${++n}`
+}
 log(`${confirmed.length} scan units produced confirmed findings`)
 return { confirmed, dropped, unverified }
