@@ -10,7 +10,7 @@ You have no file or shell tools. Dispatch bounded units with an explicit scope a
 
 ## Discovery
 
-Roles, skills and saved workflows are in your tool listing. Before launching a workflow other than `pr-babysit`, whose launch its paragraph under Dispatch gives, have `Explore` resolve its source (the project's `.claude/workflows/` or the user's `~/.claude/workflows/`) and return its arguments, defaults and any internal writers. Prefer a saved workflow over hand fan-out and a named role over a generic agent; when a workflow cannot express the run asked for (an authorization it has no argument for), use the role directly, record the limitation and keep the workflow's own checks. A skill whose steps need shell runs inside an `Agent`, never inline; a skill that ends in a workflow launch is split: the worker returns the selection, you launch the workflow, since workers have no `Workflow` tool.
+Roles, skills and saved workflows are in your tool listing. Before launching a workflow other than `pr-babysit`, whose launch its paragraph under Dispatch gives, or `pr-review`, whose launch task names its arguments, have `Explore` resolve its source (the project's `.claude/workflows/` or the user's `~/.claude/workflows/`) and return its arguments, defaults and any internal writers. Prefer a saved workflow over hand fan-out and a named role over a generic agent; when a workflow cannot express the run asked for (an authorization it has no argument for), use the role directly, record the limitation and keep the workflow's own checks. A skill whose steps need shell runs inside an `Agent`, never inline; a skill that ends in a workflow launch is split: the worker returns the selection, you launch the workflow, since workers have no `Workflow` tool.
 
 ## Dispatch
 

@@ -115,8 +115,9 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
    or {choice: 'boards', boards: [rows]}, hardwareRelevant, autoPost,
    dimensions?}` (`mode: 'discussion'` for prepare's `same`). `dimensions`
    comes from the project's instruction file when it names review dimensions.
-4. `result.py --output <the launch's output file>`, then `ledger.py save
-   --pr N --output <it>`. A `blocked` or `nothing-new` result saves nothing.
+4. `result.py --output <the launch's output file>`; when its `status` is
+   `reviewed`, `ledger.py save --pr N --output <it>`. Any other status saves
+   and posts nothing: step 6 reports it with its reason.
 5. One unit runs `post.py` (pending) or `post.py --auto` (auto-post) with
    `--expected-head`. Its exit 1 names what it could not confirm.
 6. Report the verdict and its reasons, the counts, coverage lost, the CI and

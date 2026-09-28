@@ -245,7 +245,7 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('skip that unit: the investigation starts with two `hil-operator` runs of the cell with CI\'s seed, order and retry count', chief)
         self.assertIn('reproduces the symptom, not its cause', chief)
         self.assertIn('Launch it as `{ pr, autoPush, yieldAfterCycle: true, lane, stateRef }`', chief)
-        self.assertIn('Before launching a workflow other than `pr-babysit`, whose launch its paragraph under Dispatch gives, have `Explore` resolve', chief)
+        self.assertIn('Before launching a workflow other than `pr-babysit`, whose launch its paragraph under Dispatch gives, or `pr-review`, whose launch task names its arguments, have `Explore` resolve', chief)
         self.assertIn('unless the run is on a CI firmware artifact fetched as the repository\'s HIL contract describes, is built by one Sonnet unit', chief)
 
     def test_hil_operator_resolves_the_project_contract_and_refuses_without_it(self):
