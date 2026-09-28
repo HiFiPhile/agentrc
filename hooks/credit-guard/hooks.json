@@ -1,0 +1,5 @@
+{
+  "SessionStart": [{"matcher": "startup|resume|clear|fork", "hooks": [{"type": "command", "command": "credit_guard.py", "timeout": 15}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "credit_guard.py", "timeout": 15}]}],
+  "PreToolUse": [{"hooks": [{"type": "command", "command": "credit_guard.py", "timeout": 15}]}]
+}

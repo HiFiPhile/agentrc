@@ -79,6 +79,8 @@ def verdict(rc, result, body):
         return 1, 'no result event'
     if result.get('is_error'):
         return 1, f'result is an error ({result.get("subtype", "?")})'
+    if result.get('num_turns') == 0:
+        return 1, 'no model turn; see stream.jsonl'
     if not body:
         return 1, 'result has no text'
     return 0, 'result ok'
@@ -175,6 +177,8 @@ def main(argv=None):
                 warn('unusable', 'unusable stdout lines; see stderr.log')
         rc = child.wait()
     body = str(result.get('result') or '') if result is not None else ''
+    if result is not None and result.get('num_turns') == 0:
+        body = ''   # a hook refused the prompt: not chief's report
     code, reason = verdict(rc, result, body.strip())
     report = a.out / 'report.md'
     if body.strip():

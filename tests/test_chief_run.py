@@ -220,6 +220,8 @@ class ChiefRun(unittest.TestCase):
             ('error result', (init(), result('boom', is_error=True, subtype='error_during_execution')), {}, 1,
              'result is an error (error_during_execution)', True),
             ('empty result', (init(), result('  ')), {}, 1, 'result has no text', False),
+            ('prompt blocked by a hook', (init(), {**result('UserPromptSubmit operation blocked by hook:\nx'), 'num_turns': 0}),
+             {}, 1, 'no model turn; see stream.jsonl', False),
             ('claude failed', (init(), result()), {'FAKE_RC': '3'}, 3, 'claude exited 3', True),
             ('claude killed', (init(), result()), {'FAKE_SIGNAL': str(sig)}, 128 + sig, f'claude killed by signal {sig}', True),
         ]

@@ -111,6 +111,31 @@ model and effort; `on --model M --effort E` overrides the defaults at the top
 of `simplify_gate.py`. Session state lives under
 `~/.cache/agentrc/simplify-gate/`.
 
+## Credit guard (per config dir)
+
+`hooks/credit-guard` keeps a session on an account with extra usage enabled
+from spending credits. At session start it asks `/api/oauth/usage` once
+whether credits are enabled; if not, it stays off for that session. Otherwise
+it blocks the prompt, or denies the next tool call and ends the session, once
+any plan limit reaches 100%. Usage is re-read on a window that shrinks with
+headroom and burn rate (`HEADROOM` in `credit_guard.py`, tuned from
+`credit-guard/readings.log`); a read that fails once the window runs out,
+or a payload it cannot parse, blocks. It cannot stop a model call already
+running, a subagent's next turn, or a hook that Claude Code kills on timeout,
+and it does not know the session's model.
+
+`install.py` does not register it. Register it per config dir that needs it
+(`~/.claude-ada` here); the recipe refuses a dir that already has it:
+
+```sh
+d=~/.claude-ada; ! grep -q credit_guard.py $d/settings.json && mkdir -p $d/hooks &&
+ln -sfn ~/code/agentrc/hooks/credit-guard $d/hooks/credit-guard &&
+jq --arg c "$d/hooks/credit-guard/credit_guard.py" --slurpfile h ~/code/agentrc/hooks/credit-guard/hooks.json \
+  '.hooks = reduce ($h[0] | to_entries[]) as $e (.hooks // {}; .[$e.key] += [$e.value[] | .hooks |= map(.command = $c)])' \
+  $d/settings.json > $d/settings.json.new && chmod --reference=$d/settings.json $d/settings.json.new &&
+mv $d/settings.json.new $d/settings.json
+```
+
 ## Chief session
 
 `agents/chief.md` is a dispatch-only main session with no file or shell tools:
