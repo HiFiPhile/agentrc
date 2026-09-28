@@ -789,6 +789,7 @@ test('a relayed copy that does not match its seal gets one fresh agent; a second
   const plain = await run({ garble: cut('head', 'preflight') })
   assert.equal(plain.result.pass, true)
   assert.deepEqual(plain.labels.slice(0, 2), ['preflight', 'preflight.retry'])
+  assert.deepEqual(plain.calls.slice(0, 2).map(c => c.model), ['haiku', 'sonnet'], 'the fresh agent copies on Sonnet')
 
   const twice = await run({ garble: (l, a) => l.startsWith('preflight') ? cut('head')(l, a) : a })
   assert.equal(twice.result.reason, 'preflight-died', 'a second bad copy is a dead relay')
@@ -2371,6 +2372,28 @@ test('a broken challenge response fails the cycle', async () => {
     })
     assert.equal(result.reason, 'review-challenger-died')
   }
+})
+
+test('ids a challenger left unjudged go to one fresh challenger, alone', async () => {
+  const reviews = {
+    findings: [invalidFinding(), invalidFinding({ commentId: 2 })],
+    replies: [{ commentId: 1, body: 'no' }, { commentId: 2, body: 'no' }], bots: 'reviewed',
+  }
+  const answers = (...rounds) => { let n = 0; return () => { const ids = rounds[n++]; return ids && { verdicts: ids.map(id => ({ id, upheld: true, reason: 'stands' })) } } }
+  const healed = await run({ reviews, challengePerCycle: answers([0], [1]), args: { autoPush: true, maxCycles: 1 } })
+  assert.notEqual(healed.result.reason, 'review-challenger-died')
+  assert.ok(healed.logs.includes('cycle 1: the challenger judged 1 of 2 findings — a fresh one takes the rest'), healed.logs.join('\n'))
+  const retry = healed.calls.find(c => c.label === 'challenge#1.retry')
+  assert.deepEqual(JSON.parse(retry.prompt.match(/Findings: (\[.*\])\.$/s)[1]).map(x => x.id), [1])
+  assert.deepEqual(manifestOf(healed.calls, healed.labels.find(l => l.startsWith('replies#'))).map(r => r.commentId), [1, 2])
+
+  const revived = await run({ reviews, challengePerCycle: answers(null, [0, 1]), args: { autoPush: true, maxCycles: 1 } })
+  assert.notEqual(revived.result.reason, 'review-challenger-died', 'a dead challenger gets one fresh one for every id')
+  assert.deepEqual(JSON.parse(revived.calls.find(c => c.label === 'challenge#1.retry').prompt.match(/Findings: (\[.*\])\.$/s)[1]).map(x => x.id), [0, 1])
+
+  const still = await run({ reviews, challengePerCycle: answers([0], [0]), args: { autoPush: true, maxCycles: 1 } })
+  assert.equal(still.result.reason, 'review-challenger-died', 'the fresh one must judge exactly the ids left')
+  assert.equal(still.labels.some(l => l.startsWith('replies#')), false)
 })
 
 test('the summary marks an overturned finding', async () => {
@@ -5367,6 +5390,17 @@ test('without markSonar nothing goes to SonarCloud and the issue stays owed in t
   const { calls, result } = await run({ reviews: scanRefuted, args: { autoPush: true, maxCycles: 1 } })
   assert.equal(calls.some(c => c.label.startsWith('sonar#')), false)
   assert.deepEqual(result.state.answeredWith, [[3, { how: 'refutation', digest: 'd3', sonar: 'Not injectable: a list argv.' }]])
+})
+
+test('a repair naming no reply and no offered body is owed afresh; one with an offered body stays held', async () => {
+  const frozen = { dismissals: ['1#1'], notes: [], digest: 'd1', repair: { replyId: null, error: 'over length: a point exceeds 60 words or a line 300 characters' } }
+  const reviews = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' }
+  const base = (await run({ args: { ...YIELD } })).result.state
+  const owed = await run({ reviews, args: { ...YIELD, autoPush: true, state: seal({ ...base, debt: [[1, frozen]] }) } })
+  assert.deepEqual(manifestOf(owed.calls, owed.labels.find(l => l.startsWith('replies#'))).map(r => r.commentId), [1])
+  const offered = { ...frozen, attempt: { body: 'no', how: 'refutation', digest: 'd1' } }
+  const held = await run({ reviews, args: { ...YIELD, autoPush: true, state: seal({ ...base, debt: [[1, offered]] }) } })
+  assert.equal(held.labels.some(l => l.startsWith('replies#')), false, 'an offered body may be on the thread: a human reconciles')
 })
 
 test('the note is the body that was posted, and an edited comment is marked with no stale answer', async () => {

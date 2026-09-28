@@ -693,11 +693,12 @@ const relayAgent = async (prompt, opts) => {
   }
   return v
 }
-// A relay that died or did not match its seal gets one fresh agent; an error the
-// script reported is its answer. Only for a script that is safe to run twice.
+// A relay that died or did not match its seal gets one fresh agent, on Sonnet:
+// Haiku mis-copies a long line. An error the script reported is its answer. Only
+// for a script that is safe to run twice.
 const relayOnce = async (prompt, opts, retryPrompt = prompt) => {
-  const run = (p, label) => relayAgent(p, { ...opts, label }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
-  return (await run(prompt, opts.label)) ?? run(retryPrompt, `${opts.label}.retry`)
+  const run = (p, o) => relayAgent(p, o).catch(e => { log(`${o.label} errored — ${e && e.message}`); return null })
+  return (await run(prompt, opts)) ?? run(retryPrompt, { ...opts, label: `${opts.label}.retry`, model: 'sonnet' })
 }
 // facts.py's seal: fnv1a over the canonical JSON with null members left out. A
 // checked line has no error, so one a relay filled in (error: '') is not hashed.
@@ -862,7 +863,10 @@ const debt = new Map(restored
   ? restored.debt.map(([id, d]) => {
     const notes = new Set(d.notes || (d.note ? [NO_ID] : []))
     const seen = d.renumbered ? { seenSinceEdit: new Set(d.seenSinceEdit || [...d.dismissals, ...notes]) } : {}
-    return [id, { dismissals: new Set(d.dismissals), notes, ...seen, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]
+    // A repair naming no reply of ours and no offered body (an over-length draft an
+    // earlier version froze) has nothing on the thread to repair: the comment is owed afresh.
+    const repair = d.repair && (d.repair.replyId || d.attempt) ? { repair: d.repair } : {}
+    return [id, { dismissals: new Set(d.dismissals), notes, ...seen, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...repair, ...(d.attempt ? { attempt: d.attempt } : {}) }]
   })
   : [])
 for (const a of (restored && restored.acceptedFailures) || []) {
@@ -2204,7 +2208,7 @@ const runCycle = async (cycle, entry) => {
       })
       // The challenger is a second Claude role, not an independent model: an
       // independent second opinion is the chief session's coworker lane.
-      const ch = await agent(
+      const ask = (ids, label) => agent(
         `${IN_CHECKOUT}Another reviewer judged these findings on PR #${args.pr}. A dismissal (any verdict but 'valid') ` +
           "is about to be posted publicly and will close the reviewer's thread; a finding called 'valid' against an earlier " +
           'dismissal is about to be fixed. For every id, decide whether the finding is real: ' +
@@ -2214,16 +2218,21 @@ const runCycle = async (cycle, entry) => {
           'reason for departing from it (possibly null): a verdict of yours that differs from `earlier` also says the earlier one ' +
           'no longer holds, and your reason must say why. ' +
           'Return exactly one verdict per submitted id and no others.\n' +
-          `Findings: ${JSON.stringify(submitted)}.`,
-        { label: `challenge#${cycle}`, phase: 'Triage', agentType: 'finding-verifier', schema: CHALLENGE },
+          `Findings: ${JSON.stringify(ids.map(id => submitted[id]))}.`,
+        { label, phase: 'Triage', agentType: 'finding-verifier', schema: CHALLENGE },
       ).catch(e => { log(`cycle ${cycle}: challenger errored — ${e && e.message}`); return null })
-
-      // ids are indexes into challenged, so a bad one indexes to undefined.
-      const seen = new Set()
-      const complete = ch && Array.isArray(ch.verdicts) &&
-        ch.verdicts.length === challenged.length &&
-        ch.verdicts.every(v => challenged[v.id] && !seen.has(v.id) && (seen.add(v.id), true))
-      if (!complete) {
+      // A response is usable only when each id it judges was asked, once; ids are
+      // indexes into challenged. The ids it left out go to one fresh challenger.
+      const usable = (ch, ids) => {
+        const want = new Set(ids)
+        return ch && Array.isArray(ch.verdicts) && ch.verdicts.every(v => want.delete(v.id)) ? ch.verdicts : []
+      }
+      const all = challenged.map((_, id) => id)
+      const first = usable(await ask(all, `challenge#${cycle}`), all)
+      const missing = all.filter(id => !first.some(v => v.id === id))
+      if (missing.length > 0 && first.length > 0) log(`cycle ${cycle}: the challenger judged ${first.length} of ${all.length} findings — a fresh one takes the rest`)
+      const verdicts = missing.length > 0 ? [...first, ...usable(await ask(missing, `challenge#${cycle}.retry`), missing)] : first
+      if (verdicts.length !== challenged.length) {
         // Silence must never become a public claim that a reviewer was wrong.
         // An unchecked reversal stays held, so a later harvest that omits it
         // does not let the earlier verdict stand unanswered.
@@ -2233,7 +2242,7 @@ const runCycle = async (cycle, entry) => {
         return { pass: false, cycles: cycle, history, reason: 'review-challenger-died' }
       }
 
-      for (const v of ch.verdicts) {
+      for (const v of verdicts) {
         const f = challenged[v.id]
         // Failing to prove a verdict does not prove the other: the finding is
         // held, neither posted as refuted nor fixed. Nor does a verdict with no evidence.
