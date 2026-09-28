@@ -17,7 +17,7 @@ S=~/.claude/skills/pr-review/scripts
 python3 $S/prepare.py --pr N [--repo O/R] [--full]            # primary checkout top level: pin, worktree, mode
 python3 $S/prepare.py --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
 python3 $S/threads.py --pr N --out FILE                         # every comment and thread, bodies in FILE
-python3 $S/ledger.py show --pr N [--finding ID] [--draft]       # standing findings, unpublished answers; --draft: the saved review
+python3 $S/ledger.py show --pr N [--finding ID] [--draft] [--pending]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists
 python3 $S/ledger.py disputes --pr N --threads FILE --head SHA  # replies on our threads still to judge
 python3 $S/ledger.py save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
 python3 $S/post.py --pr N --expected-head SHA [--auto]         # a pending GitHub review; --auto: submit it

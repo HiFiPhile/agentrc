@@ -423,6 +423,9 @@ class Ledger(Case):
         self.assertIn('**src/core/a.c:1**: far from the diff', rev['draft']['body'])
         self.assertEqual(rev['draft']['digest'], out['draftDigest'])
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['open'], [], 'a pending draft carries nothing')
+        pending = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--pending'])['pending']
+        self.assertEqual((pending['status'], pending['digest'], [(f['id'], f['severity'], f['priority']) for f in pending['findings']]),
+                         ('pending', out['draftDigest'], [(f'pr{PR}-f1', 'high', 'P1')]))
         shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--draft'])
         self.assertEqual(shown['status'], 'pending')
         self.assertEqual([(c['findingId'], c['severity']) for c in shown['draft']['comments']], [(f'pr{PR}-f1', 'high')],
@@ -430,7 +433,14 @@ class Ledger(Case):
         self.mark_posted(self.p)
         shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])
         self.assertEqual([f['id'] for f in shown['open']], [f'pr{PR}-f1'])
+        self.assertIsNone(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--pending'])['pending'])
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--finding', f'pr{PR}-f1'])['finding']['line'], 21)
+        led = json.loads(Path(self.p['ledger']).read_text())
+        for status in ('drafted', 'uncertain'):
+            led['reviews'][0]['status'] = status
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--pending'])['pending']['status'], status,
+                             'a review already pending on GitHub is still not submitted')
 
     def test_a_second_draft_for_the_head_needs_the_first_settled_and_a_reason(self):
         self.save(self.result_for(self.p))

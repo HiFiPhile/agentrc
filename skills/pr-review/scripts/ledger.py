@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pr-review's per-PR ledger: what each review of a PR found, drafted and posted.
 
-  ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --threads FILE]
+  ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --pending | --threads FILE]
   ledger.py save --pr N --output FILE [--repo OWNER/NAME] [--reason TEXT]
   ledger.py disputes --pr N --threads FILE --head SHA [--repo OWNER/NAME]
 
@@ -20,7 +20,10 @@ recheck's reason and
 the thread's link; --finding prints one finding's whole
 record from those reviews; --draft prints the newest review's saved draft as it
 would be posted (event, body, anchored inline comments, fix notes), with its
-status and digest. With --threads, a threads.py snapshot, it also lists each
+status and digest; --pending prints the newest review saved and not yet submitted
+or confirmed (pending, drafted or uncertain: head, status, event, digest) with all its
+findings as show lists them, or null, since show itself lists only reviews that
+reached the PR. With --threads, a threads.py snapshot, it also lists each
 settled finding whose thread is still open and due to be resolved (resolveDue,
 resolve_due()), and in heldThreads those it never resolves again by itself.
 
@@ -289,7 +292,12 @@ def open_row(f, due):
             'claim': cut(f['why']), 'commentId': f.get('commentId'), 'resolveDue': due.get(f['id'])}
 
 
-def show(led, finding=None, draft=False, snapshot=None):
+def show(led, finding=None, draft=False, snapshot=None, pending=False):
+    if pending:
+        rev = next((r for r in reversed(led['reviews']) if r['status'] in DRAFTS), None)
+        return {'pending': rev and {'head': rev['head'], 'status': rev['status'], 'event': rev['draft'].get('event'),
+                                    'digest': rev['draft'].get('digest'),
+                                    'findings': sorted((open_row(f, {}) for f in rev['findings']), key=by_severity)}}
     if draft:
         if not led['reviews']:
             raise Unusable('no review on the ledger')
@@ -531,6 +539,7 @@ def collect(argv):
     which = sub.choices['show'].add_mutually_exclusive_group()
     which.add_argument('--finding')
     which.add_argument('--draft', action='store_true')
+    which.add_argument('--pending', action='store_true')
     which.add_argument('--threads')
     sub.choices['disputes'].add_argument('--threads', required=True)
     sub.choices['disputes'].add_argument('--head', required=True)
@@ -541,7 +550,7 @@ def collect(argv):
     path = ledger_path(repo, a.pr)
     snapshot = read_snapshot(a.threads, a.pr) if getattr(a, 'threads', None) else None
     if a.cmd == 'show':
-        return {'ledger': str(path), **show(load(path, repo, a.pr), a.finding, a.draft, snapshot)}
+        return {'ledger': str(path), **show(load(path, repo, a.pr), a.finding, a.draft, snapshot, a.pending)}
     if a.cmd == 'disputes':
         if not FULL_SHA.match(a.head):
             raise Unusable('--head must be a full SHA')
