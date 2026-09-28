@@ -3105,6 +3105,23 @@ test('a deferral naming no current valid finding, or its issue not covering it, 
   }
 })
 
+test('a deferral whose reason alone breaks the reply limit is refused before anything runs', async () => {
+  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'w '.repeat(55).trim() })] } }),
+    /deferral reason too long for its reply \(60 words, a line 300 characters with the issue URL\): 1#1/)
+  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral(), deferral({ findingId: '1#2', reason: 'x'.repeat(250) })] } }),
+    /: 1#2$/, 'a long line is refused too, and only the offending finding is named')
+  const { calls } = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'w '.repeat(40).trim() })], maxCycles: 1 } })
+  assert.ok(calls.length > 0, 'a reason within the limit runs')
+})
+
+test('a deferral whose whole reply point, claim included, breaks the limit is refused when it meets its finding', async () => {
+  const wordyClaim = { findings: [finding({ claim: 'w '.repeat(30).trim() })], replies: [], bots: 'reviewed' }
+  const { result, calls } = await run({ reviews: wordyClaim, args: { deferrals: [deferral({ reason: 'r '.repeat(35).trim() })], maxCycles: 2 } })
+  assert.equal(result.reason, 'deferral-refused')
+  assert.match(result.detail, /^1#1: its reply point would exceed 60 words or a line 300 characters; pass a shorter reason$/)
+  assert.equal(calls.some(c => c.label.startsWith('defer#')), false, 'nothing is posted')
+})
+
 test('a deferral applied once holds on a resumed launch without being passed again, until the comment is edited', async () => {
   const first = await run({ reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 3, yieldAfterCycle: true, autoPush: false } })
   const again = await run({ reviews: oneValid, args: { maxCycles: 3, state: first.result.state } })
@@ -3660,7 +3677,7 @@ test('the offered body survives a restart', async () => {
   assert.equal(second.result.pass, true)
 })
 
-test('a reply with a point over the length limit is a repair, never posted or cut', async () => {
+test('a reply with a point over the length limit is never posted or cut, and a shorter redraft posts later', async () => {
   const wordy = 'w '.repeat(61).trim()
   const long = await run({
     args: { autoPush: true, maxCycles: 1 },
@@ -3668,9 +3685,16 @@ test('a reply with a point over the length limit is a repair, never posted or cu
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.equal(long.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'nothing is posted')
-  assert.match(long.result.state.debt.find(([id]) => id === 2)[1].repair.error, /^over length: a point exceeds 60 words/)
-  assert.ok(long.logs.some(l => /no reply posted to comment 2 \(over length: .*\) — a human answers it/.test(l)), long.logs.join('\n'))
-  assert.equal(long.logs.some(l => /exists with the wrong content/.test(l)), false, 'no reply exists to be wrong')
+  assert.ok(long.logs.some(l => /no reply posted to comment 2 \(over length: a point exceeds 60 words.*\) — withheld until a shorter draft/.test(l)), long.logs.join('\n'))
+  const owed = long.result.state.debt.find(([id]) => id === 2)[1]
+  assert.equal(owed.repair, undefined, 'nothing was offered, so nothing needs a human repair')
+  assert.equal(owed.attempt, undefined, 'a withheld draft is not an offered body')
+  const shorter = await run({
+    args: { autoPush: true, maxCycles: 2, state: long.result.state },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'short' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.equal(manifestOf(shorter.calls, 'replies#2')[0].body, 'short', 'the next launch posts a shorter draft')
   const points = await run({
     args: { autoPush: true, maxCycles: 1 },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: `${'w '.repeat(60).trim()}\n\n- ${'w '.repeat(60).trim()}` }], bots: 'reviewed' },

@@ -30,8 +30,8 @@ export const meta = {
 //            a job with one result) and first diagnostic, or on the 16-hex `key` of those four that the result
 //            reports beside each failure: never fixed, and a run red only from them passes, listing them),
 //          deferrals?: [{ findingId, commentDigest, issueUrl, reason }] (valid findings the caller
-//            leaves to an existing GitHub issue: not fixed, answered with the issue and the reason;
-//            kept in the state while the comment body stands),
+//            leaves to an existing GitHub issue: not fixed, answered with the issue and the reason,
+//            which must fit the reply limit; kept in the state while the comment body stands),
 //          build?: string (verify command; default: the project's build contract; per launch, so a
 //            resumed launch may change it),
 //          yieldAfterCycle?: boolean (run one cycle and return, with `state` for the next launch),
@@ -789,12 +789,16 @@ const COVERS = {
   },
 }
 // The answer a deferred point gets, in whichever reply its comment receives.
-const deferralLine = (f) => `- ${f.file}:${f.line}: ${f.claim}\n  Real, and out of this PR's scope: ${f.deferral.reason}. Tracked in ${f.deferral.issueUrl}.`
+const deferralAnswer = (d) => `  Real, and out of this PR's scope: ${d.reason}. Tracked in ${d.issueUrl}.`
+const deferralLine = (f) => `- ${f.file}:${f.line}: ${f.claim}\n${deferralAnswer(f.deferral)}`
 // A reply is measured as posted, point by point (a merged one has a point per finding), and never cut: a
-// point over the limit is a human repair, not a post.
+// point over the limit is never posted.
 const REPLY_WORDS = 60, REPLY_LINE_CHARS = 300 // words per point; about 3 rendered lines
 const overLength = (body) => body.split(/\n\s*\n|\n(?=[-*+] )/).some(p => p.split(/\s+/).filter(w => w && !/^[-*+]$/.test(w)).length > REPLY_WORDS) ||
   body.split('\n').some(l => l.length > REPLY_LINE_CHARS)
+// A reason that alone breaks the limit could never be posted: refused before anything runs.
+const longReasons = deferralsArg.filter(d => overLength(deferralAnswer(d))).map(d => d.findingId)
+if (longReasons.length) throw new Error(`deferral reason too long for its reply (${REPLY_WORDS} words, a line ${REPLY_LINE_CHARS} characters with the issue URL): ${longReasons.join(', ')}`)
 
 // Across launches only the last cycle's publication outcome is read (pendingOf);
 // its reports and the older cycles stay in the results that carried them.
@@ -1770,8 +1774,11 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
       continue
     }
     // An offered body may be on the thread already: one over the limit is neither reused nor redrafted.
+    // A draft never offered is only withheld, so a shorter one can go out later.
     if (overLength(a ? a.body : body)) {
-      repair(commentId, null, `over length: a point exceeds ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters`)
+      const why = `over length: a point exceeds ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters`
+      if (a) repair(commentId, null, why)
+      else log(`cycle ${cycle}: no reply posted to comment ${commentId} (${why}) — withheld until a shorter draft`)
       continue
     }
     if (a && a.body !== body) log(`cycle ${cycle}: comment ${commentId} keeps the body already offered, not this cycle's redraft`)
@@ -2277,6 +2284,8 @@ const runCycle = async (cycle, entry) => {
       if (!d || f.verdict !== 'valid') continue
       if (d.digest !== f.commentDigest) return refusedDeferral(`${f.findingId}: its comment was edited since it was deferred; decide again`)
       f.deferral = { issueUrl: d.issueUrl, reason: d.reason }
+      // The claim is the validator's wording this cycle, so the whole point is measured here.
+      if (overLength(deferralLine(f))) return refusedDeferral(`${f.findingId}: its reply point would exceed ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters; pass a shorter reason`)
     }
     const deferredOn = (commentId) => r.findings.filter(f => f.deferral && f.commentId === commentId)
     const withDeferred = (commentId, body) => deferredOn(commentId).length
