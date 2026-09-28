@@ -401,6 +401,14 @@ async function run(opts = {}) {
         ...(opts.reuse ? opts.reuse(u.commentId) : {}),
       }))) }, label)
     }
+    if (label.startsWith('sonar#')) {
+      // sonar.py's sealed line: every item marked unless opts.sonar(items, label) answers otherwise.
+      const items = payloadOf(prompt, 'Manifest').items
+      const answer = typeof opts.sonar === 'function' ? opts.sonar(items, label)
+        : { results: items.map(x => ({ commentId: x.commentId, issue: `K${x.commentId}`, outcome: 'marked', detail: 'false positive' })) }
+      if (answer === null) return null
+      return conforms(options.schema, answer.error ? answer : sealLine(answer), label)
+    }
     if (label.startsWith('build:resolve#')) {
       // The repository's build for the batch, resolved when the caller named none.
       const plan = typeof opts.buildPlan === 'function' ? opts.buildPlan(label) : opts.buildPlan
@@ -5303,4 +5311,126 @@ test('stateRef is refused when malformed or given with state', async () => {
   for (const outputFile of ['/tmp/$(printf injected).output', '/tmp/`id`.output', "/tmp/a'b.output", '/tmp/a b.output', '/tmp/../etc/x']) {
     await assert.rejects(run({ args: { stateRef: { outputFile, digest: stateDigest } } }), /stateRef must be/, outputFile)
   }
+})
+
+// The SonarCloud notes a state still owes, from its answeredWith.
+const sonarOf = (state) => state.answeredWith.filter(([, a]) => a.sonar).map(([id, a]) => [id, a.sonar])
+const scanRefuted = { findings: [invalidFinding({ source: 'code-scanning', commentId: 3 })], replies: [{ commentId: 3, body: 'Not injectable: a list argv.' }], bots: 'reviewed' }
+
+test('markSonar marks the SonarCloud issue of a refuted code-scanning comment with the reply', async () => {
+  const { calls, result } = await run({ reviews: scanRefuted, args: { autoPush: true, markSonar: true, maxCycles: 1 } })
+  const labels = calls.map(c => c.label)
+  assert.ok(labels.indexOf('sonar#1') > labels.findIndex(l => l.startsWith('replies#')), labels.join(', '))
+  const [item] = payloadOf(calls.find(c => c.label === 'sonar#1').prompt, 'Manifest').items
+  assert.deepEqual(item, { commentId: 3, commentDigest: 'd3', how: 'refutation', note: 'Not injectable: a list argv.', digest: fnv1a('Not injectable: a list argv.') })
+  assert.match(calls.find(c => c.label === 'sonar#1').prompt, new RegExp(`--pr 3888 --head ${HEAD} --manifest`))
+  assert.deepEqual(result.history[0].sonar, [{ commentId: 3, issue: 'K3', outcome: 'marked', detail: 'false positive' }])
+  assert.equal('sonarUnmarked' in result, false)
+  assert.deepEqual(sonarOf(result.state), [])
+})
+
+test('without markSonar nothing goes to SonarCloud and the issue stays owed in the state', async () => {
+  const { calls, result } = await run({ reviews: scanRefuted, args: { autoPush: true, maxCycles: 1 } })
+  assert.equal(calls.some(c => c.label.startsWith('sonar#')), false)
+  assert.deepEqual(result.state.answeredWith, [[3, { how: 'refutation', digest: 'd3', sonar: 'Not injectable: a list argv.' }]])
+})
+
+test('the note is the body that was posted, and an edited comment is marked with no stale answer', async () => {
+  // An earlier offered body is what reply.py posts again: the SonarCloud note is that one.
+  const offered = { dismissals: [], notes: [], attempt: { body: 'first wording', how: 'refutation', digest: 'd3' } }
+  const state = seal({ ...(await run({ args: { ...YIELD } })).result.state, debt: [[3, offered]] })
+  const { calls, result } = await run({
+    reviews: { ...scanRefuted, replies: [{ commentId: 3, body: 'second wording' }] },
+    args: { ...YIELD, markSonar: true, state },
+  })
+  assert.match(calls.find(c => c.label.startsWith('replies#')).prompt, /first wording/)
+  assert.equal(payloadOf(calls.find(c => c.label.startsWith('sonar#')).prompt, 'Manifest').items[0].note, 'first wording')
+  assert.deepEqual(sonarOf(result.state), [])
+  // Owed before an edit, then the reviewer edits the comment: nothing is marked with the old answer.
+  const owed = (await run({ reviews: scanRefuted, args: { ...YIELD } })).result.state
+  const edited = await run({
+    reviews: { findings: [invalidFinding({ source: 'code-scanning', commentId: 3, commentDigest: 'd3-edited' })], replies: [], bots: 'reviewed' },
+    args: { ...YIELD, markSonar: true, state: owed },
+    posting: null,
+  })
+  assert.equal(edited.calls.some(c => c.label.startsWith('sonar#')), false, edited.calls.map(c => c.label).join(', '))
+  assert.deepEqual(sonarOf(edited.result.state), [])
+})
+
+test('a later launch with markSonar marks what an earlier one left owed', async () => {
+  const first = await run({ reviews: scanRefuted, args: { ...YIELD } })
+  const again = await run({ args: { ...YIELD, markSonar: true, state: first.result.state } })
+  const sonar = again.calls.find(c => c.label.startsWith('sonar#'))
+  assert.ok(sonar, again.calls.map(c => c.label).join(', '))
+  assert.equal(payloadOf(sonar.prompt, 'Manifest').items[0].commentId, 3)
+  assert.deepEqual(sonarOf(again.result.state), [])
+})
+
+test('markSonar needs autoPush', async () => {
+  await assert.rejects(run({ reviews: scanRefuted, args: { autoPush: false, markSonar: true } }), /markSonar publishes to SonarCloud: it needs autoPush/)
+})
+
+test('a refuted comment from another reviewer owes SonarCloud nothing', async () => {
+  const { calls, result } = await run({
+    reviews: { findings: [invalidFinding({ commentId: 3 })], replies: [{ commentId: 3, body: 'no' }], bots: 'reviewed' },
+    args: { autoPush: true, markSonar: true, maxCycles: 1 },
+  })
+  assert.equal(calls.some(c => c.label.startsWith('sonar#')), false)
+  assert.deepEqual(sonarOf(result.state), [])
+})
+
+test('a waiting or failed issue stays owed and is listed unmarked, and a relay error stops asking for the launch', async () => {
+  const two = { findings: [invalidFinding({ source: 'code-scanning', commentId: 3 }), invalidFinding({ source: 'code-scanning', commentId: 4 })],
+    replies: [{ commentId: 3, body: 'a' }, { commentId: 4, body: 'b' }], bots: 'reviewed' }
+  const partial = await run({
+    reviews: two, args: { autoPush: true, markSonar: true, maxCycles: 1 },
+    sonar: () => ({ results: [{ commentId: 3, issue: 'K3', outcome: 'failed', detail: 'HTTP 403' }, { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' }] }),
+  })
+  assert.equal(partial.result.pass, true, 'the PR is green')
+  assert.deepEqual(sonarOf(partial.result.state), [[3, 'a'], [4, 'b']])
+  assert.deepEqual(partial.result.sonarUnmarked, [
+    { commentId: 3, how: 'refutation', last: { commentId: 3, issue: 'K3', outcome: 'failed', detail: 'HTTP 403' } },
+    { commentId: 4, how: 'refutation', last: { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' } }])
+  assert.ok(partial.logs.some(l => /sonar#1: comment 3, issue K3: failed \(HTTP 403\)/.test(l)), partial.logs.join('\n'))
+  const dead = await run({ reviews: two, args: { autoPush: true, markSonar: true, maxCycles: 1 }, sonar: () => null })
+  assert.deepEqual(sonarOf(dead.result.state).map(([id]) => id), [3, 4])
+  let cycle = 0
+  const down = await run({
+    reviewsPerCycle: () => ++cycle === 1 ? { ...two, bots: 'pending' }
+      : { findings: [invalidFinding({ source: 'code-scanning', commentId: 5 })], replies: [{ commentId: 5, body: 'c' }], bots: 'reviewed' },
+    args: { autoPush: true, markSonar: true, maxCycles: 2 },
+    sonar: () => ({ error: 'SONAR_TOKEN is not set', results: [] }),
+  })
+  assert.equal(down.calls.filter(c => c.label === 'sonar#1').length, 1, down.calls.map(c => c.label).join(', '))
+  assert.equal(down.calls.some(c => c.label.startsWith('sonar#2')), false, 'nothing more is asked this launch')
+  assert.ok(down.calls.some(c => c.label === 'replies#2'), 'cycle 2 answered another code-scanning comment')
+  assert.deepEqual(sonarOf(down.result.state).map(([id]) => id), [3, 4, 5])
+  assert.deepEqual(down.result.sonarUnmarked.map(x => x.last.outcome), ['not asked', 'not asked', 'not asked'])
+})
+
+test('a mark re-arms only for SonarCloud\'s own check, not an Actions job named for the scanner', async () => {
+  const scannerJob = { status: 'red', infraRerun: [], realFailures: [{ check: 'SonarQube (stm32h743eval)', workflow: 'static_analysis', firstError: 'build failed', files: ['src/a.c'], verdict: 'real' }] }
+  const { logs } = await run({ reviews: scanRefuted, ci: scannerJob, args: { autoPush: true, markSonar: true, maxCycles: 1 } })
+  assert.equal(logs.some(l => /re-arming to read the SonarCloud check again/.test(l)), false, logs.join('\n'))
+})
+
+test('a fixed code-scanning finding still flagged is marked once CI settles, and a red SonarCloud check is read again, not fixed', async () => {
+  let cycle = 0
+  const sonarRed = { status: 'red', infraRerun: [], realFailures: [{ check: 'SonarCloud', workflow: '', firstError: 'Quality Gate failed', files: [], verdict: 'real' }] }
+  const { calls, result, logs } = await run({
+    reviewsPerCycle: () => ++cycle === 1
+      ? { findings: [finding({ source: 'code-scanning', commentId: 5 })], replies: [], bots: 'reviewed' }
+      : { findings: [], replies: [], bots: 'reviewed' },
+    ci: sonarRed,
+    args: { autoPush: true, markSonar: true, maxCycles: 2 },
+  })
+  const sonar = calls.filter(c => c.label.startsWith('sonar#'))
+  assert.deepEqual(sonar.map(c => c.label), ['sonar#2'], calls.map(c => c.label).join(', '))
+  const [item] = payloadOf(sonar[0].prompt, 'Manifest').items
+  assert.equal(item.how, 'fixNote')
+  assert.match(item.note, /^Fixed in [0-9a-f]{40}\./)
+  assert.match(sonar[0].prompt, new RegExp(`--head ${shaFor(1)} `))
+  assert.ok(logs.some(l => /cycle 2: 1 SonarCloud issue\(s\) marked false positive — re-arming/.test(l)), logs.join('\n'))
+  assert.equal(calls.some(c => c.label.startsWith('fix:ci')), false, 'the SonarCloud check is not a CI fix')
+  assert.equal(result.pass, false)
 })

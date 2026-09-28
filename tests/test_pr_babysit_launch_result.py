@@ -141,6 +141,15 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['receipts']['replies'][0], {'batch': 'refutedPosts', 'findingVerdicts': [], 'commentId': 9, 'kind': 'review', 'sent': True,
                                                        'posted': True, 'verified': False, 'error': None})
 
+    def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
+        data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [
+            {'commentId': 3, 'how': 'refutation', 'last': {'commentId': 3, 'issue': 'K3', 'outcome': 'failed', 'detail': 'HTTP 403'}},
+            {'commentId': 4, 'how': 'fixNote', 'last': None}]})
+        _, s = self.run_it(data)
+        self.assertIn('SonarCloud issue of comment 3 not marked false positive: failed: HTTP 403', s['blockers'])
+        self.assertIn('SonarCloud issue of comment 4 not marked false positive: not asked', s['blockers'])
+        self.assertEqual(len(s['result']['sonarUnmarked']), 2)
+
     def test_the_checkout_is_compared_with_the_state(self):
         _, s = self.run_it(output(), '--checkout', self.repo())
         self.assertEqual(s['checkout']['branch'], 'pr')

@@ -11,6 +11,9 @@ export const meta = {
 //            reviewers but code-scanning, which is harvested only and never named here),
 //          maxCycles?: number (ceiling on review/fix/CI cycles, default 5; a resumed launch
 //            defaults to its state's), autoPush?: boolean (default false = dry run),
+//          markSonar?: boolean (with autoPush: the SonarCloud issue behind a code-scanning comment
+//            this run refuted, or fixed while SonarCloud still flags it on the head it analysed, is
+//            marked false positive with the reply as its comment; needs SONAR_TOKEN; per launch),
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
 //          protected?: string (regex over canonical repo-relative paths; matches are
 //            dropped from a fix scope and never committed),
@@ -48,7 +51,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -143,6 +146,9 @@ const lane = args.lane === undefined ? 'both' : args.lane
 if (!['both', 'ci', 'reviews'].includes(lane)) throw new Error("lane must be 'both', 'ci' or 'reviews'")
 if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs one lane for one cycle: it needs yieldAfterCycle`)
 const ciLane = lane !== 'reviews'
+// Marking publishes to SonarCloud: like autoPush, given to each launch afresh.
+const markSonar = args.markSonar === true
+if (markSonar && args.autoPush !== true) throw new Error('markSonar publishes to SonarCloud: it needs autoPush')
 const reviewLane = lane !== 'ci'
 const STATE_VERSION = 3
 // A state crosses its caller between launches, so it is sealed: key order and
@@ -501,6 +507,19 @@ const PUSH = withSeal({
     prHead: { type: ['string', 'null'] },
   },
 })
+const SONAR = withSeal({
+  type: 'object', additionalProperties: false,
+  required: ['results'],
+  properties: {
+    error: { type: 'string' },
+    results: {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false, required: ['commentId', 'issue', 'outcome', 'detail'],
+        properties: { commentId: { type: 'integer' }, issue: { type: ['string', 'null'] },
+          outcome: { type: 'string', enum: ['skipped', 'resolved', 'waiting', 'marked', 'failed'] }, detail: { type: 'string' } } },
+    },
+  },
+})
 // The chain a caller asks this run to adopt, oldest first, read back commit by
 // commit so every one is audited, not only the tip.
 const ADOPT_AUDIT = withSeal({
@@ -605,6 +624,7 @@ const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
 const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
 const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
 const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
+const SONAR_SCRIPT = '~/.claude/skills/pr-babysit/scripts/sonar.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build_compare.py'
@@ -802,10 +822,12 @@ if (restored && restored.ciCache) {
   } else if (restored.ciCache.entries.length) log(`ciNotes changed: ${restored.ciCache.entries.length} cached CI verdict(s) judged again`)
 }
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
-// commentId -> { how, digest }: how the comment was answered ('refutation' or
+// commentId -> { how, digest, sonar? }: how the comment was answered ('refutation' or
 // 'fixNote') and the digest of the body that answer addressed. An answered
 // comment accrues no further debt until the reviewer edits it, which the
-// digest catches.
+// digest catches. `sonar` is the posted answer of a code-scanning comment while
+// the SonarCloud issue it may name is not settled; kept without markSonar too,
+// so a later launch that has it can still mark it.
 const answeredWith = new Map(restored ? restored.answeredWith : [])
 // commentId -> { dismissals, notes }: dismissals relied on without telling the
 // reviewer, and the valid or deferred findings still owed a note. Standing
@@ -844,6 +866,10 @@ const corrections = []
 // findingId -> { digest, issueUrl, reason }: a caller's deferral once its issue
 // was read to cover the finding. It holds while the comment body it named stands.
 const deferrals = new Map(restored && restored.deferrals ? restored.deferrals : [])
+// Set once sonar.py reports an error (no SONAR_TOKEN, say): nothing more is asked this launch.
+let sonarDown = null
+// commentId -> sonar.py's last result for it this launch.
+const sonarLast = new Map()
 // What HEAD must still be at the next publish: the PR head at preflight, each
 // pushed SHA after, and across launches the SHA the previous one left.
 let expectedHead = restored ? restored.expectedHead : ''
@@ -942,11 +968,14 @@ const finish = (verdict, status) => {
     } : null,
   }
   const state = stateOut()
+  // What markSonar was asked for and did not get, so a green launch does not read as all marked.
+  const sonarUnmarked = !markSonar ? [] : [...answeredWith].filter(([, a]) => a.sonar)
+    .map(([commentId, a]) => ({ commentId, how: a.how, last: sonarLast.get(commentId) || (sonarDown ? { outcome: 'not asked', detail: sonarDown } : null) }))
   // A caller's completion notice shows the result's head: what decides comes first, the bulk last.
   const { reason, pass, cycles, history: cycleHistory, ...rest } = verdict
   return {
     stateDigest: state.digest, status: status || (pass ? 'complete' : 'blocked'), ...(reason !== undefined ? { reason } : {}), pass, cycles,
-    rollup: launchRollup(), ...rest, ...(corrections.length ? { corrections } : {}), history: cycleHistory, observation, state,
+    rollup: launchRollup(), ...rest, ...(corrections.length ? { corrections } : {}), ...(sonarUnmarked.length ? { sonarUnmarked } : {}), history: cycleHistory, observation, state,
   }
 }
 const owesDismissal = (commentId) => {
@@ -1700,8 +1729,8 @@ let napMs = 0 // backoff owed from the previous cycle, taken after its summary
 // A refutation settles the comment outright; a fix note ("fixed in X") is
 // not the answer a dismissal owes, so it settles only the note. digest is the
 // comment body's the answer addressed.
-const pay = (commentId, how, digest) => {
-  answeredWith.set(commentId, { how, digest })
+const pay = (commentId, how, digest, sonarNote) => {
+  answeredWith.set(commentId, { how, digest, ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
   const d = debt.get(commentId)
   if (!d) return
   d.notes.clear()
@@ -1732,7 +1761,8 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   // reviewer's edit or a verdict flip since makes it stale: neither reused
   // nor reposted; a human reconciles.
   const replies = []
-  for (const { commentId, body } of drafts) {
+  const sonarNotes = new Map()
+  for (const { commentId, body, scanning } of drafts) {
     const d = debt.get(commentId)
     const a = d && d.attempt
     if (a && (a.how !== how || a.digest !== digestOf.get(commentId))) {
@@ -1748,6 +1778,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     const out = a ? a.body : body
     if (d) d.attempt = { body: out, how, digest: digestOf.get(commentId) }
     replies.push({ commentId, body: out, digest: fnv1a(out) })
+    if (scanning) sonarNotes.set(commentId, out)
   }
   if (replies.length === 0) return { pass: false, detail: 'nothing publishable', receipts: [] }
   const out = await runReplyScript(label, 'manifest', `Publish these replies on PR #${args.pr}`,
@@ -1786,7 +1817,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
       else log(`cycle ${cycle}: ${label} receipt for comment ${commentId} says none and a POST — not trusted`)
       continue
     }
-    if (settles(r)) { pay(commentId, how, digestOf.get(commentId)); settled.add(commentId); replied.push(commentId) }
+    if (settles(r)) { pay(commentId, how, digestOf.get(commentId), sonarNotes.get(commentId)); settled.add(commentId); replied.push(commentId) }
     else if (r.verified === false && r.replyId !== null) repair(commentId, r.replyId, r.error || 'read-back mismatch')
     else if (r.verified === null && r.replyId !== null) log(`cycle ${cycle}: reply ${r.replyId} to comment ${commentId} could not be read back (${r.error}) — retried next cycle`)
   }
@@ -1801,6 +1832,33 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   }
   if (!receipt.pass) log(`cycle ${cycle}: ${label} incomplete — ${receipt.detail}`)
   return receipt
+}
+
+// SonarCloud keeps its quality gate red on an issue until it is resolved, so
+// sonar.py marks the issue behind each answered code-scanning comment false
+// positive: a refutation at once, a fix only while SonarCloud still flags it on
+// the head it analysed. One ask per cycle; a waiting or failed issue is asked
+// about again, and the result lists what is still unmarked. Returns how many
+// were marked.
+const settleSonar = async (cycle, entry) => {
+  const items = [...answeredWith].filter(([, a]) => a.sonar)
+    .map(([commentId, a]) => ({ commentId, commentDigest: a.digest, how: a.how, note: a.sonar, digest: fnv1a(a.sonar) }))
+  if (!markSonar || sonarDown || entry.sonar || items.length === 0) return 0
+  const label = `sonar#${cycle}`
+  const r = await relayOnce(
+    `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file and run ` +
+    `\`python3 ${SONAR_SCRIPT} --pr ${args.pr} --head ${expectedHead} --manifest <that file>\` ` + relayed(SONAR) +
+    ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`,
+    { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
+  if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }
+  if (r.error) { sonarDown = r.error; log(`${label}: ${r.error} — the issues stay owed, nothing more is asked this launch`); return 0 }
+  entry.sonar = r.results.filter(x => items.some(i => i.commentId === x.commentId))
+  for (const x of entry.sonar) {
+    sonarLast.set(x.commentId, x)
+    if (!['waiting', 'failed'].includes(x.outcome)) delete answeredWith.get(x.commentId).sonar
+    if (x.outcome !== 'skipped') log(`${label}: comment ${x.commentId}, issue ${x.issue}: ${x.outcome} (${x.detail})`)
+  }
+  return entry.sonar.filter(x => x.outcome === 'marked').length
 }
 
 // A comment held for repair because a reply of ours already answers it in
@@ -1856,7 +1914,7 @@ const reconcileReplies = async (cycle, stuck, pointsOf, digestOf) => {
     const mine = (out ? out.receipts : []).filter(r => r.commentId === s.commentId)
     const r = mine.length === 1 ? mine[0] : null
     if (r && r.kind === s.kind && r.replyId === s.replyId && r.digest === s.bodyDigest && !r.sent && !r.posted && settles(r)) {
-      pay(s.commentId, s.how, s.originalDigest)
+      pay(s.commentId, s.how, s.originalDigest, s.scanning ? s.body : undefined)
       const d = debt.get(s.commentId)
       if (d) delete d.repair
       log(`cycle ${cycle}: comment ${s.commentId} settled on reply ${s.replyId}, already there`)
@@ -2299,6 +2357,7 @@ const runCycle = async (cycle, entry) => {
     // On a renumbered comment only the ids reported since the edit name its
     // points; one never is settled on a reused reply.
     const harvested = new Set(r.findings.map(dismissalKey))
+    const scanning = new Set(r.findings.filter(f => f.source === 'code-scanning').map(f => f.commentId))
     const showsAll = (id, dismissalsToo) => {
       const d = debt.get(id)
       return !d || [...(dismissalsToo ? d.dismissals : []), ...d.notes]
@@ -2307,7 +2366,7 @@ const runCycle = async (cycle, entry) => {
     const stuck = [...debt]
       .filter(([id, d]) => d.repair && d.repair.replyId && ['refutation', 'fixNote', 'deferral'].includes(owed(id)) &&
         !d.seenSinceEdit && showsAll(id, true))
-      .map(([commentId, d]) => ({ commentId, replyId: d.repair.replyId, how: owed(commentId) }))
+      .map(([commentId, d]) => ({ commentId, replyId: d.repair.replyId, how: owed(commentId), scanning: scanning.has(commentId) }))
     if (stuck.length) {
       const pointsOf = (commentId) => r.findings.filter(f => f.commentId === commentId)
         .map(f => `${f.file}:${f.line}: ${f.claim} (${f.deferral ? `deferred: ${f.deferral.reason}; tracked in ${f.deferral.issueUrl}` : `${f.verdict}: ${f.reason}`})`)
@@ -2337,12 +2396,13 @@ const runCycle = async (cycle, entry) => {
       if (prev) prev.body += `\n\n${x.body}`
       else replyFor.set(x.commentId, { commentId: x.commentId, body: x.body })
     }
-    const freshReplies = [...replyFor.values()].map(x => ({ ...x, body: withDeferred(x.commentId, x.body) }))
+    const freshReplies = [...replyFor.values()].map(x => ({ ...x, body: withDeferred(x.commentId, x.body), scanning: scanning.has(x.commentId) }))
     if (withheld.size) log(`cycle ${cycle}: drafted reply/replies withheld — ${[...withheld].map(([why, n]) => `${why}: ${n}`).join(', ')}`)
     if (freshReplies.length > 0 && args.autoPush === true) {
       // Keep the receipt before anything later can fail: a cycle that dies after
       // posting must still be able to say what went out.
       entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation', cycle, digestOf)
+      entry.sonarMarked = await settleSonar(cycle, entry)
     }
     // A comment whose every point is deferred is answered now: no fix is coming.
     const deferralReplies = [...ledger.keys()]
@@ -2388,7 +2448,7 @@ const runCycle = async (cycle, entry) => {
         const line = `- ${f.file}:${f.line}: ${f.claim}`
         const prev = answerable.get(f.commentId)
         if (prev) prev.body += `\n${line}`
-        else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}` })
+        else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}`, scanning: scanning.has(f.commentId) })
       }
       for (const x of answerable.values()) x.body = withDeferred(x.commentId, x.body)
       if (answerable.size > 0) {
@@ -2411,6 +2471,14 @@ const runCycle = async (cycle, entry) => {
       // The push restarted CI: this cycle's CI verdict is superseded. Re-arm;
       // next cycle's CI lane collects the fresh run.
       log(`cycle ${cycle}: review-lane push superseded the CI run — re-arming`)
+      return null
+    }
+    // A mark this cycle may clear the SonarCloud gate this CI run failed on:
+    // the next cycle reads CI again rather than fixing a check that may be passing.
+    const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry)
+    // SonarCloud's own check, not an Actions job that runs the scanner.
+    if (marked > 0 && c.realFailures.some(rf => !rf.workflow && /^SonarCloud\b/.test(rf.check))) {
+      log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
       return null
     }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })

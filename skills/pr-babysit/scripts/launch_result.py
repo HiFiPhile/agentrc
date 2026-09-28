@@ -145,6 +145,10 @@ def summarize(output, output_path, state_ref=None, tree=None):
         blockers += blocking
         if actions.get('error'):
             blockers.append(f'action error: {cut(actions["error"])}')
+        for u in result.get('sonarUnmarked') or []:
+            last = u.get('last') or {}
+            blockers.append(f"SonarCloud issue of comment {u.get('commentId')} not marked false positive: "
+                            f"{last.get('outcome', 'not asked')}{': ' + cut(last['detail']) if last.get('detail') else ''}")
         for f in (ci or {}).get('realFailures') or []:
             if f.get('complete') is not True:
                 blockers.append(f'CI evidence incomplete for {f.get("check")} / {f.get("cell")}')
