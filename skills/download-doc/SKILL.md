@@ -32,6 +32,7 @@ vendor should mean writing one adapter, not another pipeline.
 | `scripts/vendor_nxp.py` | NXP adapter |
 | `scripts/vendor_espressif.py` | Espressif adapter |
 | `scripts/vendor_rpi.py` | Raspberry Pi adapter (RP2040/RP2350, Pico boards) — probes a name list, no index exists |
+| `scripts/vendor_arm.py` | Arm adapter (architecture and debug-interface specs) — a name list resolved through Arm's documentation service |
 | `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry-run by default. |
 | `references/st.md`, `references/nxp.md` | Per-vendor endpoints, quirks, and the gated-download flow |
 

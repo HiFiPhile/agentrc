@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'download-doc' / 'scripts'))
 import doclib  # noqa: E402
+import vendor_arm  # noqa: E402
 import vendor_ti  # noqa: E402
 
 
@@ -81,6 +82,47 @@ class TiParts(unittest.TestCase):
         self.serve('ina3221')
         with self.assertRaisesRegex(SystemExit, 'ina32211'):
             vendor_ti.enumerate_docs(parts=['ina3221', 'ina32211'])
+
+
+class LetterSubRevisions(unittest.TestCase):
+    """Arm labels an issue by letter and its re-releases by a second letter: B.y, B.z, C."""
+
+    def test_a_minor_letter_orders_between_its_issue_and_the_next(self):
+        self.assertEqual(doclib.compare_rev('B.z', 'B.y')[0], 'newer')
+        self.assertEqual(doclib.compare_rev('E.e', 'E')[0], 'newer')
+        self.assertEqual(doclib.compare_rev('C', 'B.z')[0], 'newer')
+        self.assertEqual(doclib.compare_rev('B.z', 'B.z')[0], 'current')
+
+
+class ArmCatalogue(unittest.TestCase):
+    """Each listed document resolves through Arm's documentation service to its PDF."""
+
+    def setUp(self):
+        saved = vendor_arm.get_json
+        self.addCleanup(lambda: setattr(vendor_arm, 'get_json', saved))
+
+    def serve(self, resources):
+        def get_json(url, **kw):
+            code = url.split('/documentation/')[1].split('/')[0]
+            return {'document': code, 'title': f'{code} title', 'versionLabel': 'B.z',
+                    '_links': {'resources': resources(code)}}
+        vendor_arm.get_json = get_json
+
+    def test_a_document_resolves_to_its_pdf_and_revision(self):
+        self.serve(lambda code: [
+            {'href': f'https://documentation-service.arm.com/static/{code}x?token=',
+             'name': f'{code}.xlsx', 'extension': 'xlsx'},
+            {'href': f'https://documentation-service.arm.com/static/{code}?token=',
+             'name': f'{code.upper()}B_z.pdf', 'extension': 'pdf'}])
+        d = next(d for d in vendor_arm.enumerate_docs() if d.doc_id == 'DDI0553')
+        self.assertEqual((d.ident, d.version, d.url, d.author, d.aliases), (
+            'arm:DDI0553', 'B.z', 'https://documentation-service.arm.com/static/ddi0553?token=',
+            'ARM Limited', ['ddi0553 title']))
+
+    def test_a_document_without_a_pdf_fails(self):
+        self.serve(lambda code: [])
+        with self.assertRaisesRegex(SystemExit, 'ddi0419 has no PDF'):
+            vendor_arm.enumerate_docs()
 
 
 def setattr_all(saved):

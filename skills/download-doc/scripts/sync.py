@@ -26,14 +26,14 @@ import vendor_espressif, vendor_microchip, vendor_nxp, vendor_renesas   # noqa: 
 import vendor_allwinner, vendor_geehy, vendor_hpmicro, vendor_silabs   # noqa: E402
 import vendor_ti                                                       # noqa: E402
 import vendor_wch                                                      # noqa: E402
-import vendor_rpi, vendor_st                                          # noqa: E402
+import vendor_arm, vendor_rpi, vendor_st                              # noqa: E402
 
 VENDORS = {"st": vendor_st, "nxp": vendor_nxp, "espressif": vendor_espressif,
            "rpi": vendor_rpi, "renesas": vendor_renesas,
            "microchip": vendor_microchip, "ti": vendor_ti, "silabs": vendor_silabs,
            "allwinner": vendor_allwinner,
            "wch": vendor_wch, "hpmicro": vendor_hpmicro,
-           "geehy": vendor_geehy}
+           "geehy": vendor_geehy, "arm": vendor_arm}
 
 
 def enumerate_vendor(name: str, args) -> list:
@@ -73,7 +73,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("vendor", choices=sorted(VENDORS))
     ap.add_argument("--types", help="comma list: datasheet,errata,reference-manual,...")
-    ap.add_argument("--family", help="ST only: STM32H7,STM32U5,... (default: all grids)")
+    ap.add_argument("--family", help="family tags: STM32H7,STM32U5,... for ST, Armv8-M,ADIv5 for Arm (default: all)")
     ap.add_argument("--device", default="Arm MCU", help="NXP only: taxonomy branch")
     ap.add_argument("--chips", help="Espressif only: esp32-s3,esp32-p4 (default: USB-OTG parts)")
     ap.add_argument("--parts", help="TI only: ina3221,tca9548a (default: parts in the TinyUSB BSP)")

@@ -229,6 +229,10 @@ def parse_rev(raw):
         # one *after* Z, not a rewind to A. A bare ordinal tuple gets that backwards,
         # ordering (26,) above (1,1).
         return ("alpha", (len(s),) + tuple(ord(c) - 64 for c in s.upper()))
+    # Arm re-releases an issue under a second letter (B.y, B.z), all before issue C.
+    m = re.fullmatch(r"([A-Za-z])\.([A-Za-z])", s)
+    if m:
+        return ("alpha", (1, ord(m.group(1).upper()) - 64, ord(m.group(2).upper()) - 64))
 
     m = re.fullmatch(r"(\d+(?:\.\d+)*)\s*([A-Za-z])?", s)
     if m:
@@ -927,6 +931,9 @@ if __name__ == "__main__":   # run `python3 doclib.py` to sanity check
     assert rev_newer("2.1A", "2.1") and rev_newer("2.2", "2.1A")
     assert rev_newer("Rev B", "Rev A") and not rev_newer("Rev A", "Rev B")
     assert parse_rev("2.1A") == ("num", (2, 1, 1))       # sorts after 2.1
+    # Arm: B.y -> B.z -> C is one letter scheme, so a sub-letter sorts inside its issue.
+    assert parse_rev("B.z") == ("alpha", (1, 2, 26))
+    assert rev_newer("C", "B.z") and rev_newer("B.z", "B.y") and rev_newer("E.e", "E")
     assert rev_newer("2.1A", "2.1") and not rev_newer("2.1", "2.1A")
     assert parse_rev("2024-01-30")[1] == date(2024, 1, 30)      # ISO
     assert parse_rev("01/30/2024")[1] == date(2024, 1, 30)      # MM/DD, day > 12
