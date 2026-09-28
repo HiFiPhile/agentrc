@@ -12,7 +12,9 @@ post.py write it, under an exclusive lock, by write-then-rename.
 show prints the last review that reached the PR (posted or partial:
 head, mergeBase, verdict, status), its standing findings (open, upheld,
 disputed: id, file, line, severity with its P0-P4 priority, the grading
-behind it, claim cut short), ordered by severity, and the thread answers
+behind it, its claim, and the number of the defect it shares with other findings
+of that review, if any), ordered by
+severity, and the thread answers
 drafted and not yet published, each
 with the replies it answers (author,
 excerpt, from the threads snapshot it was judged on, null once edited), the
@@ -289,7 +291,8 @@ def open_row(f, due):
     return {'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'],
             'severity': sev, 'priority': priority(sev), 'confidence': f.get('confidence'),
             'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
-            'claim': cut(f['why']), 'commentId': f.get('commentId'), 'resolveDue': due.get(f['id'])}
+            'why': f['why'], 'commentId': f.get('commentId'), 'defect': f.get('defect'),
+            'resolveDue': due.get(f['id'])}
 
 
 def show(led, finding=None, draft=False, snapshot=None, pending=False):

@@ -454,6 +454,13 @@ class Ledger(Case):
             self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--pending'])['pending']['status'], status,
                              'a review already pending on GitHub is still not submitted')
 
+    def test_show_names_the_defect_a_finding_shares_and_its_whole_claim(self):
+        one = {'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised ' * 20, 'severity': 'high', 'dimension': 'correctness', 'status': 'open'}
+        self.save(self.result_for(self.p, findings=[{**one, 'defect': 0}, {**one, 'severity': 'medium', 'defect': 0}]))
+        self.mark_posted(self.p)
+        shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['open']
+        self.assertEqual([(f['id'], f['defect'], f['why']) for f in shown], [(f'pr{PR}-f1', 0, one['why']), (f'pr{PR}-f2', 0, one['why'])])
+
     def test_a_second_draft_for_the_head_needs_the_first_settled_and_a_reason(self):
         self.save(self.result_for(self.p))
         with self.assertRaisesRegex(facts.Unusable, 'pending draft'):
@@ -1651,18 +1658,18 @@ class Compare(unittest.TestCase):
         with self.assertRaisesRegex(compare.Unusable, 'two agents labelled scan:d0x0'):
             compare.collect(['units', '--run', str(self.run_dir([('scan:d0x0', None, None), ('scan:d0x0', None, None)]))])
 
-    def output(self, findings, claims, event='REQUEST_CHANGES', unjudged=(), unverified=()):
+    def output(self, findings, claims, event='REQUEST_CHANGES', unjudged=(), unverified=(), comments=()):
         f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
         json.dump({'result': {'status': 'reviewed', 'findings': findings, 'claims': claims, 'verdict': {'event': event, 'reasons': []},
-                              'coverage': {'dropped': [], 'unverified': list(unverified), 'unjudged': list(unjudged)}}}, f)
+                              'coverage': {'dropped': [], 'unverified': list(unverified), 'unjudged': list(unjudged)},
+                              'draft': {'body': 'b', 'comments': [{'path': 'a.c', 'line': 1, 'finding': i, 'body': 'x'} for i in comments]}}}, f)
         f.close()
         return f.name
 
     def test_diff_names_what_changed_per_finding_and_claim(self):
-        graded = GRADED
-        a = {'file': 'a.c', 'line': 1, 'dimension': 'd', 'status': 'open', 'severity': 'high', 'confidence': 'high', **graded}
+        a = {'file': 'a.c', 'line': 1, 'dimension': 'd', 'status': 'open', 'severity': 'high', 'confidence': 'high', **GRADED}
         base = self.output(
-            [a, {'id': 'pr7-f1', 'status': 'open', 'severity': 'low', 'confidence': 'low', **graded}, {'file': 'b.c', 'line': 2, 'dimension': 'd'},
+            [a, {'id': 'pr7-f1', 'status': 'open', 'severity': 'low', 'confidence': 'low', **GRADED}, {'file': 'b.c', 'line': 2, 'dimension': 'd'},
              {'file': 'c.c', 'line': 3, 'dimension': 'd'}, {'file': 'c.c', 'line': 3, 'dimension': 'd'}],
             [{'commentId': 5, 'verdict': 'confirmed', 'severity': 'high'}, {'commentId': 5, 'verdict': 'refuted'}],
             unjudged=[{'kind': 'claim', 'commentId': 8}])
@@ -1676,7 +1683,7 @@ class Compare(unittest.TestCase):
         self.assertFalse(out['same'])
         f = out['findings']
         self.assertEqual({c['key']: {k: v for k, v in c.items() if k not in ('key', 'label')} for c in f['changed']},
-                         {'a.c:1:d': {'status': ['open', 'covered'], 'severity': ['high', 'medium'], 'coveredBy': [None, 5]},
+                         {'a.c:1:d': {'status': ['open', 'covered'], 'severity': ['high', 'medium']},
                           'pr7-f1': {'status': ['open', 'fixed'], 'graded': [True, False]}})
         self.assertEqual(([x['key'] for x in f['onlyBase']], [x['key'] for x in f['onlyCandidate']]), (['b.c:2:d'], ['d.c:4:d']))
         self.assertEqual(f['ambiguous'], [{'key': 'c.c:3:d', 'base': 2, 'candidate': 1}])
@@ -1697,13 +1704,29 @@ class Compare(unittest.TestCase):
         self.assertEqual((out['coverage']['base'], out['coverage']['candidate'], len(out['coverage']['onlyCandidate'])), (2, 2, 2),
                          'another claim lost at the same place is another loss')
 
+    def test_diff_compares_which_findings_and_claims_are_one_defect_not_its_number(self):
+        f = lambda line, defect: {'file': 'a.c', 'line': line, 'dimension': 'd', 'status': 'open', 'severity': 'high', 'defect': defect, **GRADED}  # noqa: E731
+        base = self.output([f(1, 0), f(2, 0), f(3, None)], [])
+        self.assertTrue(compare.collect(['diff', '--base', base, '--candidate', self.output([f(1, 4), f(2, 4), f(3, None)], [])])['same'])
+        out = compare.collect(['diff', '--base', base, '--candidate', self.output([f(1, None), f(2, 0), f(3, 0)], [{'commentId': 5, 'defect': 0}])])
+        self.assertFalse(out['same'])
+        self.assertEqual(out['defects'], {'onlyBase': [['a.c:1:d', 'a.c:2:d']], 'onlyCandidate': [['5#1', 'a.c:2:d', 'a.c:3:d']]})
+
+    def test_diff_names_a_comment_lost_or_gained_and_a_claim_id_held_twice(self):
+        f = lambda line: {'file': 'a.c', 'line': line, 'dimension': 'd', 'status': 'open', 'severity': 'high', **GRADED}  # noqa: E731
+        claim = {'commentId': 5, 'claimId': '5#1', 'verdict': 'confirmed', 'severity': 'high'}
+        base = self.output([f(1), f(2)], [claim], comments=[0, 1])
+        out = compare.collect(['diff', '--base', base, '--candidate', self.output([f(1), f(2)], [claim, {**claim, 'verdict': 'refuted'}], comments=[1, 7])])
+        self.assertFalse(out['same'])
+        self.assertEqual(out['comments'], {'onlyBase': ['a.c:1:d'], 'onlyCandidate': ['comment on a.c:1']}, 'a comment naming no finding is kept')
+        self.assertEqual(out['claims']['ambiguous'], [{'key': '5#1', 'base': 1, 'candidate': 2}])
+
     def test_diff_refuses_an_unreviewed_output(self):
         blocked = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
         json.dump({'result': {'status': 'blocked'}}, blocked)
         blocked.close()
         with self.assertRaisesRegex(compare.Unusable, 'no reviewed pr-review result'):
             compare.collect(['diff', '--base', blocked.name, '--candidate', blocked.name])
-
 
 
 class Workflow(unittest.TestCase):

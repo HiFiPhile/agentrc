@@ -15,15 +15,18 @@ named in `missingCost`.
 
 `diff` names, per finding and per thread claim, what changed between two pr-review
 outputs (Workflow output files or bare results): under `changed`, status or verdict,
-severity, confidence, what covers it and whether the grading is complete; under
+severity, confidence and whether the grading is complete; under
 `reworded`, the text a reader must judge (the finding or claim, the impact facts,
 the reason for the level), since two runs never repeat their wording; then each
 unit, finding and claim coverage lost, and the verdict. A finding is keyed by its ledger id, else by file, line and dimension;
-a claim by comment id and its order among that comment's claims, an alignment that
-holds only while both read the same threads (a reordered claim shows as reworded).
-A key holding more
-than one record on a side is `ambiguous` unless both sides hold the same records
-there, never paired by guess. `same` is true only when nothing differs.
+a claim by its claimId, its comment and its order among that comment's claims, an
+alignment that holds only while both read the same threads (a reordered claim shows
+as reworded). A key holding more than one record on a side is `ambiguous` unless
+both sides hold the same records there, never paired by guess. `defects` names each
+group of findings and claims counted as one defect on one side only, by its members'
+keys. `comments` names the findings a drafted inline comment carries on one side
+only; the drafted text itself (body, comments, replies) is never compared, since two
+runs never repeat it. `same` is true only when none of these differs.
 
 stdout ends with one JSON line; {"error": ...}, exit 2, when an input is unusable.
 """
@@ -38,12 +41,10 @@ sys.path.insert(0, str(HERE.parents[1] / 'pr-babysit' / 'scripts'))
 sys.path.insert(0, str(HERE.parents[1] / 'headless-chief' / 'scripts'))
 from facts import Parser, Unusable, report  # noqa: E402
 from launch_result import load_output  # noqa: E402
+from ledger import CONFIDENCE, LEVELS  # noqa: E402
 from run_cost import GENERIC, priced_at, rate_of, stage_of, usage_of  # noqa: E402
 
 IMPACT = ('consequence', 'path', 'variants', 'recovery')
-# pr-review.js's and code-audit.js's scales: a level counts only as one of these, with its facts and reason.
-LEVELS = ('critical', 'high', 'medium', 'low', 'nit')
-CONFIDENCE = ('high', 'medium', 'low')
 
 
 def cost_of(transcript):
@@ -78,10 +79,11 @@ def units(run):
             continue
         unit = label.split(':', 1)[1]
         proposals = []
-        for k, f in enumerate((scan or {}).get('findings') or []):
+        found = scan or {}
+        for k, f in enumerate(found.get('findings') or []):
             v, vcost = agents.get(f'verify:{unit}:{k}', (None, None))
             proposals.append({**f, 'verdict': v, 'verifyCost': vcost})
-        scans.append({'unit': unit, 'dimension': (scan or {}).get('dimension'), 'dead': scan is None, 'cost': cost,
+        scans.append({'unit': unit, 'dimension': found.get('dimension'), 'dead': scan is None, 'cost': cost,
                       'proposals': proposals})
     read, _ = agents.get('claims', (None, None))
     claims = []
@@ -121,11 +123,12 @@ def keyed(records, key):
 
 
 def claim_keys(claims):
+    """(claim, key): its claimId, or for an output that predates claimIds, its place among its comment's claims."""
     seen = Counter()
     out = []
     for c in claims:
         seen[c.get('commentId')] += 1
-        out.append((c, f"{c.get('commentId')}#{seen[c.get('commentId')]}"))
+        out.append((c, c.get('claimId') or f"{c.get('commentId')}#{seen[c.get('commentId')]}"))
     return out
 
 
@@ -172,17 +175,47 @@ def lost(r):
     return sorted(keys)
 
 
+def defects(r):
+    """Each defect several findings or claims share, as the sorted keys of its members; its number is per run, never compared."""
+    members = defaultdict(list)
+    for f in r.get('findings', []):
+        if f.get('defect') is not None:
+            members[f['defect']].append(finding_key(f))
+    for c, k in claim_keys(r.get('claims', [])):
+        if c.get('defect') is not None:
+            members[c['defect']].append(k)
+    return sorted(sorted(m) for m in members.values())
+
+
+def by_claim(r):
+    out = defaultdict(list)
+    for c, k in claim_keys(r.get('claims', [])):
+        out[k].append(c)
+    return out
+
+
+def posted(r):
+    """The key of the finding each drafted inline comment carries."""
+    fs = r.get('findings', [])
+    return [finding_key(fs[i]) if isinstance(i, int) and 0 <= i < len(fs) else f'comment on {c.get("path")}:{c.get("line")}'
+            for c in (r.get('draft') or {}).get('comments', []) for i in [c.get('finding')]]
+
+
 def diff(base, cand):
     findings = side_by_side(keyed(base.get('findings', []), finding_key), keyed(cand.get('findings', []), finding_key),
-                            ('status', 'severity', 'confidence', 'coveredBy'), ('why', 'severityReason'),
+                            ('status', 'severity', 'confidence'), ('why', 'severityReason'),
                             lambda f: str(f.get('why') or f.get('id'))[:100])
-    claims = side_by_side({k: [c] for c, k in claim_keys(base.get('claims', []))}, {k: [c] for c, k in claim_keys(cand.get('claims', []))},
+    claims = side_by_side(by_claim(base), by_claim(cand),
                           ('verdict', 'severity', 'confidence'), ('claim', 'severityReason'), lambda c: str(c.get('claim'))[:100])
     lb, lc = lost(base), lost(cand)
     cov = {'onlyBase': [k for k in lb if k not in lc], 'onlyCandidate': [k for k in lc if k not in lb], 'base': len(lb), 'candidate': len(lc)}
+    db, dc = defects(base), defects(cand)
+    grouped = {'onlyBase': [g for g in db if g not in dc], 'onlyCandidate': [g for g in dc if g not in db]}
+    pb, pc = Counter(posted(base)), Counter(posted(cand))
+    comments = {'onlyBase': sorted((pb - pc).elements()), 'onlyCandidate': sorted((pc - pb).elements())}
     verdict = {'base': base.get('verdict'), 'candidate': cand.get('verdict')}
-    same = all(not v for part in (findings, claims) for v in part.values()) and lb == lc and verdict['base'] == verdict['candidate']
-    return {'same': same, 'findings': findings, 'claims': claims, 'coverage': cov, 'verdict': verdict}
+    same = all(not v for part in (findings, claims, grouped, comments) for v in part.values()) and lb == lc and verdict['base'] == verdict['candidate']
+    return {'same': same, 'findings': findings, 'claims': claims, 'defects': grouped, 'comments': comments, 'coverage': cov, 'verdict': verdict}
 
 
 def collect(argv):

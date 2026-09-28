@@ -110,7 +110,7 @@ const DISPUTES = { type: 'object', additionalProperties: false, properties: { er
     replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } } } }
 const [prior, pushback] = await parallel([
   () => relay('ledger', 'Context', `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}'`,
-    { type: 'object', properties: { reviews: { type: 'integer' }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } } }, required: ['id'] } },
+    { type: 'object', properties: { reviews: { type: 'integer' }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, why: { type: 'string' }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } } }, required: ['id'] } },
       heldThreads: { type: 'array', items: { type: 'object', properties: { findingId: { type: 'string' }, commentId: { type: 'integer' }, why: { type: 'string' } } } }, error: { type: 'string' } } }),
   () => relay('disputes', 'Context', `python3 ${S}/ledger.py disputes --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`, DISPUTES),
 ])
@@ -156,6 +156,8 @@ const recheckPrompt = (f) => {
     `For withdrawn or upheld, \`answer\` is what a maintainer would post in that thread to its author: the evidence and nothing else, at most ${LIMIT.answer} words, bullets for more than one point. ${STYLE}`
 }
 const JUDGE = { type: 'object', required: ['verdict', 'reason', 'severity', 'impact', 'severityReason', 'confidence'], properties: { verdict: { enum: ['confirmed', 'refuted', 'stale', 'misattributed'] }, reason: { type: 'string' }, ...GRADE } }
+// A claim's identity: its comment and its place among that comment's claims, as the claims reader listed them.
+const withClaimIds = (cs) => { const n = {}; return cs.map(c => Object.assign(c, { claimId: `${c.commentId}#${n[c.commentId] = (n[c.commentId] || 0) + 1}` })) }
 const shellPath = (p) => `'${String(p).replace(/'/g, `'\\''`)}'`
 // One finding-verifier per claim, started as soon as the claims are read, alongside the audit.
 const judge = (c, i) => agent(
@@ -173,7 +175,7 @@ const [audit, rechecked, claims] = await parallel([
     `${IN}Read ${threadsFile} (every comment on PR #${pr}). List the review claims still open that are not ours: each point raised in an unresolved, not outdated thread, and each finding in a bot's review body or summary comment (split multi-point comments; split a bot's comments into findings as the bot rules in ~/.claude/agents/pr-review-validator.md do, a CodeRabbit nitpick or a Greptile summary item included). ` +
     'Skip comments with ours=true, replies that only acknowledge, questions with no claim about the code, and threads marked resolved. One record per claim, its claim in one sentence. ' + DATA,
     { label: 'claims', phase: 'Review', model: 'sonnet', effort: 'medium', schema: CLAIMS },
-  )).then(cs => cs && parallel(cs.claims.map((c, i) => () => judge(c, i))).then(judged => ({ claims: cs.claims, judged }))),
+  )).then(cs => cs && parallel(withClaimIds(cs.claims).map((c, i) => () => judge(c, i))).then(judged => ({ claims: cs.claims, judged }))),
 ])
 if (!audit) return blocked('audit-failed', 'code-audit returned nothing')
 if (!claims) return blocked('claims-failed', 'the claims reader died')
@@ -195,18 +197,6 @@ const ours = audit.confirmed.flatMap(u => u.findings.map(f => ({
   ...gradeOf(f), why: f.why, snippet: f.snippet, verdictReason: f.verdict.reason, status: 'open',
 })))
 const confirmedClaims = claimsOut.filter(c => c.verdict === 'confirmed')
-const MATCH = { type: 'object', required: ['matches'], properties: { matches: { type: 'array', items: { type: 'object', required: ['finding', 'commentId'], properties: { finding: { type: 'integer' }, commentId: { type: 'integer' } } } } } }
-// Only a claim on the same file can make the same claim; with none there is nothing to ask.
-const sameFile = confirmedClaims.filter(c => ours.some(f => f.file === c.path))
-const matched = sameFile.length ? await agent(
-  `Match review findings to open thread claims that make the SAME claim about the same code (not merely the same file or topic).\nFindings: ${JSON.stringify(ours.map((f, i) => ({ finding: i, file: f.file, line: f.line, why: f.why })).filter(f => sameFile.some(c => c.path === f.file)))}\n` +
-  `Claims: ${JSON.stringify(sameFile.map(c => ({ commentId: c.commentId, path: c.path, line: c.line, claim: c.claim })))}\nReturn only the pairs you are sure of.`,
-  { label: 'covered', phase: 'Judge', model: 'sonnet', effort: 'medium', schema: MATCH },
-) : { matches: [] }
-if (!matched) unjudged.push({ kind: 'covered-match' })
-for (const m of (matched && matched.matches) || []) {
-  if (ours[m.finding] && confirmedClaims.some(c => c.commentId === m.commentId)) Object.assign(ours[m.finding], { status: 'covered', coveredBy: m.commentId })
-}
 // Without new replies a recheck cannot move an upheld or disputed finding back to plain open.
 const statusOf = (f, v) => v.state === 'open' && ['upheld', 'disputed'].includes(f.status) ? f.status : v.state
 const answerOf = (f, v) => {
@@ -227,14 +217,68 @@ const carriedOut = carried.map((f, i) => {
   return out
 })
 
+// One verified defect found by several dimensions or reviews, or also raised on a thread, is one group, formed anew
+// on every run over the new and the standing findings: each member keeps its own record, grade and recheck, the group
+// is posted at most once and counts once, at its strongest grade.
+const GROUPS = { type: 'object', required: ['groups'], properties: { groups: { type: 'array', items: { type: 'object', required: ['findings', 'claims'],
+  properties: { findings: { type: 'array', items: { type: 'integer' } }, claims: { type: 'array', items: { type: 'string' } } } } } } }
+const rankIn = (scale, v) => scale.includes(v) ? scale.indexOf(v) : scale.length
+const stronger = (a, b) => rankIn(LEVELS, a.severity) - rankIn(LEVELS, b.severity) || rankIn(CONFIDENCE, a.confidence) - rankIn(CONFIDENCE, b.confidence)
+const strongest = (xs) => [...xs].sort(stronger)[0]
+const standing = carriedOut.filter(f => ['open', 'upheld'].includes(f.status))
+const pool = [...ours, ...standing]
+const claimOf = Object.fromEntries(confirmedClaims.map(c => [c.claimId, c]))
+const earlier = Object.fromEntries(carried.map(f => [f.id, f]))
+// Only items on one file can be one defect; standing ones are regrouped too, since a push can split what was one. A
+// discussion sees only the answered findings, a subset it cannot regroup, and leaves their groups as saved.
+const onFile = new Map()
+for (const x of [...pool, ...confirmedClaims.filter(c => c.path)]) onFile.set(x.file || x.path, [...(onFile.get(x.file || x.path) || []), x])
+const asked = new Set(discussion ? [] : [...onFile].filter(([, xs]) => xs.length > 1).map(([p]) => p))
+const grouped = asked.size ? await agent(
+  'Group the review findings and thread claims below that describe the SAME defect in the same code: one group per defect, at least two members, only groups you are sure of. ' +
+  'An item belongs to a group only if its whole substance is that defect: a finding or claim that also raises another problem stays out. Items about different variants belong together only when the path and the fix are the same.\n' +
+  `Findings: ${JSON.stringify(pool.map((f, i) => ({ finding: i, file: f.file, line: f.line, dimension: f.dimension, why: f.why || earlier[f.id].why })).filter(f => asked.has(f.file)))}\n` +
+  `Claims: ${JSON.stringify(confirmedClaims.filter(c => asked.has(c.path)).map(c => ({ claim: c.claimId, path: c.path, line: c.line, text: c.claim })))}`,
+  { label: 'group', phase: 'Judge', model: 'sonnet', effort: 'medium', schema: GROUPS },
+) : { groups: [] }
+// An item named twice, an index or id that names nothing, a group of one, one across files or on a file not asked
+// about is a grouping to distrust whole.
+const members = grouped ? grouped.groups.flatMap(g => [...g.findings.map(i => `f${i}`), ...g.claims.map(id => `c${id}`)]) : []
+const oneFile = (g) => { const at = new Set([...g.findings.map(i => pool[i].file), ...g.claims.map(id => claimOf[id].path)]); return at.size === 1 && asked.has([...at][0]) }
+const groupsOk = grouped && new Set(members).size === members.length &&
+  grouped.groups.every(g => g.findings.length + g.claims.length > 1 && g.findings.every(i => Number.isInteger(i) && pool[i]) &&
+    g.claims.every(id => Object.hasOwn(claimOf, id)) && oneFile(g))
+if (!groupsOk) unjudged.push({ kind: 'group' })
+const groups = groupsOk ? grouped.groups : []
+// A lead thread claim graded below our lead finding: the body names our stronger grade.
+const ourGrade = new Map()
+for (const [k, g] of groups.entries()) {
+  const fs = g.findings.map(i => pool[i])
+  const cs = g.claims.map(id => claimOf[id])
+  for (const x of [...fs, ...cs]) x.group = k
+  const leadClaim = strongest(cs)
+  const leadFinding = strongest(fs)
+  // Still ours to recheck until fixed; posted only as the group's one new comment, never where a thread says it.
+  for (const f of fs) if (f !== leadFinding || leadClaim) f.muted = true
+  if (leadClaim && leadFinding && rankIn(LEVELS, leadFinding.severity) < rankIn(LEVELS, leadClaim.severity)) ourGrade.set(leadClaim, leadFinding)
+}
+// Without a grouping it can trust, each item is its own defect: counted twice rather than one hidden.
+const keyOf = (x, own) => x.group != null ? `g${x.group}` : own
+
 // The verdict is this rule, not a model's judgment.
 const BLOCKING = ['critical', 'high']
 const MINOR = ['nit']
 const where = (file, line) => `\`${file}${line ? `:${line}` : ''}\``
-// A covered finding is its thread's confirmed claim: counted once, as the claim.
-const openFindings = [...ours.filter(f => f.status === 'open'), ...carriedOut.filter(f => ['open', 'upheld'].includes(f.status))]
-  .map(f => ({ severity: f.severity, at: where(f.file, f.line) }))
-  .concat(confirmedClaims.map(c => ({ severity: c.severity, at: c.path ? where(c.path, c.line) : `@${c.author}'s comment` })))
+// One entry per defect: each group counts once, at its strongest grade.
+const byDefect = new Map()
+const count = (key, x, at) => {
+  const was = byDefect.get(key)
+  if (!was || stronger(x, was) < 0) byDefect.set(key, { severity: x.severity, confidence: x.confidence, at })
+}
+ours.forEach((f, i) => { if (f.status === 'open') count(keyOf(f, `n${i}`), f, where(f.file, f.line)) })
+for (const f of standing) count(keyOf(f, f.id), f, where(f.file, f.line))
+for (const c of confirmedClaims) count(keyOf(c, c.claimId), c, c.path ? where(c.path, c.line) : `@${c.author}'s comment`)
+const openFindings = [...byDefect.values()]
 const blocking = openFindings.filter(o => BLOCKING.includes(o.severity))
 // A disputed finding waits for a maintainer: it never requests changes, and it keeps approval off.
 const disputedAt = carriedOut.filter(f => f.status === 'disputed').map(f => where(f.file, f.line))
@@ -265,7 +309,8 @@ if (blockers || regressions.length) {
 log(`verdict ${event}: ${reasons.join('; ') || 'nothing open, coverage complete, CI green, hardware covered'}`)
 
 phase('Draft')
-const toPost = ours.filter(f => f.status === 'open')
+// A finding of a group is posted once, as the group's strongest.
+const toPost = ours.filter(f => f.status === 'open' && !f.muted)
 const FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sentence>`, then at most 3 bullets: the cause with `file:line`, ' +
   `the impact, and a fix only where the finding supports one; at most ${LIMIT.comment} words; a question only when genuinely asking. ` +
   `The summary: 1 to ${LIMIT.summaryBullets} Markdown bullets, one per distinct problem, not repeating the comments in full. `
@@ -352,7 +397,12 @@ lines.push(`Reviewed ${args.mode === 'incremental' ? `the changes since ${scopeB
 if (disputed) {
   lines.push('', `${blocking.length ? `Blocking: ${blocking.map(o => o.at).join(', ')}; disputed` : 'Disputed'}, waiting for a maintainer: ${disputedAt.join(', ')}.`)
 }
-if (confirmedClaims.length) lines.push('', 'Confirmed from existing threads:', ...confirmedClaims.map(c => `- @${c.author}${c.path ? ` on ${where(c.path, c.line)}` : ''}: ${c.claim}`))
+// A standing finding no comment on the PR states, its own or its group's, is named here, so every blocker is.
+const stated = new Set([...pool.filter(f => (earlier[f.id] || {}).commentId || toPost.includes(f)), ...confirmedClaims].map(x => keyOf(x, x)))
+const unstated = standing.filter(f => !stated.has(keyOf(f, f)))
+if (unstated.length) lines.push('', 'Still standing from earlier reviews, not in any comment:', ...unstated.map(f => `- **${f.severity || 'finding'}** ${where(f.file, f.line)}: ${earlier[f.id].why}`))
+if (confirmedClaims.length) lines.push('', 'Confirmed from existing threads:', ...confirmedClaims.map(c => `- @${c.author}${c.path ? ` on ${where(c.path, c.line)}` : ''}: ${c.claim}` +
+  (ourGrade.has(c) ? ` (our review grades it **${ourGrade.get(c).severity}**, ${where(ourGrade.get(c).file, ourGrade.get(c).line)})` : '')))
 lines.push('', `CI: ${ci.state}.`)
 if (hil.choice === 'boards') lines.push('', row(['Board', 'HIL', 'Regression']), row(['---', '---', '---']), ...hil.boards.map(b => row([b.board, b.verdict, b.regression])))
 else lines.push('', 'Hardware: not run.')
@@ -360,8 +410,8 @@ else lines.push('', 'Hardware: not run.')
 return {
   status: 'reviewed', pr, repo, head, mergeBase, scopeBase, mode: args.mode,
   verdict: { event, reasons },
-  findings: [...carriedOut, ...ours],
-  claims: claimsOut,
+  findings: [...carriedOut, ...ours].map(({ group, muted, ...f }) => (!discussion && (f.id || group != null) ? { ...f, defect: group ?? null } : f)),
+  claims: claimsOut.map(({ group, ...c }) => (group != null ? { ...c, defect: group } : c)),
   coverage: { dropped: audit.dropped, unverified: audit.unverified, unjudged },
   ci, hil,
   heldThreads: prior.heldThreads || [],

@@ -158,8 +158,9 @@ carries the earlier findings, replies and receipts.
   regrade a standing finding when new facts change it.
 - The verdict is the workflow's rule, not a model's: blocking findings
   (critical or high, including
-  earlier ones still standing and confirmed thread claims) or a verified HIL
-  regression request changes. A disputed finding never blocks, and the body
+  earlier ones still standing and confirmed thread claims; one defect found by
+  several dimensions or threads counts once, at its strongest grade) or a
+  verified HIL regression request changes. A disputed finding never blocks, and the body
   names it apart from the findings the verdict rests on;
   approval needs nothing open above a nit, no finding under dispute, every
   scan and verifier accounted for, green CI and hardware covered when the
