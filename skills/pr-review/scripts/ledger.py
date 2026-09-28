@@ -11,7 +11,8 @@ post.py write it, under an exclusive lock, by write-then-rename.
 
 show prints the last review that reached the PR (posted or partial:
 head, mergeBase, verdict, status), its standing findings (open, upheld,
-disputed: id, file, line, severity, claim cut short) and the thread answers
+disputed: id, file, line, severity with its P0-P4 priority, the grading
+behind it, claim cut short), ordered by severity, and the thread answers
 drafted and not yet published, each
 with the replies it answers (author,
 excerpt, from the threads snapshot it was judged on, null once edited), the
@@ -61,6 +62,30 @@ from launch_result import load_output  # noqa: E402
 VERSION = 2
 CUT = 160
 OPEN = ('open', 'upheld', 'disputed')
+# The one scale (finding-verifier.md's Severity section); P0-P4 are its report aliases.
+LEVELS = ('critical', 'high', 'medium', 'low', 'nit')
+CONFIDENCE = ('high', 'medium', 'low')
+# Older reviews stored code-verifier's own words; they are read onto the scale, never rewritten.
+LEGACY = {'blocker': 'critical', 'major': 'high', 'minor': 'low', 'info': 'nit'}
+
+
+def level(severity):
+    if severity is None:
+        return None
+    v = LEGACY.get(str(severity).lower(), str(severity).lower())
+    if v not in LEVELS:
+        raise Unusable(f'severity {severity!r} is on no known scale')
+    return v
+
+
+def priority(severity):
+    return f'P{LEVELS.index(severity)}' if severity in LEVELS else None
+
+
+def by_severity(f):
+    """Report order: severity, then confidence, then place; a finding's id never moves with it."""
+    rank = lambda xs, v: xs.index(v) if v in xs else len(xs)  # noqa: E731
+    return (rank(LEVELS, f.get('severity')), rank(CONFIDENCE, f.get('confidence')), f.get('file') or '', f.get('line') or 0)
 
 
 def repo_of(repo):
@@ -255,7 +280,7 @@ def show(led, finding=None, draft=False, snapshot=None):
         for r in reversed(reached(led)):
             for f in r.get('findings', []):
                 if f['id'] == finding:
-                    return {'finding': f, 'reviewHead': r['head']}
+                    return {'finding': {**f, 'severity': level(f.get('severity'))}, 'reviewHead': r['head']}
         raise Unusable(f'no finding {finding} on the ledger')
     if not rev:
         return {'reviews': 0, 'last': None, 'open': []}
@@ -269,9 +294,11 @@ def show(led, finding=None, draft=False, snapshot=None):
         'reviews': len(led['reviews']),
         'last': {k: rev.get(k) for k in ('head', 'mergeBase', 'mode', 'status', 'reviewedAt')} | {'event': rev['verdict']['event']},
         'answers': answers,
-        'open': [{'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'], 'severity': f.get('severity'),
-                  'claim': cut(f['why']), 'commentId': f.get('commentId'), 'resolveDue': due.get(f['id'])}
-                 for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due],
+        'open': sorted(({'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'],
+                         'severity': level(f.get('severity')), 'priority': priority(level(f.get('severity'))),
+                         'confidence': f.get('confidence'), 'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
+                         'claim': cut(f['why']), 'commentId': f.get('commentId'), 'resolveDue': due.get(f['id'])}
+                        for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
         **({'heldThreads': held} if snapshot else {}),
     }
 

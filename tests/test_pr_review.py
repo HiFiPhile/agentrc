@@ -1435,12 +1435,53 @@ class Result(unittest.TestCase):
                                   'draft': {'body': 'secret words', 'comments': [{}], 'replies': []}}}, f)
         out = result.collect(['--output', f.name])
         self.assertEqual((out['event'], out['findings'], out['openBySeverity'], out['claims'], out['coverage']['dropped']),
-                         ('REQUEST_CHANGES', {'open': 1, 'covered': 1}, {'high': 1}, {'refuted': 1}, 1))
+                         ('REQUEST_CHANGES', {'open': 1, 'covered': 1}, {'P1 high': 1}, {'refuted': 1}, 1))
         self.assertNotIn('secret words', json.dumps(out))
         self.assertEqual(out['heldThreads'], [{'findingId': 'pr7-f1', 'why': 'resolve unconfirmed'}])
         Path(f.name).write_text('')
         self.assertEqual(result.collect(['--output', f.name])['status'], 'no-result')
 
+
+
+class Severity(unittest.TestCase):
+    """The one scale: older words read onto it, reports ordered by it, every copy of it the same."""
+
+    def led(self, *findings):
+        rev = {'status': 'posted', 'head': 'a' * 40, 'mergeBase': 'b' * 40, 'mode': 'full', 'reviewedAt': 't',
+               'verdict': {'event': 'COMMENT'}, 'findings': [{'status': 'open', 'file': 'src/a.c', 'line': 1, 'why': 'w', **f} for f in findings]}
+        return {'v': ledger.VERSION, 'repo': REPO, 'pr': PR, 'reviews': [rev]}
+
+    def test_older_words_are_read_onto_the_scale_and_never_rewritten(self):
+        led = self.led({'id': 'f1', 'severity': 'major'}, {'id': 'f2', 'severity': 'Minor'}, {'id': 'f3', 'severity': 'blocker'},
+                       {'id': 'f4', 'severity': 'info'}, {'id': 'f5', 'severity': None})
+        before = json.dumps(led, sort_keys=True)
+        shown = {f['id']: (f['severity'], f['priority']) for f in ledger.show(led)['open']}
+        self.assertEqual(shown, {'f1': ('high', 'P1'), 'f2': ('low', 'P3'), 'f3': ('critical', 'P0'), 'f4': ('nit', 'P4'), 'f5': (None, None)})
+        self.assertEqual(ledger.show(led, finding='f1')['finding']['severity'], 'high')
+        self.assertEqual(json.dumps(led, sort_keys=True), before, 'the stored history keeps its own words')
+        with self.assertRaisesRegex(facts.Unusable, "severity 'severe' is on no known scale"):
+            ledger.show(self.led({'id': 'f1', 'severity': 'severe'}))
+
+    def test_reports_order_by_severity_then_confidence_then_place_and_ids_never_move(self):
+        led = self.led({'id': 'pr7-f1', 'severity': 'low', 'confidence': 'high'}, {'id': 'pr7-f2', 'severity': 'high', 'confidence': 'low'},
+                       {'id': 'pr7-f3', 'severity': 'high', 'confidence': 'high', 'line': 9}, {'id': 'pr7-f4', 'severity': 'high', 'confidence': 'high', 'line': 2},
+                       {'id': 'pr7-f5', 'severity': 'nit'})
+        self.assertEqual([f['id'] for f in ledger.show(led)['open']], ['pr7-f4', 'pr7-f3', 'pr7-f2', 'pr7-f1', 'pr7-f5'])
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+            self.addCleanup(os.unlink, f.name)
+            json.dump({'result': {'status': 'reviewed', 'pr': PR, 'head': 'a' * 40, 'findings': [
+                {'status': 'open', 'severity': s} for s in ('nit', 'high', 'critical', 'high', 'medium')]}}, f)
+        self.assertEqual(list(result.collect(['--output', f.name])['openBySeverity'].items()),
+                         [('P0 critical', 1), ('P1 high', 2), ('P2 medium', 1), ('P4 nit', 1)])
+
+    def test_every_copy_of_the_scale_is_the_one_in_finding_verifier(self):
+        table = re.findall(r'^\| `(\w+)` \|', (ROOT / 'agents' / 'finding-verifier.md').read_text(), re.M)
+        self.assertEqual(tuple(table), ledger.LEVELS)
+        for wf in ('code-audit.js', 'pr-review.js'):
+            src = (ROOT / 'workflows' / wf).read_text()
+            for const, want in (('LEVELS', ledger.LEVELS), ('CONFIDENCE', ledger.CONFIDENCE)):
+                got = re.search(rf"^const {const} = \[([^\]]*)\]", src, re.M).group(1)
+                self.assertEqual(tuple(re.findall(r"'(\w+)'", got)), want, f'{wf} {const}')
 
 
 class Workflow(unittest.TestCase):

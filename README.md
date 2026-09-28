@@ -119,8 +119,9 @@ workflows. Its direct Codex exchanges go through `agents/coworker.md`, the
 `cowork.py` transport. `workflows/code-audit.js` is its saved review: one `code-verifier`
 per directory x dimension, then `finding-verifier` on every finding
 (`args: { dirs, dimensions, diff? }`, the first two required; `diff: { base, head }`
-narrows it to a change). `workflows/pr-review.js` reviews a pinned PR head
-through it. Start it inside the task
+narrows it to a change); the verifier sets each finding's level by the one
+severity scale in `agents/finding-verifier.md`'s Severity section.
+`workflows/pr-review.js` reviews a pinned PR head through it. Start it inside the task
 worktree:
 
 ```sh
