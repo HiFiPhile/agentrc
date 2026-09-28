@@ -82,10 +82,25 @@ def priority(severity):
     return f'P{LEVELS.index(severity)}' if severity in LEVELS else None
 
 
+def rank(scale, v):
+    return scale.index(v) if v in scale else len(scale)
+
+
 def by_severity(f):
     """Report order: severity, then confidence, then place; a finding's id never moves with it."""
-    rank = lambda xs, v: xs.index(v) if v in xs else len(xs)  # noqa: E731
     return (rank(LEVELS, f.get('severity')), rank(CONFIDENCE, f.get('confidence')), f.get('file') or '', f.get('line') or 0)
+
+
+def refuse_off_scale(result):
+    """A new result stores the scale's own words; only a carried record may still lack a level."""
+    for f in result['findings']:
+        s = f.get('severity')
+        if s not in LEVELS and not (s is None and f.get('id')):
+            name = f.get('id') or f"{f.get('file')}:{f.get('line')}"
+            raise Unusable(f'finding {name} has severity {s!r}, not a level of the one scale')
+    for c in result.get('claims') or []:
+        if c.get('verdict') == 'confirmed' and c.get('severity') not in LEVELS:
+            raise Unusable(f"claim {c.get('commentId')} has severity {c.get('severity')!r}, not a level of the one scale")
 
 
 def repo_of(repo):
@@ -266,6 +281,14 @@ def resolve_due(led, snapshot):
     return due, held
 
 
+def open_row(f, due):
+    sev = level(f.get('severity'))
+    return {'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'],
+            'severity': sev, 'priority': priority(sev), 'confidence': f.get('confidence'),
+            'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
+            'claim': cut(f['why']), 'commentId': f.get('commentId'), 'resolveDue': due.get(f['id'])}
+
+
 def show(led, finding=None, draft=False, snapshot=None):
     if draft:
         if not led['reviews']:
@@ -294,11 +317,7 @@ def show(led, finding=None, draft=False, snapshot=None):
         'reviews': len(led['reviews']),
         'last': {k: rev.get(k) for k in ('head', 'mergeBase', 'mode', 'status', 'reviewedAt')} | {'event': rev['verdict']['event']},
         'answers': answers,
-        'open': sorted(({'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'],
-                         'severity': level(f.get('severity')), 'priority': priority(level(f.get('severity'))),
-                         'confidence': f.get('confidence'), 'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
-                         'claim': cut(f['why']), 'commentId': f.get('commentId'), 'resolveDue': due.get(f['id'])}
-                        for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
+        'open': sorted((open_row(f, due) for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
         **({'heldThreads': held} if snapshot else {}),
     }
 
@@ -461,6 +480,7 @@ def save(led, result, reason):
             raise Unusable(f'the output result has no {key}: not a pr-review result')
     if result['pr'] != led['pr']:
         raise Unusable(f"the output reviews PR {result['pr']}, the ledger is for {led['pr']}")
+    refuse_off_scale(result)
     result = with_answer_digests(result)
     if result.get('mode') == 'discussion':
         return merge_discussion(led, result)

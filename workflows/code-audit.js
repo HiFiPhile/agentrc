@@ -72,7 +72,8 @@ const VERDICT = {
 }
 // A confirmed finding without its level and the facts behind it is not a verified one.
 const graded = v => LEVELS.includes(v.severity) && CONFIDENCE.includes(v.confidence) &&
-  !!v.severityReason && !!v.impact && ['consequence', 'path', 'variants', 'recovery'].every(k => v.impact[k])
+  !!v.severityReason && !!v.impact && IMPACT.required.every(k => v.impact[k])
+const gradeOf = v => ({ severity: v.severity, confidence: v.confidence, impact: v.impact, severityReason: v.severityReason })
 
 const pairs = dirs.flatMap((dir, i) => dims.map((dim, j) => ({ dir, dim, id: `d${i}x${j}` })))
 log(`${pairs.length} scan units (${dirs.length} dirs x ${dims.length} dimensions)`)
@@ -96,15 +97,15 @@ const results = await pipeline(
         { label: `verify:${p.id}:${k}`, phase: 'Verify', agentType: 'finding-verifier', schema: VERDICT },
       ).then(v => v && { f, v })
     )).then(vs => {
-      const ungraded = vs.filter(x => x && x.v.real && !graded(x.v)).length
-      const unverified = scan.findings.filter((_, k) => !vs[k] || (vs[k].v.real && !graded(vs[k].v)))
+      const kind = x => !x ? 'dead' : !x.v.real ? 'refuted' : graded(x.v) ? 'confirmed' : 'ungraded'
+      const kinds = vs.map(kind)
+      const count = k => kinds.filter(x => x === k).length
+      const unverified = scan.findings.filter((_, k) => kinds[k] === 'dead' || kinds[k] === 'ungraded')
       if (unverified.length > 0) {
-        log(`${p.dir}: ${unverified.length} finding(s) unverified (${unverified.length - ungraded} dead verifier(s), ${ungraded} confirmed without complete grading) — re-run if needed`)
+        log(`${p.dir}: ${unverified.length} finding(s) unverified (${count('dead')} dead verifier(s), ${count('ungraded')} confirmed without complete grading) — re-run if needed`)
       }
-      const findings = vs.filter(x => x && x.v.real && graded(x.v)).map(({ f, v }) => ({
-        ...f, severity: v.severity, confidence: v.confidence, impact: v.impact, severityReason: v.severityReason,
-        verdict: { real: true, reason: v.reason },
-      }))
+      const findings = vs.filter((_, k) => kinds[k] === 'confirmed')
+        .map(({ f, v }) => ({ ...f, ...gradeOf(v), verdict: { real: true, reason: v.reason } }))
       return { dir: p.dir, dim: p.dim, findings, unverified }
     })
   },
@@ -123,6 +124,8 @@ const confirmed = results.filter(r => r.findings.length > 0)
 const byPlace = (a, b) => a.file.localeCompare(b.file) || a.line - b.line
 let n = 0
 for (const r of results) {
+  r.findings.sort(byPlace)
+  r.unverified.sort(byPlace)
   for (const f of [...r.findings, ...r.unverified].sort(byPlace)) f.id = `F${++n}`
 }
 log(`${confirmed.length} scan units produced confirmed findings`)

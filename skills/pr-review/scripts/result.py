@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import Parser, Unusable, report  # noqa: E402
 from launch_result import load_output  # noqa: E402
-from ledger import by_severity, priority  # noqa: E402
+from ledger import LEVELS, priority, rank  # noqa: E402
 
 
 def condense(r):
@@ -36,8 +36,8 @@ def condense(r):
         'event': (r.get('verdict') or {}).get('event'), 'reasons': (r.get('verdict') or {}).get('reasons', []),
         'findings': dict(Counter(f.get('status') for f in findings)),
         # Reported most severe first, each level under its P0-P4 alias.
-        'openBySeverity': {f'{priority(v)} {v}' if priority(v) else str(v): n
-                           for v, n in sorted(Counter(f.get('severity') for f in open_).items(), key=lambda x: by_severity({'severity': x[0]}))},
+        'openBySeverity': {' '.join(filter(None, (priority(v), str(v)))): n
+                           for v, n in sorted(Counter(f.get('severity') for f in open_).items(), key=lambda x: rank(LEVELS, x[0]))},
         'claims': dict(Counter(c.get('verdict') for c in r.get('claims', []))),
         'coverage': {k: len((r.get('coverage') or {}).get(k, [])) for k in ('dropped', 'unverified', 'unjudged')},
         'ci': (r.get('ci') or {}).get('state'), 'hil': r.get('hil'), 'heldThreads': r.get('heldThreads', []),

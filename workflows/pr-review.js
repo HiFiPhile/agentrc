@@ -26,13 +26,17 @@ const SHA = /^[0-9a-f]{40}$/
 const LEVELS = ['critical', 'high', 'medium', 'low', 'nit']
 const CONFIDENCE = ['high', 'medium', 'low']
 const IMPACT = {
-  type: ['object', 'null'], required: ['consequence', 'path', 'variants', 'recovery'],
+  type: ['object', 'null'], additionalProperties: false,
+  required: ['consequence', 'path', 'variants', 'recovery'],
   properties: { consequence: { type: 'string' }, path: { type: 'string' }, variants: { type: 'string' }, recovery: { type: 'string' } },
 }
 const GRADE = { severity: { enum: [...LEVELS, null] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, confidence: { enum: [...CONFIDENCE, null] } }
 // A level counts only with the facts and the reason behind it.
 const graded = v => LEVELS.includes(v.severity) && CONFIDENCE.includes(v.confidence) &&
-  !!v.severityReason && !!v.impact && ['consequence', 'path', 'variants', 'recovery'].every(k => v.impact[k])
+  !!v.severityReason && !!v.impact && IMPACT.required.every(k => v.impact[k])
+const gradeOf = v => Object.fromEntries(Object.keys(GRADE).map(k => [k, v[k]]))
+// A recheck that returns any of the grading returns all of it: null when it returned none, false when incomplete.
+const regradeOf = v => v && Object.keys(GRADE).some(k => v[k] != null) ? graded(v) && gradeOf(v) : null
 const GRADING = 'Grade by the Severity section of your role: severity, impact, severityReason and confidence.'
 const fail = (msg) => { throw new Error(`${msg}; args is { pr, repo, head, mergeBase, scopeBase, mode, groups, factsDir, hil, hardwareRelevant, autoPost, dimensions? }`) }
 if (!args || typeof args !== 'object') fail('args must be an object')
@@ -140,7 +144,7 @@ const recheckPrompt = (f) => {
   const d = disputeOf[f.id]
   const ask = `${IN}Adversarially recheck ONE earlier review finding of this PR on head ${head}. Read it with: python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --finding ${f.id}\n` +
     'Where the record has `published`, on the finding or on an answer, that is what the PR shows, as the maintainer edited it: judge that text, not the draft.\n' +
-    `Its level is ${f.severity || 'unset'}. Only when new evidence changes its facts, return a new severity with the revised impact, severityReason and confidence by the Severity section of your role; otherwise leave them out.\n`
+    `Its level is ${f.severity || 'unset'}. Only when new evidence changes its facts: ${GRADING} Otherwise leave them out.\n`
   if (!d) {
     return ask + `Then read the code at ${head}. state=open if the problem is still there, fixed if the change since removed it (say which code does), na if the code it named is gone or the claim no longer applies` +
       `${f.status === 'withdrawn' ? ', withdrawn if it was withdrawn earlier and the code still shows the finding was wrong' : ''}. ${DATA}`
@@ -178,7 +182,7 @@ const { judged } = claims
 // A regrade without the facts behind it keeps the old level and loses coverage.
 const unjudged = [
   ...carried.filter((_, i) => !rechecked[i]).map(f => ({ kind: 'recheck', id: f.id })),
-  ...carried.filter((f, i) => { const v = rechecked[i]; return v && v.severity && v.severity !== f.severity && !graded(v) }).map(f => ({ kind: 'regrade', id: f.id })),
+  ...carried.filter((_, i) => regradeOf(rechecked[i]) === false).map(f => ({ kind: 'regrade', id: f.id })),
   ...claims.claims.filter((_, i) => !judged[i]).map(c => ({ kind: 'claim', commentId: c.commentId })),
 ]
 const misattributed = judged.filter(v => v && v.verdict === 'misattributed').length
@@ -188,8 +192,7 @@ const claimsOut = judged.filter(v => v && v.verdict !== 'misattributed')
 phase('Judge')
 const ours = audit.confirmed.flatMap(u => u.findings.map(f => ({
   source: 'review', file: repoPath(f.file), line: f.line, dimension: u.dim,
-  severity: f.severity, confidence: f.confidence, impact: f.impact, severityReason: f.severityReason,
-  why: f.why, snippet: f.snippet, verdictReason: f.verdict.reason, status: 'open',
+  ...gradeOf(f), why: f.why, snippet: f.snippet, verdictReason: f.verdict.reason, status: 'open',
 })))
 const confirmedClaims = claimsOut.filter(c => c.verdict === 'confirmed')
 const MATCH = { type: 'object', required: ['matches'], properties: { matches: { type: 'array', items: { type: 'object', required: ['finding', 'commentId'], properties: { finding: { type: 'integer' }, commentId: { type: 'integer' } } } } } }
@@ -213,10 +216,7 @@ const answerOf = (f, v) => {
 // A dead verifier records no dispute, so the same replies are judged on the next run.
 const carriedOut = carried.map((f, i) => {
   const v = rechecked[i]
-  const kept = { severity: f.severity, confidence: f.confidence, impact: f.impact, severityReason: f.severityReason }
-  const regraded = v && v.severity && v.severity !== f.severity
-  const base = { id: f.id, file: f.file, line: f.line,
-    ...(regraded && graded(v) ? { severity: v.severity, confidence: v.confidence, impact: v.impact, severityReason: v.severityReason } : kept) }
+  const base = { id: f.id, file: f.file, line: f.line, ...(regradeOf(v) || gradeOf(f)) }
   if (!v) return { ...base, status: f.status || 'open', recheckReason: 'unjudged' }
   const d = disputeOf[f.id]
   const out = { ...base, status: statusOf(f, v), recheckReason: v.reason }

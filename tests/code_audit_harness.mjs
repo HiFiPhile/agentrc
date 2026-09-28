@@ -213,6 +213,7 @@ test('F<n> is contiguous over confirmed and unverified findings, in unit then fi
   const { result } = await run(args, { scans, verdicts, reverse: true })
   const ids = Object.fromEntries([...result.confirmed, ...result.unverified].flatMap(r => r.findings).map(f => [f.why, f.id]))
   assert.deepEqual(ids, { a9: 'F1', a30: 'F2', b1: 'F3', 'b2-lost': 'F4' })
+  assert.deepEqual(result.confirmed.map(r => r.findings.map(f => f.id)), [['F1', 'F2'], ['F3']])
 })
 
 test('the scan schema takes only the one scale', async () => {

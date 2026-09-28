@@ -390,6 +390,21 @@ class Ledger(Case):
         self.push_pr()
         self.p = self.prepare()
 
+    def test_save_refuses_a_word_off_the_scale_before_anything_is_stored(self):
+        for word in ('major', 'severe', None):
+            finding = {'file': 'src/core/a.c', 'line': 21, 'why': 'w', 'severity': word, 'status': 'open'}
+            with self.assertRaisesRegex(facts.Unusable, f'finding src/core/a.c:21 has severity {word!r}, not a level'):
+                self.save(self.result_for(self.p, findings=[finding]))
+            with self.assertRaisesRegex(facts.Unusable, 'not a level'):
+                self.save(self.result_for(self.p, mode='discussion', findings=[{'id': f'pr{PR}-f1', 'severity': word or 'x', 'status': 'open'}]))
+        self.assertFalse(Path(self.p['ledger']).exists() and json.loads(Path(self.p['ledger']).read_text())['reviews'])
+        carried = {'id': f'pr{PR}-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'w', 'severity': None, 'status': 'open'}
+        self.assertIsNone(ledger.refuse_off_scale({'findings': [carried]}), 'a carried record may predate levels')
+        claim = {'commentId': 55, 'verdict': 'confirmed', 'severity': 'Major'}
+        with self.assertRaisesRegex(facts.Unusable, "claim 55 has severity 'Major', not a level"):
+            self.save(self.result_for(self.p, claims=[claim]))
+        self.assertIsNone(ledger.refuse_off_scale({'findings': [], 'claims': [{**claim, 'verdict': 'refuted', 'severity': None}]}))
+
     def test_save_numbers_findings_anchors_comments_and_fixes_the_digest(self):
         out = self.save(self.result_for(self.p))
         self.assertEqual((out['inline'], out['moved'], out['findings']), (1, 1, 1))
@@ -1475,13 +1490,17 @@ class Severity(unittest.TestCase):
                          [('P0 critical', 1), ('P1 high', 2), ('P2 medium', 1), ('P4 nit', 1)])
 
     def test_every_copy_of_the_scale_is_the_one_in_finding_verifier(self):
-        table = re.findall(r'^\| `(\w+)` \|', (ROOT / 'agents' / 'finding-verifier.md').read_text(), re.M)
-        self.assertEqual(tuple(table), ledger.LEVELS)
+        role = (ROOT / 'agents' / 'finding-verifier.md').read_text()
+        self.assertEqual(tuple(re.findall(r'^\| `(\w+)` \|', role, re.M)), ledger.LEVELS)
+        facts_ = re.findall(r'^- `(\w+)`: ', role.split('## Severity')[1], re.M)
+        self.assertEqual(facts_, ['consequence', 'path', 'variants', 'recovery'])
         for wf in ('code-audit.js', 'pr-review.js'):
             src = (ROOT / 'workflows' / wf).read_text()
             for const, want in (('LEVELS', ledger.LEVELS), ('CONFIDENCE', ledger.CONFIDENCE)):
                 got = re.search(rf"^const {const} = \[([^\]]*)\]", src, re.M).group(1)
                 self.assertEqual(tuple(re.findall(r"'(\w+)'", got)), want, f'{wf} {const}')
+            got = re.search(r"^const IMPACT = \{.*?required: \[([^\]]*)\]", src, re.M | re.S).group(1)
+            self.assertEqual(re.findall(r"'(\w+)'", got), facts_, f'{wf} IMPACT')
 
 
 class Workflow(unittest.TestCase):

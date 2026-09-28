@@ -377,4 +377,10 @@ test('a recheck regrades only with the facts behind it; without them the old lev
   assert.equal(bare.result.verdict.event, 'REQUEST_CHANGES', 'the standing high still blocks')
   const same = await run(inc, { ...base, recheck: () => ({ state: 'open', reason: 'still' }) })
   assert.deepEqual([same.result.findings[0].severity, same.result.coverage.unjudged], ['high', []])
+  const revised = await run(inc, { ...base, recheck: () => ({ state: 'open', reason: 'still', severity: 'high', ...facts }) })
+  assert.deepEqual([revised.result.findings[0].severity, revised.result.findings[0].severityReason, revised.result.coverage.unjudged], ['high', 'the host retries', []],
+    'revised facts at the same level replace the old ones')
+  const partial = await run(inc, { ...base, recheck: () => ({ state: 'open', reason: 'still', impact: facts.impact }) })
+  assert.deepEqual([partial.result.findings[0].severityReason, partial.result.coverage.unjudged], ['old', [{ kind: 'regrade', id: 'pr7-f1' }]],
+    'facts without their level are an incomplete regrade')
 })
