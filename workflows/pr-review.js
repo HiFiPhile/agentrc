@@ -219,7 +219,7 @@ const carriedOut = carried.map((f, i) => {
 
 // One verified defect found by several dimensions or reviews, or also raised on a thread, is one group, formed anew
 // on every run over the new and the standing findings: each member keeps its own record, grade and recheck, the group
-// is posted at most once and counts once, at its strongest grade.
+// counts once, at its strongest grade.
 const GROUPS = { type: 'object', required: ['groups'], properties: { groups: { type: 'array', items: { type: 'object', required: ['findings', 'claims'],
   properties: { findings: { type: 'array', items: { type: 'integer' } }, claims: { type: 'array', items: { type: 'string' } } } } } } }
 const rankIn = (scale, v) => scale.includes(v) ? scale.indexOf(v) : scale.length
@@ -229,6 +229,7 @@ const standing = carriedOut.filter(f => ['open', 'upheld'].includes(f.status))
 const pool = [...ours, ...standing]
 const claimOf = Object.fromEntries(confirmedClaims.map(c => [c.claimId, c]))
 const earlier = Object.fromEntries(carried.map(f => [f.id, f]))
+const whyOf = (f) => f.why || earlier[f.id].why
 // Only items on one file can be one defect; standing ones are regrouped too, since a push can split what was one. A
 // discussion sees only the answered findings, a subset it cannot regroup, and leaves their groups as saved.
 const onFile = new Map()
@@ -237,7 +238,7 @@ const asked = new Set(discussion ? [] : [...onFile].filter(([, xs]) => xs.length
 const grouped = asked.size ? await agent(
   'Group the review findings and thread claims below that describe the SAME defect in the same code: one group per defect, at least two members, only groups you are sure of. ' +
   'An item belongs to a group only if its whole substance is that defect: a finding or claim that also raises another problem stays out. Items about different variants belong together only when the path and the fix are the same.\n' +
-  `Findings: ${JSON.stringify(pool.map((f, i) => ({ finding: i, file: f.file, line: f.line, dimension: f.dimension, why: f.why || earlier[f.id].why })).filter(f => asked.has(f.file)))}\n` +
+  `Findings: ${JSON.stringify(pool.map((f, i) => ({ finding: i, file: f.file, line: f.line, dimension: f.dimension, why: whyOf(f) })).filter(f => asked.has(f.file)))}\n` +
   `Claims: ${JSON.stringify(confirmedClaims.filter(c => asked.has(c.path)).map(c => ({ claim: c.claimId, path: c.path, line: c.line, text: c.claim })))}`,
   { label: 'group', phase: 'Judge', model: 'sonnet', effort: 'medium', schema: GROUPS },
 ) : { groups: [] }
@@ -252,15 +253,44 @@ if (!groupsOk) unjudged.push({ kind: 'group' })
 const groups = groupsOk ? grouped.groups : []
 // A lead thread claim graded below our lead finding: the body names our stronger grade.
 const ourGrade = new Map()
+const leadOf = new Map()
 for (const [k, g] of groups.entries()) {
   const fs = g.findings.map(i => pool[i])
   const cs = g.claims.map(id => claimOf[id])
   for (const x of [...fs, ...cs]) x.group = k
   const leadClaim = strongest(cs)
   const leadFinding = strongest(fs)
-  // Still ours to recheck until fixed; posted only as the group's one new comment, never where a thread says it.
+  leadOf.set(k, leadFinding)
+  // Still ours to recheck until fixed; muted unless beyond, below, finds it stating more than its group's text.
   for (const f of fs) if (f !== leadFinding || leadClaim) f.muted = true
   if (leadClaim && leadFinding && rankIn(LEVELS, leadFinding.severity) < rankIn(LEVELS, leadClaim.severity)) ourGrade.set(leadClaim, leadFinding)
+}
+// A muted finding that states a verified issue its group's printed text lacks is posted too: the group still counts
+// once, but no issue goes unsaid behind a claim or a stronger finding. The issue named only steers the comment.
+const muted = groups.flatMap(g => g.findings.map(i => pool[i]).filter(f => f.muted))
+// A standing finding's verification is this run's recheck.
+const verifiedOf = (f) => f.verdictReason || (f.recheckReason !== 'unjudged' && f.recheckReason) || null
+const shown = (f) => ({ file: f.file, line: f.line, dimension: f.dimension, why: whyOf(f), verified: verifiedOf(f) })
+const BEYOND = { type: 'object', required: ['beyond'], properties: { beyond: { type: 'array', items: { type: 'object', required: ['finding', 'issue'],
+  properties: { finding: { type: 'integer' }, issue: { type: 'string' } } } } } }
+const beyond = muted.length ? await agent(
+  'Each group below is ONE defect; only its printed text will state it, and its muted findings are not posted. For each muted finding, compare its ' +
+  'text and its verification with the printed text. List every muted finding that states a VERIFIED issue the printed text does not: another problem, ' +
+  'another site, a documentation or style problem, a different failure mode. A detail of the same defect is not one; a point its own verification ' +
+  'rejects, calls unproven or pre-existing is not verified. When unsure, list it.\n' +
+  `Groups: ${JSON.stringify(groups.filter(g => g.findings.some(i => pool[i].muted)).map(g => ({
+    printed: g.claims.length ? g.claims.map(id => claimOf[id].claim) : g.findings.map(i => pool[i]).filter(f => !f.muted).map(f => ({ ...shown(f), verified: undefined })),
+    muted: g.findings.map(i => pool[i]).filter(f => f.muted).map(f => ({ finding: muted.indexOf(f), ...shown(f) })),
+  })))}`,
+  { label: 'beyond', phase: 'Judge', model: 'sonnet', effort: 'medium', schema: BEYOND },
+) : { beyond: [] }
+// Without a trusted answer every muted finding is posted: duplicates, nothing hidden, and the coverage stays unproven.
+const beyondOk = beyond && Array.isArray(beyond.beyond) && new Set(beyond.beyond.map(b => b && b.finding)).size === beyond.beyond.length &&
+  beyond.beyond.every(b => b && Number.isInteger(b.finding) && muted[b.finding] && typeof b.issue === 'string' && b.issue.trim())
+if (!beyondOk) unjudged.push({ kind: 'beyond' })
+for (const b of beyondOk ? beyond.beyond : muted.map((_, i) => ({ finding: i, issue: null }))) {
+  Object.assign(muted[b.finding], { muted: false, beside: b.issue })
+  if (b.issue) log(`posted beside its group, ${muted[b.finding].file}:${muted[b.finding].line}: ${b.issue}`)
 }
 // Without a grouping it can trust, each item is its own defect: counted twice rather than one hidden.
 const keyOf = (x, own) => x.group != null ? `g${x.group}` : own
@@ -309,7 +339,7 @@ if (blockers || regressions.length) {
 log(`verdict ${event}: ${reasons.join('; ') || 'nothing open, coverage complete, CI green, hardware covered'}`)
 
 phase('Draft')
-// A finding of a group is posted once, as the group's strongest.
+// A muted finding is not posted.
 const toPost = ours.filter(f => f.status === 'open' && !f.muted)
 const FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sentence>`, then at most 3 bullets: the cause with `file:line`, ' +
   `the impact, and a fix only where the finding supports one; at most ${LIMIT.comment} words; a question only when genuinely asking. ` +
@@ -318,8 +348,9 @@ const COMMENTS = { type: 'array', items: { type: 'object', required: ['finding',
 const WRITE = { type: 'object', required: ['summary', 'comments'], properties: { summary: { type: 'string' }, comments: COMMENTS } }
 const written = toPost.length ? await agent(
   `Write the inline comments of a code review for a contributor's PR, one per finding below, and its summary. ${FORMAT}${STYLE}` +
-  'Use ONLY what each finding states: add no new claim, number, API or file. No sign-off, no attribution.\n' +
-  `Findings: ${JSON.stringify(toPost.map((f, i) => ({ finding: i, file: f.file, line: f.line, severity: f.severity, dimension: f.dimension, why: f.why, evidence: f.verdictReason })))}`,
+  'Use ONLY what each finding states: add no new claim, number, API or file. A finding with `alsoState` must also state that issue, as far as its ' +
+  'finding and evidence support it. No sign-off, no attribution.\n' +
+  `Findings: ${JSON.stringify(toPost.map((f, i) => ({ finding: i, file: f.file, line: f.line, severity: f.severity, dimension: f.dimension, why: f.why, evidence: f.verdictReason, alsoState: f.beside || undefined })))}`,
   { label: 'write', phase: 'Draft', model: 'sonnet', effort: 'medium', schema: WRITE },
 ) : { summary: '', comments: [] }
 const bodies = toPost.map((f, i) => ((written && written.comments) || []).find(c => c.finding === i))
@@ -354,10 +385,11 @@ if (summaryLong) summary = ''
 const CHECKED = { type: 'object', required: ['bad', 'summaryBad', 'answersBad'], properties: { bad: { type: 'array', items: { type: 'integer' } },
   summaryBad: { type: 'boolean' }, answersBad: { type: 'array', items: { type: 'string' } } } }
 const checked = (toPost.length && written) || reworded.length ? await agent(
-  `List the finding numbers whose comment states any claim, number, API or file that its finding does not, or fails to state the finding's problem. ` +
+  `List the finding numbers whose comment states any claim, number, API or file that its finding does not, or fails to state the finding's problem, ` +
+  'or, for a finding with alsoState, omits that issue or states it beyond what the finding and evidence support. ' +
   'summaryBad: does the summary state anything that no finding states, or say nothing about the findings? ' +
   'answersBad: the findings whose shortened answer states anything its original does not, or drops its conclusion or the evidence it rests on.\n' +
-  `Pairs: ${JSON.stringify(toPost.map((f, i) => ({ finding: i, finding_text: f.why, evidence: f.verdictReason, comment: bodies[i] ? bodies[i].body : null })))}\n` +
+  `Pairs: ${JSON.stringify(toPost.map((f, i) => ({ finding: i, finding_text: f.why, evidence: f.verdictReason, alsoState: f.beside || undefined, comment: bodies[i] ? bodies[i].body : null })))}\n` +
   `Summary: ${JSON.stringify(summary || null)}\n` +
   `Answers: ${JSON.stringify(reworded.map(x => ({ finding: x.finding, original: x.was, shortened: x.a.body })))}`,
   { label: 'check-draft', phase: 'Draft', model: 'sonnet', effort: 'low', schema: CHECKED },
@@ -365,7 +397,8 @@ const checked = (toPost.length && written) || reworded.length ? await agent(
 // A shortened answer the check flags, or one left unchecked, goes back to its original.
 for (const x of reworded) if (!checked || (checked.answersBad || []).includes(x.finding)) x.a.body = x.was
 // A comment the check flags, lost, unchecked or still off its format falls back to the finding's own words.
-const template = (f) => `**${f.severity || 'finding'}**: ${f.why}`
+// A finding posted beside its group falls back with its verification too, which states what the group's text lacks.
+const template = (f) => `**${f.severity || 'finding'}**: ${f.why}${f.beside ? `\n\n${f.verdictReason}` : ''}`
 // `finding` indexes the result's findings (carried first), so the ledger can give the comment its finding's id.
 const comments = toPost.map((f, i) => ({
   path: f.file, line: f.line, finding: carriedOut.length + ours.indexOf(f),
@@ -397,10 +430,13 @@ lines.push(`Reviewed ${args.mode === 'incremental' ? `the changes since ${scopeB
 if (disputed) {
   lines.push('', `${blocking.length ? `Blocking: ${blocking.map(o => o.at).join(', ')}; disputed` : 'Disputed'}, waiting for a maintainer: ${disputedAt.join(', ')}.`)
 }
-// A standing finding no comment on the PR states, its own or its group's, is named here, so every blocker is.
-const stated = new Set([...pool.filter(f => (earlier[f.id] || {}).commentId || toPost.includes(f)), ...confirmedClaims].map(x => keyOf(x, x)))
-const unstated = standing.filter(f => !stated.has(keyOf(f, f)))
-if (unstated.length) lines.push('', 'Still standing from earlier reviews, not in any comment:', ...unstated.map(f => `- **${f.severity || 'finding'}** ${where(f.file, f.line)}: ${earlier[f.id].why}`))
+// A standing finding no comment on the PR states, its own or its group's, is named here, so every blocker is; so is
+// one its group's text states only in part.
+// A group is stated by its lead's comment or a claim; a member's own comment states only that member.
+const said = (f) => (earlier[f.id] || {}).commentId || toPost.includes(f)
+const stated = new Set([...pool.filter(f => said(f) && (f.group == null || leadOf.get(f.group) === f)), ...confirmedClaims].map(x => keyOf(x, x)))
+const unstated = standing.filter(f => 'beside' in f || !(said(f) || stated.has(keyOf(f, f))))
+if (unstated.length) lines.push('', 'Still standing from earlier reviews, not stated in full by any comment:', ...unstated.map(f => `- **${f.severity || 'finding'}** ${where(f.file, f.line)}: ${whyOf(f)}${f.beside && verifiedOf(f) ? `\n  ${verifiedOf(f)}` : ''}`))
 if (confirmedClaims.length) lines.push('', 'Confirmed from existing threads:', ...confirmedClaims.map(c => `- @${c.author}${c.path ? ` on ${where(c.path, c.line)}` : ''}: ${c.claim}` +
   (ourGrade.has(c) ? ` (our review grades it **${ourGrade.get(c).severity}**, ${where(ourGrade.get(c).file, ourGrade.get(c).line)})` : '')))
 lines.push('', `CI: ${ci.state}.`)
@@ -410,7 +446,7 @@ else lines.push('', 'Hardware: not run.')
 return {
   status: 'reviewed', pr, repo, head, mergeBase, scopeBase, mode: args.mode,
   verdict: { event, reasons },
-  findings: [...carriedOut, ...ours].map(({ group, muted, ...f }) => (!discussion && (f.id || group != null) ? { ...f, defect: group ?? null } : f)),
+  findings: [...carriedOut, ...ours].map(({ group, muted, beside, ...f }) => (!discussion && (f.id || group != null) ? { ...f, defect: group ?? null } : f)),
   claims: claimsOut.map(({ group, ...c }) => (group != null ? { ...c, defect: group } : c)),
   coverage: { dropped: audit.dropped, unverified: audit.unverified, unjudged },
   ci, hil,
