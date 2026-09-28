@@ -133,6 +133,10 @@ class FakeGitHub:
             self.posts.append(json.loads(stdin))
             if self.post_fails is True:
                 return 1, '', 'HTTP 502'
+            if self.post_fails == 'refused':
+                return 1, '', 'gh: API rate limit exceeded for user ID 1. (HTTP 403)'
+            if self.post_fails == 'proxy':
+                return 1, '', 'gh: Forbidden (HTTP 403)'
             rid = self.next_id = self.next_id + 1
             body = json.loads(stdin)
             state = post.STATE[body.get('event')]
@@ -144,6 +148,8 @@ class FakeGitHub:
                 self.publish(rid)
             if self.post_fails == 'lost':
                 return 1, '', 'HTTP 502'
+            if self.post_fails == 'created-refused':
+                return 1, '', 'gh: API rate limit exceeded for user ID 1. (HTTP 403)'
             return 0, json.dumps({'id': rid, 'node_id': f'PRR_{rid}'})
         if argv[0] == 'api':
             path = next(a for a in argv[1:] if a.startswith('repos/')).split('?')[0]
@@ -576,7 +582,7 @@ class Post(PostCase):
         self.assertEqual(len(self.gh.submits), 1)
 
     def test_a_review_handed_to_the_human_exits_1(self):
-        for out, code in (({'status': 'drafted', 'handedOver': 'x'}, 1), ({'status': 'drafted'}, 0)):
+        for out, code in (({'status': 'drafted', 'handedOver': 'x'}, 1), ({'status': 'drafted'}, 0), ({'status': 'failed'}, 1)):
             with mock.patch.object(post, 'collect', return_value=out), mock.patch('sys.stdout'):
                 self.assertEqual(post.main([]), code)
 
@@ -588,7 +594,7 @@ class Post(PostCase):
         self.gh.submit_fails = True
         out = self.post('--auto')
         self.assertEqual((out['status'], out['handedOver']), ('drafted', "the submit's outcome is unknown"))
-        self.assertEqual(post.main(['--pr', str(PR), '--repo', REPO, '--sync']), 0)
+        self.assertEqual(self.call(post, ['--pr', str(PR), '--repo', REPO, '--sync'])['status'], 'synced')
         self.assertEqual(len(self.gh.submits), 2, 'never sent again')
 
     def test_a_push_after_the_pending_review_was_made_hands_it_to_the_human(self):
@@ -621,6 +627,42 @@ class Post(PostCase):
         self.gh.submit(self.review()['receipts']['review']['reviewId'])
         self.assertEqual(synced(), 'posted')
         self.assertEqual(self.gh.submits, [])
+
+    def test_a_post_github_refused_created_nothing_and_a_later_run_posts_it_once(self):
+        self.save(self.result_for(self.p))
+        self.gh.post_fails = 'refused'
+        for _ in range(2):
+            out = self.post()
+            self.assertEqual((out['status'], out['review']['sent']), ('failed', False))
+            self.assertIn('HTTP 403', out['review']['error'])
+            self.assertEqual(self.review()['status'], 'pending', 'nothing reached GitHub: the draft is still only ours')
+        self.gh.post_fails = False
+        self.assertEqual(self.post()['status'], 'drafted')
+        self.assertEqual((len(self.gh.posts), len(self.gh.reviews)), (3, 1))
+
+    def test_a_4xx_after_the_review_was_created_is_recovered_by_its_marker(self):
+        self.save(self.result_for(self.p))
+        self.gh.post_fails = 'created-refused'
+        out = self.post()
+        self.assertEqual((out['status'], out['review']['sent'], out['review']['recovered']), ('drafted', True, True))
+        self.assertEqual((len(self.gh.posts), len(self.gh.reviews)), (1, 1))
+
+    def test_any_other_4xx_stays_sent_and_is_only_recovered_by_its_marker(self):
+        self.save(self.result_for(self.p))
+        self.gh.post_fails = 'proxy'
+        out = self.post()
+        self.assertEqual((out['status'], out['review']['sent']), ('uncertain', True))
+        self.gh.post_fails = False
+        self.assertEqual(self.post()['status'], 'uncertain', 'it may still show up: never POST again')
+        self.assertEqual(len(self.gh.posts), 1)
+
+    def test_an_auto_post_github_refused_is_failed_not_handed_over(self):
+        self.save(self.result_for(self.p))
+        self.gh.post_fails = 'refused'
+        out = self.post('--auto')
+        self.assertEqual((out['status'], out['review']['sent'], self.review()['status']), ('failed', False, 'pending'))
+        self.gh.post_fails = False
+        self.assertEqual((self.post('--auto')['status'], len(self.gh.reviews)), ('posted', 1))
 
     def test_a_lost_answer_is_uncertain_and_the_relaunch_recovers_by_marker_without_posting_again(self):
         self.save(self.result_for(self.p))

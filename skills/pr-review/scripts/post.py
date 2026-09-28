@@ -45,11 +45,15 @@ left for --auto to recover by its marker). Submitted: posted, with the event the
 
 A write is stored as sent before it is sent, so a run that dies in it only looks for it afterwards (a review by
 its marker, a reply by its thread and body digest), never sends it twice. --decline records that the human
-declined a draft never created. stdout ends with one JSON line; exit 0 when drafted, posted, declined or synced,
-1 when partial, uncertain or handed over, 2 with {"error": ...} when nothing was attempted.
+declined a draft never created. A POST GitHub itself refused (its rate limit or Validation Failed, on a 403, 422 or
+429) whose marker does not read back right after created nothing: the review stays pending and unsent, reported
+failed, and a later run may POST it again; one that does read back is recovered. Any other error stays sent. stdout ends with
+one JSON line; exit 0 when drafted, posted, declined or synced, 1 when failed, partial, uncertain or handed over,
+2 with {"error": ...} when nothing was attempted.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -124,6 +128,10 @@ def settled(repo, pr, rid, review, sent, recovered):
             'error': None if ok else got, 'commentIds': got if ok else None}
 
 
+# GitHub's own refusals, which it answers before creating anything; any other error may follow a review created.
+REJECTED = re.compile(r'(API rate limit exceeded|secondary rate limit|Validation Failed).*\(HTTP (403|422|429)\)', re.S)
+
+
 def post_review(repo, pr, review, login, recover_only, persist):
     """Create the review PENDING, or find the one an earlier run created."""
     found, others = find_ours(repo, pr, review, login)
@@ -149,6 +157,13 @@ def post_review(repo, pr, review, login, recover_only, persist):
         rid = json.loads(out)['id'] if code == 0 else None
     except (ValueError, KeyError, TypeError):
         rid = None
+    if rid is None and code != 0 and REJECTED.search(err or ''):
+        # GitHub refused it, and the marker read back right after shows nothing: a later run may POST again.
+        found, _ = find_ours(repo, pr, review, login)
+        if len(found) == 1:
+            return settled(repo, pr, found[0]['id'], review, sent=True, recovered=True)
+        if not found:
+            return {'sent': False, 'reviewId': None, 'verified': None, 'recovered': False, 'error': err.strip()[:300]}
     if rid is None:
         # A lost answer may still have posted: the marker settles it on the next run.
         return {'sent': True, 'reviewId': None, 'verified': None, 'recovered': False,
@@ -161,6 +176,8 @@ def publish_review(repo, pr, review, login, recover_only, persist_all):
     rec = review['receipts']
     sent = bool((rec.get('review') or {}).get('sent'))
     if not (rec.get('review') or {}).get('verified'):
+        before = review['status']
+
         def persist(intent):
             rec['review'] = intent
             # From its send intent on, the review may be on GitHub, whatever head the PR has moved to.
@@ -169,6 +186,8 @@ def publish_review(repo, pr, review, login, recover_only, persist_all):
         got = post_review(repo, pr, review, login, sent or recover_only, persist)
         # Once sent, always sent: no later receipt may clear it, or a run would POST again.
         rec['review'] = {**got, 'sent': got['sent'] or sent}
+        if not rec['review']['sent']:
+            review['status'] = before
         persist_all()
     return rec['review'].get('verified') is True
 
@@ -457,6 +476,8 @@ def publish_auto(repo, pr, led, review, event, login, recovering, persist):
     # Only the human sees a pending review: one an earlier run left may have been changed since.
     earlier = bool((rec.get('review') or {}).get('sent'))
     if not publish_review(repo, pr, review, login, recovering, persist):
+        if not rec['review'].get('sent'):
+            return {'status': 'failed', 'review': rec['review'], 'staged': rec.get('staged', [])}
         review['status'] = 'uncertain'
         persist()
         return {'status': 'uncertain', 'review': rec['review'], 'staged': rec.get('staged', [])}
@@ -486,6 +507,8 @@ def publish_draft(repo, pr, led, review, login, recovering, persist):
     rec = review['receipts']
     review['publish'] = 'draft'
     ok = publish_review(repo, pr, review, login, recovering, persist)
+    if not ok and not rec['review'].get('sent'):
+        return {'status': 'failed', 'review': rec['review'], 'staged': rec.get('staged', [])}
     # After a push the review is only found again: answers judged on the old head are not added to it.
     staged = stage(repo, pr, led, review, login, persist) if ok and not recovering else rec.get('staged', [])
     review['status'] = 'drafted' if ok else 'uncertain'
