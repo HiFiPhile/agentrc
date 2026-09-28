@@ -32,6 +32,12 @@ def sh(cwd, *argv):
     return subprocess.run(argv, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
+# GitHub's own refusals of a review POST, answered before it creates anything.
+REFUSALS = {'refused': 'gh: API rate limit exceeded for user ID 1. (HTTP 403)',
+            'invalid': 'gh: Validation Failed: {"resource":"PullRequestReview","code":"custom"} (HTTP 422)',
+            'secondary': 'gh: You have exceeded a secondary rate limit. (HTTP 429)'}
+
+
 class FakeGitHub:
     def __init__(self):
         self.head = None
@@ -44,6 +50,7 @@ class FakeGitHub:
         self.threads = []
         self.posts = []
         self.post_fails = False
+        self.list_fails = False
         self.readback_state = None
         self.readback_body = None
         self.next_id = 500
@@ -134,8 +141,8 @@ class FakeGitHub:
             self.posts.append(json.loads(stdin))
             if self.post_fails is True:
                 return 1, '', 'HTTP 502'
-            if self.post_fails == 'refused':
-                return 1, '', 'gh: API rate limit exceeded for user ID 1. (HTTP 403)'
+            if self.post_fails in REFUSALS:
+                return 1, '', REFUSALS[self.post_fails]
             if self.post_fails == 'proxy':
                 return 1, '', 'gh: Forbidden (HTTP 403)'
             rid = self.next_id = self.next_id + 1
@@ -149,8 +156,11 @@ class FakeGitHub:
                 self.publish(rid)
             if self.post_fails == 'lost':
                 return 1, '', 'HTTP 502'
-            if self.post_fails == 'created-refused':
-                return 1, '', 'gh: API rate limit exceeded for user ID 1. (HTTP 403)'
+            if self.post_fails == 'created-twice-refused':
+                self.reviews[rid + 1] = {**self.reviews[rid], 'id': rid + 1, 'node_id': f'PRR_{rid + 1}'}
+                self.next_id += 1
+            if self.post_fails in ('created-refused', 'created-twice-refused'):
+                return 1, '', REFUSALS['refused']
             return 0, json.dumps({'id': rid, 'node_id': f'PRR_{rid}'})
         if argv[0] == 'api':
             path = next(a for a in argv[1:] if a.startswith('repos/')).split('?')[0]
@@ -169,6 +179,8 @@ class FakeGitHub:
                     r['body'] += self.readback_body
                 return 0, json.dumps(r)
             if path == f'repos/{REPO}/pulls/{PR}/reviews':
+                if self.list_fails and self.posts:
+                    return 1, '', 'HTTP 502'
                 return 0, json.dumps(page(self.reviews.values()))
             if path == f'repos/{REPO}/pulls/{PR}/comments':
                 return 0, json.dumps(page(self.inline))
@@ -650,6 +662,35 @@ class Post(PostCase):
         self.gh.post_fails = False
         self.assertEqual(self.post()['status'], 'drafted')
         self.assertEqual((len(self.gh.posts), len(self.gh.reviews)), (3, 1))
+
+    def test_a_validation_failure_or_a_secondary_limit_created_nothing_either(self):
+        self.save(self.result_for(self.p))
+        for refusal in ('invalid', 'secondary'):
+            self.gh.post_fails = refusal
+            out = self.post()
+            self.assertEqual((out['status'], out['review']['sent'], self.review()['status']), ('failed', False, 'pending'), refusal)
+        self.gh.post_fails = False
+        self.assertEqual((self.post()['status'], len(self.gh.posts), len(self.gh.reviews)), ('drafted', 3, 1))
+
+    def test_a_refusal_whose_marker_cannot_be_read_back_stays_sent(self):
+        self.save(self.result_for(self.p))
+        self.gh.post_fails, self.gh.list_fails = 'refused', True
+        with self.assertRaisesRegex(facts.Unusable, 'HTTP 502'):
+            self.post()
+        self.assertEqual((self.review()['status'], self.review()['receipts']['review']['sent']), ('uncertain', True))
+        self.gh.post_fails = self.gh.list_fails = False
+        self.assertEqual(self.post()['status'], 'uncertain', 'no marker proves it absent: never POST again')
+        self.assertEqual(len(self.gh.posts), 1)
+
+    def test_a_refusal_with_two_reviews_carrying_its_marker_is_reconciled_by_hand(self):
+        self.save(self.result_for(self.p))
+        self.gh.post_fails = 'created-twice-refused'
+        self.assertEqual((self.post()['status'], self.review()['receipts']['review']['sent']), ('uncertain', True))
+        self.gh.post_fails = False
+        out = self.post()
+        self.assertEqual(out['status'], 'uncertain')
+        self.assertIn('2 reviews carry this draft', out['review']['error'])
+        self.assertEqual(len(self.gh.posts), 1)
 
     def test_a_4xx_after_the_review_was_created_is_recovered_by_its_marker(self):
         self.save(self.result_for(self.p))
