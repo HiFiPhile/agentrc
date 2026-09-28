@@ -33,12 +33,13 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    then read `report.md`, chief's final report, or, when there is none, the
    exit line and `stderr.log`. When it can table the session's cost, the
    launcher appends `cost.md` to the report: `scripts/run_cost.py`'s table of
-   the spend by Workflow run, stage and model, in claude's own dollars, and
-   its breakouts; the exit line ends with its total, or with `cost none` and
-   why.
+   the spend by Workflow run, stage and model, in claude's own dollars, its
+   breakouts and a time table of each run's wall by stage kind; the exit line ends
+   with its total, or with `cost none` and why.
    In the message that reports the exit, unasked, relay chief's launch
    table, the total and `cost.md`'s two breakout tables, spend by part and
-   by model, verbatim; a stage that dwarfs the work it did is worth a word.
+   by model, and its time table, verbatim; a stage that dwarfs the work it
+   did, or a stage kind that dwarfs the run's wall, is worth a word.
    The exit code says how the run ended, not whether the task passed:
 
    | Exit | Meaning |

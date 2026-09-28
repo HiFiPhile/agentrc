@@ -47,6 +47,7 @@ class RunCostTest(unittest.TestCase):
         patcher = mock.patch.object(run_cost, 'PROJECTS', self.projects)
         patcher.start()
         self.addCleanup(patcher.stop)
+        run_cost.usage_of.cache_clear()   # each test writes its own transcripts at the same paths
         self.session = self.projects / '-home-x-repo' / SID
         run = self.session / 'subagents' / 'workflows' / 'wf_aaa'
         self.journal = run / 'journal.jsonl'
@@ -191,6 +192,27 @@ class RunCostTest(unittest.TestCase):
             self.assertEqual(rows[('chief', 'chief', model)][3::5], ['1', '-'], model)
         self.assertEqual(rows[('wf_aaa', 'ci:collect', 'haiku-4-5')][8], '5 s', 'single-model transcripts keep their spans')
         self.assertEqual(self.table(out)[-1].split('|')[4].strip(), '5', 'the total counts each transcript once')
+
+    def test_the_timeline_splits_each_runs_wall_by_kind_and_unions_the_runs(self):
+        write(self.session.with_suffix('.jsonl'), self.chief + [turn('m9', 'claude-opus-5-5', '2026-09-25T10:10:00Z', out=1)])
+        later = self.session / 'subagents' / 'workflows' / 'wf_bbb'
+        for aid, label, t0, t1 in (('d1', 'state:load#1', '10:05:00', '10:06:00'), ('d2', 'reviews#1', '10:06:00', '10:08:00'),
+                                   ('d3', 'challenge#1', '10:07:00', '10:08:30'), ('d4', 'ci:collect#1.1', '10:06:00', '10:09:00')):
+            (later / f'agent-{aid}.meta.json').parent.mkdir(parents=True, exist_ok=True)
+            (later / f'agent-{aid}.meta.json').write_text(json.dumps({'description': label}))
+            write(later / f'agent-{aid}.jsonl', [turn(f'n{aid}', 'claude-haiku-4-5', f'2026-09-25T{t}Z', out=1) for t in (t0, t1)])
+        out = self.main('--session-id', SID)[1]
+        rows = self.breakout(out, 3)
+        self.assertEqual(rows['wf_aaa'], ['10:00:00', '2.5', '0.0', '0.1', '0.5', '1.0'], 'chief ran from 09:59; ci:collect 5 s and an instant, fix 30 s')
+        self.assertEqual(rows['wf_bbb'], ['10:05:00', '4.0', '1.0', '3.0', '2.5', '2.5'], 'overlapping agents of one kind count once')
+        self.assertIn('Session wall 11.0 min, of which Workflow runs 6.5 min.', out)
+        # a second workflow running beside wf_bbb adds only what it covers beyond it
+        beside = self.session / 'subagents' / 'workflows' / 'wf_ccc'
+        beside.mkdir(parents=True)
+        (beside / 'agent-e1.meta.json').write_text(json.dumps({'description': 'reviews#1'}))
+        write(beside / 'agent-e1.jsonl', [turn(f'e{t}', 'claude-haiku-4-5', f'2026-09-25T{t}Z', out=1) for t in ('10:06:00', '10:10:00')])
+        self.assertIn('Session wall 11.0 min, of which Workflow runs 7.5 min.', self.main('--session-id', SID)[1])
+        self.assertEqual(run_cost.lane_of(run_cost.stage_of('preflight.retry')), 'setup', 'a relay retry keeps its stage kind')
 
     def test_a_session_it_cannot_place_is_refused(self):
         rc, _, err = self.main('--session-id', 'nope')

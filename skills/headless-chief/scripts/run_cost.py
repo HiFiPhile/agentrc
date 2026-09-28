@@ -25,8 +25,13 @@ Two breakout tables follow, each summing the rows above with its share of the to
 by part (each Workflow run, named by its saved workflow; chief's own turns; each role
 chief ran itself; any unallocated cost) and by model. A sum is marked `(partial)` when one
 of its rows has no dollars.
+
+A time table ends it: each Workflow run's wall, the busy time of its stages by kind
+(setup: state:load and preflight; CI: the ci: stages; other: the rest) and the gap
+before it; the note under the table defines them.
 """
 import argparse
+import functools
 import json
 import re
 import sys
@@ -79,6 +84,7 @@ def records(path):
             continue   # a transcript being written can end mid-line
 
 
+@functools.lru_cache(maxsize=None)
 def usage_of(path):
     """{model: {turns, peak, tokens: Counter of PARTS}}, first and last timestamp, of one transcript."""
     last, t0, t1 = {}, None, None
@@ -154,15 +160,20 @@ def rows_for(group, agents):
     return sorted(acc.values(), key=lambda r: -priced_at(rate_of(r['model']) or GENERIC, r['tokens']))
 
 
-def collect(session):
+def runs_of(session):
+    """[(start, run name, [(stage, transcript)])] of the session's Workflow runs, in start order."""
     runs = []
     for run in (session / 'subagents' / 'workflows').glob('wf_*'):
         agents = [(stage_of(meta_of(m).get('description') or '?'), transcript_of(m)) for m in run.glob('agent-*.meta.json')]
         agents = [(s, p) for s, p in agents if p.exists()]
         start = min((usage_of(p)[1] or '~' for _, p in agents), default='~')
         runs.append((start, run.name, agents))
+    return sorted(runs)
+
+
+def collect(session):
     rows = []
-    for _, name, agents in sorted(runs):
+    for _, name, agents in runs_of(session):
         rows += rows_for(name, agents)
     own = [('chief', session.with_suffix('.jsonl'))]
     own += [(f'chief:{meta_of(m).get("agentType") or "?"}', transcript_of(m)) for m in (session / 'subagents').glob('agent-*.meta.json')]
@@ -239,6 +250,50 @@ def breakout(rows, session):
     return '\n'.join(lines(part, 'part')) + '\n\n' + '\n'.join(lines(lambda r: r['model'].removeprefix('claude-'), 'model'))
 
 
+SETUP = ('state:load', 'preflight')
+
+
+def lane_of(stage):
+    return 'setup' if stage.removesuffix('.retry') in SETUP else 'ci' if stage.startswith('ci:') else 'other'
+
+
+def busy(intervals):
+    """Seconds covered by the union of [(t0, t1)] ISO intervals."""
+    total, end = 0.0, None
+    for t0, t1 in sorted(intervals):
+        if end is None or t0 > end:
+            total, end = total + seconds(t0, t1), t1
+        elif t1 > end:
+            total, end = total + seconds(end, t1), t1
+    return total
+
+
+def timeline(session):
+    """The Markdown time table: each Workflow run's wall and the busy time of its stages by kind, and the gap before it."""
+    minutes = lambda s: f'{s / 60:.1f}'
+    _, s0, s1 = usage_of(session.with_suffix('.jsonl'))
+    out = ['| run | start UTC | wall min | setup min | CI lane min | other work min | gap before it min |',
+           '|---|---|---:|---:|---:|---:|---:|']
+    last, walls = s0, []
+    for _, name, agents in runs_of(session):
+        spans = [(lane_of(stage), *usage_of(p)[1:]) for stage, p in agents]
+        spans = [(lane, t0, t1) for lane, t0, t1 in spans if t0 and t1]
+        if not spans:
+            continue
+        r0, r1 = min(t0 for _, t0, _ in spans), max(t1 for _, _, t1 in spans)
+        lane = {k: busy([(t0, t1) for x, t0, t1 in spans if x == k]) for k in ('setup', 'ci', 'other')}
+        walls.append((r0, r1))
+        out.append(f'| {name} | {r0[11:19]} | {minutes(seconds(r0, r1))} | {minutes(lane["setup"])} | {minutes(lane["ci"])} | '
+                   f'{minutes(lane["other"])} | {minutes(max(0.0, seconds(last, r0)))} |')
+        last = max(last, r1) if last else r1
+    session_wall = seconds(s0, max(s1 or '', last or ''))
+    out.append(f'\nSession wall {minutes(session_wall)} min, of which Workflow runs {minutes(busy(walls))} min. A run\'s wall runs from its '
+               'first agent record to its last; a kind\'s time is the union of its agents\' spans, idle waits included (ci:collect waits '
+               'on CI), and kinds overlap. The gap before a run is everything chief did since the previous one: its own turns, its '
+               'units, writers, checks and review rounds.')
+    return '\n'.join(out)
+
+
 def workflow_name(session, run):
     """The saved workflow a run executed, from its record beside the transcripts, or None."""
     try:
@@ -257,7 +312,7 @@ def summary(session):
     notes = [f'Scope: the whole session {session.name}, every Workflow run and agent in it and its own turns, not one workflow alone.']
     if state is None:
         notes.append('No cost-state record in the transcript: every $ is its tokens at RATES.')
-    return table(rows) + '\n\n' + breakout(rows, session) + '\n\n' + '\n'.join(notes), total_cell(rows)
+    return table(rows) + '\n\n' + breakout(rows, session) + '\n\n' + timeline(session) + '\n\n' + '\n'.join(notes), total_cell(rows)
 
 
 def main(argv=None):
