@@ -15,19 +15,16 @@ used another model, since that time cannot be split between the two.
 
 The total is claude's own: the session's last cost-state record. Each model's cost
 there is allocated over its rows by RATES, so a row's dollars are a share of claude's
-figure. A model's figures are marked est. when its rate is unknown (generic weights
-then), when the rates priced over its tokens miss claude's cost by a cent or more
-(fast mode, a price change), or when its tokens in the transcripts differ from what
-the record counted (a session still running, a missing transcript). A model the
-record lists and no transcript shows keeps its cost on an `unallocated` row; a model it
-does not list has `-`. With no record at all, every row is priced at RATES and marked est.
-(`-` for a model with no rate). A note under the table says the figures cover the whole
-session, and when there was no record.
+figure (generic weights for a model with no rate). A model the record lists and no
+transcript shows keeps its cost on an `unallocated` row; a model it does not list has
+`-`. With no record at all, every row is priced at RATES (`-` for a model with no
+rate). A note under the table says the figures cover the whole session, and when there
+was no record.
 
 Two breakout tables follow, each summing the rows above with its share of the total:
 by part (each Workflow run, named by its saved workflow; chief's own turns; each role
-chief ran itself; any unallocated cost) and by model. A sum carries est. from any of its
-rows, and `(partial)` when one of them has no dollars.
+chief ran itself; any unallocated cost) and by model. A sum is marked `(partial)` when one
+of its rows has no dollars.
 """
 import argparse
 import json
@@ -106,12 +103,11 @@ def usage_of(path):
 
 
 def cost_state(transcript):
-    """The last cost-state's {model: ($, [input, output, cache read, cache write] tokens)}, or None."""
+    """The last cost-state's {model: $}, or None."""
     state = None
     for e in records(transcript):
         if e.get('type') == 'cost-state':
-            state = {k: (v.get('costUSD'), [v.get('inputTokens'), v.get('outputTokens'), v.get('cacheReadInputTokens'),
-                                            v.get('cacheCreationInputTokens')]) for k, v in (e.get('modelUsage') or {}).items()}
+            state = {k: v.get('costUSD') for k, v in (e.get('modelUsage') or {}).items()}
     return state
 
 
@@ -140,7 +136,7 @@ def transcript_of(meta_path):
 
 def row(group, stage, model, **given):
     return {'group': group, 'stage': stage, 'model': model, 'paths': set(), 'turns': 0, 'peak': 0,
-            'tokens': Counter(), 'secs': 0.0, 'cost': None, 'est': False, **given}
+            'tokens': Counter(), 'secs': 0.0, 'cost': None, **given}
 
 
 def rows_for(group, agents):
@@ -174,43 +170,41 @@ def collect(session):
 
 
 def priced(rows, state):
-    """Sets each row's share of its model's recorded cost, or None, and whether it is estimated."""
+    """Sets each row's share of its model's recorded cost, or None."""
     if state is None:
         for r in rows:
             rate = rate_of(r['model'])
             if rate:
-                r['cost'], r['est'] = priced_at(rate, r['tokens']), True
+                r['cost'] = priced_at(rate, r['tokens'])
         return rows
     tokens = defaultdict(Counter)
     for r in rows:
         tokens[r['model']].update(r['tokens'])
     for model, total in tokens.items():
         rate = rate_of(model)
-        cost, recorded = state.get(model, (None, None))
+        cost = state.get(model)
         if cost is None:
             continue
         weight = lambda t: priced_at(rate or GENERIC, t)
-        counted = [total['in'], total['out'], total['read'], total['w5m'] + total['w1h']]
-        est = rate is None or abs(weight(total) - cost) >= 0.01 or recorded != counted
         for r in (r for r in rows if r['model'] == model):
-            r['cost'], r['est'] = (cost * weight(r['tokens']) / weight(total) if weight(total) else None), est
+            r['cost'] = cost * weight(r['tokens']) / weight(total) if weight(total) else None
     # a model claude billed that no transcript on disk shows: its cost stays in the total, unallocated
-    for model, (cost, _) in state.items():
+    for model, cost in state.items():
         if cost is not None and model not in tokens:
             rows.append(row('-', 'unallocated: no transcript', model, cost=cost))
     return rows
 
 
 def total_cell(rows):
-    """The total as the table shows it: claude's dollars, marked est. or partial, or '-'."""
+    """The sum of rows' dollars, `(partial)` when one has none, or '-'."""
     known = [r['cost'] for r in rows if r['cost'] is not None]
     if not known:
         return '-'
-    return f'{sum(known):.2f}' + (' est.' if any(r['est'] for r in rows) else '') + ('' if len(known) == len(rows) else ' (partial)')
+    return f'{sum(known):.2f}' + ('' if len(known) == len(rows) else ' (partial)')
 
 
 def table(rows):
-    money = lambda r: '-' if r['cost'] is None else f'{r["cost"]:.2f}{" est." if r["est"] else ""}'
+    money = lambda r: '-' if r['cost'] is None else f'{r["cost"]:.2f}'
     span = lambda r: '-' if r['secs'] is None else f'{r["secs"]:.0f} s'
     out = ['| run | stage | model | agents | turns | peak context | output | allocated $ | span |',
            '|---|---|---|---:|---:|---:|---:|---:|---:|']
@@ -262,7 +256,7 @@ def summary(session):
     rows = priced(collect(session), state)
     notes = [f'Scope: the whole session {session.name}, every Workflow run and agent in it and its own turns, not one workflow alone.']
     if state is None:
-        notes.append('No cost-state record in the transcript: every $ is its tokens at RATES, an estimate.')
+        notes.append('No cost-state record in the transcript: every $ is its tokens at RATES.')
     return table(rows) + '\n\n' + breakout(rows, session) + '\n\n' + '\n'.join(notes), total_cell(rows)
 
 

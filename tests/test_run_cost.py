@@ -25,14 +25,13 @@ def turn(mid, model, ts, inp=0, out=0, read=0, w5m=0, w1h=0):
 
 
 def cost_state(**models):
-    """model=(dollars, [input, output, cache read, cache write]) as claude records them."""
-    keys = ('inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens')
-    return {'type': 'cost-state', 'modelUsage': {m: {'costUSD': c, **dict(zip(keys, n))} for m, (c, n) in models.items()}}
+    """model=dollars as claude records them."""
+    return {'type': 'cost-state', 'modelUsage': {m: {'costUSD': c} for m, c in models.items()}}
 
 
-# the fixture's tokens per model, and their dollars at RATES, as a record counting every turn holds them
-HAIKU = [2000, 18000, 0, 200000]      # $0.342
-OPUS = [0, 45000, 2200000, 500000]    # $5.34
+# the fixture's dollars per model at RATES, as a record counting every turn holds them
+HAIKU = 0.342
+OPUS = 5.34
 
 
 def write(path, records):
@@ -91,7 +90,7 @@ class RunCostTest(unittest.TestCase):
         return {c[0]: c[1:] for c in ([x.strip() for x in line.strip('|').split('|')] for line in self.table(text, n)[2:])}
 
     def test_stages_and_models_share_claudes_own_cost(self):
-        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': OPUS})])
         rc, out, _ = self.main('--session-id', SID)
         self.assertEqual(rc, 0)
         rows = self.rows(out)
@@ -107,7 +106,7 @@ class RunCostTest(unittest.TestCase):
     def test_the_breakouts_sum_the_rows_by_part_and_by_model(self):
         (self.session / 'workflows').mkdir(parents=True)
         (self.session / 'workflows' / 'wf_aaa.json').write_text(json.dumps({'runId': 'wf_aaa', 'workflowName': 'pr-babysit'}))
-        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': OPUS})])
         out = self.main('--session-id', SID)[1]
         rows, parts, models = self.rows(out), self.breakout(out, 1), self.breakout(out, 2)
         self.assertEqual(set(parts), {'wf_aaa (pr-babysit)', 'chief (own turns)', 'chief:Explore'}, 'a run is named by its saved workflow')
@@ -116,50 +115,46 @@ class RunCostTest(unittest.TestCase):
         self.assertEqual(parts['chief:Explore'], ['0.60', '11%'])
         self.assertEqual(models, {'opus-5-5': ['5.34', '94%'], 'haiku-4-5': ['0.34', '6%']})
         self.assertEqual(list(parts)[0], 'wf_aaa (pr-babysit)', 'largest first')
-        # without the run's record the id alone names it; an estimate carries into every sum it is in
+        # without the run's record the id alone names it; a row with no dollars makes every sum it is in partial
         (self.session / 'workflows' / 'wf_aaa.json').unlink()
-        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-opus-5-5': (5.34, OPUS)})])
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-opus-5-5': OPUS})])
         out = self.main('--session-id', SID)[1]
         parts, models = self.breakout(out, 1), self.breakout(out, 2)
         self.assertTrue(parts['wf_aaa'][0].endswith(' (partial)'), 'its Haiku rows have no dollars')
         self.assertEqual(models['haiku-4-5'], ['-', '-'])
 
-    def test_a_cost_the_rates_do_not_price_or_an_unknown_model_is_estimated(self):
-        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (4.00, OPUS)})])
-        rows = self.rows(self.main('--session-id', SID)[1])
-        self.assertEqual(rows[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '0.34')
-        self.assertTrue(rows[('wf_aaa', 'fix', 'opus-5-5')][7].endswith(' est.'), 'fast mode or a price change')
+    def test_a_model_the_rates_misprice_or_do_not_know_still_sums_to_its_recorded_dollars(self):
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': 4.00})])
+        out = self.main('--session-id', SID)[1]
+        self.assertEqual(self.rows(out)[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '0.34')
+        self.assertEqual(self.breakout(out, 2)['opus-5-5'][0], '4.00', 'fast mode or a price change: the record, split by the rates')
         with mock.patch.dict(run_cost.RATES, clear=True):
-            write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
-            self.assertTrue(self.rows(self.main('--session-id', SID)[1])[('wf_aaa', 'ci:collect', 'haiku-4-5')][7].endswith(' est.'))
+            write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': OPUS})])
+            out = self.main('--session-id', SID)[1]
+            self.assertEqual(self.rows(out)[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '0.34')
+            self.assertIn('**5.68**', self.table(out)[-1], 'generic weights split the recorded dollars')
 
-    def test_tokens_the_record_did_not_count_mark_that_models_dollars_estimated(self):
-        # the record predates chief's turn: its Opus count lacks that turn's 5,000 output and 300,000 written
-        write(self.session.with_suffix('.jsonl'), [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (2.84, [0, 40000, 2200000, 200000])})] + self.chief)
-        out = self.main('--journal', str(self.journal))[1]
-        rows = self.rows(out)
-        self.assertEqual(rows[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '0.34', 'a model the record counted in full is exact')
-        self.assertTrue(rows[('wf_aaa', 'fix', 'opus-5-5')][7].endswith(' est.'))
-        self.assertIn('**3.18 est.**', self.table(out)[-1])
-        # a transcript missing from disk is the same mismatch the other way
+    def test_a_journal_finds_its_session_and_a_missing_transcript_leaves_its_dollars_on_the_rest(self):
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': OPUS})])
+        self.assertIn('**5.68**', self.table(self.main('--journal', str(self.journal))[1])[-1])
         (self.session / 'subagents' / 'agent-b1.jsonl').unlink()
-        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
-        self.assertTrue(self.rows(self.main('--session-id', SID)[1])[('wf_aaa', 'fix', 'opus-5-5')][7].endswith(' est.'))
+        self.assertEqual(self.breakout(self.main('--session-id', SID)[1], 2)['opus-5-5'][0], '5.34')
 
-    def test_no_cost_record_prices_every_row_at_rates_as_an_estimate(self):
+    def test_no_cost_record_prices_every_row_at_rates(self):
         write(self.session.with_suffix('.jsonl'), self.chief)
         out = self.main('--session-id', SID)[1]
         rows = self.rows(out)
-        self.assertEqual(rows[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '0.34 est.')
-        self.assertEqual(rows[('wf_aaa', 'fix', 'opus-5-5')][7], f'{run_cost.priced_at(run_cost.RATES["claude-opus-5-5"], {"out": 20000, "read": 1200000, "w1h": 200000, "in": 0, "w5m": 0}):.2f} est.')
-        self.assertIn('**5.68 est.**', self.table(out)[-1], 'the same dollars a record would hold, marked')
+        self.assertEqual(rows[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '0.34')
+        self.assertEqual(rows[('wf_aaa', 'fix', 'opus-5-5')][7], f'{run_cost.priced_at(run_cost.RATES["claude-opus-5-5"], {"out": 20000, "read": 1200000, "w1h": 200000, "in": 0, "w5m": 0}):.2f}')
+        self.assertIn('**5.68**', self.table(out)[-1], 'the same dollars a record would hold')
+        self.assertNotIn('est.', out)
         self.assertIn('No cost-state record in the transcript', out)
         self.assertIn(f'Scope: the whole session {SID}', out)
         with mock.patch.dict(run_cost.RATES, clear=True):
             self.assertTrue(self.table(self.main('--session-id', SID)[1])[-1].endswith('| **-** | |'), 'no rate, no dollars')
 
     def test_an_unlisted_model_leaves_dollars_out(self):
-        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-opus-5-5': (5.34, OPUS)})])
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-opus-5-5': OPUS})])
         out = self.main('--session-id', SID)[1]
         self.assertEqual(self.rows(out)[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '-')
         self.assertIn('5.34 (partial)', self.table(out)[-1])
@@ -167,7 +162,7 @@ class RunCostTest(unittest.TestCase):
     def test_a_billed_model_with_no_transcript_keeps_its_cost_unallocated(self):
         for aid in ('a1', 'a2'):
             (self.journal.parent / f'agent-{aid}.jsonl').unlink()
-        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': OPUS})])
         out = self.main('--session-id', SID)[1]
         self.assertEqual(self.rows(out)[('-', 'unallocated: no transcript', 'haiku-4-5')][7], '0.34')
         self.assertIn('**5.68**', self.table(out)[-1], 'the total stays claude\'s')
