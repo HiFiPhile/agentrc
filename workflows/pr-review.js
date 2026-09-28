@@ -105,7 +105,7 @@ const threadsFile = `${args.factsDir}/threads-${head}.json`
 const threadsOut = await relay('threads', 'Context', `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`,
   { type: 'object', properties: { file: { type: 'string' }, count: { type: 'integer' }, error: { type: 'string' } } })
 if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return blocked('threads-failed', threadsOut ? threadsOut.error || 'wrong file' : 'the threads relay died')
-const DISPUTES = { type: 'object', properties: { error: { type: 'string' }, disputes: { type: 'array', items: { type: 'object', required: ['findingId', 'key', 'replies'],
+const DISPUTES = { type: 'object', additionalProperties: false, properties: { error: { type: 'string' }, disputes: { type: 'array', items: { type: 'object', required: ['findingId', 'key', 'replies'],
   properties: { findingId: { type: 'string' }, key: { type: 'string' }, rootCommentId: { type: 'integer' }, outdated: { type: 'boolean' },
     replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } } } }
 const [prior, pushback] = await parallel([
@@ -115,7 +115,7 @@ const [prior, pushback] = await parallel([
   () => relay('disputes', 'Context', `python3 ${S}/ledger.py disputes --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`, DISPUTES),
 ])
 if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
-if (!pushback || pushback.error || !Array.isArray(pushback.disputes)) return blocked('disputes-failed', pushback ? pushback.error : 'the disputes relay died')
+if (!pushback || pushback.error || !Array.isArray(pushback.disputes)) return blocked('disputes-failed', pushback ? pushback.error || `disputes answered ${JSON.stringify(pushback)}` : 'the disputes relay died')
 const disputeOf = Object.fromEntries(pushback.disputes.map(d => [d.findingId, d]))
 // A discussion run judges only the findings someone answered; any other run rechecks every standing one.
 const carried = (prior.open || []).filter(f => !discussion || disputeOf[f.id])
