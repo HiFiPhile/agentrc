@@ -15,6 +15,7 @@ SCRIPTS = ROOT / 'skills' / 'pr-review' / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / 'skills' / 'pr-babysit' / 'scripts'))
 
+import compare  # noqa: E402
 import facts  # noqa: E402
 import harvest  # noqa: E402
 import ledger  # noqa: E402
@@ -1499,7 +1500,6 @@ class Result(unittest.TestCase):
         self.assertEqual(result.collect(['--output', f.name])['status'], 'no-result')
 
 
-
 class Severity(unittest.TestCase):
     """The one scale: older words read onto it, reports ordered by it, every copy of it the same."""
 
@@ -1553,6 +1553,106 @@ class Severity(unittest.TestCase):
                 self.assertEqual(tuple(re.findall(r"'(\w+)'", got)), want, f'{wf} {const}')
             got = re.search(r"^const IMPACT = \{.*?required: \[([^\]]*)\]", src, re.M | re.S).group(1)
             self.assertEqual(re.findall(r"'(\w+)'", got), facts_, f'{wf} IMPACT')
+
+
+GRADED = {'severityReason': 'why', 'impact': dict.fromkeys(('consequence', 'path', 'variants', 'recovery'), 'x')}
+
+
+class Compare(unittest.TestCase):
+    def run_dir(self, agents):
+        """A Workflow run directory from [(label, result or None, output tokens or None)]."""
+        run = Path(tempfile.mkdtemp()) / 'wf_x'
+        run.mkdir()
+        rows = []
+        for i, (label, res, out) in enumerate(agents):
+            rows.append({'type': 'started', 'key': f'k{i}', 'agentId': f'a{i}', 'label': label})
+            if res is not None:
+                rows.append({'type': 'result', 'key': f'k{i}', 'agentId': f'a{i}', 'result': res})
+            if out is not None:
+                usage = {'input_tokens': 0, 'output_tokens': out, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
+                (run / f'agent-a{i}.jsonl').write_text(json.dumps(
+                    {'type': 'assistant', 'message': {'id': 'm', 'model': 'claude-opus-5-5', 'usage': usage}}) + '\n')
+        (run / 'journal.jsonl').write_text('\n'.join(json.dumps(r) for r in rows) + '\n')
+        return run
+
+    def test_units_recover_every_proposal_with_its_verdict_and_cost(self):
+        scan = {'dimension': 'correctness', 'findings': [{'file': 'a.c', 'line': 1}, {'file': 'a.c', 'line': 2}, {'file': 'b.c', 'line': 3},
+                                                          {'file': 'b.c', 'line': 4}]}
+        run = self.run_dir([
+            ('scan:d0x0', scan, 1000), ('scan:d0x1', None, None),
+            ('verify:d0x0:0', {'real': True, 'severity': 'high', 'confidence': 'high', 'reason': 'r', **GRADED}, 10_000),
+            ('verify:d0x0:1', {'real': False, 'reason': 'no'}, 50_000), ('verify:d0x0:2', None, 1000),
+            ('verify:d0x0:3', {'real': True, 'reason': 'r', **GRADED}, 1000),
+            ('claims', {'claims': [{'commentId': 9, 'claim': 'c'}]}, 100), ('judge:0', {'verdict': 'refuted'}, 2000)])
+        out = compare.collect(['units', '--run', str(run)])
+        self.assertEqual(out['proposals'], {'confirmed': 1, 'refuted': 1, 'dead': 1, 'ungraded': 1}, 'a level needs severity and confidence')
+        self.assertEqual(out['missingCost'], ['scan:d0x1'])
+        self.assertEqual(out['scans'][0]['proposals'][0]['verdict']['impact'], GRADED['impact'], 'the whole grade is kept')
+        self.assertEqual(out['refutedVerifyCost'], 1.0)   # 50k output tokens at $20/M
+        self.assertEqual([s['dead'] for s in out['scans']], [False, True])
+        self.assertEqual([p['verdict'] and p['verdict']['real'] for p in out['scans'][0]['proposals']], [True, False, None, True])
+        self.assertEqual((out['claims'][0]['verdict']['verdict'], out['claims'][0]['judgeCost']), ('refuted', 0.04))
+        self.assertEqual(out['stages']['verify'], 1.24)
+
+    def test_units_refuse_a_run_without_journal_or_with_a_label_twice(self):
+        with self.assertRaisesRegex(compare.Unusable, 'no journal'):
+            compare.collect(['units', '--run', tempfile.mkdtemp()])
+        with self.assertRaisesRegex(compare.Unusable, 'two agents labelled scan:d0x0'):
+            compare.collect(['units', '--run', str(self.run_dir([('scan:d0x0', None, None), ('scan:d0x0', None, None)]))])
+
+    def output(self, findings, claims, event='REQUEST_CHANGES', unjudged=(), unverified=()):
+        f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
+        json.dump({'result': {'status': 'reviewed', 'findings': findings, 'claims': claims, 'verdict': {'event': event, 'reasons': []},
+                              'coverage': {'dropped': [], 'unverified': list(unverified), 'unjudged': list(unjudged)}}}, f)
+        f.close()
+        return f.name
+
+    def test_diff_names_what_changed_per_finding_and_claim(self):
+        graded = GRADED
+        a = {'file': 'a.c', 'line': 1, 'dimension': 'd', 'status': 'open', 'severity': 'high', 'confidence': 'high', **graded}
+        base = self.output(
+            [a, {'id': 'pr7-f1', 'status': 'open', 'severity': 'low', 'confidence': 'low', **graded}, {'file': 'b.c', 'line': 2, 'dimension': 'd'},
+             {'file': 'c.c', 'line': 3, 'dimension': 'd'}, {'file': 'c.c', 'line': 3, 'dimension': 'd'}],
+            [{'commentId': 5, 'verdict': 'confirmed', 'severity': 'high'}, {'commentId': 5, 'verdict': 'refuted'}],
+            unjudged=[{'kind': 'claim', 'commentId': 8}])
+        self.assertTrue(compare.collect(['diff', '--base', base, '--candidate', base])['same'])
+        cand = self.output(
+            [{**a, 'severity': 'medium', 'status': 'covered', 'coveredBy': 5}, {'id': 'pr7-f1', 'status': 'fixed', 'severity': 'low', 'confidence': 'low'},
+             {'file': 'd.c', 'line': 4, 'dimension': 'd'}, {'file': 'c.c', 'line': 3, 'dimension': 'd'}],
+            [{'commentId': 5, 'verdict': 'confirmed', 'severity': 'high'}, {'commentId': 5, 'verdict': 'stale'}],
+            event='COMMENT', unjudged=[{'kind': 'claim', 'commentId': 9}])
+        out = compare.collect(['diff', '--base', base, '--candidate', cand])
+        self.assertFalse(out['same'])
+        f = out['findings']
+        self.assertEqual({c['key']: {k: v for k, v in c.items() if k not in ('key', 'label')} for c in f['changed']},
+                         {'a.c:1:d': {'status': ['open', 'covered'], 'severity': ['high', 'medium'], 'coveredBy': [None, 5]},
+                          'pr7-f1': {'status': ['open', 'fixed'], 'graded': [True, False]}})
+        self.assertEqual(([x['key'] for x in f['onlyBase']], [x['key'] for x in f['onlyCandidate']]), (['b.c:2:d'], ['d.c:4:d']))
+        self.assertEqual(f['ambiguous'], [{'key': 'c.c:3:d', 'base': 2, 'candidate': 1}])
+        self.assertEqual([(c['key'], c['verdict']) for c in out['claims']['changed']], [('5#2', ['refuted', 'stale'])])
+        self.assertEqual((out['coverage']['onlyBase'], out['coverage']['onlyCandidate'], out['verdict']['candidate']['event']),
+                         (['unjudged {"commentId": 8, "kind": "claim"}'], ['unjudged {"commentId": 9, "kind": "claim"}'], 'COMMENT'))
+
+    def test_diff_reports_new_wording_and_a_different_loss_of_the_same_size(self):
+        f = {'file': 'a.c', 'line': 1, 'dimension': 'd', 'status': 'open', 'severity': 'high', 'why': 'w', **GRADED}
+        lost = lambda why: [{'dir': 'src', 'dim': 'd', 'findings': [{'file': 'a.c', 'line': 2, 'why': why}]}]  # noqa: E731
+        base = self.output([f], [{'commentId': 5, 'claim': 'c'}], unjudged=[{'kind': 'claim', 'commentId': 8}], unverified=lost('one'))
+        cand = self.output([{**f, 'impact': {**GRADED['impact'], 'variants': 'another MCU'}}], [{'commentId': 5, 'claim': 'c2'}],
+                           unjudged=[{'kind': 'claim', 'commentId': 9}], unverified=lost('another'))
+        out = compare.collect(['diff', '--base', base, '--candidate', cand])
+        self.assertFalse(out['same'])
+        self.assertEqual((out['findings']['changed'], out['findings']['reworded']), ([], [{'key': 'a.c:1:d', 'variants': ['x', 'another MCU']}]))
+        self.assertEqual(out['claims']['reworded'], [{'key': '5#1', 'claim': ['c', 'c2']}])
+        self.assertEqual((out['coverage']['base'], out['coverage']['candidate'], len(out['coverage']['onlyCandidate'])), (2, 2, 2),
+                         'another claim lost at the same place is another loss')
+
+    def test_diff_refuses_an_unreviewed_output(self):
+        blocked = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
+        json.dump({'result': {'status': 'blocked'}}, blocked)
+        blocked.close()
+        with self.assertRaisesRegex(compare.Unusable, 'no reviewed pr-review result'):
+            compare.collect(['diff', '--base', blocked.name, '--candidate', blocked.name])
+
 
 
 class Workflow(unittest.TestCase):
