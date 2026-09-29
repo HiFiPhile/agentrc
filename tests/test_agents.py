@@ -198,9 +198,25 @@ class AgentFiles(unittest.TestCase):
                        'a mismatch stops publishing',
                        "question and the human's affirmative answer verbatim", 'during this chief invocation',
                        'solely through the workflow\'s publishing switch', 'requires a fresh exchange',
-                       'no new PRs or issues, force-push, merge or onward delegation'):
+                       'no new PRs, no issues beyond the follow-up issue rule, no force-push, merge or onward delegation'):
             self.assertIn(phrase, exception)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
+
+    def test_follow_up_issues_ride_a_push_grant_within_bounds(self):
+        body = ' '.join((AGENTS / 'chief.md').read_text().split())
+        rule = body.split('Follow-up issue rule:')[1].split('Exception for a headless PR review launch:')[0]
+        for phrase in ("a headless exchange whose question names this action and both repositories",
+                       "the PR's base repository, never a fork's head repository, and `hathach/agentrc`",
+                       'an unclassified CI failure or any other unresolved classification stays a blocker or handoff',
+                       'At most three new issues and three comments per invocation', 'Never close, edit or relabel an issue',
+                       'one follow-up publishing unit', 'loads `followup-issue`',
+                       "The script's repository allowlist is a guard, not an authorization",
+                       'Opening an issue changes no deferral decision', 'a deferral names only an open issue the unit returned'):
+            self.assertIn(phrase, rule)
+        self.assertIn("Supply the issue's URL; open one only under Authorization's follow-up issue rule.", body)
+        self.assertNotIn('never open one headless', body)
+        exception = body.split('Exception for a headless PR launch:')[1].split('Follow-up issue rule:')[0]
+        self.assertIn('and the follow-up issues and comments it names', exception)
 
     def test_chief_verifies_a_round_in_one_batch_and_reviews_each_handed_on_head_once(self):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())

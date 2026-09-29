@@ -54,6 +54,7 @@ Agent collaboration and PRs:
 | [`herdr-peer`](skills/herdr-peer/SKILL.md) | the same with the agent in the neighbouring Herdr pane, watched live; needs `HERDR_ENV=1` | `peer.py peers`, `send --to <pane> --files none --task -`, `read --from <pane> --for <id>` |
 | [`simplify-gate`](skills/simplify-gate/SKILL.md) | switch the per-repository Codex YAGNI check at Stop (below) | `/simplify-gate status\|on\|off` |
 | [`pr-reply`](skills/pr-reply/SKILL.md) | post PR review replies from a manifest, read each back, resolve verified review threads | `reply.py --pr N --manifest f.json` |
+| [`followup-issue`](skills/followup-issue/SKILL.md) | open a follow-up issue, or comment new evidence on one that covers the topic, read it back, never post twice | `publish.py create --repo o/r --allow-repo o/r --title t --body-file f` |
 | [`pr-babysit`](skills/pr-babysit/SKILL.md) | the fact collectors the pr-babysit workflow runs before it commits a fix | `preflight.py --pr N`, `hooks.py <path>...` |
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR: pin it, pick rig boards, run the pr-review workflow, leave it as a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's log, rerun its failed jobs once after an infra failure | `circleci.py log <job>`, `rerun <job>...` |
@@ -161,7 +162,9 @@ lines while it runs and its report when it exits.
 
 For headless PR publishing, follow `agents/chief.md`'s Authorization exception
 before launching; a PR review submits under its own PR review exception, as
-`skills/pr-review/SKILL.md` asks it; its pending reviews need no exchange, under chief's standing exception. Include the named PR, head repository and branch, expected
+`skills/pr-review/SKILL.md` asks it; its pending reviews need no exchange, under chief's standing exception. The PR launch question also names opening follow-up issues and commenting on
+them in the PR's base repository and `hathach/agentrc`; an exchange without
+it lets chief open none. Include the named PR, head repository and branch, expected
 HEAD, worktree, task scope and the verbatim authorization exchange in the
 task, and, when a pr-babysit launch continues an earlier chief's run, that
 run's last reported `stateRef`. Leave the checkout to chief until it exits. Each new chief invocation
