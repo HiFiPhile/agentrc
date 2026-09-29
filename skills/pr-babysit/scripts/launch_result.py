@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """One pr-babysit launch, condensed for its caller from the launch's saved Workflow output.
 
-    launch_result.py --output FILE [--state-ref FILE:DIGEST] [--checkout DIR]
+    launch_result.py --output FILE [--state-ref FILE:DIGEST] [--checkout DIR] [--keys]
 
 --output is the launch's Workflow output file. It is empty when the launch threw
 before returning, and then --state-ref, the stateRef that launch was given, is
 the one to continue from. --checkout adds the checkout's branch, HEAD and dirty
-paths. Every CI failure carries the `key` a caller passes back as
-acceptedFailures: [{ key, reason, scope }].
+paths. A CI failure that needs attention carries the `key` a caller passes back
+as acceptedFailures: [{ key, reason, scope }]; a settled one (rig-side or accepted,
+complete) is listed by its cell per check, and --keys adds each one's key.
 
 `result` keeps every top-level result field verbatim except history, observation
 and state, which are condensed; receipts are kept verbatim, each reply receipt
@@ -89,18 +90,24 @@ def receipts(actions, findings):
     return {'pushes': pushes, 'replies': replies, 'adoption': adoption}, blocking
 
 
-def ci_summary(ci):
-    """Counts by verdict, accepted and sonarGate apart; complete rig-side or accepted failures as {cell, key} per check; every other failure verbatim."""
+ATTENTION = ('check', 'cell', 'state', 'verdict', 'key', 'complete', 'files')
+
+
+def ci_summary(ci, keys=False):
+    """Counts by verdict, accepted and sonarGate apart; complete rig-side or accepted failures as their cells per check, or
+    with keys as {cell, key}; every other failure by the fields a caller acts on, its firstError cut."""
     failures = ci.get('realFailures') or []
     # The workflow stamps each failure's state; an output from before the stamp predates the sonarGate state too.
     state = lambda f: f.get('state') or ('accepted' if f.get('accepted') else {'rig-side': 'rigSide'}.get(f.get('verdict'), f.get('verdict')))
     settled = lambda f: f.get('complete') is True and state(f) in ('accepted', 'rigSide')
     cells = {}
     for f in filter(settled, failures):
-        cells.setdefault(f.get('check'), []).append({'cell': f.get('cell'), 'key': f.get('key')})
+        cells.setdefault(f.get('check'), []).append({'cell': f.get('cell'), 'key': f.get('key')} if keys else f.get('cell'))
     return {'status': ci.get('status'), 'headSha': ci.get('headSha'), 'infraRerun': ci.get('infraRerun'),
             'verdicts': dict(Counter(f.get('verdict') if state(f) in ('rigSide', 'real', 'unclassified') else state(f) for f in failures)),
-            'settledCells': cells, 'attention': [f for f in failures if not settled(f)]}
+            'settledCells': cells,
+            'attention': [{**{k: f.get(k) for k in ATTENTION}, 'state': state(f), 'firstError': cut(f.get('firstError', ''))}
+                          for f in failures if not settled(f)]}
 
 
 def logs(lines):
@@ -118,7 +125,7 @@ def checkout(path):
             'dirty': [l for l in git('-C', path, 'status', '--porcelain').splitlines() if l]}
 
 
-def summarize(output, output_path, state_ref=None, tree=None):
+def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     blockers, notes = [], []
     summary = {'launch': None, 'result': None, 'stateRef': None, 'observation': None, 'receipts': None,
                'logs': [], 'checkout': tree, 'blockers': blockers, 'notes': notes}
@@ -141,7 +148,7 @@ def summarize(output, output_path, state_ref=None, tree=None):
             'bots': [{'bot': b.get('bot'), 'state': b.get('state'), 'sha': (b.get('sha') or '')[:8] or None} for b in reviews.get('bots') or []],
             'findings': [{'id': f.get('findingId'), 'digest': f.get('commentDigest'), 'source': f.get('source'), 'verdict': f.get('verdict'),
                           'at': f'{f.get("file")}:{f.get("line")}'} for f in reviews.get('findings') or []],
-            'ci': ci and ci_summary(ci),
+            'ci': ci and ci_summary(ci, keys),
         }
         summary['receipts'], blocking = receipts(actions, reviews.get('findings') or [])
         blockers += blocking
@@ -172,6 +179,7 @@ def collect(argv):
     p.add_argument('--output', required=True)
     p.add_argument('--state-ref')
     p.add_argument('--checkout')
+    p.add_argument('--keys', action='store_true')
     a = p.parse_args(argv)
     ref = None
     if a.state_ref:
@@ -179,7 +187,7 @@ def collect(argv):
         if not sep or not file or not re.fullmatch(r'[0-9a-f]{8}', digest):
             raise Unusable(f'--state-ref must be FILE:DIGEST with an 8-hex digest, not {a.state_ref!r}')
         ref = {'outputFile': file, 'digest': digest}
-    return summarize(load_output(a.output), str(Path(a.output).resolve()), ref, checkout(a.checkout) if a.checkout else None)
+    return summarize(load_output(a.output), str(Path(a.output).resolve()), ref, checkout(a.checkout) if a.checkout else None, a.keys)
 
 
 if __name__ == '__main__':

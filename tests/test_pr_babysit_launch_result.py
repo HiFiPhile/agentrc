@@ -83,9 +83,15 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['observation']['findings'], [{'id': '7#1', 'digest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid', 'at': 'a.c:3'}])
         ci = s['observation']['ci']
         self.assertEqual(ci['verdicts'], {'rig-side': 1, 'real': 1})
-        self.assertEqual(ci['settledCells'], {'hil-tinyusb (tinyusb.json)': [{'cell': 'f072 cdc', 'key': failure('f072 cdc')['key']}]},
-                         'the key a caller passes back to accept it')
-        self.assertEqual(ci['attention'], [failure('pico host', verdict='real')], 'an unsettled failure is shown in full')
+        self.assertEqual(ci['settledCells'], {'hil-tinyusb (tinyusb.json)': ['f072 cdc']}, 'a settled failure by its cell, to investigate')
+        pico = failure('pico host', verdict='real')
+        self.assertEqual(ci['attention'], [{'check': pico['check'], 'cell': 'pico host', 'state': 'real', 'verdict': 'real', 'key': pico['key'],
+                                           'complete': True, 'files': None, 'firstError': launch_result.cut(pico['firstError'])}],
+                         'an unsettled failure by the fields a caller acts on, with the key that accepts it')
+        self.assertTrue(ci['attention'][0]['firstError'].endswith('…'))
+        rc, s = self.run_it(output(), '--keys')
+        self.assertEqual(s['observation']['ci']['settledCells'], {'hil-tinyusb (tinyusb.json)': [{'cell': 'f072 cdc', 'key': failure('f072 cdc')['key']}]},
+                         'with --keys, the key a caller passes back to accept it')
         self.assertEqual(s['receipts']['replies'], [{'batch': 'fixNotePosts', 'findingVerdicts': ['valid'], 'commentId': 7, 'kind': 'review-body', 'replyId': 8, 'sent': True,
                                                      'posted': True, 'verified': True, 'resolved': None, 'error': None}], 'receipts verbatim')
         self.assertEqual(s['receipts']['pushes'][0]['committed'], True)
