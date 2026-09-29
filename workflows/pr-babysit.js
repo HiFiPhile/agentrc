@@ -175,6 +175,7 @@ if (args.stateRef != null) {
   const PER_CALL = 4 // a live sonnet copy of 9 chunks truncated and spliced them
   // sonnet, not haiku: on five real 4-6 KB states haiku never loaded three, mis-copying the same chunks on every retry (2026-09-25)
   const MAX = 64 * 1024
+  const ROUNDS = 6
   const ENVELOPE = {
     type: 'object', additionalProperties: false,
     properties: {
@@ -186,28 +187,21 @@ if (args.stateRef != null) {
   }
   let why = ''
   let length = 0 // of the envelope the retained chunks came from; 0 asks for a first batch
-  let most = 0 // the longest length accepted: a copied length can be short, so it only grows the budget
   let got = new Map() // chunk index -> its checked bytes
-  let idle = 0 // consecutive calls that checked no new chunk
+  let idle = 0 // consecutive rounds that checked no new chunk
+  let call = 0
   const reset = (reason) => { why = reason; length = 0; got = new Map() }
-  for (let call = 1; args.state == null && idle < 2 && call <= 3 + 2 * Math.ceil(most / SIZE / PER_CALL); call++) {
-    idle++
-    const asked = length ? [...Array(Math.ceil(length / SIZE)).keys()].filter(i => !got.has(i)).slice(0, PER_CALL) : null
-    const env = await agent(
-      `Run exactly: python3 ${STATE_SCRIPT} '${ref.outputFile}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
-      'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
-      'copy every character exactly and change, reorder, drop or add nothing.',
-      { label: `state:load#${call}`, model: 'sonnet', effort: 'low', schema: ENVELOPE },
-    ).catch(e => { why = `loader died: ${e && e.message}`; return null })
-    if (!env) continue
-    if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; continue }
+  // One reply: false when it dropped what was retained, else whether it added a chunk.
+  const take = (env, asked) => {
+    if (!env) return false
+    if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; return false }
     const fresh = env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
       env.digest === ref.digest && Array.isArray(env.chunks)
-    if (!fresh || (length && env.length !== length)) { reset('the envelope metadata is malformed or changed'); continue }
+    // A malformed copy costs its own reply; a differing length drops what was retained.
+    if (!fresh) { why = 'the envelope metadata is malformed'; return false }
+    if (length && env.length !== length) { reset('the envelope length changed'); return false }
     length = env.length
-    most = Math.max(most, length)
-    const total = Math.ceil(length / SIZE)
-    const want = new Set(asked || [...Array(Math.min(total, PER_CALL)).keys()])
+    const want = new Set(asked || indices().slice(0, PER_CALL))
     const byIndex = new Map()
     for (const c of env.chunks) byIndex.set(c.i, byIndex.has(c.i) ? null : c) // a duplicate settles neither copy
     let added = false
@@ -216,10 +210,29 @@ if (args.stateRef != null) {
       const bytes = fromBase64(c.data)
       if (bytes !== null && bytes.length === Math.min(SIZE, length - i * SIZE)) { got.set(i, bytes); added = true }
     }
-    const missing = [...Array(total).keys()].filter(i => !got.has(i))
-    if (missing.length) { if (added) idle = 0; why = `chunks ${missing.join(',')} missing or mis-copied`; continue }
+    return added
+  }
+  // The first round learns the length; each later one asks for every missing chunk
+  // at once, PER_CALL to a call, so a state loads in two rounds whatever its size.
+  const indices = () => [...Array(Math.ceil(length / SIZE)).keys()]
+  const missingOf = () => indices().filter(i => !got.has(i))
+  for (let round = 1; args.state == null && idle < 2 && round <= ROUNDS; round++) {
+    const missing = length ? missingOf() : null
+    const groups = missing ? [...Array(Math.ceil(missing.length / PER_CALL)).keys()].map(g => missing.slice(g * PER_CALL, (g + 1) * PER_CALL)) : [null]
+    const replies = await parallel(groups.map(asked => () => agent(
+      `Run exactly: python3 ${STATE_SCRIPT} '${ref.outputFile}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
+      'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
+      'copy every character exactly and change, reorder, drop or add nothing.',
+      { label: `state:load#${++call}`, model: 'sonnet', effort: 'low', schema: ENVELOPE },
+    ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
+    let added = false
+    replies.forEach((env, g) => { added = take(env, groups[g]) || added })
+    const left = missingOf()
+    // Progress is a new chunk toward an incomplete state; a whole one that fails its seal is none.
+    idle = added && left.length ? 0 : idle + 1
+    if (!length || left.length) { if (length) why = `chunks ${left.join(',')} missing or mis-copied`; continue }
     let st = null
-    try { st = JSON.parse([...Array(total).keys()].map(i => got.get(i)).join('')) } catch {}
+    try { st = JSON.parse(indices().map(i => got.get(i)).join('')) } catch {}
     if (st && st.digest === ref.digest && sealOf(st) === ref.digest) { args.state = st; break }
     // Every chunk passed its sum yet the whole fails: a chunk and its sum were changed together.
     reset('the reassembled state does not match stateRef.digest')

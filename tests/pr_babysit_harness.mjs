@@ -5313,7 +5313,7 @@ const savedLarge = async () => {
   return large
 }
 
-test('a large state arrives four chunks per call, and a mangled batch costs only its bad chunks', async () => {
+test('a large state arrives in two rounds, four chunks per call, and a mangled batch costs only its bad chunks', async () => {
   const { state, stateRef } = await savedLarge()
   const clean = await loadWith(state, stateRef)
   assert.deepEqual(asks(clean.calls), ['all', '4,5,6,7', '8'])
@@ -5326,8 +5326,12 @@ test('a large state arrives four chunks per call, and a mangled batch costs only
     if (label === 'state:load#2') { delete e.chunks[2].sum; e.chunks[3].data = flip(e.chunks[3].data) }
     return e
   })
-  assert.deepEqual(asks(live.calls), ['all', '3,4,5,6', '5,6,7,8'])
-  assert.equal(live.labels[3], 'preflight')
+  assert.deepEqual(asks(live.calls), ['all', '3,4,5,6', '7,8', '5,6'], 'every missing chunk is asked for at once, four to a call')
+  assert.equal(live.labels[4], 'preflight')
+  // A reply with mis-copied metadata costs its own chunks, not its siblings'.
+  const sibling = await loadWith(state, stateRef, (env, label) => label === 'state:load#2' ? { ...env, digest: '00000000' } : env)
+  assert.deepEqual(asks(sibling.calls), ['all', '4,5,6,7', '8', '4,5,6,7'])
+  assert.equal(sibling.labels[4], 'preflight')
   // A short copied length sizes a short budget; the true length, once accepted, grows it.
   const short = await loadWith(state, stateRef, (env, label) => {
     const e = structuredClone(env)
@@ -5336,13 +5340,33 @@ test('a large state arrives four chunks per call, and a mangled batch costs only
     if (label === 'state:load#5') for (const c of e.chunks) if (c.i !== 8) c.data = flip(c.data)
     return e
   })
-  assert.deepEqual(asks(short.calls), ['all', '3', 'all', '4,5,6,7', '4,5,6,8', '4,5,6'])
+  assert.deepEqual(asks(short.calls), ['all', '3', 'all', '4,5,6,7', '8', '4,5,6'])
   assert.equal(short.labels[6], 'preflight')
-  // Progress undone by every other reply stops at the budget: 3 + 2 per batch of four.
+  // Progress undone by every other reply stops at the round budget.
   const seesaw = await loadWith(state, stateRef, (env, label) =>
     Number(label.split('#')[1]) % 2 ? env : { ...env, length: env.length - 1 })
   assert.equal(seesaw.result.reason, 'state-transfer-failed')
-  assert.equal(seesaw.labels.length, 9)
+  assert.equal(seesaw.labels.length, 11, 'six rounds: the first, then one or two calls each')
+})
+
+test('the chunks left after the first reply are asked for at once, in parallel calls', async () => {
+  const { state, stateRef } = await savedLarge()
+  const started = new Set()
+  let release
+  const both = new Promise(resolve => { release = resolve })
+  let timer
+  const serial = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the second round ran its calls one after another')), 2000) })
+  const got = await Promise.race([serial, loadWith(state, stateRef, async (env, label) => {
+    if (label !== 'state:load#1') {
+      started.add(label)
+      if (started.size === 2) release()
+      await both // each waits for the other: only concurrent calls get past
+    }
+    return env
+  })]).finally(() => clearTimeout(timer))
+  assert.deepEqual(asks(got.calls), ['all', '4,5,6,7', '8'])
+  assert.equal(got.labels[3], 'preflight')
+  assert.deepEqual(got.result.state.decisions, state.decisions)
 })
 
 test('a transfer that never checks out blocks before preflight with the stateRef untouched', async () => {
