@@ -170,7 +170,9 @@ def hook_entry(hook, name):
     except ValueError:
         return False
     roots = (Path.home() / '.claude' / 'hooks' / name, REPO / 'hooks')
-    return any(inside(word.strip('"\''), root) for word in words for root in roots)
+    # only absolute words: a relative one would resolve against the cwd
+    paths = [p for p in (word.strip('"\'') for word in words) if os.path.isabs(p)]
+    return any(inside(p, root) for p in paths for root in roots)
 
 
 def quote_command(path):

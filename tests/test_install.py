@@ -21,12 +21,12 @@ class InstallTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_cli(self, *argv):
-        return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True,
+    def run_cli(self, *argv, cwd=None):
+        return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, cwd=cwd,
                               env={**os.environ, 'HOME': str(self.home), 'USERPROFILE': str(self.home)})
 
-    def ok(self, *argv):
-        done = self.run_cli(*argv)
+    def ok(self, *argv, cwd=None):
+        done = self.run_cli(*argv, cwd=cwd)
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout
 
@@ -91,6 +91,14 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(json.loads((self.claude / 'settings.json.before-agentrc').read_text())['hooks']['PreToolUse'][0]['hooks'][0]['command'], old)
         self.assertEqual(self.ok('install', '--skill'), '', 'idempotent')
         self.assertEqual(self.settings(), data)
+
+    def test_a_foreign_hook_with_relative_words_survives_a_run_from_inside_the_hooks(self):
+        self.claude.mkdir()
+        foreign = {'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'bash other-stop.sh'}]}]}}
+        (self.claude / 'settings.json').write_text(json.dumps(foreign))
+        self.ok('install', '--skill', cwd=ROOT / 'hooks')
+        self.ok('remove', '--skill', cwd=ROOT / 'hooks')
+        self.assertEqual(self.settings(), foreign)
 
     def test_a_hook_path_with_a_space_is_quoted(self):
         home = self.home / 'my home'
