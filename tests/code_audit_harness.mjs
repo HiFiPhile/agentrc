@@ -34,7 +34,7 @@ async function run(args, { scans = {}, verdicts = {}, reverse = false } = {}) {
   const logs = []
   const finished = []
   const agent = async (prompt, options) => {
-    calls.push({ label: options.label, agentType: options.agentType, prompt: String(prompt), schema: options.schema })
+    calls.push({ label: options.label, agentType: options.agentType, prompt: String(prompt), schema: options.schema, options })
     if (options.label.startsWith('scan:')) {
       const m = /^Review (.+?) for exactly one dimension: (.+?)\. Read the sources yourself/.exec(prompt)
       assert.ok(m, prompt)
@@ -121,6 +121,15 @@ test('mixed verdicts keep only confirmed findings, each verified once by finding
     dir: 'src/portable/x', dim: 'correctness',
     findings: [confirmedAs(finding(10, 'real bug'), 'F1'), confirmedAs(finding(10, 'another real'), 'F2')],
   }])
+})
+
+test('a scanner-labelled nit is verified by Sonnet, every other level by the agent\'s own model', async () => {
+  const levels = ['critical', 'high', 'medium', 'low', 'nit']
+  const scans = { 'src/portable/x|correctness': levels.map((severity, i) => ({ ...finding(i + 1, severity), severity })) }
+  const { calls } = await run(ONE, { scans, verdicts: Object.fromEntries(levels.map(l => [l, true])) })
+  const byLevel = Object.fromEntries(calls.filter(c => c.label.startsWith('verify:'))
+    .map(c => [levels[+c.label.split(':').pop()], [c.options.model, c.options.effort]]))
+  assert.deepEqual(byLevel, Object.fromEntries(levels.map(l => [l, l === 'nit' ? ['sonnet', 'medium'] : [undefined, undefined]])))
 })
 
 test('a dead scanner is reported as dropped, a dead verifier as unverified, never as clean', async () => {

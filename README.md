@@ -142,7 +142,8 @@ mv $d/settings.json.new $d/settings.json
 every read, edit, build and review goes to the repository's agents, skills and
 workflows. Its direct Codex exchanges go through `agents/coworker.md`, the
 `cowork.py` transport. `workflows/code-audit.js` is its saved review: one `code-verifier`
-per directory x dimension, then `finding-verifier` on every finding
+per directory x dimension, then `finding-verifier` on every finding (on Sonnet for a
+scanner-labelled nit)
 (`args: { dirs, dimensions, diff? }`, the first two required; `diff: { base, head }`
 narrows it to a change); the verifier sets each finding's level by the one
 severity scale in `agents/finding-verifier.md`'s Severity section.

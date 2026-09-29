@@ -75,6 +75,9 @@ const graded = v => LEVELS.includes(v.severity) && CONFIDENCE.includes(v.confide
   !!v.severityReason && !!v.impact && IMPACT.required.every(k => v.impact[k])
 const gradeOf = v => ({ severity: v.severity, confidence: v.confidence, impact: v.impact, severityReason: v.severityReason })
 
+// Owner's policy: a finding the scanner labels nit needs no Opus verification.
+const verifierModel = f => f.severity === 'nit' ? { model: 'sonnet', effort: 'medium' } : {}
+
 const pairs = dirs.flatMap((dir, i) => dims.map((dim, j) => ({ dir, dim, id: `d${i}x${j}` })))
 log(`${pairs.length} scan units (${dirs.length} dirs x ${dims.length} dimensions)`)
 
@@ -94,7 +97,7 @@ const results = await pipeline(
         `Adversarially verify ONE review finding about ${p.dir}.\nDimension: ${p.dim}\nFinding: ${JSON.stringify(f)}\n` +
         `Read the cited code and enough surrounding context to judge.${scopeOf(p.dir)} Try to REFUTE it; real=true only if it survives your best attempt. ` +
         `If real, set severity, impact, severityReason and confidence by the Severity section of your role; the finding's own severity is the scanner's guess. If refuted, set them null.`,
-        { label: `verify:${p.id}:${k}`, phase: 'Verify', agentType: 'finding-verifier', schema: VERDICT },
+        { label: `verify:${p.id}:${k}`, phase: 'Verify', agentType: 'finding-verifier', schema: VERDICT, ...verifierModel(f) },
       ).then(v => v && { f, v })
     )).then(vs => {
       const kind = x => !x ? 'dead' : !x.v.real ? 'refuted' : graded(x.v) ? 'confirmed' : 'ungraded'
