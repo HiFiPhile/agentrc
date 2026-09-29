@@ -1,6 +1,6 @@
 ---
 name: read-doc
-description: Use when you need authoritative hardware/protocol facts from a primary source rather than model memory — an MCU/peripheral datasheet, reference manual (RM/TRM), errata, pinout, register/bitfield layout, memory map, a vendor evaluation-board schematic PDF, or the USB spec — before answering register/electrical/timing/protocol questions from training knowledge or the web; or when the user asks to read/open/look up a manual, datasheet, book, or PDF/EPUB from their Calibre library. Board wiring in EAGLE/KiCad design sources is `read-pcb`'s. Requires a local Calibre library at ~/Documents/calibre-library; no-ops if absent.
+description: Use when you need authoritative hardware/protocol facts from a primary source rather than model memory — an MCU/peripheral datasheet, reference manual (RM/TRM), errata, pinout, register/bitfield layout, memory map, a vendor evaluation-board schematic PDF, or the USB spec — before stating, changing or reviewing anything that depends on hardware or protocol behaviour; or when the user asks to read/open/look up a manual, datasheet, book, or PDF/EPUB from their Calibre library. Board wiring in EAGLE/KiCad design sources is `read-pcb`'s. Requires a local Calibre library at ~/Documents/calibre-library; absent, hardware or protocol claims are reported unavailable.
 ---
 
 # Read Doc
@@ -26,9 +26,11 @@ directory:
 [ -f "${CALIBRE_LIBRARY:-$HOME/Documents/calibre-library}/metadata.db" ] && echo present || echo absent
 ```
 
-Absent → the skill does not apply; fall back to normal sources silently (don't
-mention the library unless the user named it). For a claim record (below),
-report the failed gate as unavailable instead of silently falling back.
+Absent → a question outside hardware or protocol semantics falls back to normal
+sources silently (don't mention the library unless the user named it). A hardware
+or protocol claim stays unverified: report the source as unavailable, as a claim record when one
+is asked for (below), and never settle it from memory, the web or a filesystem
+search; code and observed behaviour are evidence, not the documented semantics.
 
 ## When to use
 
@@ -38,6 +40,17 @@ report the failed gate as unavailable instead of silently falling back.
   STM32H7 RM say about…".
 
 Not for general concepts, repo/code questions, or when no such doc is likely.
+
+An agent that writes, reviews, debugs or validates hardware-facing code carries
+this rule verbatim in its own prompt, so the trigger reaches it before the skill
+is loaded:
+
+> Whenever a conclusion, hypothesis, review finding, experiment or code change
+> depends on hardware or protocol behaviour (registers and bitfields, access
+> order and side effects, interrupts, DMA or cache, clocks, timing, the USB IP's
+> state machine and FIFO rules, errata, the USB specification), load the
+> `read-doc` skill and check the base document and the errata of every affected
+> part and variant before treating it as verified.
 
 ## Find the book
 

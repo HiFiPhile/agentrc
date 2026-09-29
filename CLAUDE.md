@@ -209,9 +209,10 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 
 # Reference docs
 - Hardware manuals, datasheets, reference manuals, errata, schematics and spec
-  sheets are archived in my Calibre library. Before answering
-  register/bitfield/pinout/errata/timing questions from memory or the web, use
-  the `read-doc` skill to check it and report if the document is missing.
+  sheets are archived in my Calibre library. Before stating, changing or
+  reviewing anything that depends on hardware or protocol behaviour from memory
+  or the web, use the `read-doc` skill to check it and report if the document is
+  missing.
   Report a fact as undocumented only after the lookup ran; one not run is
   pending.
 - Never search the library tree directly; the skill owns its location and

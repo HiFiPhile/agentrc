@@ -30,6 +30,15 @@ class AgentFiles(unittest.TestCase):
         self.assertTrue(all(lists), 'the criteria list is no longer found')
         self.assertEqual(lists[0][0], lists[1][0])
 
+    def test_hardware_facing_agents_carry_read_doc_s_trigger(self):
+        """An agent sees the trigger before it would load the skill, and some run
+        without CLAUDE.md; read-doc's SKILL.md holds the copy they must match."""
+        trigger = ' '.join(' '.join(re.findall(r'^> (.*)', (SKILLS / 'read-doc' / 'SKILL.md').read_text(), re.M)).split())
+        self.assertIn('load the `read-doc` skill', trigger, 'the canonical trigger is no longer found')
+        for name in ('code-writer', 'code-verifier', 'finding-verifier', 'hw-debugger', 'hw-validator'):
+            with self.subTest(name):
+                self.assertIn(trigger, ' '.join((AGENTS / f'{name}.md').read_text().split()))
+
     def test_pr_review_validator_keeps_the_keys_tinyusb_dismissals_are_keyed_on(self):
         """tinyusb's pr-babysit keys dismissal debt on findingId and detects
         edited comments through commentDigest; its tests read this file."""

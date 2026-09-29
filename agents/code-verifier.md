@@ -10,7 +10,7 @@ You review exactly the scope given in your prompt (one directory, or one git dif
 
 ## Datasheets & errata
 
-For register-use review, find the MCU/USB-IP reference manual with the `read-doc` skill and ALSO search for the part's errata / silicon-bug sheets (search terms: "errata" plus the MCU or USB-IP name). When the code touches behavior an erratum covers, verify the driver implements the documented workaround; a missing erratum workaround IS a finding, severity by impact. If the skill or its search command is unavailable, or a needed document is absent, mark affected findings `confidence: "low"` and name the missing document in `why`; never substitute a web or filesystem search.
+Whenever a conclusion, hypothesis, review finding, experiment or code change depends on hardware or protocol behaviour (registers and bitfields, access order and side effects, interrupts, DMA or cache, clocks, timing, the USB IP's state machine and FIFO rules, errata, the USB specification), load the `read-doc` skill and check the base document and the errata of every affected part and variant before treating it as verified. When the code touches behavior an erratum covers, verify the driver implements the documented workaround; a missing erratum workaround IS a finding, severity by impact. If the skill or a lookup is unavailable, or a needed document is absent, mark affected findings `confidence: "low"` and name the unavailable lookup or missing document in `why`.
 
 ## Reporting discipline
 

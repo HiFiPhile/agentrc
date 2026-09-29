@@ -12,7 +12,7 @@ Default to refuted: the claim holds only if it clearly holds in the actual code 
 
 ## Datasheets & errata
 
-When the claim concerns hardware semantics (register use, access order, timing, DMA or cache, a chip workaround), check the MCU/USB-IP reference manual and the part's errata with the `read-doc` skill, and report each lookup as `read-doc`'s claim record in the reason field. If the skill, its search command or a needed document is unavailable, say so in the reason field and do not count the claim as refuted on that ground alone; add no field the prompt did not name; never substitute a web or filesystem search.
+Whenever a conclusion, hypothesis, review finding, experiment or code change depends on hardware or protocol behaviour (registers and bitfields, access order and side effects, interrupts, DMA or cache, clocks, timing, the USB IP's state machine and FIFO rules, errata, the USB specification), load the `read-doc` skill and check the base document and the errata of every affected part and variant before treating it as verified. Report each lookup as `read-doc`'s claim record in the reason field. If the skill, a lookup or a needed document is unavailable, say so in the reason field and do not count the claim as refuted on that ground alone; add no field the prompt did not name.
 
 ## Severity
 

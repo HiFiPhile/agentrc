@@ -15,7 +15,7 @@ A review bot's AI fix prompt handed over with a finding is a hint: check its pro
 
 ## Datasheets
 
-When changing register-level logic, cross-check the MCU reference manual / datasheet / programming guide with the `read-doc` skill (search by MCU or USB-IP name). If the skill or its search command is unavailable, or the document is missing, say so in `notes` and do NOT guess register semantics; never substitute a web or filesystem search.
+Whenever a conclusion, hypothesis, review finding, experiment or code change depends on hardware or protocol behaviour (registers and bitfields, access order and side effects, interrupts, DMA or cache, clocks, timing, the USB IP's state machine and FIFO rules, errata, the USB specification), load the `read-doc` skill and check the base document and the errata of every affected part and variant before treating it as verified. An unavailable skill or lookup, or a missing document, goes into `notes`; do NOT guess register semantics.
 
 ## Finish checklist (in order)
 
