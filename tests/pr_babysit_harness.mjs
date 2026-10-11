@@ -6533,3 +6533,49 @@ test('a finding its validator could not scope sends its group through the scope 
   assert.equal(result.reason, 'fix-verification-failed')
   assert.ok(logs.some(l => /fix for src\/a\.c: no file scope determinable — withheld for the caller/.test(l)), logs.join('\n'))
 })
+
+test('a rejudge the user asked for hands an answered comment to the caller until its reply settles it (#61)', async () => {
+  const LONG = { autoPush: true, maxCycles: 8, yieldAfterCycle: true }
+  const first = await run({ reviews: oneValid, args: { ...LONG } })
+  const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
+  // a resolved thread is not harvested: the rejudge works from our answer, not the harvest
+  const quiet = { findings: [], replies: [], bots: 'reviewed' }
+  const reason = 'the rewrite dropped dma_drain(), which our reply cites'
+  const asked = await run({ reviews: quiet, preflight: at, args: { ...LONG, state: first.result.state, rejudge: [{ commentId: 1, reason }] } })
+  assert.deepEqual(asked.result.handoffs, [{ commentId: 1, why: `the user asked to judge our answer again: ${reason}`, rejudge: { reason } }])
+  assert.notEqual(asked.result.pass, true, 'an answer the user asked to judge again is still owed')
+  assert.equal(asked.calls.some(c => c.label.startsWith('replies#')), false, 'the run never answers it itself')
+  // it stays without the argument, and through a harvest that judges the comment valid
+  const later = await run({ reviews: quiet, preflight: at, args: { ...LONG, state: asked.result.state } })
+  assert.deepEqual(later.result.handoffs.map(h => h.rejudge), [{ reason }])
+  const judged = await run({ reviews: structuredClone(oneValid), preflight: at, args: { ...LONG, state: later.result.state } })
+  assert.deepEqual(judged.result.handoffs.map(h => [h.commentId, h.rejudge]), [[1, { reason }]])
+  // the caller's verified reply settles it; the state then owes nothing for it
+  const settlement = { commentId: 1, commentDigest: 'd1', replyId: 777, bodyDigest: 'abcd1234', headSha: at.head }
+  const settled = await run({ reviews: quiet, preflight: at, args: { ...LONG, state: later.result.state, replySettlements: [settlement] } })
+  assert.deepEqual(settled.result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
+  assert.equal(settled.result.handoffs, undefined)
+  assert.equal(settled.result.state.debt.some(([id]) => id === 1), false)
+})
+
+test('a rejudge on a comment edited since we answered it keeps both until one settlement clears them', async () => {
+  const { edited, at, state, settlement } = await reanswered()
+  const reason = 'the design changed under it'
+  const asked = await run({ reviews: edited, preflight: at, args: { ...YIELD, maxCycles: 6, state, rejudge: [{ commentId: 1, reason }] } })
+  assert.deepEqual(asked.result.handoffs, [{ commentId: 1, commentDigest: 'edited', why: 'edited after we answered it', rejudge: { reason } }])
+  const settled = await run({ reviews: edited, preflight: at, args: { ...YIELD, maxCycles: 6, state: asked.result.state, replySettlements: [settlement] } })
+  assert.deepEqual(settled.result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
+  assert.equal(settled.result.handoffs, undefined)
+  assert.equal(settled.result.state.reanswer, undefined)
+  assert.equal(settled.result.state.debt.some(([id]) => id === 1), false)
+})
+
+test('a rejudge names answered comments, each once, with a reason', async () => {
+  const first = await run({ reviews: oneValid, args: { ...YIELD } })
+  const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
+  await assert.rejects(run({ reviews: oneValid, preflight: at, args: { ...YIELD, state: first.result.state, rejudge: [{ commentId: 9, reason: 'x' }] } }),
+    /rejudge: comment 9 has no answer of ours in the state/)
+  for (const rejudge of [[{ commentId: 1, reason: 'x' }, { commentId: 1, reason: 'y' }], [{ commentId: 1, reason: ' ' }], [{ commentId: '1', reason: 'x' }], { commentId: 1 }]) {
+    await assert.rejects(run({ reviews: oneValid, preflight: at, args: { ...YIELD, state: first.result.state, rejudge } }), /rejudge must be/, JSON.stringify(rejudge))
+  }
+})

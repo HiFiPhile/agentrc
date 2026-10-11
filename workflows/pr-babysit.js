@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, rebasedHead? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -97,6 +97,12 @@ const settlementShaped = (s) => s && typeof s === 'object' && [s.commentId, s.re
     fnv1a(s.sonar.note) === s.bodyDigest))
 if (!Array.isArray(settlementsArg) || !settlementsArg.every(settlementShaped) || new Set(settlementsArg.map(s => s.commentId)).size !== settlementsArg.length) {
   throw new Error('replySettlements must be [{ commentId, commentDigest, replyId, bodyDigest, headSha: the full SHA its answer was judged at, sonar?: { how: refutation|fixNote, note: the reply body bodyDigest digests } }], one per comment')
+}
+// Answered comments the user named for the caller to judge again (a rewrite dropped the code our reply cites, say).
+const rejudgeArg = args.rejudge ?? []
+if (!Array.isArray(rejudgeArg) || !rejudgeArg.every(x => x && Number.isInteger(x.commentId) && x.commentId > 0 && typeof x.reason === 'string' && x.reason.trim()) ||
+  new Set(rejudgeArg.map(x => x.commentId)).size !== rejudgeArg.length) {
+  throw new Error('rejudge must be [{ commentId, reason }], one per comment the user named')
 }
 const pathRe = (name) => {
   if (args[name] === undefined || args[name] === null) return null
@@ -736,7 +742,7 @@ const stateOut = () => {
       reruns: ciReruns.filter(r => r.head === expectedHead),
       entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest, placedWith }) => ({ head, link, bucket, digest, ...(placedWith ? { placedWith } : {}) })),
     },
-    debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.edited ? { edited: d.edited } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
+    debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.edited ? { edited: d.edited } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.rejudge ? { rejudge: d.rejudge } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
   return { ...st, digest: sealOf(st) }
@@ -810,7 +816,7 @@ const finish = (verdict, status) => {
 const handoffList = () => [...new Set([...debt.keys(), ...reanswer])].filter(handedOff).map(commentId => {
   const d = debt.get(commentId) || {}
   return { commentId, ...(d.digest !== undefined ? { commentDigest: d.digest } : {}), why: handoffWhy(commentId),
-    ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.repair && d.repair.replyId ? { replyId: d.repair.replyId } : {}), ...(d.repair && d.repair.draft ? { draft: d.repair.draft } : {}) }
+    ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.repair && d.repair.replyId ? { replyId: d.repair.replyId } : {}), ...(d.repair && d.repair.draft ? { draft: d.repair.draft } : {}), ...(d.rejudge ? { rejudge: d.rejudge } : {}) }
 })
 // Why the caller answers it now, or null: the workflow posts nothing more on it until the caller's reply settles it.
 const handoffWhy = (commentId) => {
@@ -818,6 +824,7 @@ const handoffWhy = (commentId) => {
   return d && d.edited ? 'edited after its finding ids were carried'
     : reanswer.has(commentId) ? 'edited after we answered it'
     : d && d.repair ? `${d.repair.replyId ? `reply ${d.repair.replyId}: ` : ''}${d.repair.error}`
+    : d && d.rejudge ? `the user asked to judge our answer again: ${d.rejudge.reason}`
     : null
 }
 const handedOff = (commentId) => !!handoffWhy(commentId)
@@ -1450,6 +1457,11 @@ const debtEntry = (commentId, digest) => {
   if (!debt.has(commentId)) debt.set(commentId, { dismissals: new Set(), notes: new Set(), ...(digest !== undefined ? { digest } : {}) })
   return debt.get(commentId)
 }
+// A rejudge stands beside any repair or edit until the caller's reply settles the comment.
+for (const x of rejudgeArg) {
+  if (!answeredWith.has(x.commentId) && !reanswer.has(x.commentId)) throw new Error(`rejudge: comment ${x.commentId} has no answer of ours in the state`)
+  debtEntry(x.commentId).rejudge = { reason: x.reason.trim() }
+}
 // A refutation or an answer by hand settles the comment; a fix note settles only its notes.
 const pay = (commentId, how, digest, sonarNote) => {
   answeredWith.set(commentId, { how, digest, ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
@@ -1459,7 +1471,8 @@ const pay = (commentId, how, digest, sonarNote) => {
   d.notes.clear()
   delete d.attempt
   if (how === 'refutation' || how === 'byHand') d.dismissals.clear()
-  if (d.dismissals.size === 0) debt.delete(commentId)
+  if (how === 'byHand') delete d.rejudge
+  if (d.dismissals.size === 0 && !d.rejudge) debt.delete(commentId)
 }
 // While its body stands, none of a comment's findings is this run's to fix or answer once the caller answered it.
 const answeredByHand = (f) => { const a = answeredWith.get(f.commentId); return !!a && a.how === 'byHand' && a.digest === f.commentDigest }
@@ -2111,7 +2124,7 @@ const runCycle = async (cycle, entry) => {
       // Retiring a dismissal is always allowed, even on an answered comment.
       if (d) d.dismissals.delete(dismissalKey(f))
       if (!answered) { const e = open(); e.notes.add(dismissalKey(f)); if (e.digest === undefined) e.digest = f.commentDigest }
-      if (d && d.dismissals.size === 0 && d.notes.size === 0 && !d.repair) debt.delete(f.commentId)
+      if (d && d.dismissals.size === 0 && d.notes.size === 0 && !d.repair && !d.rejudge) debt.delete(f.commentId)
     }
 
     // A comment is answered only when this harvest shows every point its answer settles; a reused reply resolves the thread, so it needs them all.

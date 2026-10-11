@@ -245,7 +245,8 @@ class LaunchResultTest(unittest.TestCase):
         data = output()
         data['result']['handoffs'] = [
             {'commentId': 5, 'commentDigest': 'd5', 'why': 'edited after its finding ids were carried'},
-            {'commentId': 7, 'why': 'no reply posted: over length', 'draft': 'a long draft'}]
+            {'commentId': 7, 'why': 'no reply posted: over length', 'draft': 'a long draft'},
+            {'commentId': 8, 'why': 'edited after we answered it', 'rejudge': {'reason': 'the rewrite dropped dma_drain()'}}]
         data['result']['settlements'] = [
             {'commentId': 3, 'outcome': 'settled', 'replyId': 30},
             {'commentId': 5, 'outcome': 'refused', 'why': 'a point of the comment is held'},
@@ -256,6 +257,8 @@ class LaunchResultTest(unittest.TestCase):
             'edited after its finding ids were carried; settlement refused: a point of the comment is held',
             "comment 7 is the caller's to answer (chief's reply takeover rule), then to settle through replySettlements: "
             'no reply posted: over length; draft: a long draft',
+            "comment 8 is the caller's to answer (chief's reply takeover rule), then to settle through replySettlements: "
+            "edited after we answered it; the user's rejudge request: the rewrite dropped dma_drain()",
             'comment 6: settlement not processed: no review harvest in this launch'])
         self.assertEqual(s['result']['handoffs'][0]['commentDigest'], 'd5', 'the whole handoff stays in the reading')
 
