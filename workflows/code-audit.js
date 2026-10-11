@@ -8,12 +8,14 @@ export const meta = {
   ],
 }
 
-// args: { dirs: string[], dimensions: string[], diff?: { base, head }, root?: string }, dirs and
+// args: { dirs: string[], dimensions: string[], diff?: { base, head }, root?: string, batch?: boolean }, dirs and
 // dimensions nonempty; no defaults, since `dimensions: []` would review nothing
 // and look like a clean pass. `diff` (two full SHAs, the checkout at head) narrows
 // every unit to what base..head introduces or breaks, as a PR review needs; the
 // caller checks that the checkout is clean and at head before launching. `root`, the
-// checkout's absolute top, turns a scanner's absolute path under it into a relative one.
+// checkout's absolute top, turns a scanner's absolute path under it into a relative one. `batch`
+// verifies close findings on one file in one dispatch once every scan is in (see Batching); it stays off
+// by default until it passes bench/finding-verify's adoption gate.
 const list = (v, name) => {
   if (!Array.isArray(v) || v.length === 0 || !v.every(s => typeof s === 'string' && s.trim())) {
     throw new Error(`args.${name} must be a nonempty array of nonblank strings; args is { dirs: string[], dimensions: string[] }`)
@@ -29,11 +31,12 @@ if (args.diff != null && !(isSha(args.diff.base) && isSha(args.diff.head))) {
   throw new Error('args.diff must be { base, head }, two full 40-hex SHAs')
 }
 if (args.root != null && !(typeof args.root === 'string' && /^\/./.test(args.root))) throw new Error('args.root must be an absolute path')
+if (args.batch != null && typeof args.batch !== 'boolean') throw new Error('args.batch must be a boolean')
 const root = args.root == null ? null : args.root.replace(/\/+$/, '')
 // A verifier reads the path it is given, and a finding's consumers need it repository-relative. Strings only:
 // root is the checkout's real path, and a scanner reports the path it read.
 const placed = (f) => {
-  const file = f.file.startsWith('/') && root && f.file.startsWith(`${root}/`) ? f.file.slice(root.length + 1) : f.file.replace(/^(?:\.\/)+/, '')
+  const file = root && f.file.startsWith(`${root}/`) ? f.file.slice(root.length + 1) : f.file.replace(/^(?:\.\/)+/, '')
   const pathError = !file ? 'no file'
     : file.startsWith('/') ? `absolute path outside the checkout${root ? ` ${root}` : ' (no root given)'}`
     : file.split('/').includes('..') ? 'path escapes the checkout' : null
@@ -67,10 +70,11 @@ const FINDINGS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['file', 'line', 'snippet', 'why', 'severity', 'confidence'],
+        required: ['file', 'line', 'snippet', 'why', 'severity', 'confidence', 'hardware'],
         properties: {
           file: { type: 'string' }, line: { type: 'integer' }, snippet: { type: 'string' },
           why: { type: 'string' }, severity: { enum: LEVELS }, confidence: { enum: CONFIDENCE },
+          hardware: { type: ['boolean', 'null'] },
           docs: DOCS,
         },
       },
@@ -99,42 +103,128 @@ const gradeOf = v => ({ severity: v.severity, confidence: v.confidence, impact: 
 // Owner's policy: a finding the scanner labels nit needs no Opus verification.
 const verifierModel = f => f.severity === 'nit' ? { model: 'sonnet', effort: 'medium' } : {}
 
+const GRADING = "If real, set severity, impact, severityReason and confidence by the Severity section of your role; the finding's own severity is the scanner's guess. If refuted, set them null."
+const verifyPrompt = (p, f) =>
+  `Adversarially verify ONE review finding about ${p.dir}.\nDimension: ${p.dim}\nFinding: ${JSON.stringify(f)}\n` +
+  `Read the cited code and enough surrounding context to judge.${scopeOf(p.dir)} Try to REFUTE it; real=true only if it survives your best attempt. ` +
+  GRADING
+// A dead or partly graded verdict gets one more verifier; what is still short after it is unverified.
+const usable = v => !!v && (!v.real || graded(v))
+const verifyOne = (p, f, label) => agent(verifyPrompt(p, f), { label, phase: 'Verify', agentType: 'finding-verifier', schema: VERDICT, ...verifierModel(f) })
+const verifyAgain = (p, f, label, v) => usable(v) ? v : verifyOne(p, f, `${label}.retry`).then(w => w || v)
+// A finding verified alone, with its one retry: { v } or null.
+const verifyChecked = (p, f, label) => verifyOne(p, f, label).then(v => verifyAgain(p, f, label, v)).then(v => v && { v })
+
+// One scan unit's findings and their verdicts (x: { v } a verdict, null a dead verifier, { pathError }) as the unit's result.
+const unitResult = (p, found, xs) => {
+  const kind = x => !x || !x.v ? (x && x.pathError ? 'unplaced' : 'dead') : !x.v.real ? 'refuted' : graded(x.v) ? 'confirmed' : 'ungraded'
+  const kinds = xs.map(kind)
+  const count = k => kinds.filter(x => x === k).length
+  const unverified = found.filter((_, k) => ['dead', 'ungraded', 'unplaced'].includes(kinds[k]))
+  if (unverified.length > 0) {
+    log(`${p.dir}: ${unverified.length} finding(s) unverified (${count('dead')} dead verifier(s), ${count('ungraded')} confirmed without complete grading${count('unplaced') ? `, ${count('unplaced')} with an unusable path` : ''}) — re-run if needed`)
+  }
+  const findings = found.flatMap((f, k) => kinds[k] === 'confirmed' ? [{ ...f, ...gradeOf(xs[k].v), verdict: { real: true, reason: xs[k].v.reason } }] : [])
+  return { dir: p.dir, dim: p.dim, findings, unverified }
+}
+
 const pairs = dirs.flatMap((dir, i) => dims.map((dim, j) => ({ dir, dim, id: `d${i}x${j}` })))
 log(`${pairs.length} scan units (${dirs.length} dirs x ${dims.length} dimensions)`)
-
-const results = await pipeline(
-  pairs,
-
-  p => agent(
-    `Review ${p.dir} for exactly one dimension: ${p.dim}. Read the sources yourself.${scopeOf(p.dir)} Report each \`file\` relative to the repository root. Coverage-first: report everything, a verifier filters.`,
-    { label: `scan:${p.id}`, phase: 'Scan', agentType: 'code-verifier', schema: FINDINGS },
-  ),
-
-  (scan, p) => {
-    if (!scan) return { dir: p.dir, dim: p.dim, dropped: true, findings: [], unverified: [] }
-    if (scan.findings.length === 0) return { dir: p.dir, dim: p.dim, findings: [], unverified: [] }
-    const found = scan.findings.map(placed)
-    return parallel(found.map((f, k) => () => f.pathError ? { f, pathError: f.pathError } :
-      agent(
-        `Adversarially verify ONE review finding about ${p.dir}.\nDimension: ${p.dim}\nFinding: ${JSON.stringify(f)}\n` +
-        `Read the cited code and enough surrounding context to judge.${scopeOf(p.dir)} Try to REFUTE it; real=true only if it survives your best attempt. ` +
-        `If real, set severity, impact, severityReason and confidence by the Severity section of your role; the finding's own severity is the scanner's guess. If refuted, set them null.`,
-        { label: `verify:${p.id}:${k}`, phase: 'Verify', agentType: 'finding-verifier', schema: VERDICT, ...verifierModel(f) },
-      ).then(v => v && { f, v })
-    )).then(vs => {
-      const kind = x => !x ? 'dead' : x.pathError ? 'unplaced' : !x.v.real ? 'refuted' : graded(x.v) ? 'confirmed' : 'ungraded'
-      const kinds = vs.map(kind)
-      const count = k => kinds.filter(x => x === k).length
-      const unverified = found.filter((_, k) => ['dead', 'ungraded', 'unplaced'].includes(kinds[k]))
-      if (unverified.length > 0) {
-        log(`${p.dir}: ${unverified.length} finding(s) unverified (${count('dead')} dead verifier(s), ${count('ungraded')} confirmed without complete grading${count('unplaced') ? `, ${count('unplaced')} with an unusable path` : ''}) — re-run if needed`)
-      }
-      const findings = vs.filter((_, k) => kinds[k] === 'confirmed')
-        .map(({ f, v }) => ({ ...f, ...gradeOf(v), verdict: { real: true, reason: v.reason } }))
-      return { dir: p.dir, dim: p.dim, findings, unverified }
-    })
-  },
+const scanOf = p => agent(
+  `Review ${p.dir} for exactly one dimension: ${p.dim}. Read the sources yourself.${scopeOf(p.dir)} Report each \`file\` relative to the repository root. ` +
+  'Set each finding\'s `hardware` true when its conclusion depends on how hardware or a protocol behaves, false when the code alone decides it, null when unsure. ' +
+  'Coverage-first: report everything, a verifier filters.',
+  { label: `scan:${p.id}`, phase: 'Scan', agentType: 'code-verifier', schema: FINDINGS },
 )
+const placedOf = scan => !scan ? null : scan.findings.map(placed)
+const emptyUnit = (p, found) => ({ dir: p.dir, dim: p.dim, ...(found ? {} : { dropped: true }), findings: [], unverified: [] })
+
+// Batching: findings on one file within SPAN lines of the previous one, at most BATCH of them and PROMPT_CAP characters
+// of finding text, verified in one dispatch on one model. A finding whose conclusion may rest on hardware or a document
+// stays alone: the scanner's own flag, its cited documents, its text or its dimension says so, and unsure counts.
+const SPAN = 15
+const BATCH = 4
+const PROMPT_CAP = 8000
+const HARDWARE = /datasheet|errat|reference manual|user manual|\bregister|W1C|write-1-to-clear|silicon|read-doc|\b(?:UM|RM|AN|DS)\d{4,}/i
+const HARDWARE_DIMENSION = /hardware|datasheet|errat|register|protocol|reference manual/i
+const batchable = (f, dim) => f.hardware === false && !(f.docs && f.docs.length) && !HARDWARE.test(`${f.why}\n${f.snippet}`) && !HARDWARE_DIMENSION.test(dim)
+const batchPrompt = (members) =>
+  `Adversarially verify EACH of these ${members.length} review findings on one file. Judge each on its own evidence: ` +
+  'one finding\'s verdict is no evidence for another\'s, and two findings on one line may differ.\n\n' +
+  members.map(x => `[${x.id}] about ${x.p.dir}.\nDimension: ${x.p.dim}\nFinding: ${JSON.stringify(x.f)}${scopeOf(x.p.dir) && `\n${scopeOf(x.p.dir).trim()}`}`).join('\n\n') +
+  '\n\nRead the cited code and enough surrounding context to judge each. Try to REFUTE each; real=true only if it survives your best attempt. ' +
+  `${GRADING} Return verdicts with exactly one entry per id above.`
+const batchSchema = (ids) => ({
+  type: 'object', additionalProperties: false, required: ['verdicts'],
+  properties: { verdicts: { type: 'array', items: { ...VERDICT, required: ['id', ...VERDICT.required], properties: { id: { enum: ids }, ...VERDICT.properties } } } },
+})
+const batchesOf = (items) => {
+  const by = new Map()
+  for (const x of items) {
+    const key = JSON.stringify([x.f.file, verifierModel(x.f)])
+    by.set(key, [...(by.get(key) || []), x])
+  }
+  const out = []
+  for (const group of by.values()) {
+    group.sort((a, b) => a.f.line - b.f.line)
+    let cur = []
+    const size = xs => xs.reduce((n, x) => n + JSON.stringify(x.f).length, 0)
+    for (const x of group) {
+      if (cur.length && (x.f.line - cur[cur.length - 1].f.line > SPAN || cur.length === BATCH || size([...cur, x]) > PROMPT_CAP)) { out.push(cur); cur = [] }
+      cur.push(x)
+    }
+    out.push(cur)
+  }
+  return out
+}
+// One verdict per id or none trusted: a dead, unknown, duplicate or missing entry sends every member to its own
+// verifier once; a confirmed entry without its grading sends that member alone.
+const verifyBatch = async (members, b) => {
+  const ids = members.map(x => x.id)
+  const got = await agent(batchPrompt(members), { label: `verify:b${b}`, phase: 'Verify', agentType: 'finding-verifier', schema: batchSchema(ids), ...verifierModel(members[0].f) })
+  const entries = got && Array.isArray(got.verdicts) ? got.verdicts : null
+  const whole = entries && entries.length === ids.length && new Set(entries.map(e => e.id)).size === ids.length && entries.every(e => ids.includes(e.id))
+  if (!whole) log(`verify:b${b}: ${got ? 'not one verdict per finding' : 'dead'} — ${ids.length} finding(s) verified one by one`)
+  return parallel(members.map(x => () => {
+    const e = whole ? entries.find(e => e.id === x.id) : null
+    const { id, ...v } = e || {}
+    return e && usable(v) ? { v } : verifyOne(x.p, x.f, `verify:${x.id}`).then(w => w ? { v: w } : (e ? { v } : null))
+  }))
+}
+
+const results = !args.batch
+  ? await pipeline(pairs, scanOf, (scan, p) => {
+    const found = placedOf(scan)
+    if (!found || !found.length) return emptyUnit(p, found)
+    return parallel(found.map((f, k) => () => f.pathError ? { pathError: f.pathError } : verifyChecked(p, f, `verify:${p.id}:${k}`)))
+      .then(xs => unitResult(p, found, xs))
+  })
+  : await (async () => {
+    // Clusters cross scan units, so a batchable finding waits for every scan; any other is verified as its scan returns.
+    const verdict = new Map()
+    const alone = x => verifyChecked(x.p, x.f, `verify:${x.id}`).then(v => verdict.set(x.id, v))
+    const itemsOf = (p, found) => (found || []).map((f, k) => ({ p, f, k, id: `${p.id}:${k}` }))
+    const early = []
+    const founds = await parallel(pairs.map(p => () => scanOf(p).then(scan => {
+      const found = placedOf(scan)
+      for (const x of itemsOf(p, found)) {
+        if (x.f.pathError) verdict.set(x.id, { pathError: x.f.pathError })
+        else if (!batchable(x.f, p.dim)) early.push(alone(x).catch(() => verdict.set(x.id, null)))
+      }
+      return found
+    })))
+    const open = pairs.flatMap((p, i) => itemsOf(p, founds[i])).filter(x => !x.f.pathError && batchable(x.f, x.p.dim))
+    const batches = batchesOf(open).filter(b => b.length > 1)
+    const batched = new Set(batches.flat().map(x => x.id))
+    log(`${early.length + open.length} finding(s) to verify: ${batched.size} in ${batches.length} batch(es), ${early.length + open.length - batched.size} alone`)
+    await parallel([
+      ...batches.map((b, n) => () => verifyBatch(b, n).then(xs => b.forEach((x, k) => verdict.set(x.id, xs[k])))),
+      ...open.filter(x => !batched.has(x.id)).map(x => () => alone(x)),
+    ])
+    await Promise.all(early)
+    return pairs.map((p, i) => !founds[i] || !founds[i].length ? emptyUnit(p, founds[i])
+      : unitResult(p, founds[i], founds[i].map((_, k) => verdict.get(`${p.id}:${k}`) || null)))
+  })()
 
 // Lost coverage travels with the findings: an empty `confirmed` only means
 // "clean" when `dropped` and `unverified` are empty too.

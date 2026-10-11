@@ -8,6 +8,8 @@ independently of the verifier.
 - `extract.py`: journals and verify transcripts into cases; run it on the host that ran the reviews.
 - `sample.py`: a seeded, stratified draw in clusters.
 - `adjudicate.py`: the blind brief, and the merge of adjudicators' answers into `corpus.jsonl`.
+- `replay.mjs`: one run of the corpus through `workflows/code-audit.js`, per finding or batched.
+- `score.py`: a paired repetition's figures and its adoption gate, and the blind evidence brief.
 
 Each script's docstring has the rules.
 
@@ -40,14 +42,64 @@ adjudicate.py merge --sample sample.jsonl --a codex=a1.json,a2.json --b opus=b1.
 
 ## Replaying a case
 
-- Fetch `head` (and `base`) into a scratch worktree and send `prompt` unchanged, except that a case naming a
-  `worktree` has that prefix replaced with the scratch worktree; `path` is the file relative to the root.
+- `prompt` is what the verifier was sent then. To replay it verbatim, fetch `head` (and `base`) into a
+  scratch worktree and send it unchanged, except that a case naming a `worktree` has that prefix replaced
+  with the scratch worktree; `path` is the file relative to the root.
 - The prompt leans on context the case does not pin: the finding-verifier role and its Severity section,
   the verdict schema in `workflows/code-audit.js`, and the instructions loaded where the run's session
-  started. A comparison fixes them at one agentrc revision and reruns per-finding and batched modes under
-  it; the historical `verifier` verdicts are a reference, not that baseline.
-- Dead responses and duplicated response ids are faults of a run, not of a case: the comparison harness
-  injects them. Same-line findings here are distinct cases with distinct ids.
+  started. The historical `verifier` verdicts are a reference, not a baseline.
+- Same-line findings here are distinct cases with distinct ids.
+
+## Comparing batched and per-finding verification
+
+The adoption experiment for #64 is not the verbatim replay: `replay.mjs` runs today's `code-audit.js` in
+both modes on the same findings, `path` in place of any absolute `file` as code-audit now makes it, so the
+two modes differ only in batching. Each verify dispatch is a fresh `claude -p --agent finding-verifier` in a
+worktree of the case's head, on the model and effort code-audit names (the role's own, Opus at high, unless
+it routes a nit to Sonnet). A finding is batchable only when its routing `hardware` is false: here derived
+from the adjudicators' `needs` and the claim's text, unsure counting as hardware, then code-audit's own
+checks. Faults (a dead reply, a missing, duplicate or unknown id, a partial grade) are tested in
+`tests/code_audit_harness.mjs`, not injected into the paid run; both modes retry a dead or partly graded
+verdict once.
+
+```bash
+replay.mjs --corpus corpus.jsonl --mode single --out runs/r1-single --worktrees runs/wt \
+  --checkout hathach/tinyusb=$HOME/code/tinyusb --checkout hathach/agentrc=$HOME/code/agentrc
+replay.mjs ... --mode batch --out runs/r1-batch
+score.py brief --corpus corpus.jsonl --single runs/r1-single --batch runs/r1-batch > runs/r1-brief.md
+# a blind reviewer answers the brief as runs/r1-evidence.json
+score.py report --corpus corpus.jsonl --single runs/r1-single --batch runs/r1-batch \
+  --evidence runs/r1-evidence.json --out runs/r1-report.json
+```
+
+Batching is adopted only when every repetition passes the gate `score.py` names, each pair run under one
+unchanged `env.json`.
+
+The routing here is the adjudicators', which production does not have: code-audit batches on the scanner's
+own `hardware` flag. A pass therefore shows batching safe under that routing only. Before batching becomes
+the default, rescan the corpus heads and measure the scanner flag against `needs`: the cases it would batch
+that an adjudicator needed a document or a board for, and the original findings a rescan no longer reports,
+which give no routing verdict at all.
+
+### Repetition 1, 2026-10-11
+
+Run at agentrc `d4c03bb` (the digests in each run's `env.json`), all 63 cases, both runs under one
+environment. 22 cases were batched (all routed `hardware` false); 41 stayed alone.
+
+| | single | batch |
+|---|---|---|
+| right of 59 settled | 47 | 50 |
+| false refutations / confirmations | 10 / 2 | 8 / 1 |
+| dispatches (retries) | 66 (3) | 54 (2) |
+| cost, all cases | $25.12 | $19.71 |
+| cost, the 22 batched cases | $7.89 | $4.76 (-40%) |
+
+Environment, accounting (no coverage lost), correctness (no regression; batch mode fixed three single-mode
+errors) and cost passed. Evidence failed: a blind Opus review of the 22 found the batch reason dropping its
+verdict's decisive fact in three (`03b9552f0973`, `6252fb798b42`, `b4f1fb2afbc5`: each verdict right, its
+reason citing less than the reference rests on), the single reason in none. Repetition 2 was stopped after
+its first dispatches: it could not change the outcome. Batching stays opt-in (`args.batch`); a next attempt
+changes the batch prompt to keep each member's evidence and needs fresh repetitions.
 
 ## This draw
 

@@ -11,7 +11,7 @@ const body = readFileSync(new URL('../workflows/code-audit.js', import.meta.url)
 const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
 
 const finding = (line, why) =>
-  ({ file: 'src/a.c', line, snippet: 'x = y;', why, severity: 'high', confidence: 'medium' })
+  ({ file: 'src/a.c', line, snippet: 'x = y;', why, severity: 'high', confidence: 'medium', hardware: false })
 
 const IMPACT = { consequence: 'wrong data', path: 'every OUT transfer', variants: 'all', recovery: 'reset' }
 // A verifier's graded verdict; `over` replaces fields, e.g. a regrade or a missing level.
@@ -28,8 +28,10 @@ const confirmedAs = (f, id, over = {}) => {
 // "<dir>|<dim>" to a findings array (null = dead scanner); `verdicts` maps a
 // finding's `why` to real, or to a full verdict object (null = dead verifier). `reverse` makes later
 // verifiers of a batch resolve before earlier ones; `finished` records the
-// order in which verifiers actually returned.
-async function run(args, { scans = {}, verdicts = {}, reverse = false } = {}) {
+// order in which verifiers actually returned. `scanDelay` holds a scan's reply for the given ms, and `returned`
+// records each scan's key as it replies.
+async function run(args, { scans = {}, verdicts = {}, reverse = false, batchReply = (label, ids, reply) => reply, scanDelay = {} } = {}) {
+  const returned = []
   const calls = []
   const logs = []
   const finished = []
@@ -41,7 +43,18 @@ async function run(args, { scans = {}, verdicts = {}, reverse = false } = {}) {
       const key = `${m[1]}|${m[2]}`
       assert.ok(key in scans, `unstubbed scan ${key}`)
       const fs = scans[key]
+      if (scanDelay[key]) await new Promise(r => setTimeout(r, scanDelay[key]))
+      returned.push(key)
       return fs === null ? null : { scope: m[1], dimension: m[2], findings: fs }
+    }
+    if (options.label.startsWith('verify:b')) {
+      // A batch's members by id, each answered as `verdicts` says; batchReply reshapes the reply (null is a dead verifier).
+      const members = [...String(prompt).matchAll(/^\[(\S+)\] about .*\nDimension: .*\nFinding: (.+)$/gm)].map(m => [m[1], JSON.parse(m[2])])
+      const ids = members.map(([id]) => id)
+      assert.deepEqual(options.schema.properties.verdicts.items.properties.id.enum, ids)
+      for (const [, f] of members) finished.push(f.why)
+      const one = (id, f) => { const r = verdicts[f.why]; return r === null ? null : { id, ...(typeof r === 'object' ? r : graded(r)) } }
+      return batchReply(options.label, ids, { verdicts: members.map(([id, f]) => one(id, f)).filter(Boolean) })
     }
     if (options.label.startsWith('verify:')) {
       const f = JSON.parse(/^Finding: (.+)$/m.exec(prompt)[1])
@@ -67,7 +80,7 @@ async function run(args, { scans = {}, verdicts = {}, reverse = false } = {}) {
     ...ABSENT, body)
   const result = await fn(args, agent, pipeline, parallel, () => {}, m => logs.push(String(m)), workflow, null,
     ...ABSENT.map(() => undefined))
-  return { result, calls, logs, finished, labels: calls.map(c => c.label) }
+  return { result, calls, logs, finished, returned, labels: calls.map(c => c.label) }
 }
 
 const ONE = { dirs: ['src/portable/x'], dimensions: ['correctness'] }
@@ -147,7 +160,8 @@ test('verdicts stay attached to their finding when verifiers finish in reverse o
   const scans = { 'src/portable/x|correctness': [finding(1, 'first'), finding(2, 'second'), finding(3, 'third')] }
   const verdicts = { first: true, second: null, third: false }
   const { result, finished } = await run(ONE, { scans, verdicts, reverse: true })
-  assert.deepEqual(finished, ['third', 'second', 'first'], 'the stub really completed them in reverse')
+  assert.deepEqual(finished.slice(0, 2), ['third', 'second'], 'the stub really completed them in reverse')
+  assert.deepEqual(finished.filter(w => w === 'second').length, 2, 'a dead verifier gets one more')
   assert.deepEqual(result.confirmed[0].findings.map(f => f.why), ['first'])
   assert.deepEqual(result.unverified[0].findings.map(f => f.why), ['second'])
 })
@@ -278,4 +292,89 @@ test('without root an absolute scanner path is unverified, and root must be abso
   assert.equal(calls.filter(c => c.label.startsWith('verify:')).length, 0)
   assert.equal(result.unverified[0].findings[0].pathError, 'absolute path outside the checkout (no root given)')
   await assert.rejects(run({ ...ONE, root: 'w/top' }), /args\.root must be an absolute path/)
+})
+
+const BATCHED = { dirs: ['src/portable/x'], dimensions: ['correctness', 'concurrency'], batch: true }
+const scansOf = (correctness, concurrency = []) => ({ 'src/portable/x|correctness': correctness, 'src/portable/x|concurrency': concurrency })
+const batchCalls = (calls) => calls.filter(c => c.label.startsWith('verify:b'))
+const singles = (calls) => calls.filter(c => /^verify:d/.test(c.label)).map(c => c.label)
+
+test('batch mode verifies close findings on one file together, across dimensions, and leaves the rest alone', async () => {
+  const scans = scansOf([finding(1, 'a'), finding(5, 'b'), finding(40, 'far'), { ...finding(2, 'other file'), file: 'src/b.c' }], [finding(9, 'c')])
+  const verdicts = { a: true, b: false, far: true, 'other file': true, c: true }
+  const batched = await run(BATCHED, { scans, verdicts })
+  const [b] = batchCalls(batched.calls)
+  assert.equal(batchCalls(batched.calls).length, 1)
+  assert.match(b.prompt, /^Adversarially verify EACH of these 3 review findings on one file\./)
+  assert.match(b.prompt, /\[d0x0:0\] about src\/portable\/x\.\nDimension: correctness\nFinding: .*\n\n\[d0x0:1\] about src\/portable\/x\.\nDimension: correctness\nFinding: .*\n\n\[d0x1:0\] about src\/portable\/x\.\nDimension: concurrency\n/)
+  assert.deepEqual(singles(batched.calls).sort(), ['verify:d0x0:2', 'verify:d0x0:3'])
+  const alone = await run({ ...BATCHED, batch: false }, { scans, verdicts })
+  assert.deepEqual(batched.result, alone.result, 'the same verdicts give the same report either way')
+})
+
+test('in batch mode a finding that cannot batch is verified as its own scan returns, not after every scan', async () => {
+  const scans = scansOf([{ ...finding(1, 'unsure'), hardware: null }, finding(2, 'a')], [finding(3, 'b')])
+  const r = await run(BATCHED, { scans, verdicts: { unsure: true, a: true, b: true }, scanDelay: { 'src/portable/x|concurrency': 30 } })
+  assert.deepEqual(r.returned, ['src/portable/x|correctness', 'src/portable/x|concurrency'])
+  assert.equal(r.finished[0], 'unsure', 'its verifier ran while the slow scan was still out')
+  assert.deepEqual(r.labels.filter(l => l.startsWith('verify:')).sort(), ['verify:b0', 'verify:d0x0:0'])
+  assert.equal(r.result.confirmed.flatMap(u => u.findings).length, 3)
+})
+
+test('a batch holds at most four findings, one model, and nothing that may rest on hardware or a document', async () => {
+  const close = [1, 2, 3, 4, 5].map(l => finding(l, `f${l}`))
+  const { calls } = await run({ ...BATCHED, dimensions: ['correctness'] }, { scans: { 'src/portable/x|correctness': close }, verdicts: Object.fromEntries(close.map(f => [f.why, true])) })
+  assert.deepEqual(batchCalls(calls).map(c => c.options.schema.properties.verdicts.items.properties.id.enum), [['d0x0:0', 'd0x0:1', 'd0x0:2', 'd0x0:3']])
+  assert.deepEqual(singles(calls), ['verify:d0x0:4'])
+  const apart = [
+    { ...finding(1, 'flagged'), hardware: true }, { ...finding(2, 'unsure'), hardware: null }, { ...finding(3, 'cited'), docs: [{ book: 1, pages: '2' }] },
+    finding(4, 'reads the W1C bit'), { ...finding(5, 'nit one'), severity: 'nit' }, { ...finding(6, 'nit two'), severity: 'nit' },
+  ]
+  const hw = await run({ ...BATCHED, dimensions: ['correctness'] }, { scans: { 'src/portable/x|correctness': apart }, verdicts: Object.fromEntries(apart.map(f => [f.why, true])) })
+  const [nits] = batchCalls(hw.calls)
+  assert.equal(batchCalls(hw.calls).length, 1, 'only the two nits batch')
+  assert.deepEqual(nits.options.schema.properties.verdicts.items.properties.id.enum, ['d0x0:4', 'd0x0:5'])
+  assert.deepEqual([nits.options.model, nits.options.effort], ['sonnet', 'medium'])
+  const dim = await run({ ...BATCHED, dimensions: ['hardware conformance: register use against the reference manual'] },
+    { scans: { 'src/portable/x|hardware conformance: register use against the reference manual': close.slice(0, 2) }, verdicts: { f1: true, f2: true } })
+  assert.equal(batchCalls(dim.calls).length, 0, 'a hardware dimension never batches')
+  const plain = await run({ ...BATCHED, dimensions: ['hardware'] }, { scans: { 'src/portable/x|hardware': close.slice(0, 2) }, verdicts: { f1: true, f2: true } })
+  assert.equal(batchCalls(plain.calls).length, 0, 'a dimension named hardware alone never batches either')
+})
+
+test('a batch reply without exactly one verdict per id is not trusted: each member is verified alone, once', async () => {
+  const scans = scansOf([finding(1, 'a'), finding(2, 'b'), finding(3, 'c')])
+  const verdicts = { a: true, b: false, c: true }
+  const want = (await run({ ...BATCHED, batch: false }, { scans, verdicts })).result
+  for (const [name, batchReply] of [
+    ['dead', () => null],
+    ['missing', (l, ids, r) => ({ verdicts: r.verdicts.slice(1) })],
+    ['duplicate', (l, ids, r) => ({ verdicts: [...r.verdicts.slice(0, 2), { ...r.verdicts[2], id: ids[0] }] })],
+    ['unknown', (l, ids, r) => ({ verdicts: [...r.verdicts.slice(0, 2), { ...r.verdicts[2], id: 'd9x9:9' }] })],
+  ]) {
+    const { result, calls, logs } = await run(BATCHED, { scans, verdicts, batchReply })
+    assert.deepEqual(singles(calls), ['verify:d0x0:0', 'verify:d0x0:1', 'verify:d0x0:2'], name)
+    assert.deepEqual(result, want, name)
+    assert.ok(logs.some(l => /verify:b0: .* — 3 finding\(s\) verified one by one/.test(l)), name)
+  }
+})
+
+test('a confirmed batch entry without its grading sends that member alone; still short, it is unverified', async () => {
+  const scans = scansOf([finding(1, 'a'), finding(2, 'b')])
+  const partial = (l, ids, r) => ({ verdicts: r.verdicts.map(v => v.id === ids[1] ? { ...v, severityReason: null } : v) })
+  const fixed = await run(BATCHED, { scans, verdicts: { a: true, b: true }, batchReply: partial })
+  assert.deepEqual(singles(fixed.calls), ['verify:d0x0:1'])
+  assert.deepEqual(fixed.result.confirmed[0].findings.map(f => f.why), ['a', 'b'])
+  const still = await run(BATCHED, { scans, verdicts: { a: true, b: graded(true, { severityReason: null }) }, batchReply: partial })
+  assert.deepEqual(still.result.unverified[0].findings.map(f => f.why), ['b'])
+})
+
+test('a dead or partly graded verifier gets one more, in either mode', async () => {
+  for (const batch of [false, true]) {
+    const scans = { 'src/portable/x|correctness': [{ ...finding(1, 'lone'), hardware: true }] }
+    const { calls, result } = await run({ ...ONE, batch }, { scans, verdicts: { lone: null } })
+    assert.deepEqual(calls.filter(c => c.label.startsWith('verify:')).map(c => c.label), ['verify:d0x0:0', 'verify:d0x0:0.retry'])
+    assert.equal(result.unverified[0].findings[0].why, 'lone')
+  }
+  await assert.rejects(run({ ...ONE, batch: 'yes' }), /args\.batch must be a boolean/)
 })

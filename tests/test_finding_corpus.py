@@ -1,9 +1,13 @@
 """Tests for bench/finding-verify: extraction over synthetic journals and transcripts, sampling, adjudication."""
+import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
+import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -18,7 +22,7 @@ def load(name):
     return module
 
 
-extract, sample, adjudicate = load('extract'), load('sample'), load('adjudicate')
+extract, sample, adjudicate, score = load('extract'), load('sample'), load('adjudicate'), load('score')
 
 BASE, HEAD = 'a' * 40, 'b' * 40
 FINDING = {'file': 'src/x.c', 'line': 3, 'snippet': 'x = 1;', 'why': 'x is never read', 'severity': 'low', 'confidence': 'high'}
@@ -304,3 +308,228 @@ class Adjudicate(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+FAKE_CLAUDE = r"""#!/usr/bin/env python3
+import json, os, re, sys
+if '--version' in sys.argv:
+    print('0.0.0 (fake)')
+    sys.exit(0)
+prompt = sys.stdin.read()
+schema = json.loads(sys.argv[sys.argv.index('--json-schema') + 1])
+with open(os.environ['FAKE_LOG'], 'a') as log:
+    log.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': prompt}) + '\n')
+def verdict(why):
+    if 'garble me' in why:
+        return {'real': 'yes', 'reason': 'not the schema'}
+    if 'refute me' in why:
+        return {'real': False, 'reason': 'src/x.c:1 shows otherwise', 'severity': None, 'impact': None, 'severityReason': None, 'confidence': None}
+    return {'real': True, 'reason': 'src/x.c:3 holds', 'severity': 'low', 'confidence': 'high', 'severityReason': 's',
+            'impact': {'consequence': 'c', 'path': 'p', 'variants': 'v', 'recovery': 'r'}}
+whys = [json.loads(f)['why'] for f in re.findall(r'^Finding: (.+)$', prompt, re.M)]
+if any('dirty me' in w for w in whys):
+    open('stray.txt', 'w').close()
+if any('slow' in w for w in whys):
+    import time
+    time.sleep(30)
+if 'verdicts' in schema['properties']:
+    ids = re.findall(r'^\[(\S+)\] about ', prompt, re.M)
+    out = {'verdicts': [{'id': i, **verdict(w)} for i, w in zip(ids, whys)]}
+else:
+    out = verdict(whys[0])
+# as the CLI does under --agent: the reply is the result text, with no structured_output
+print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'total_cost_usd': 0.3,
+                  'modelUsage': {'claude-opus-5-5': {}}, 'result': json.dumps(out)}))
+"""
+
+
+class Replay(unittest.TestCase):
+    """replay.mjs drives code-audit.js itself against a stand-in claude; score.py reads what it wrote."""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.root = Path(td.name)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        self.env.update({'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
+                         'FAKE_LOG': str(self.root / 'fake.log'), 'HOME': str(self.root / 'home')})
+        (self.root / 'home').mkdir()
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        (bin_dir / 'claude').write_text(FAKE_CLAUDE)
+        (bin_dir / 'claude').chmod(0o755)
+        self.env['PATH'] = f"{bin_dir}{os.pathsep}{self.env['PATH']}"
+        self.repo = self.root / 'clone'
+        (self.repo / 'src').mkdir(parents=True)
+        (self.repo / 'src' / 'x.c').write_text('int x;\n')
+        self.sh('git', 'init', '-q')
+        self.sh('git', 'add', '-A')
+        self.sh('git', 'commit', '-qm', 'base')
+        self.base = self.sh('git', 'rev-parse', 'HEAD').strip()
+        (self.repo / 'src' / 'x.c').write_text('int x;\nint y;\n')
+        self.sh('git', 'commit', '-qam', 'head')
+        self.head = self.sh('git', 'rev-parse', 'HEAD').strip()
+
+    def sh(self, *argv):
+        return subprocess.run(argv, cwd=self.repo, env=self.env, check=True, capture_output=True, text=True).stdout
+
+    @staticmethod
+    def digest(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def corpus(self):
+        def one(i, line, why, needs='none', label='true'):
+            return {'id': f'c{i}', 'repo': 'o/r', 'pr': 1, 'head': self.head, 'base': self.base, 'dir': 'src',
+                    'dimension': 'correctness: logic', 'path': 'src/x.c', 'worktree': None,
+                    'finding': {'file': 'src/x.c', 'line': line, 'snippet': 'int y;', 'why': why, 'severity': 'low', 'confidence': 'high'},
+                    'truth': {'label': label, 'status': 'agreed', 'answers': {'a': {'label': label, 'evidence': 'src/x.c:2', 'needs': needs},
+                                                                            'b': {'label': label, 'evidence': 'src/x.c:2', 'needs': 'none'}}}}
+        rows = [one(0, 1, 'y is unused'), one(1, 3, 'refute me', label='false'), one(2, 2, 'clears a W1C flag', needs='hardware')]
+        path = self.root / 'corpus.jsonl'
+        path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        return path
+
+    def replay(self, mode, corpus, *extra, out=None, ok=True):
+        out = out or str(self.root / mode)
+        done = subprocess.run(['node', str(ROOT / 'bench' / 'finding-verify' / 'replay.mjs'), '--corpus', str(corpus), '--mode', mode,
+                               '--out', out, '--worktrees', str(self.root / 'wt'), '--checkout', f'o/r={self.repo}', *extra],
+                              env=self.env, capture_output=True, text=True, cwd=self.root)
+        self.assertEqual(done.returncode == 0, ok, done.stderr + done.stdout)
+        return Path(self.root, out), done.stderr
+
+    def test_both_modes_run_code_audit_and_record_every_dispatch(self):
+        corpus = self.corpus()
+        single, batch = self.replay('single', corpus)[0], self.replay('batch', corpus)[0]
+        calls = {m: [json.loads(l) for l in (self.root / m / 'calls.jsonl').read_text().splitlines()] for m in ('single', 'batch')}
+        self.assertEqual(sorted(c['label'] for c in calls['single']), ['verify:d0x0:0', 'verify:d0x0:1', 'verify:d0x0:2'])
+        self.assertEqual(sorted((c['label'], tuple(c['caseIds'])) for c in calls['batch']),
+                         [('verify:b0', ('c0', 'c1')), ('verify:d0x0:1', ('c2',))], 'the hardware case stays alone')
+        self.assertTrue(all(c['prompt'] and c['schema'] for c in calls['batch']), 'each dispatch keeps what it was sent')
+        logged = [json.loads(l) for l in (self.root / 'fake.log').read_text().splitlines()]
+        self.assertTrue(all(Path(x['cwd']).resolve() == (self.root / 'wt' / f'o-r-{self.head[:12]}').resolve() for x in logged))
+        self.assertTrue(all(x['argv'][:7] == ['-p', '--agent', 'finding-verifier', '--model', 'opus', '--effort', 'high'] for x in logged))
+        self.assertFalse(any('agreed' in x['prompt'] or '"label"' in x['prompt'] for x in logged), 'no truth reaches a verifier')
+        records = {m: {v['id']: v for v in map(json.loads, (self.root / m / 'verdicts.jsonl').read_text().splitlines())} for m in calls}
+        self.assertEqual({i: r['kind'] for i, r in records['single'].items()}, {'c0': 'confirmed', 'c1': 'refuted', 'c2': 'confirmed'})
+        self.assertEqual({i: r['kind'] for i, r in records['batch'].items()}, {i: r['kind'] for i, r in records['single'].items()})
+        self.assertEqual(records['batch']['c0']['from'], 'verify:b0')
+        r = score.report(score.load(corpus), score.run(single), score.run(batch), corpus_digest=self.digest(corpus))
+        self.assertEqual((r['batched'], r['regressions'], r['lostCoverage']), (2, [], []))
+        self.assertEqual({k: v for k, v in r['gate'].items()}, {'environment': True, 'accounting': True, 'correctness': True, 'cost': True, 'evidence': None})
+        self.assertFalse(r['pass'], 'unscored evidence is no pass')
+        text = score.brief(score.load(corpus), score.run(single), score.run(batch))
+        self.assertNotIn('single', text.split('\n## ')[1])
+        letter = lambda i: 'A' if score.letters(i)['A'] == 'batch' else 'B'
+        review = lambda c0, c1='preserved': [{'id': 'c0', 'verdict': c0, 'why': 'x'}, {'id': 'c1', 'verdict': c1, 'why': 'y'}]
+        self.assertTrue(score.report(score.load(corpus), score.run(single), score.run(batch), review('preserved'), self.digest(corpus))['pass'])
+        for verdicts, gate in ((review(f'lost-{letter("c0")}'), False), (review('lost-both'), False), (review('inconclusive'), False),
+                               (review(f'lost-{"B" if letter("c0") == "A" else "A"}'), True)):
+            self.assertEqual(score.report(score.load(corpus), score.run(single), score.run(batch), verdicts, self.digest(corpus))['gate']['evidence'], gate, verdicts)
+        for bad in (review('preserved')[:1], review('preserved') + review('preserved')[:1], [], review('maybe')):
+            with self.assertRaises(SystemExit, msg=bad):
+                score.report(score.load(corpus), score.run(single), score.run(batch), bad, self.digest(corpus))
+
+    def test_a_coverage_trade_missing_cost_or_other_environment_fails_the_gate(self):
+        corpus = self.corpus()
+        single, batch = score.run(self.replay('single', corpus)[0]), score.run(self.replay('batch', corpus)[0])
+        traded = (dict(batch[0]), batch[1], batch[2])
+        traded[0]['c0'] = {**traded[0]['c0'], 'kind': 'unverified'}
+        swapped = (dict(single[0]), single[1], single[2])
+        swapped[0]['c2'] = {**swapped[0]['c2'], 'kind': 'unverified'}
+        r = score.report(score.load(corpus), swapped, traded, corpus_digest=self.digest(corpus))
+        self.assertEqual((r['lostCoverage'], r['gate']['accounting']), (['c0'], False), 'a case gained elsewhere does not pay for c0')
+        uncosted = (batch[0], [{**c, 'cost': None} for c in batch[1]], batch[2])
+        self.assertFalse(score.report(score.load(corpus), single, uncosted, corpus_digest=self.digest(corpus))['gate']['cost'])
+        moved = (batch[0], batch[1], {'before': {**batch[2]['before'], 'workflow': 'other'}, 'after': {**batch[2]['after'], 'workflow': 'other'}})
+        r = score.report(score.load(corpus), single, moved, corpus_digest=self.digest(corpus))
+        self.assertEqual((r['gate']['environment'], r['environment']), (False, "the runs differ in ['workflow']"))
+        drifted = (batch[0], batch[1], {'before': batch[2]['before'], 'after': {**batch[2]['after'], 'role': 'other'}})
+        self.assertFalse(score.report(score.load(corpus), single, drifted, corpus_digest=self.digest(corpus))['gate']['environment'])
+        resonnet = (batch[0], [{**c, 'model': 'sonnet', 'effort': 'medium', 'models': ['claude-sonnet-5-5']} for c in batch[1]], batch[2])
+        r = score.report(score.load(corpus), single, resonnet, corpus_digest=self.digest(corpus))
+        self.assertEqual((r['gate']['environment'], r['environment']), (False, "cases asked of other models or efforts: ['c0', 'c1', 'c2']"))
+        answered = (batch[0], [{**c, 'models': ['claude-opus-4-1']} for c in batch[1]], batch[2])
+        self.assertEqual(score.report(score.load(corpus), single, answered, corpus_digest=self.digest(corpus))['environment'],
+                         "cases answered by other models: ['c0', 'c1', 'c2']")
+        # two revisions swapped between cases cancel out overall, never per case
+        rev = lambda calls, first: [{**c, 'models': ['rev-1' if ('c2' in c['caseIds']) == first else 'rev-2']} for c in calls]
+        r = score.report(score.load(corpus), (single[0], rev(single[1], True), single[2]), (batch[0], rev(batch[1], False), batch[2]),
+                         corpus_digest=self.digest(corpus))
+        self.assertEqual(r['environment'], "cases answered by other models: ['c0', 'c1', 'c2']")
+        unnamed = (batch[0], [{**c, 'models': []} for c in batch[1]], batch[2])
+        self.assertEqual(score.report(score.load(corpus), single, unnamed, corpus_digest=self.digest(corpus))['environment'],
+                         'a dispatch names no model that answered it')
+        relabelled = [json.loads(l) for l in corpus.read_text().splitlines()]
+        relabelled[1]['truth']['label'] = 'true'
+        r = score.report(relabelled, single, batch, corpus_digest=hashlib.sha256(json.dumps(relabelled).encode()).hexdigest())
+        self.assertEqual((r['gate']['environment'], r['environment']), (False, 'the corpus scored is not the one replayed'))
+
+    def test_heads_replay_concurrently_each_in_its_own_worktree_and_units_by_their_label(self):
+        rows = [json.loads(l) for l in self.corpus().read_text().splitlines()]
+        (self.repo / 'src' / 'x.c').write_text('int x;\nint y;\nint z;\n')
+        self.sh('git', 'commit', '-qam', 'second head')
+        head2 = self.sh('git', 'rev-parse', 'HEAD').strip()
+        later = [{**rows[0], 'id': 'd0', 'head': head2, 'base': self.head},
+                 {**rows[1], 'id': 'd1', 'head': head2, 'base': self.head, 'dimension': 'concurrency'}]
+        corpus = self.root / 'two-heads.jsonl'
+        corpus.write_text(''.join(json.dumps(r) + '\n' for r in rows + later))
+        out, _ = self.replay('single', corpus, '--jobs', '2')
+        records = {v['id']: v for v in map(json.loads, (out / 'verdicts.jsonl').read_text().splitlines())}
+        self.assertEqual({i: r['kind'] for i, r in records.items()},
+                         {'c0': 'confirmed', 'c1': 'refuted', 'c2': 'confirmed', 'd0': 'confirmed', 'd1': 'refuted'})
+        calls = [json.loads(l) for l in (out / 'calls.jsonl').read_text().splitlines()]
+        self.assertEqual(sorted((c['head'][:12], c['label'], tuple(c['caseIds'])) for c in calls if c['head'] == head2),
+                         [(head2[:12], 'verify:d0x0:0', ('d0',)), (head2[:12], 'verify:d0x1:0', ('d1',))], 'scan:d0x1 is the second dimension')
+        logged = [json.loads(l) for l in (self.root / 'fake.log').read_text().splitlines()]
+        self.assertEqual({Path(x['cwd']).name for x in logged}, {f'o-r-{self.head[:12]}', f'o-r-{head2[:12]}'})
+
+    def test_a_failing_head_stops_the_other_heads_dispatches_and_keeps_their_calls(self):
+        rows = [json.loads(l) for l in self.corpus().read_text().splitlines()]
+        (self.repo / 'src' / 'x.c').write_text('int x;\nint y;\nint z;\n')
+        self.sh('git', 'commit', '-qam', 'second head')
+        head2 = self.sh('git', 'rev-parse', 'HEAD').strip()
+        slow = {**rows[0], 'id': 's0', 'finding': {**rows[0]['finding'], 'why': 'slow'}}
+        dirty = {**rows[0], 'id': 'd0', 'head': head2, 'base': self.head, 'finding': {**rows[0]['finding'], 'why': 'dirty me'}}
+        corpus = self.root / 'failing.jsonl'
+        corpus.write_text(json.dumps(slow) + '\n' + json.dumps(dirty) + '\n')
+        started = time.monotonic()
+        out, err = self.replay('single', corpus, ok=False)
+        self.assertLess(time.monotonic() - started, 20, 'the slow verifier was terminated, not awaited')
+        self.assertIn(f'changed while {head2} was replayed', err)
+        calls = {c['label'] + '@' + c['head'][:12]: c for c in map(json.loads, (out / 'calls.jsonl').read_text().splitlines())}
+        killed = calls[f'verify:d0x0:0@{self.head[:12]}']
+        self.assertEqual((killed['caseIds'], killed['structured']), (['s0'], None), 'the terminated call is still recorded')
+        self.assertNotIn(f'verify:d0x0:0.retry@{self.head[:12]}', calls, 'no dispatch starts after the failure')
+        self.assertFalse((out / 'verdicts.jsonl').exists())
+
+    def test_a_reply_off_its_schema_counts_as_none(self):
+        rows = [json.loads(l) for l in self.corpus().read_text().splitlines()]
+        corpus = self.root / 'garbled.jsonl'
+        corpus.write_text(json.dumps({**rows[0], 'finding': {**rows[0]['finding'], 'why': 'garble me'}}) + '\n')
+        out, _ = self.replay('single', corpus)
+        [record] = map(json.loads, (out / 'verdicts.jsonl').read_text().splitlines())
+        self.assertEqual((record['kind'], record['attempts']), ('unverified', ['verify:d0x0:0', 'verify:d0x0:0.retry']))
+        calls = [json.loads(l) for l in (out / 'calls.jsonl').read_text().splitlines()]
+        self.assertTrue(all(c['structured'] is None and c['error'].startswith('success: {') for c in calls))
+
+    def test_nothing_is_spent_on_a_run_that_cannot_be_scored(self):
+        corpus = self.corpus()
+        _, err = self.replay('single', corpus, '--jobs', '0', ok=False)
+        self.assertIn('--jobs must be a positive integer', err)
+        (self.root / 'taken').mkdir()
+        _, err = self.replay('single', corpus, out='taken', ok=False)
+        self.assertIn('exists', err)
+        rows = [json.loads(l) for l in corpus.read_text().splitlines()]
+        twin = self.root / 'twin.jsonl'
+        twin.write_text(''.join(json.dumps(r) + '\n' for r in rows + [{**rows[0], 'id': 'c9'}]))
+        _, err = self.replay('single', twin, ok=False)
+        self.assertIn('cases c0 and c9 share a scan unit, file, line and claim', err)
+        gone = self.root / 'gone.jsonl'
+        gone.write_text(''.join(json.dumps({**r, 'base': 'f' * 40}) + '\n' for r in rows))
+        _, err = self.replay('single', gone, ok=False)
+        self.assertIn(f"o/r {'f' * 40}: not in", err)
+        self.assertFalse((self.root / 'fake.log').exists(), 'no verifier was started')
+        self.replay('single', Path('corpus.jsonl'), '--worktrees', 'wt2', out='relative')
+        self.assertTrue((self.root / 'relative' / 'verdicts.jsonl').exists(), 'relative paths resolve against the caller')
+        self.assertTrue((self.root / 'wt2' / f'o-r-{self.head[:12]}' / 'src' / 'x.c').exists(), 'not inside the checkout')
+        self.assertFalse((self.repo / 'wt2').exists())
