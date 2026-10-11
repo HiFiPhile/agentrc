@@ -21,8 +21,10 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
 - `generated`: regex over repo-relative paths a fixer's build regenerates; a
   plain modification to one is admitted into the commit on the caller's word
   that the repository hooks validate it.
-- `build`: verify command, `<BUILD>` for a fresh build directory; default the
-  repository's build contract; per launch.
+- `build`: verify command, `<BUILD>` for a fresh build directory, carrying any
+  environment setup it needs; default the repository's build contract, its
+  setup and the tools it requires resolved with it, a missing one stopping
+  `build-unverifiable` rather than failing the batch; per launch.
 - `ciWait`: minutes to wait on pending checks, default 30.
 - `ciNotes`: what the caller established about this PR's CI, handed to the
   judge verbatim; it never revises a placed verdict stored on the head, while

@@ -470,7 +470,7 @@ async function run(opts = {}) {
       // The repository's build for the batch, resolved when the caller named none.
       const plan = typeof opts.buildPlan === 'function' ? opts.buildPlan(label) : opts.buildPlan
       if (plan === null) return null
-      return conforms(options.schema, { command: 'make -C <BUILD> all', contract: ['AGENTS.md'], reason: 'stub contract', error: null, ...plan }, label)
+      return conforms(options.schema, { command: 'make -C <BUILD> all', setup: null, requires: [], contract: ['AGENTS.md'], reason: 'stub contract', error: null, ...plan }, label)
     }
     if (label.startsWith('build#')) {
       // build.py's receipt: the build fails when a writer's did; opts.candidate reshapes it, null is a dead agent.
@@ -482,7 +482,8 @@ async function run(opts = {}) {
       const asked = (flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
       return conforms(options.schema, bare({
         revision: head, snapshot: 'snap', snapshotAfter: 'snap',
-        command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), buildDir: '/tmp/b', exit,
+        command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? '', requires: asked('require'), stage: 'build',
+        buildDir: '/tmp/b', exit,
         log: '/tmp/candidate.log', retained: [],
         ...(typeof over === 'function' ? over(label, String(prompt)) : over),
       }), label)
@@ -1035,6 +1036,27 @@ test('a build receipt counts only as the run that was asked for', async () => {
     assert.equal(result.reason, 'build-unverifiable', JSON.stringify(candidate))
     assert.ok(logs.some(l => why.test(l)), `${why}\n${logs.join('\n')}`)
   }
+})
+
+test('a contract setup and its tools go to build.py, and a shell that stopped before the build is the environment', async () => {
+  const buildPlan = { command: 'idf.py -B <BUILD> build', setup: '. "$IDF_PATH/export.sh"', requires: ['idf.py'] }
+  const ok = await run({ reviews: oneValid, buildPlan })
+  assert.match(ok.calls.find(c => c.label === 'build#1-review').prompt, /--command='idf\.py -B <BUILD> build' --setup='\. "\$IDF_PATH\/export\.sh"' --require='idf\.py'`/)
+  assert.equal(ok.result.history[0].reviewPush.pass, true)
+  for (const [candidate, why] of [
+    [{ stage: 'prerequisite', exit: 127 }, /the build environment is not set up: its prerequisite step stopped the shell \(exit 127\)/],
+    [{ stage: 'setup', exit: 0 }, /the build environment is not set up: its setup step stopped the shell \(exit 0\)/],
+    [{ setup: '' }, /the build did not count: the receipt is for another setup/],
+    [{ requires: [] }, /the build did not count: the receipt is for another setup/],
+  ]) {
+    const { result, labels } = await run({ reviews: oneValid, buildPlan, candidate })
+    assert.equal(result.reason, 'build-unverifiable', JSON.stringify(candidate))
+    assert.match(result.detail, why)
+    assert.equal(labels.some(l => l.startsWith('push#')), false)
+  }
+  const unknown = await run({ reviews: oneValid, buildPlan, candidate: { stage: 'elsewhere' } })
+  assert.equal(unknown.result.reason, 'build-unverifiable')
+  assert.match(unknown.result.detail, /the build did not count: the receipt names no step it stopped in \("elsewhere"\)/)
 })
 
 test('a batch no build applies to is published with the reason logged', async () => {

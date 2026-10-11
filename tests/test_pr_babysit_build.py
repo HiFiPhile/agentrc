@@ -97,6 +97,42 @@ class BuildTest(unittest.TestCase):
         self.assertIn('Permission denied', out['error'])
         self.assertEqual(set(Path(tempfile.gettempdir()).glob('pr-babysit-build-*')), before, 'the build dir is gone')
 
+    def toolchain(self):
+        """An export script that puts a fake idf.py on PATH, as ESP-IDF's does."""
+        tools = Path(self.repo.parent / 'idf')
+        (tools / 'bin').mkdir(parents=True)
+        (tools / 'bin' / 'idf.py').write_text('#!/bin/sh\necho idf "$@"\n')
+        os.chmod(tools / 'bin' / 'idf.py', 0o755)
+        (tools / 'export.sh').write_text(f'export PATH="{tools}/bin:$PATH"\n')
+        return tools / 'export.sh'
+
+    def test_setup_reaches_the_build_and_its_tools_are_checked_after_it(self):
+        export = self.toolchain()
+        code, out = self.run_script('--path=.', f'--setup=. "{export}"', '--require=idf.py', '--command', 'idf.py build')
+        self.assertEqual((code, out['stage'], out['exit']), (0, 'build', 0), out)
+        self.assertEqual((out['setup'], out['requires']), (f'. "{export}"', ['idf.py']))
+        self.assertIn('idf build', Path(out['log']).read_text())
+
+    def test_a_missing_tool_or_failed_setup_never_reaches_the_build(self):
+        export = self.toolchain()
+        for argv, stage, code in (
+            (['--require=idf.py'], 'prerequisite', 127),
+            ([f'--setup=. "{export}"', '--require=idf.py', '--require=no-such-tool'], 'prerequisite', 127),
+            (['--setup=false'], 'setup', 1),
+            (['--setup=exit 0'], 'setup', 0),
+            (['--setup=set -e\nfalse\necho setup continued'], 'setup', 1),
+        ):
+            _, out = self.run_script('--path=.', *argv, '--command', 'touch built')
+            self.assertEqual((out['stage'], out['exit']), (stage, code), argv)
+            self.assertFalse((self.repo / 'built').exists(), argv)
+        _, out = self.run_script('--path=.', '--require=no-such-tool', '--command', 'true')
+        self.assertIn('missing tool: no-such-tool', Path(out['log']).read_text())
+
+    def test_a_build_that_fails_or_kills_its_shell_is_a_build_failure(self):
+        for command, exit in (('exit 3', 3), ('kill -9 $$', -9)):
+            code, out = self.run_script('--path=.', '--command', command)
+            self.assertEqual((code, out['stage'], out['exit'], out['setup'], out['requires']), (0, 'build', exit, '', []), command)
+
     def test_refusals(self):
         for argv, why in [
             (['--command', 'true'], 'usage'),

@@ -435,18 +435,20 @@ const COMPAT = {
 }
 const BUILD_PLAN = {
   type: 'object', additionalProperties: false,
-  required: ['command', 'contract', 'reason', 'error'],
+  required: ['command', 'setup', 'requires', 'contract', 'reason', 'error'],
   properties: {
-    command: { type: ['string', 'null'] }, contract: { type: 'array', items: { type: 'string' } },
-    reason: { type: 'string' }, error: { type: ['string', 'null'] },
+    command: { type: ['string', 'null'] }, setup: { type: ['string', 'null'] }, requires: { type: 'array', items: { type: 'string' } },
+    contract: { type: 'array', items: { type: 'string' } }, reason: { type: 'string' }, error: { type: ['string', 'null'] },
   },
 }
 const BUILD_RUN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['revision', 'snapshot', 'snapshotAfter', 'command', 'buildDir', 'exit', 'log', 'retained'],
+  required: ['revision', 'snapshot', 'snapshotAfter', 'command', 'setup', 'requires', 'stage', 'buildDir', 'exit', 'log', 'retained'],
   properties: {
     revision: { type: 'string' }, snapshot: { type: 'string' }, snapshotAfter: { type: 'string' },
-    command: { type: 'string' }, buildDir: { type: 'string' }, exit: { type: 'integer' }, log: { type: 'string' },
+    command: { type: 'string' }, setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
+    stage: { type: 'string' },
+    buildDir: { type: 'string' }, exit: { type: 'integer' }, log: { type: 'string' },
     retained: { type: 'array', items: { type: 'string' } }, error: { type: 'string' },
   },
 })
@@ -929,7 +931,7 @@ const groupWork = (notes) => {
 // Build plan per owned path set, dropped once a push changes a contract file it was read from.
 const buildPlans = new Map()
 const contractTouched = (plan, paths) => plan.contract.some(f => paths.has(canon(f)))
-const callerPlan = buildCmd && { command: buildCmd, contract: [], reason: "the caller's build", error: null }
+const callerPlan = buildCmd && { command: buildCmd, setup: null, requires: [], contract: [], reason: "the caller's build", error: null }
 // The batch is built once, as it settled: a writer's own build ran before later writers' edits. A failure blocks.
 const BUILD_FAILED = 'the build failed'
 const buildCheck = async (tag, owned) => {
@@ -942,6 +944,8 @@ const buildCheck = async (tag, owned) => {
       plan = await agent(
         `${IN_CHECKOUT}Editing and building nothing, resolve the repository's build contract (its agent instructions and build docs) for a change to ${owned.join(', ')}. ` +
         "command = the shell command, run from the checkout's top level, that builds what these paths affect, with `<BUILD>` where the contract takes a fresh build directory; " +
+        'setup = the shell lines the contract says must run first in the same shell (sourcing a toolchain\'s environment script, say), else null; ' +
+        'requires = the executables command runs that setup or the system must put on PATH, each a bare name; ' +
         'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
         { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
       ).catch(quiet(`build:resolve#${tag}`))
@@ -952,17 +956,22 @@ const buildCheck = async (tag, owned) => {
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
   const r = await relayRun(
-    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}\` ` +
+    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
+    `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}\` ` +
     relayed(BUILD_RUN),
     { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
   )
   const why = !r ? 'no sealed receipt (the relay died or its copy failed its seal)' : r.error ? r.error
     : r.revision !== expectedHead ? `the receipt is for ${String(r.revision).slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
     : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir) ? 'the receipt is for another command'
+    : !['setup', 'prerequisite', 'build'].includes(r.stage) ? `the receipt names no step it stopped in (${JSON.stringify(r.stage)})`
+    : r.setup !== (plan.setup || '') || JSON.stringify(r.requires) !== JSON.stringify(plan.requires) ? 'the receipt is for another setup'
     : r.snapshot !== r.snapshotAfter ? `the build changed ${owned.join(', ')}, which were verified before it`
     : null
   if (why) return `the build did not count: ${why}`
   if (r.retained.length) log(`build#${tag}: cleanup left ${r.retained.join(', ')}`)
+  // A shell that stopped before the build says nothing of the code: its environment is missing.
+  if (r.stage !== 'build') return `the build environment is not set up: its ${r.stage} step stopped the shell (exit ${r.exit}); log ${r.log}`
   return r.exit === 0 ? null : `${BUILD_FAILED} (exit ${r.exit}); log ${r.log}`
 }
 
