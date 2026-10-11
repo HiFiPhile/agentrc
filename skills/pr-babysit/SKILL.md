@@ -22,14 +22,15 @@ python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD,
 python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
 python3 $S/sonar.py --pr N --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
-python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>'  # build the checkout as it stands
+python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
+python3 $S/scope_check.py --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
 python3 $S/state_transfer.py <saved output> [--chunks I,J]  # a stateRef's state as checksummed base64 chunks
 python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR]  # the caller's reading of a launch
 ```
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch and lists the `blockers` to settle before continuing.
-`preflight.py`, `harvest.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
+`preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 `commits.py commit` stages and commits exactly its paths; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build.py` builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, and `sonar.py` comments on and resolves SonarCloud issues. Run either by hand only with the user's authorization to publish there.

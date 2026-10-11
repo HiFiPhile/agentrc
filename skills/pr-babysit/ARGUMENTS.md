@@ -14,7 +14,8 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   flags, false positive): per launch, never restored from a state.
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
   paths are ignored; any other pre-existing edit refuses the start.
-- `protected`: regex over repo-relative paths dropped from every fix scope and
+- `protected`: regex over repo-relative paths kept out of every fix scope (a
+  review fix needing one is withheld, a CI fix's guess at one dropped) and
   never committed or published; an adopted chain may carry one only in commits
   the PR already has, or in a merge from the base that takes either parent's
   version of it.

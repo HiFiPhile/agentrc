@@ -23,7 +23,7 @@ const finding = (over = {}) => {
     source: 'coderabbit', commentId: 1, file: 'src/a.c', line: 1,
     claim: 'bad', verdict: 'valid', reason: '', fixHint: 'fix it', ...over,
   }
-  return { findingId: `${f.commentId}#${f.line}`, commentDigest: `d${f.commentId}`, ...f } // overridable
+  return { findingId: `${f.commentId}#${f.line}`, commentDigest: `d${f.commentId}`, fixFiles: f.verdict === 'valid' ? [f.file] : [], ...f } // overridable
 }
 const invalidFinding = (over = {}) => finding({ verdict: 'invalid', ...over })
 const oneValid = { findings: [finding()], replies: [], bots: 'reviewed' }
@@ -63,6 +63,8 @@ const keyOf = (f) => {
   return h.toString(16).padStart(16, '0')
 }
 // The checks a CI judge prompt asks about.
+// The values a relay prompt passes a script, each shell-quoted as --flag='value'.
+const flagValues = (prompt, flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
 const askedOf = (prompt) => JSON.parse(String(prompt).match(/each needing exactly one entry in your reply: (\[.*\])\./)[1])
 const manifestOf = (calls, label) => payloadOf(calls.find(c => c.label === label).prompt, 'Manifest').replies
 // The nth commit a run makes. Each is distinct, as a real commit is, because the
@@ -322,13 +324,17 @@ async function run(opts = {}) {
         bots: bots.map(b => ({ ...b, sha: b.sha === 'head' ? head : b.sha })),
       }
     }
-    if (label === 'scope:verify') {
-      // git ls-files echoes the paths that exist; the prompt single-quotes each
-      // one, so reading them back out of it is also the proof that it did.
-      const quoted = [...String(prompt).matchAll(/'([^']*)'/g)].map(m => m[1])
-      return { files: opts.lsFiles ? opts.lsFiles(quoted) : quoted }
+    if (label === 'scope:check') {
+      // scope_check.py's receipt over the paths the prompt asked it for; opts.lsFiles keeps those it accepts.
+      const asked = flagValues(prompt, 'path')
+      const ok = opts.lsFiles ? opts.lsFiles(asked) : asked
+      return conforms(options.schema, bare({
+        accepted: asked.filter(f => ok.includes(f)).map(path => ({ path, kind: 'existing' })),
+        refused: asked.filter(f => !ok.includes(f)).map(path => ({ path, why: 'exists but is not tracked' })),
+      }), label)
     }
-    if (label.startsWith('scope:')) return { files: opts.scope ?? [] }
+    // Unless opts.scope says otherwise, the scope step names the file each review note cites, as reading the code would.
+    if (label.startsWith('scope:')) return { files: opts.scope ?? [...String(prompt).matchAll(/^- (?:\[[^\]]*\] )?(\S+):\d+ \[/gm)].map(m => m[1]) }
     if (label.startsWith('fix:')) {
       // opts.fix overrides every writer's result; a function shapes it per label
       // (and may delay, to finish writers out of order); null is a dead writer.
@@ -478,8 +484,7 @@ async function run(opts = {}) {
       const exit = brokenWriter ? 1 : 0
       brokenWriter = false
       if (over === null) return null
-      // What the prompt asked build.py for, each value shell-quoted as --flag='value'.
-      const asked = (flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
+      const asked = (flag) => flagValues(prompt, flag)
       return conforms(options.schema, bare({
         revision: head, snapshot: 'snap', snapshotAfter: 'snap',
         command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? '', requires: asked('require'), stage: 'build',
@@ -734,7 +739,7 @@ test('.idea/ drift is the one dirt a start tolerates, and it never enters a comm
   // a finding on an .idea/ path gets no writer, like a protected one
   const scoped = await run({ reviews: { findings: [finding({ file: '.idea/misc.xml' })], replies: [], bots: 'reviewed' } })
   assert.equal(scoped.labels.some(l => l.startsWith('fix:')), false)
-  assert.ok(scoped.logs.some(l => /\.idea\/misc\.xml is IDE metadata — dropped from scope/.test(l)))
+  assert.ok(scoped.logs.some(l => /\.idea\/misc\.xml refused — IDE metadata/.test(l)), scoped.logs.join('\n'))
   // .idea/ drift around the hooks neither blocks the publish nor rides into the commit
   const drifting = await run({ ...publishing,
     hooks: b => ({ before: [...b.before, ' M .idea/misc.xml'], after: [...b.after, ' M .idea/misc.xml', '?? .idea/workspace.xml'] }) })
@@ -1339,24 +1344,30 @@ test('a dry run dispatches no publisher and no posting agent', async () => {
   }
 })
 
-test('a change to a protected path is dropped from scope, and a group needing only it is left red', async () => {
+test('a review fix needing a protected path is withheld, its other paths included', async () => {
   const { result, logs, labels } = await run({
     args: { protected: '^test/hil/[^/]+\\.json$' },
     reviews: { findings: [finding({ file: 'test/hil/tinyusb.json' })], replies: [], bots: 'reviewed' },
   })
   assert.equal(result.reason, 'fix-verification-failed')
   assert.equal(labels.some(l => l.startsWith('fix:')), false, 'no fixer may be dispatched for a protected path')
-  assert.ok(logs.some(l => /test\/hil\/tinyusb\.json is protected — dropped from scope/.test(l)))
-  assert.ok(logs.some(l => /only a protected path would address it — leaving red for the user/.test(l)))
+  assert.ok(logs.some(l => /test\/hil\/tinyusb\.json refused — protected, the caller's to change/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /a path it needs was refused — withheld for the caller/.test(l)))
   assert.match(rowsOf(summaries(logs)[0])[0][3], /withheld/)
+  // A fix that also needs a source file is not narrowed to it: without the protected test it is withheld too.
+  const both = await run({
+    args: { protected: '^test/hil/[^/]+\\.json$' },
+    reviews: { findings: [finding({ fixFiles: ['src/a.c', 'test/hil/tinyusb.json'] })], replies: [], bots: 'reviewed' },
+  })
+  assert.equal(both.labels.some(l => l.startsWith('fix:')), false, both.labels.join(' '))
+  assert.equal(both.result.reason, 'fix-verification-failed')
 })
 
 test('the publisher stages exactly the owned paths, never a protected one', async () => {
   const { result, calls } = await run({
     args: { protected: 'rig\\.json$' },
     reviews: {
-      findings: [finding({ commentId: 1, file: 'hw/bsp/stm32f4/family.c' }),
-        finding({ commentId: 2, file: 'hw/bsp/stm32f4/rig.json' })],
+      findings: [finding({ commentId: 1, file: 'hw/bsp/stm32f4/family.c' })],
       replies: [], bots: 'reviewed',
     },
   })
@@ -1444,8 +1455,8 @@ test('a path whose name has a leading or trailing space is rejected, not trimmed
     },
     scope: [' src/lead.c', 'src/trail.c ', 'src/keep me.c'],
   })
-  const ls = calls.find(c => c.label === 'scope:verify')
-  assert.match(ls.prompt, /git -c core\.quotePath=false ls-files -- 'src\/keep me\.c'\n/, 'an interior space is still a legal path')
+  const ls = calls.find(c => c.label === 'scope:check')
+  assert.match(ls.prompt, /scope_check\.py --path='src\/keep me\.c'`/, 'an interior space is still a legal path')
   assert.equal(ls.prompt.includes('lead.c'), false)
   assert.equal(ls.prompt.includes('trail.c'), false)
 })
@@ -1455,7 +1466,7 @@ test('the scoper offers every candidate to git, and keeps only the paths it know
   // So the invented path has to be one the stub withholds: if the workflow stopped
   // intersecting candidates with the ls-files output, `src/invented.c` would reach
   // the fixer and this would fail.
-  const { calls } = await run({
+  const { calls, logs } = await run({
     ci: {
       status: 'red', infraRerun: [],
       realFailures: [{ check: 'build / arm', firstError: 'the log named no files', files: [], verdict: 'real' }],
@@ -1463,12 +1474,13 @@ test('the scoper offers every candidate to git, and keeps only the paths it know
     scope: ['src/my file (v2).c', 'src/./plus+@~[1].c', 'src/nope/../plus+@~[1].c', 'src/invented.c'],
     lsFiles: (offered) => offered.filter(f => f !== 'src/invented.c'),
   })
-  const ls = calls.find(c => c.label === 'scope:verify')
-  // Offered: both spellings of plus+@~[1].c collapsed to one, and the invented path too.
-  assert.match(ls.prompt, /git -c core\.quotePath=false ls-files -- 'src\/my file \(v2\)\.c' 'src\/plus\+@~\[1\]\.c' 'src\/invented\.c'\n/)
+  const ls = calls.find(c => c.label === 'scope:check')
+  // Offered as spelled: a path canon() would respell is refused before the check, never checked as another path.
+  assert.match(ls.prompt, /scope_check\.py --path='src\/my file \(v2\)\.c' --path='src\/invented\.c'`/)
   const fix = calls.find(c => c.label.startsWith('fix:'))
-  assert.match(fix.prompt, /Scope: src\/my file \(v2\)\.c, src\/plus\+@~\[1\]\.c/)
+  assert.match(fix.prompt, /Scope: src\/my file \(v2\)\.c\n/)
   assert.equal(fix.prompt.includes('invented'), false, 'a path git did not confirm never reaches the fixer')
+  assert.ok(logs.some(l => /src\/nope\/\.\.\/plus\+@~\[1\]\.c dropped — not a plain repository-relative path/.test(l)), logs.join('\n'))
 })
 
 test('two matrix legs of one check name keep separate fixes', async () => {
@@ -6471,4 +6483,53 @@ test('a launch that runs several cycles returns every cycle\'s publication recei
   assert.ok(posted.includes(1), `cycle 1's reply receipt is kept: ${JSON.stringify(result.observation.launchActions)}`)
   assert.deepEqual(result.observation.launchActions[0].findings.map(f => f.verdict), ['invalid'])
   assert.deepEqual(result.observation.launchActions.map(a => a.cycle), result.history.map(e => e.cycle))
+})
+
+test('a finding asking for a test gets the test file in its fix scope, checked by scope_check.py (#63)', async () => {
+  const wants = finding({ file: 'src/class/hid/hid_device.c', fixFiles: ['src/class/hid/hid_device.c', 'test/unit-test/test/device/test_hid.c'] })
+  const { calls, labels } = await run({ reviews: { findings: [wants], replies: [], bots: 'reviewed' } })
+  assert.match(calls.find(c => c.label === 'scope:check').prompt, /--path='src\/class\/hid\/hid_device\.c' --path='test\/unit-test\/test\/device\/test_hid\.c'`/)
+  assert.match(calls.find(c => c.label.startsWith('fix:')).prompt, /Scope: src\/class\/hid\/hid_device\.c, test\/unit-test\/test\/device\/test_hid\.c\n/)
+  assert.equal(labels.some(l => /^scope:src/.test(l)), false, 'a scoped finding needs no scope step')
+  // A required path refused withholds the finding rather than fix it without its test.
+  const refused = await run({ reviews: { findings: [wants], replies: [], bots: 'reviewed' }, lsFiles: (asked) => asked.filter(f => !f.startsWith('test/')) })
+  assert.equal(refused.labels.some(l => l.startsWith('fix:')), false)
+  assert.equal(refused.result.reason, 'fix-verification-failed')
+  assert.ok(refused.logs.some(l => /test\/unit-test\/test\/device\/test_hid\.c refused — exists but is not tracked/.test(l)), refused.logs.join('\n'))
+  // A spelling canon() would rewrite never reaches the check as the path it would become.
+  const respelled = await run({ reviews: { findings: [finding({ fixFiles: ['src/link/../a.c'] })], replies: [], bots: 'reviewed' } })
+  assert.equal(respelled.labels.includes('scope:check'), false)
+  assert.equal(respelled.labels.some(l => l.startsWith('fix:')), false)
+  assert.ok(respelled.logs.some(l => /src\/link\/\.\.\/a\.c refused — not a plain repository-relative path/.test(l)), respelled.logs.join('\n'))
+})
+
+test('findings converging on one test file are fixed by one writer', async () => {
+  const a = finding({ commentId: 1, file: 'src/a/x.c', fixFiles: ['src/a/x.c', 'test/t.c'] })
+  const b = finding({ commentId: 2, file: 'src/b/y.c', fixFiles: ['src/b/y.c', 'test/t.c'] })
+  const { calls } = await run({ reviews: { findings: [a, b], replies: [], bots: 'reviewed' } })
+  const fixes = calls.filter(c => c.label.startsWith('fix:'))
+  assert.equal(fixes.length, 1)
+  assert.match(fixes[0].prompt, /Scope: (?=.*src\/a\/x\.c)(?=.*src\/b\/y\.c)(?=.*test\/t\.c)/)
+})
+
+test('a finding its validator could not scope sends its group through the scope step, never the cited file alone', async () => {
+  const scoped = finding({ commentId: 1, line: 1 })
+  const open = finding({ commentId: 2, line: 5, claim: 'needs a test', fixFiles: [] })
+  const reviews = { findings: [scoped, open], replies: [], bots: 'reviewed' }
+  const found = await run({ reviews, scope: ['test/test_a.c'] })
+  const step = found.calls.find(c => c.label === 'scope:src/a.c')
+  assert.ok(step, found.labels.join(' '))
+  assert.match(step.prompt, /Already in scope: src\/a\.c\n/)
+  assert.match(found.calls.find(c => c.label.startsWith('fix:')).prompt, /Scope: src\/a\.c, test\/test_a\.c\n/)
+  // An answer naming a file the group already owns resolves it too: two findings may need the same file.
+  const owned = await run({ reviews, scope: ['src/a.c'] })
+  assert.match(owned.calls.find(c => c.label.startsWith('fix:')).prompt, /Scope: src\/a\.c\n/)
+  // A review finding's scope answer is required as given: a refused test file withholds it rather than narrow it.
+  const partial = await run({ reviews, scope: ['src/a.c', 'test/t.c'], lsFiles: (asked) => asked.filter(f => f !== 'test/t.c') })
+  assert.equal(partial.labels.some(l => l.startsWith('fix:')), false)
+  assert.ok(partial.logs.some(l => /scope:src\/a\.c: test\/t\.c refused — exists but is not tracked/.test(l)), partial.logs.join('\n'))
+  const { result, labels, logs } = await run({ reviews, scope: [] })
+  assert.equal(labels.some(l => l.startsWith('fix:')), false)
+  assert.equal(result.reason, 'fix-verification-failed')
+  assert.ok(logs.some(l => /fix for src\/a\.c: no file scope determinable — withheld for the caller/.test(l)), logs.join('\n'))
 })

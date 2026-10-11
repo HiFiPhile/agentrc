@@ -389,14 +389,14 @@ const REVIEWS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'related', 'changeReason'],
+        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'fixFiles', 'related', 'changeReason'],
         properties: {
           related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] },
           source: { type: 'string' }, findingId: { type: 'string' },
           commentDigest: { type: 'string' }, commentAliases: { type: 'array', items: { type: 'string' } }, commentId: { type: 'integer' },
           file: { type: 'string' }, line: { type: 'integer' }, claim: { type: 'string' },
           verdict: { type: 'string', enum: ['valid', 'invalid', 'stale'] },
-          reason: { type: 'string' }, fixHint: { type: 'string' },
+          reason: { type: 'string' }, fixHint: { type: 'string' }, fixFiles: { type: 'array', items: { type: 'string' } },
         },
       },
     },
@@ -537,6 +537,15 @@ const SCOPE = {
   required: ['files'],
   properties: { files: { type: 'array', items: { type: 'string' } } },
 }
+const SCOPE_CHECK = withSeal({
+  type: 'object', additionalProperties: false,
+  required: ['accepted', 'refused'],
+  properties: {
+    accepted: { type: 'array', items: { type: 'object', required: ['path', 'kind'], properties: { path: { type: 'string' }, kind: { type: 'string' } } } },
+    refused: { type: 'array', items: { type: 'object', required: ['path', 'why'], properties: { path: { type: 'string' }, why: { type: 'string' } } } },
+    error: { type: 'string' },
+  },
+})
 // Replies go only through reply.py, whose read-back receipts are the only proof: an agent's own "posted" once put a file path into 13 public replies, all 201.
 const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
 const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
@@ -546,9 +555,10 @@ const SONAR_SCRIPT = '~/.claude/skills/pr-babysit/scripts/sonar.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build.py'
+const SCOPE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/scope_check.py'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
-const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
+const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
@@ -920,9 +930,12 @@ const groupWork = (notes) => {
   const groups = new Map()
   for (const n of notes) {
     const key = (canon(n.scopeFile) || n.scopeFile).split('/').slice(0, 3).join('/')
-    if (!groups.has(key)) groups.set(key, { key, files: new Set(), notes: [] })
+    if (!groups.has(key)) groups.set(key, { key, paths: new Set(), files: new Set(), notes: [] })
     const g = groups.get(key)
-    n.files.forEach(f => { const c = canon(f); if (c) g.files.add(c) })
+    // Paths stay as spelled until fixAndVerify checks them. A review fix needs every path it names (strict); one its
+    // validator could not scope sends its whole group through the scope step.
+    n.files.forEach(f => g.paths.add(f))
+    if (n.strict) { g.strict = true; if (!n.files.length) g.unresolved = true }
     g.notes.push({ id: n.id, text: n.text, claim: n.claim ?? n.text })
   }
   return [...groups.values()]
@@ -1006,30 +1019,56 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
       : new Set(ids).size !== ids.length ? 'the writer rejected one issue twice'
       : fix.rejected.some(x => !x.evidence.trim()) ? 'the writer rejected an issue without evidence' : null
   }
-  // A group naming no file (a CI log with no path) is scoped first; an unscoped one is withheld for the caller.
-  const fileless = workIn.filter(w => w.files.size === 0)
-  await parallel(fileless.map(w => () =>
+  // A group naming no file (a CI log with no path), or holding a finding its validator could not scope, is scoped first.
+  const toScope = workIn.filter(w => w.paths.size === 0 || w.unresolved)
+  const proposed = new Map()
+  await parallel(toScope.map(w => () =>
     agent(
-      `${IN_CHECKOUT}Determine which repo files must change to address these notes (read the code; if a note is a CI failure, read its CI log too):\n- ${textOf(w)}\n` +
-      'files = repo-relative paths; empty only if genuinely undeterminable.',
+      `${IN_CHECKOUT}Determine which repo files must change to address these notes (read the code; if a note is a CI failure, read its CI log too; a note asking for a test needs that test's file, new or existing, where the repository keeps such tests):\n- ${textOf(w)}\n` +
+      (w.paths.size ? `Already in scope: ${[...w.paths].join(', ')}\n` : '') +
+      'files = repo-relative paths, a file to create included; empty only if genuinely undeterminable.',
       { label: `scope:${w.key}`, phase: 'Fix', model: 'sonnet', schema: SCOPE },
-    ).then(s => s && s.files.forEach(f => { const c = canon(f); if (c) w.files.add(c) }))))
-  // Scoped paths are model output: keep only what git ls-files confirms.
-  const candidates = [...new Set(fileless.flatMap(w => [...w.files]))]
-  if (candidates.length > 0) {
-    const v = await agent(
-      `${IN_CHECKOUT}Run exactly: git -c core.quotePath=false ls-files -- ${candidates.map(c => `'${c}'`).join(' ')}\nReturn files = the paths that command printed, verbatim — no additions, no substitutions.`,
-      { label: 'scope:verify', phase: 'Fix', model: 'haiku', schema: SCOPE },
-    ).catch(quiet('scope:verify'))
-    const exists = new Set((v ? v.files : []).map(canon))
-    for (const w of fileless) for (const f of [...w.files])
-      if (!exists.has(f)) { w.files.delete(f); log(`scope:${w.key}: dropped ${f} — not confirmed as a repo file`) }
+    ).then(s => s && proposed.set(w, s.files))))
+  // Every path is model output (a validator's, a CI judge's, a scope step's) and reaches a writer only as scope_check.py
+  // accepts it, a tracked file or one a writer may create, checked as spelled: one canon() would respell is refused here,
+  // so no normalization hides a `..` or a link. A protected path is the caller's (a HIL rig roster, say), IDE metadata nobody's.
+  const candidates = [...new Set(workIn.flatMap(w => [...w.paths, ...(proposed.get(w) || [])]))]
+  const refusal = new Map(candidates.flatMap(f => {
+    const why = canon(f) !== f ? 'not a plain repository-relative path' : protectedRe && protectedRe.test(f) ? "protected, the caller's to change"
+      : ideDrift(f) ? 'IDE metadata' : null
+    return why ? [[f, why]] : []
+  }))
+  const plain = candidates.filter(f => !refusal.has(f))
+  if (plain.length > 0) {
+    const v = await relayRun(
+      `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}\` ` +
+      relayed(SCOPE_CHECK),
+      { label: 'scope:check', phase: 'Fix', model: 'haiku', effort: 'low', schema: SCOPE_CHECK },
+    )
+    const usable = v && !v.error
+    const accepted = new Set(usable ? v.accepted.map(a => a.path) : [])
+    const why = new Map(usable ? v.refused.map(r => [r.path, r.why]) : [])
+    for (const f of plain) if (!accepted.has(f)) refusal.set(f, why.get(f) || (usable ? 'not confirmed' : `scope check failed: ${v ? v.error : 'no sealed receipt'}`))
   }
-  const unscoped = workIn.filter(w => w.files.size === 0)
-  for (const w of unscoped) log(`fix for ${w.key}: no file scope determinable — withheld for the caller`)
+  // A refused path withholds a review fix, which needs every path it names: a fix without it is the narrowed scope #63
+  // was about. A CI fix's paths are a judge's guesses: a refused one is dropped. An accepted scope-step path, an owned
+  // file included, resolves its group.
+  for (const w of workIn) {
+    const take = (f) => {
+      if (!refusal.has(f)) { w.files.add(f); return true }
+      if (w.strict) w.refused = true
+      log(`scope:${w.key}: ${f} ${w.strict ? 'refused' : 'dropped'} — ${refusal.get(f)}`)
+      return false
+    }
+    w.paths.forEach(take)
+    const resolved = (proposed.get(w) || []).map(take).some(Boolean)
+    if (w.unresolved) w.unresolved = !resolved
+  }
+  const unscoped = workIn.filter(w => w.files.size === 0 || w.unresolved || w.refused)
+  for (const w of unscoped) log(`fix for ${w.key}: ${w.refused ? 'a path it needs was refused' : 'no file scope determinable'} — withheld for the caller`)
   // Merge groups sharing a file so no two writers edit one file.
   const work = []
-  for (let g of workIn.filter(w => w.files.size > 0)) {
+  for (let g of workIn.filter(w => !unscoped.includes(w))) {
     for (let i; (i = work.findIndex(m => [...g.files].some(f => m.files.has(f)))) >= 0;) {
       const [m] = work.splice(i, 1)
       g.files.forEach(f => m.files.add(f)); m.notes.push(...g.notes); m.key = `${m.key}+${g.key}`
@@ -1037,24 +1076,6 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     }
     work.push(g)
   }
-  // A protected path is the caller's (a HIL rig roster, say): dropped from scope; a group needing only it stays red.
-  const withheld = []
-  for (const w of work) {
-    for (const f of [...w.files]) {
-      if (protectedRe && protectedRe.test(f)) {
-        w.files.delete(f)
-        log(`fix for ${w.key}: ${f} is protected — dropped from scope`)
-      } else if (ideDrift(f)) {
-        w.files.delete(f)
-        log(`fix for ${w.key}: ${f} is IDE metadata — dropped from scope`)
-      }
-    }
-    if (w.files.size === 0) {
-      withheld.push(w)
-      log(`fix for ${w.key}: only a protected path would address it — leaving red for the user`)
-    }
-  }
-  for (const w of withheld) work.splice(work.indexOf(w), 1)
   const scopeOf = (w) => [...w.files].join(', ')
   // One writer at a time: a writer's build reads the whole checkout, so a sibling's unfinished edit or experiment would break it (#43).
   const fixes = []
@@ -1101,7 +1122,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   for (const f of unverified) log(`fix for ${f.item}: failed verification — ${f.checkReason}`)
   // A rejection its group's verifier confirmed stands whatever the batch build says: nothing was changed for it.
   const rejected = alive.filter(f => f.addresses === true).flatMap(f => f.rejected)
-  const verified = unscoped.length === 0 && withheld.length === 0 && alive.length === work.length && unverified.length === 0
+  const verified = unscoped.length === 0 && alive.length === work.length && unverified.length === 0
   const owned = [...new Set(changing.flatMap(c => [...c.files]))]
   const brief = { issues: changing.map(c => listOf(c.notes)), claims: changing.flatMap(c => c.notes.map(n => n.claim)), notes: alive.map(f => f.notes).filter(Boolean) }
   const fail = (why) => {
@@ -2140,7 +2161,7 @@ const runCycle = async (cycle, entry) => {
     const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral && !x.hold)
     if (validFindings.length > 0) {
       const work = groupWork(validFindings.map(f => ({
-        id: f.findingId, scopeFile: f.file, files: [f.file],
+        id: f.findingId, scopeFile: f.file, files: f.fixFiles, strict: true,
         text: `${f.file}:${f.line} [${f.source}] ${f.claim} — hint: ${f.fixHint}`,
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
