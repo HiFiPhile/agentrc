@@ -88,14 +88,13 @@ phase('Check')
 const CI = { type: 'object', properties: { state: { enum: ['green', 'red', 'pending', 'unobserved', 'unknown'] }, counts: { type: 'object' }, actionRequired: { type: 'integer' } }, required: ['state'] }
 const PINS = { type: 'object', properties: { mergeBase: { type: 'string' }, scopeBase: { type: 'string' }, mode: { type: 'string' }, groups: { type: 'array', items: { type: 'string' } } } }
 const check = await relay('check', 'Check', `python3 ${S}/prepare.py --check --pr ${pr} --repo ${repo} --expected-head ${head}`,
-  { type: 'object', properties: { ok: { type: 'boolean' }, head: { type: 'string' }, top: { type: 'string' }, ci: CI, pins: PINS, error: { type: 'string' } } })
-if (!check || check.error || check.ok !== true || check.head !== head || !check.top) {
+  { type: 'object', properties: { ok: { type: 'boolean' }, head: { type: 'string' }, top: { type: 'string' }, repo: { type: 'string' }, pr: { type: 'integer' }, ci: CI, pins: PINS, error: { type: 'string' } } })
+// The check names the run's repository and PR so its journal identifies the run.
+if (!check || check.error || check.ok !== true || check.head !== head || !check.top || check.repo !== repo || check.pr !== pr) {
   return blocked('check-failed', check ? (check.error || `check answered ${JSON.stringify(check)}`) : 'the check relay died')
 }
 // A scope other than the one prepare pinned could leave changes unreviewed and still approve.
 const want = { mergeBase, scopeBase, mode: discussion ? 'same' : args.mode, groups: args.groups }
-// Scanners may report absolute paths; GitHub and the claim matcher need them repository-relative.
-const repoPath = (p) => (p.startsWith(`${check.top}/`) ? p.slice(check.top.length + 1) : p)
 const off = Object.keys(want).filter(k => JSON.stringify(want[k]) !== JSON.stringify((check.pins || {})[k]))
 if (off.length) return blocked('scope-mismatch', `args differ from prepare's pins for this head in ${off.join(', ')}: ${JSON.stringify(check.pins)}`)
 const ci = check.ci
@@ -167,7 +166,7 @@ const judge = (c, i) => agent(
   // A confirmed claim without its grading is unjudged, like a dead judge.
   { label: `judge:${i}`, phase: 'Judge', agentType: 'finding-verifier', schema: JUDGE },).then(v => v && (v.verdict !== 'confirmed' || graded(v)) ? { ...c, ...v } : null)
 const [audit, rechecked, claims] = await parallel([
-  () => discussion ? NONE : workflow('code-audit', { dirs: args.groups, dimensions, diff: { base: scopeBase, head } }),
+  () => discussion ? NONE : workflow('code-audit', { dirs: args.groups, dimensions, diff: { base: scopeBase, head }, root: check.top }),
   () => parallel(carried.map(f => () => agent(recheckPrompt(f),
     { label: `recheck:${f.id}`, phase: 'Review', agentType: 'finding-verifier', schema: RECHECK },
   ))),
@@ -193,7 +192,7 @@ const claimsOut = judged.filter(v => v && v.verdict !== 'misattributed')
 
 phase('Judge')
 const ours = audit.confirmed.flatMap(u => u.findings.map(f => ({
-  source: 'review', file: repoPath(f.file), line: f.line, dimension: u.dim,
+  source: 'review', file: f.file, line: f.line, dimension: u.dim,
   ...gradeOf(f), why: f.why, snippet: f.snippet, verdictReason: f.verdict.reason, status: 'open',
 })))
 const confirmedClaims = claimsOut.filter(c => c.verdict === 'confirmed')

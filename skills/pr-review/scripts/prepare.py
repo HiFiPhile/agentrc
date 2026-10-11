@@ -23,8 +23,9 @@ their diff before building anything. `ci` summarises the head's checks:
 
 --check refuses unless the remote head, the worktree HEAD and the expected
 head agree, the checkout is clean and the ledger is readable; it prints the
-head's CI summary again and the pins prepare recorded for that head (mode,
-merge base, scope base, groups), for the caller to compare with its own.
+head's CI summary again, the checkout's real top, the repository and PR it
+checked, and the pins prepare recorded for that head (mode, merge base, scope
+base, groups), for the caller to compare with its own.
 
 stdout ends with one JSON line; the full changed-path list and every check go
 to the facts file the line names, beside the ledger. {"error": ...}, exit 2,
@@ -223,7 +224,7 @@ def check(a):
         pinned = json.loads(facts.read_text())
     except (OSError, ValueError):
         raise Unusable(f'no prepare facts for {local} at {facts}: run prepare first')
-    return {'ok': True, 'head': local, 'top': os.path.realpath(top), 'ci': ci_summary(repo, a.pr)[0],
+    return {'ok': True, 'head': local, 'top': os.path.realpath(top), 'repo': repo, 'pr': a.pr, 'ci': ci_summary(repo, a.pr)[0],
             'pins': {k: pinned[k] for k in ('mergeBase', 'scopeBase', 'mode', 'groups')}}
 
 

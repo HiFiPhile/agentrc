@@ -7,11 +7,16 @@ journal the same verdict again, without a transcript of their own: a case is key
 and the first one with a transcript is kept. A verdict without a pinned head (the run's `check` result),
 without its transcript, or whose prompt names another head is not replayable and is only counted.
 
+A run's `check` result names its repository and PR; one from before it did is placed by its worktree path
+or the session's project directory name, a repository not in REPOS leaving it unreplayable. A check that
+names them in another shape is counted, never placed by path instead.
+
 A scanner sometimes reported an absolute path into the run's worktree; the verifier read that path. Such a
 case keeps the prompt as sent and names the `worktree` prefix, which a replay replaces with its own
 checkout of the head, and `path`, the file relative to the repository root. The prefix is the one whose
 encoding is the session's project directory name, which Claude Code derives from its working directory; a
-path with no such prefix, or a run in a repository not in REPOS, leaves the case unreplayable.
+path with no such prefix leaves the case unreplayable. code-audit normalizes such paths itself since #65, so
+only a run whose check does not name it is recovered this way.
 
     extract.py --out cases.jsonl [JOURNAL_ROOT ...]   # default: ~/.claude/projects, ~/.claude-ada/projects
 """
@@ -89,13 +94,19 @@ def cases(path, skipped):
     got = results(path)
     check = got.get('check', ({},))[0] or {}
     head, project = check.get('head'), path.parents[4].name
-    # an older check result names no worktree: the session's project directory still does
-    repo, pr = origin(check.get('top') or project)
+    named = 'repo' in check or 'pr' in check
+    if named:
+        repo, pr = check.get('repo'), check.get('pr')
+        if not (isinstance(repo, str) and re.fullmatch(r'[\w.-]+/[\w.-]+', repo) and type(pr) is int and pr > 0):
+            repo = None
+    else:
+        # an older check result names no worktree: the session's project directory still does
+        repo, pr = origin(check.get('top') or project)
     for label, (verdict, agent) in got.items():
         if not VERIFY.fullmatch(label) or verdict is None:
             continue
         if not head or not repo:
-            skipped['no pinned head' if not head else 'repository not in REPOS'] += 1
+            skipped['no pinned head' if not head else 'malformed run identity' if named else 'repository not in REPOS'] += 1
             continue
         seen = transcript(path.parent / f'agent-{agent}.jsonl')
         if not seen:
@@ -114,6 +125,10 @@ def cases(path, skipped):
         finding = json.loads(m.group('finding'))
         file, worktree = finding['file'], None
         if file.startswith('/'):
+            # a run that names itself had code-audit normalize its paths: an absolute one breaks that contract
+            if named:
+                skipped['absolute path in a run that names itself'] += 1
+                continue
             worktree = worktree_of(file, project)
             if not worktree:
                 skipped['absolute path outside the session worktree'] += 1

@@ -366,6 +366,7 @@ class Prepare(Case):
         ok = self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])
         self.assertEqual(ok['pins'], {'mergeBase': p['mergeBase'], 'scopeBase': p['scopeBase'], 'mode': 'full', 'groups': p['groups']})
         self.assertEqual(ok['top'], os.path.realpath(p['worktree']))
+        self.assertEqual((ok['repo'], ok['pr']), (REPO, PR))
         with self.assertRaisesRegex(facts.Unusable, 'a full SHA'):
             self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head + '\n'])
         Path('src/core/a.c').write_text('edited\n')

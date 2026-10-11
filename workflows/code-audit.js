@@ -8,11 +8,12 @@ export const meta = {
   ],
 }
 
-// args: { dirs: string[], dimensions: string[], diff?: { base, head } }, dirs and
+// args: { dirs: string[], dimensions: string[], diff?: { base, head }, root?: string }, dirs and
 // dimensions nonempty; no defaults, since `dimensions: []` would review nothing
 // and look like a clean pass. `diff` (two full SHAs, the checkout at head) narrows
 // every unit to what base..head introduces or breaks, as a PR review needs; the
-// caller checks that the checkout is clean and at head before launching.
+// caller checks that the checkout is clean and at head before launching. `root`, the
+// checkout's absolute top, turns a scanner's absolute path under it into a relative one.
 const list = (v, name) => {
   if (!Array.isArray(v) || v.length === 0 || !v.every(s => typeof s === 'string' && s.trim())) {
     throw new Error(`args.${name} must be a nonempty array of nonblank strings; args is { dirs: string[], dimensions: string[] }`)
@@ -26,6 +27,17 @@ const SHA = /^[0-9a-f]{40}$/
 const isSha = v => typeof v === 'string' && SHA.test(v)
 if (args.diff != null && !(isSha(args.diff.base) && isSha(args.diff.head))) {
   throw new Error('args.diff must be { base, head }, two full 40-hex SHAs')
+}
+if (args.root != null && !(typeof args.root === 'string' && /^\/./.test(args.root))) throw new Error('args.root must be an absolute path')
+const root = args.root == null ? null : args.root.replace(/\/+$/, '')
+// A verifier reads the path it is given, and a finding's consumers need it repository-relative. Strings only:
+// root is the checkout's real path, and a scanner reports the path it read.
+const placed = (f) => {
+  const file = f.file.startsWith('/') && root && f.file.startsWith(`${root}/`) ? f.file.slice(root.length + 1) : f.file.replace(/^(?:\.\/)+/, '')
+  const pathError = !file ? 'no file'
+    : file.startsWith('/') ? `absolute path outside the checkout${root ? ` ${root}` : ' (no root given)'}`
+    : file.split('/').includes('..') ? 'path escapes the checkout' : null
+  return pathError ? { ...f, pathError } : { ...f, file }
 }
 // Pinned SHAs, not HEAD: a checkout that moves under the run must not change what was reviewed.
 const shellQuote = s => `'${s.replace(/'/g, `'\\''`)}'`
@@ -101,7 +113,8 @@ const results = await pipeline(
   (scan, p) => {
     if (!scan) return { dir: p.dir, dim: p.dim, dropped: true, findings: [], unverified: [] }
     if (scan.findings.length === 0) return { dir: p.dir, dim: p.dim, findings: [], unverified: [] }
-    return parallel(scan.findings.map((f, k) => () =>
+    const found = scan.findings.map(placed)
+    return parallel(found.map((f, k) => () => f.pathError ? { f, pathError: f.pathError } :
       agent(
         `Adversarially verify ONE review finding about ${p.dir}.\nDimension: ${p.dim}\nFinding: ${JSON.stringify(f)}\n` +
         `Read the cited code and enough surrounding context to judge.${scopeOf(p.dir)} Try to REFUTE it; real=true only if it survives your best attempt. ` +
@@ -109,12 +122,12 @@ const results = await pipeline(
         { label: `verify:${p.id}:${k}`, phase: 'Verify', agentType: 'finding-verifier', schema: VERDICT, ...verifierModel(f) },
       ).then(v => v && { f, v })
     )).then(vs => {
-      const kind = x => !x ? 'dead' : !x.v.real ? 'refuted' : graded(x.v) ? 'confirmed' : 'ungraded'
+      const kind = x => !x ? 'dead' : x.pathError ? 'unplaced' : !x.v.real ? 'refuted' : graded(x.v) ? 'confirmed' : 'ungraded'
       const kinds = vs.map(kind)
       const count = k => kinds.filter(x => x === k).length
-      const unverified = scan.findings.filter((_, k) => kinds[k] === 'dead' || kinds[k] === 'ungraded')
+      const unverified = found.filter((_, k) => ['dead', 'ungraded', 'unplaced'].includes(kinds[k]))
       if (unverified.length > 0) {
-        log(`${p.dir}: ${unverified.length} finding(s) unverified (${count('dead')} dead verifier(s), ${count('ungraded')} confirmed without complete grading) — re-run if needed`)
+        log(`${p.dir}: ${unverified.length} finding(s) unverified (${count('dead')} dead verifier(s), ${count('ungraded')} confirmed without complete grading${count('unplaced') ? `, ${count('unplaced')} with an unusable path` : ''}) — re-run if needed`)
       }
       const findings = vs.filter((_, k) => kinds[k] === 'confirmed')
         .map(({ f, v }) => ({ ...f, ...gradeOf(v), verdict: { real: true, reason: v.reason } }))

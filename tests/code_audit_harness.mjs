@@ -252,3 +252,30 @@ test('docs is an optional field of the scan schema', async () => {
   assert.deepEqual(item.properties.docs.items.required, ['book', 'pages'])
   assert.deepEqual(Object.keys(item.properties.docs.items.properties), ['book', 'pages', 'lookups'])
 })
+
+test('a scanner path under root reaches the verifier relative; one outside it, or escaping, is unverified unseen', async () => {
+  const at = (file, why) => ({ ...finding(7, why), file })
+  const scans = { 'src/portable/x|correctness': [
+    at('/w/top/src/a.c', 'under root'), at('/w/top-other/src/a.c', 'prefix collision'), at('src/../../etc/x.c', 'escapes'),
+    at('./src/b.c', 'dotted'), at('/elsewhere/a.c', 'outside'),
+  ] }
+  const verdicts = { 'under root': true, dotted: true }
+  const { result, calls, logs } = await run({ ...ONE, root: '/w/top/' }, { scans, verdicts })
+  const verified = calls.filter(c => c.label.startsWith('verify:')).map(c => JSON.parse(/^Finding: (.+)$/m.exec(c.prompt)[1]).file)
+  assert.deepEqual(verified, ['src/a.c', 'src/b.c'])
+  assert.deepEqual(result.confirmed[0].findings.map(f => f.file), ['src/a.c', 'src/b.c'])
+  assert.deepEqual(result.unverified[0].findings.map(f => [f.file, f.pathError]), [
+    ['/elsewhere/a.c', 'absolute path outside the checkout /w/top'],
+    ['/w/top-other/src/a.c', 'absolute path outside the checkout /w/top'],
+    ['src/../../etc/x.c', 'path escapes the checkout'],
+  ])
+  assert.ok(logs.some(l => /3 with an unusable path/.test(l)), logs.join('\n'))
+})
+
+test('without root an absolute scanner path is unverified, and root must be absolute', async () => {
+  const scans = { 'src/portable/x|correctness': [{ ...finding(7, 'abs'), file: '/w/top/src/a.c' }] }
+  const { result, calls } = await run(ONE, { scans })
+  assert.equal(calls.filter(c => c.label.startsWith('verify:')).length, 0)
+  assert.equal(result.unverified[0].findings[0].pathError, 'absolute path outside the checkout (no root given)')
+  await assert.rejects(run({ ...ONE, root: 'w/top' }), /args\.root must be an absolute path/)
+})

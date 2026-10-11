@@ -30,7 +30,7 @@ async function run(args, stubs = {}) {
     return typeof v === 'function' ? v(prompt, label) : v
   }
   const defaults = {
-    check: { ok: true, head: H, top: '/w', ci: { state: 'green', counts: {} }, pins: { mergeBase: args.mergeBase, scopeBase: args.scopeBase, mode: args.mode, groups: args.groups } },
+    check: { ok: true, head: H, top: '/w', repo: args.repo, pr: args.pr, ci: { state: 'green', counts: {} }, pins: { mergeBase: args.mergeBase, scopeBase: args.scopeBase, mode: args.mode, groups: args.groups } },
     threads: { file: `${BASE.factsDir}/threads-${H}.json`, count: 0 },
     ledger: { reviews: 0, open: [] },
     disputes: { disputes: [] },
@@ -63,7 +63,7 @@ async function run(args, stubs = {}) {
   return { result, calls, logs, audits, labels: calls.map(c => c.label) }
 }
 
-const pinned = (a) => ({ ok: true, head: H, top: '/w', ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups } })
+const pinned = (a) => ({ ok: true, head: H, top: '/w', repo: a.repo, pr: a.pr, ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups } })
 const board = (verdict, regression, testedHead = H) => ({ board: 'b1', verdict, regression, testedHead, report: '/r/b1.json' })
 const words = (s) => s.split(/\s+/).filter(Boolean).length
 // A list's [minItems, maxItems, id enum], as the runtime is asked to hold an answer to.
@@ -89,8 +89,9 @@ test('args that would change the verdict silently are refused before any agent',
   for (const a of bad) await assert.rejects(run(a), /args|must/, JSON.stringify(a))
 })
 
-test('a failed or moved-head check stops before any review work', async () => {
-  for (const check of [null, { error: 'head moved: expected b' }, { ok: true, head: OLD, ci: { state: 'green' } }]) {
+test('a failed, moved-head or unidentified check stops before any review work', async () => {
+  const { repo, pr, ...unnamed } = pinned(BASE)
+  for (const check of [null, { error: 'head moved: expected b' }, { ok: true, head: OLD, ci: { state: 'green' } }, unnamed, { ...pinned(BASE), repo: 'o/other' }, { ...pinned(BASE), pr: 8 }]) {
     const { result, labels } = await run(BASE, { check })
     assert.equal(result.status, 'blocked')
     assert.equal(result.reason, 'check-failed')
@@ -101,7 +102,7 @@ test('a failed or moved-head check stops before any review work', async () => {
 test('a clean full review approves only with green CI, full coverage and hardware covered', async () => {
   const { result, audits, calls } = await run(BASE)
   assert.equal(result.verdict.event, 'APPROVE')
-  assert.deepEqual(audits[0], { dirs: ['src/core'], dimensions: audits[0].dimensions, diff: { base: MB, head: H } })
+  assert.deepEqual(audits[0], { dirs: ['src/core'], dimensions: audits[0].dimensions, diff: { base: MB, head: H }, root: '/w' })
   assert.equal(audits[0].dimensions.length, 4)
   assert.ok(calls.filter(c => ['check', 'threads', 'ledger'].includes(c.label)).every(c => c.options.model === 'haiku'))
   assert.match(calls.find(c => c.label === 'check').prompt, /prepare\.py --check --pr 7 --repo o\/r --expected-head b{40}/)
@@ -145,8 +146,8 @@ test('a blocking finding or a verified regression requests changes; minor ones o
   assert.equal(nit.result.verdict.event, 'APPROVE')
   const medium = await run(BASE, { audit: audited(finding('leak on error path', 'medium')) })
   assert.equal(medium.result.verdict.event, 'COMMENT')
-  const abs = await run(BASE, { audit: audited({ ...finding('overrun'), file: '/w/src/core/a.c' }) })
-  assert.equal(abs.result.draft.comments[0].path, 'src/core/a.c', 'an absolute path under the checkout is made repository-relative')
+  const abs = await run(BASE, { audit: audited(finding('overrun')) })
+  assert.equal(abs.audits[0].root, '/w', 'code-audit is given the checkout top, to make a scanner\'s absolute path repository-relative')
   const variant = await run(BASE, { audit: audited(finding('EP0 reserve missed', 'high', 10, { ...IMP, variants: 'STM32F4 OTG_FS only' })) })
   assert.equal(variant.result.verdict.event, 'REQUEST_CHANGES', 'a high on one supported variant blocks like any high')
   const graded = variant.result.findings[0]
@@ -411,7 +412,7 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
 
 test('args that differ from the pins prepare recorded for this head are blocked before review', async () => {
   for (const pins of [{ mergeBase: OLD, scopeBase: MB, mode: 'full', groups: ['src/core'] }, { mergeBase: MB, scopeBase: MB, mode: 'full', groups: ['src'] }, undefined]) {
-    const { result, labels } = await run(BASE, { check: { ok: true, head: H, top: '/w', ci: { state: 'green' }, pins } })
+    const { result, labels } = await run(BASE, { check: { ...pinned(BASE), pins } })
     assert.equal(result.reason, 'scope-mismatch')
     assert.deepEqual(labels, ['check'])
   }

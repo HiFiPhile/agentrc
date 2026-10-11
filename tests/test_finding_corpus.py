@@ -129,6 +129,22 @@ class Extract(unittest.TestCase):
         for reason in ('no transcript', 'no pinned head', 'prompt names another head', 'unparsable prompt', 'repository not in REPOS'):
             self.assertIn(f'1 verdict(s), {reason}', printed)
 
+    def test_a_check_that_names_its_run_is_placed_by_it_not_by_path(self):
+        top = '/home/u/code/tinyusb/.worktrees/pr-review-12'
+        self.journal('-home-u-code-tinyusb--worktrees-pr-review-12', [('verify:d0x0:0', REAL, prompt(), OPUS)],
+                     check={'head': HEAD, 'top': top, 'repo': 'acme/widget', 'pr': 9})
+        self.journal('-home-u-code-tinyusb--worktrees-pr-review-13', [('verify:d0x0:0', REAL, prompt(dimension='other'), OPUS)],
+                     check={'head': HEAD, 'top': top, 'repo': 'acme/widget', 'pr': '9'})
+        self.journal('-home-u-code-tinyusb--worktrees-pr-review-14', [('verify:d0x0:0', REAL, prompt(dimension='third'), OPUS)],
+                     check={'head': HEAD, 'top': top, 'repo': 'acme/widget', 'pr': 0})
+        absolute = {**FINDING, 'file': '/home/u/code/tinyusb/.worktrees/pr-review-15/src/x.c'}
+        self.journal('-home-u-code-tinyusb--worktrees-pr-review-15', [('verify:d0x0:0', REAL, prompt(finding=absolute), OPUS)],
+                     check={'head': HEAD, 'top': top, 'repo': 'acme/widget', 'pr': 15})
+        cases, printed = self.run_it()
+        self.assertEqual([(c['repo'], c['pr']) for c in cases], [('acme/widget', 9)])
+        self.assertIn('2 verdict(s), malformed run identity', printed)
+        self.assertIn('1 verdict(s), absolute path in a run that names itself', printed)
+
     def test_a_projects_tree_reached_twice_is_read_once(self):
         check = {'head': HEAD, 'top': '/x/agentrc/.worktrees/pr-review-4'}
         self.journal('p1', [('verify:d0x0:0', REAL, prompt(), OPUS)], check=check)
