@@ -3,14 +3,18 @@
 
   preflight.py --pr N [--needs PATH...]
   preflight.py --recheck
+  preflight.py --state N
 
 Reports what every later step must still be true of: branch (`git rev-parse
 --abbrev-ref HEAD`), prBranch, prHead, prBase (the base head GitHub last
 recorded for the PR, stale once the base moves until the head is pushed),
-prBaseBranch, prRepo (owner/name) and prUrl from one `gh pr view N`, verbatim
+prBaseBranch, prRepo (owner/name, "" for a PR no longer open whose head
+repository is gone), prUrl and prState (OPEN, MERGED or CLOSED, any other an
+error) from one `gh pr view N`, verbatim
 even when they disagree with git; prBaseTip, the base branch's live tip in the
 base repository (`gh api repos/{owner}/{repo}/git/ref/heads/<prBaseBranch>`,
-resolved as `gh pr view` resolves N); remote, the remote
+resolved as `gh pr view` resolves N; "" for a PR no longer open, whose base
+branch may be gone); remote, the remote
 the branch tracks, "" when it tracks none; upstreamBranch, the branch it
 tracks there, "" when none; pushUrls (`git remote get-url
 --push --all <remote>`, which a pushurl can point away from the fetch URL);
@@ -29,6 +33,9 @@ nothing is pinned.
 --recheck reads, before a commit, what the pin must still match, without gh:
 branch, pushUrls and head as above, staged (`git diff --cached --name-only -z`
 records) and status (`git status --porcelain -z` records).
+
+--state reads PR N's state alone (`gh pr view N --json state`): state, as
+prState above.
 
 stdout ends with one JSON line with exactly those keys, plus `seal` (facts.sealed),
 which pr-babysit checks its relayed copy against. Exit 0 with it; exit 2
@@ -116,19 +123,31 @@ def base_tip(name):
         raise Unusable(f'gh api git/ref/heads/{name}: unexpected answer ({e!r})')
 
 
-def pin(pr):
-    branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
-    fields = 'headRefName,headRefOid,baseRefOid,baseRefName,headRepositoryOwner,headRepository,url'
+def pr_view(pr, fields):
+    """`gh pr view N --json fields`, its state one pr-babysit knows; Unusable otherwise."""
     try:
         view = json.loads(run('gh', 'pr', 'view', str(pr), '--json', fields)[1])
+        if view['state'] not in ('OPEN', 'MERGED', 'CLOSED'):
+            raise ValueError(f"state {view['state']!r}")
+        return view
+    except (ValueError, KeyError, TypeError) as e:
+        raise Unusable(f'gh pr view {pr}: unexpected answer ({e!r})')
+
+
+def pin(pr):
+    branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
+    view = pr_view(pr, 'headRefName,headRefOid,baseRefOid,baseRefName,headRepositoryOwner,headRepository,url,state')
+    try:
+        owner, repo = view['headRepositoryOwner'], view['headRepository']
+        # A deleted head fork comes back as a null headRepository: only a PR no longer open, which stops the launch, pins without one.
+        gone = view['state'] != 'OPEN' and not (owner and repo)
         pr_facts = {'prBranch': view['headRefName'], 'prHead': view['headRefOid'], 'prBase': view['baseRefOid'],
                     'prBaseBranch': view['baseRefName'],
-                    'prRepo': f"{view['headRepositoryOwner']['login']}/{view['headRepository']['name']}",
-                    'prUrl': view['url']}
-    except (ValueError, KeyError, TypeError) as e:
-        # A deleted head fork comes back as a null headRepository.
+                    'prRepo': '' if gone else f"{owner['login']}/{repo['name']}",
+                    'prUrl': view['url'], 'prState': view['state']}
+    except (KeyError, TypeError) as e:
         raise Unusable(f'gh pr view {pr}: unexpected answer ({e!r})')
-    pr_facts['prBaseTip'] = base_tip(pr_facts['prBaseBranch'])
+    pr_facts['prBaseTip'] = base_tip(pr_facts['prBaseBranch']) if view['state'] == 'OPEN' else ''
     remote, urls = push_urls(branch)
     expected = f"{HOST}/{pr_facts['prRepo'].lower()}"
     return {'branch': branch, **pr_facts, 'remote': remote, 'upstreamBranch': upstream_branch(branch, remote),
@@ -144,13 +163,16 @@ def collect(argv):
     which = p.add_mutually_exclusive_group(required=True)
     which.add_argument('--pr', type=int)
     which.add_argument('--recheck', action='store_true')
+    which.add_argument('--state', type=int, metavar='N')
     p.add_argument('--needs', action='append', default=[])
     a = p.parse_args(argv)
-    if a.recheck and a.needs:
+    if a.pr is None and a.needs:
         p.error('--needs is for --pr')
     missing = [n for n in a.needs if not Path(n).expanduser().is_file()]
     if missing:
         raise Unusable(f"stale workflow definition: {', '.join(missing)} missing; reload the workflow (a fresh session) before relaunching")
+    if a.state is not None:
+        return {'state': pr_view(a.state, 'state')['state']}
     return recheck() if a.recheck else pin(a.pr)
 
 
