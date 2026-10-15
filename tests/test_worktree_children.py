@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -637,11 +638,11 @@ class WorktreeChildren(unittest.TestCase):
         [note] = self.notifications()
         self.assertIn('branch child: commits on no origin branch', note[note.index('--body') + 1])
         log = (self.t / 'state' / 'log').read_text()
-        retry = f'cleanup {self.parent} --branch {self.main / ".git"} child {tip}'
-        self.assertIn(f'its branch is retried by: {SCRIPT} {retry}', log)
+        retry = ['cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'child', tip]
+        self.assertIn(f'its branch is retried by: {shlex.join([str(SCRIPT), *retry])}', log)
         self.assertLess(log.index('its branch is retried by'), log.index(f'removed {child}'))
         self.git('push', '-q', 'origin', 'child', cwd=self.main)
-        done = self.run_script(*retry.split())
+        done = self.run_script(*retry)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertFalse(self.branch_exists('child'))
 
@@ -765,7 +766,7 @@ class WorktreeChildren(unittest.TestCase):
         for kid in kids:
             self.assertFalse(kid.exists())
         self.assertEqual(done.stdout.count('malformed answer'), 2)
-        [retry] = [l.split(' cleanup ', 1)[1].split() for l in done.stdout.splitlines() if l.startswith('retry: ')]
+        [retry] = [shlex.split(l.removeprefix('retry: '))[2:] for l in done.stdout.splitlines() if l.startswith('retry: ')]
         node = {'headRefName': 'a', 'headRefOid': self.oid('a'), 'state': 'OPEN', 'mergedAt': None, 'number': 1}
         for missing in ('number', 'headRefOid'):
             answer = {'nodes': [{k: v for k, v in node.items() if k != missing}], 'issueCount': 1}
@@ -836,9 +837,14 @@ class WorktreeChildren(unittest.TestCase):
 
     def test_nothing_runs_while_the_parent_path_exists(self):
         child = self.child()
-        done = self.run_script('cleanup', str(self.parent))
+        tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
+        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
         self.assertEqual(done.returncode, 2)
         self.assertTrue(child.is_dir())
+        self.assertTrue(self.branch_exists('parent'))
+        self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists', done.stdout)
+        command = [str(SCRIPT), 'cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip]
+        self.assertIn(f'retry: {shlex.join(command)}', done.stdout)
 
     def test_a_parent_recreated_during_the_checks_stops_the_sweep(self):
         kids = [self.child(), self.child('second')]
@@ -853,7 +859,8 @@ class WorktreeChildren(unittest.TestCase):
             self.assertTrue(kid.is_dir(), done.stdout)
             self.assertNotIn(f'removed {kid}', done.stdout)
         self.assertTrue(self.branch_exists('parent'), done.stdout)
-        self.assertIn(f'retry: {SCRIPT} cleanup {self.parent} --branch', done.stdout)
+        self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
+        self.assertIn(f"retry: {shlex.join([str(SCRIPT), 'cleanup', str(self.parent), '--branch'])}", done.stdout)
 
     def test_a_parent_recreated_during_a_failing_check_keeps_the_queued_branches(self):
         kid = self.child()
@@ -866,7 +873,8 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertTrue(kid.is_dir(), done.stdout)
         self.assertTrue(self.branch_exists('parent'), done.stdout)
-        self.assertIn(f'retry: {SCRIPT} cleanup {self.parent} --branch', done.stdout)
+        self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
+        self.assertIn(f"retry: {shlex.join([str(SCRIPT), 'cleanup', str(self.parent), '--branch'])}", done.stdout)
 
     def test_the_event_reads_herdrs_envelope_and_bad_events_are_usage_errors(self):
         child = self.child()
