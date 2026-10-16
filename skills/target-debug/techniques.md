@@ -13,9 +13,9 @@ which):
 python3 <skill dir>/scripts/pc_sample.py --probe <uid> --device <JLINK_DEVICE> --interface swd --speed 4000 --elf <flashed.elf>
 #   or: --hil-config <file> --board <name> --interface swd --speed 4000 --elf <flashed.elf>
 #   or, an openocd board: --hil-config <file> --board <name> --elf <flashed.elf> [--halt-samples N]
-#   --samples N (300), --interval-ms M, --raw FILE; DHCSR is read before and after,
-#   sentinel and no-PCSR samples are counted apart; exit 1 unless every sample came back
-#   DEMCR.TRCENA 0 is exit 1, no histogram
+#   --samples N (300), --interval-ms M, --raw FILE; CPUID, DHCSR and DEMCR are read first and DHCSR
+#   after (probe_state.py's sessions), sentinel and no-PCSR samples are counted apart; exit 1 unless
+#   every read came back; a core not M-profile or DEMCR.TRCENA 0 is exit 1, no histogram
 ```
 
 TRCENA is 0 after a power-on reset, and an ARMv6-M core reset clears it too; `DWT_PCSR` is then UNKNOWN (ARMv6-M/v7-M)
@@ -31,7 +31,7 @@ slept by itself, but a J-Link session does not leave that state alone: it halts 
 unless told `exec SetRestartOnClose = 0` (V9.78, verified 2026-10-16 stm32f407disco: DFSR.HALTED set after every plain
 session; a core found halted ran at the next session; with the setting, a running core stayed halted). An openocd HIL
 board (CMSIS-DAP) is sampled through `probe_state.py`'s OpenOCD session, which also reports the other cores' DHCSR.
-`--halt-samples N` is the explicit halting fallback for a single-core openocd board with no usable PCSR, its PCs
+`--halt-samples N` runs `probe_state.py`'s halting fallback (below) N times for a core with no usable PCSR, its PCs
 reported apart as halt reads (`--help`). ST-Link entries carry no OpenOCD configuration and are not covered.
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
@@ -46,18 +46,16 @@ python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [-
   [--verify <flashed.elf> | --verify <fw.bin> --base <flash addr>] \
   [--elf <flashed.elf> --read <symbol> ...] [--save <addr> <len> <new file> ...]
 #   exit 0 observed, 1 verify mismatch, 2 usage, 3 probe/tool failed, capture or save incomplete, wrong probe
-#   connected, core not M-profile, or a halt read left the core halted
+#   connected, core not M-profile, or the halting fallback failed or met a multi-core target
 ```
 
 - The script issues no configuration write; the connect does (PC-sampling above: the tools set TRCENA, OpenOCD also
   DHCSR.C_DEBUGEN), so `demcr` is the tool's value, not the firmware's. Each J-Link session also halts the core as it
   closes and restarts it (PC-sampling above), so a core it finds halted is running afterwards. Otherwise it halts only
-  with `--allow-halt`, when no sample was usable from a running core; over OpenOCD it refuses that on a multi-core
-  target, where the SMP halt stops every core and the resume fails for a core OpenOCD never polled, leaving it halted
-  (OpenOCD 0.12.0+dev-g0ce743125, `cortex_m_restore_smp`; RP2040 core1, verified 2026-10-16), and OpenOCD's resume error
-  is unreliable there in both directions, so judge each core by its DHCSR. Reads use J-Link `savebin` and OpenOCD
-  `dump_image`, never `verify_image`, whose checksum path writes its CRC loader into the target's work area first
-  (`armv7m_checksum_memory`), even on a running core.
+  in the halting fallback, `--allow-halt` (also `pc_sample.py --halt-samples`), when no sample was usable from a core
+  found running: single-core OpenOCD boards only, with recovery (rules in `--help`). Reads use J-Link `savebin` and
+  OpenOCD `dump_image`, never `verify_image`, whose checksum path writes its CRC loader into the target's work area
+  first (`armv7m_checksum_memory`), even on a running core.
 - `--budget`, `--read` and `--save` follow the rules in `--help` (which registers, which symbols, which address
   ranges). `reads.snapshot` is `false` on purpose: a running core changes memory between reads, and DHCSR before and
   after only says whether it ran. A save proves nothing about what restores the board, and a region read on a running
