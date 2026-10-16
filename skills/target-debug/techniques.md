@@ -12,36 +12,63 @@ which):
 ```bash
 python3 <skill dir>/scripts/pc_sample.py --probe <uid> --device <JLINK_DEVICE> --interface swd --speed 4000 --elf <flashed.elf>
 #   or: --hil-config <file> --board <name> --interface swd --speed 4000 --elf <flashed.elf>
+#   or, an openocd board: --hil-config <file> --board <name> --elf <flashed.elf> [--halt-samples N]
 #   --samples N (300), --interval-ms M, --raw FILE; DHCSR is read before and after,
 #   sentinel and no-PCSR samples are counted apart; exit 1 unless every sample came back
 #   DEMCR.TRCENA 0 is exit 1, no histogram
 ```
 
 TRCENA is 0 after a power-on reset, and an ARMv6-M core reset clears it too; `DWT_PCSR` is then UNKNOWN (ARMv6-M/v7-M)
-or 0xFFFFFFFF (Armv8-M). Set it from a debugger session before sampling (read DEMCR, `w4 E000EDFC` with bit 24 added);
-the script itself never writes.
+or 0xFFFFFFFF (Armv8-M). The probe tools set it at connect: J-Link Commander V9.78 (verified 2026-10-16 stm32f407disco:
+cleared by hand, held clear for 2 s with the core running, set again at the next connect) and OpenOCD, whose cortex_m
+examine replaces DEMCR with TRCENA plus its own vector-catch bits (`cortex_m.c` in 0.12.0+dev-g0ce743125). Through them
+it reads set; a tool that leaves it clear needs it set from a debugger session (read DEMCR, `w4 E000EDFC` with bit 24
+added). The script itself never writes.
 
 The histogram's top entries are the spin site; a flat histogram = core is servicing normally — and an idle loop has a
-hot spot of its own: learn it from a healthy run before reading a wedged one. A core halted from a JLinkExe session is
-running again once that session exits (Commander restores the run state it found; seen 2026-09-18 on RP2350), so the
-sentinel means the target halted or slept by itself. Native probes (ST-Link/CMSIS-DAP) are not covered by the script
-yet: repeat `mdw 0xE000101C` over OpenOCD's telnet :4444 by hand.
+hot spot of its own: learn it from a healthy run before reading a wedged one. The sentinel means the target halted or
+slept by itself, but a J-Link session does not leave that state alone: it halts the core when it closes and restarts it
+unless told `exec SetRestartOnClose = 0` (V9.78, verified 2026-10-16 stm32f407disco: DFSR.HALTED set after every plain
+session; a core found halted ran at the next session; with the setting, a running core stayed halted). An openocd HIL
+board (CMSIS-DAP) is sampled through `probe_state.py`'s OpenOCD session, which also reports the other cores' DHCSR.
+`--halt-samples N` is the explicit halting fallback for a single-core openocd board with no usable PCSR, its PCs
+reported apart as halt reads (`--help`). ST-Link entries carry no OpenOCD configuration and are not covered.
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
 
 One JSON object of what the probe sees on a Cortex-M board, with the board lock already held (the script takes none):
-CPUID, DHCSR before and after, DEMCR, N `DWT_PCSR` samples, and with `--verify` the image's address ranges read back and
-compared on the host:
+CPUID, DHCSR before and after, DEMCR, N `DWT_PCSR` samples, and on request the breakpoint budget, static variables read
+through the ELF, raw regions saved to files, and the image's address ranges read back and compared on the host:
 
 ```bash
 python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [--interface swd --speed 4000] \
-  [--samples N] [--interval-ms M] [--allow-halt] [--verify <flashed.elf> | --verify <fw.bin> --base <flash addr>]
-#   exit 0 observed, 1 verify mismatch, 2 usage, 3 probe/tool failed or core not M-profile
+  [--samples N] [--interval-ms M] [--allow-halt] [--budget] \
+  [--verify <flashed.elf> | --verify <fw.bin> --base <flash addr>] \
+  [--elf <flashed.elf> --read <symbol> ...] [--save <addr> <len> <new file> ...]
+#   exit 0 observed, 1 verify mismatch, 2 usage, 3 probe/tool failed, capture or save incomplete, wrong probe
+#   connected, core not M-profile, or a halt read left the core halted
 ```
 
-- It writes nothing to the target and halts only with `--allow-halt`, when no sample was usable from a running core.
-  `--verify` reads memory back (J-Link `savebin`, OpenOCD `dump_image`) rather than run `verify_image`, whose checksum
-  path writes its CRC loader into the target's work area first (`armv7m_checksum_memory`), even on a running core.
+- The script issues no configuration write; the connect does (PC-sampling above: the tools set TRCENA, OpenOCD also
+  DHCSR.C_DEBUGEN), so `demcr` is the tool's value, not the firmware's. Each J-Link session also halts the core as it
+  closes and restarts it (PC-sampling above), so a core it finds halted is running afterwards. Otherwise it halts only
+  with `--allow-halt`, when no sample was usable from a running core; over OpenOCD it refuses that on a multi-core
+  target, where the SMP halt stops every core and the resume fails for a core OpenOCD never polled, leaving it halted
+  (OpenOCD 0.12.0+dev-g0ce743125, `cortex_m_restore_smp`; RP2040 core1, verified 2026-10-16), and OpenOCD's resume error
+  is unreliable there in both directions, so judge each core by its DHCSR. Reads use J-Link `savebin` and OpenOCD
+  `dump_image`, never `verify_image`, whose checksum path writes its CRC loader into the target's work area first
+  (`armv7m_checksum_memory`), even on a running core.
+- `--budget`, `--read` and `--save` follow the rules in `--help` (which registers, which symbols, which address
+  ranges). `reads.snapshot` is `false` on purpose: a running core changes memory between reads, and DHCSR before and
+  after only says whether it ran. A save proves nothing about what restores the board, and a region read on a running
+  core is not coherent. The address rule is architectural: a vendor device mapped inside Code, SRAM or RAM is yours to
+  avoid. RP2040's XIP region is refused (its controller registers have read side effects); flash verification there is
+  `rp2040_verify.py`'s.
+- `connection` is the probe the tool actually connected to (J-Link serial and VTref, CMSIS-DAP serial, ST-Link target
+  voltage); a J-Link whose serial is not the requested one ends the run. `otherProbeClients` lists probe tools in the
+  process list as a possible conflict, not as proof that the probe is free, and never replaces the lock. OpenOCD boards
+  report each core's DHCSR before and after as `cores`, judged from the register since OpenOCD's own state stays
+  `unknown` until it polls; reading another core's DHCSR clears its sticky bits.
 - `pcsr.status`: `sampled`; `no-address` (only 0xFFFFFFFF or 0: halted, address unavailable, or non-invasive debug not
   permitted); `not-implemented` (all 0: RAZ, a core built without PCSR); `dwt-disabled` (DEMCR bit 24 clear: the values
   are UNKNOWN, Armv8-M returns 0xFFFFFFFF). On ARMv6-M (M0, M0+, M1) PCSR is implementation defined (ARMv6-M ARM book
@@ -92,23 +119,19 @@ per the **rtt** skill (servers per probe, transport matrix, control-block gotcha
 ```bash
 # RTT (J-Link probe; flash + reset first — the console owns the probe):
 python3 <rtt skill dir>/scripts/rtt.py --backend jlink --probe <sn> --device <JLINK_DEVICE> --interface swd --speed auto --seconds 20 > /tmp/rtt.log
-# UART (board's debug serial, if wired; name it by /dev/serial/by-id or by-path; opening a port can reset an
-#   Espressif chip through DTR/RTS: espressif.md "Console"):
-timeout 20s python3 -c '
-import os, sys, termios, tty
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
-tty.setraw(fd, termios.TCSANOW)
-a = termios.tcgetattr(fd); a[4] = a[5] = termios.B115200
-termios.tcsetattr(fd, termios.TCSANOW, a)
-while chunk := os.read(fd, 4096):
-    sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
-' /dev/serial/by-id/<port> | tee /tmp/uart.log
 ```
 
-A separate `stty` can race another client's terminal setup, and the settings are shared: the reader configures its own
-fd with `TCSANOW` (the default `TCSAFLUSH` waits for a concurrent writer's output to drain and discards unread input);
-coordinate later changes between clients (a capture stopped at 4095 bytes, a reader blocked behind the CDC writer:
-2026-10-16, P4 and S31).
+A UART console (the board's debug serial, if wired) goes through `console_capture.py` (`--help`):
+
+```bash
+python3 <skill dir>/scripts/console_capture.py --port /dev/serial/by-id/<port> --baud 115200 --seconds 20 \
+  --lines low --out <new file> [--mark '<reset banner regex>']
+```
+
+Opening a port raises DTR and RTS, which can reset an Espressif chip (`espressif.md`, "Console"): `--mark` reports
+where a reset banner shows up, so a reset at the open is measured rather than assumed. Clients share the port's
+settings and its input: a second reader takes bytes from the first, and changes to the settings need coordinating (a
+capture stopped at 4095 bytes, a reader blocked behind the CDC writer: 2026-10-16, P4 and S31).
 
 A UART write path costs what its driver does: a polled driver blocks only while the TX FIFO is full, an interrupt-driven
 ring blocks only when the ring is full, and a console that drops when the host does not drain waits as long as its
@@ -127,16 +150,20 @@ answers "what ran right before this hang".
 ## USB: dual-side capture — the default for enumeration/transfer bugs
 
 Capture both ends at once: usbmon plus a target channel when a Linux PC is the host; an MCU host has no usbmon on either
-end, so target channel plus the wire (`usb-sniffer`), plus `usb-kernel-debug` on a Linux gadget peer. Start both
-channels, then trigger the failing test (Linux-PC-host shown; MCU host: swap usbmon for `usb-sniffer`, +
-`usb-kernel-debug` on a Linux gadget peer):
+end, so target channel plus the wire (`usb-sniffer`), plus `usb-kernel-debug` on a Linux gadget peer. `dual_capture.py`
+runs both under one backstop bound and reports when each ran (`--help`); each tool keeps its own duration. Each side is
+an argv file, a JSON list:
 
 ```bash
-<usb-kernel-debug skill dir>/scripts/usbcap.py <bus> 30 /tmp/host.pcapng & cap=$!   # host URBs; the board's bus — a VID: selector spanning buses is refused
-python3 <rtt skill dir>/scripts/rtt.py --backend jlink --probe <sn> --device <dev> --interface swd --speed auto --seconds 30 > /tmp/target.rtt & rtt=$!  # target (rtt skill; or ring dump after)
-wait $cap; rc_cap=$?; wait $rtt; rc_rtt=$?   # `wait $cap && wait $rtt` would skip the rtt wait when cap failed
-[ $rc_cap -eq 0 ] && [ $rc_rtt -eq 0 ]       # a bare `wait` returns 0 even when one side failed
+echo '["python3", "-u", "<usb-kernel-debug skill dir>/scripts/usbcap.py", "<bus>", "30", "host.pcapng"]' > host.json
+echo '["python3", "<rtt skill dir>/scripts/rtt.py", "--backend", "jlink", "--probe", "<sn>", "--device", "<dev>",
+      "--interface", "swd", "--speed", "auto", "--seconds", "30"]' > target.json
+python3 <skill dir>/scripts/dual_capture.py --a host=host.json --b target=target.json --timeout 40 --out <new dir>
 ```
+
+Trigger the failing test once both sides show they are capturing in their own output (usbcap prints its start line;
+a Python side needs `-u` for that line to reach its file before it exits).
+usbcap takes the board's bus; a VID: selector spanning buses is refused.
 
 RTT lines and ring events carry no wall-clock: correlate on unambiguous anchors — bus reset, SET_ADDRESS, the first
 transfer on the failing EP — then lay device events between anchors in host-URB order. Logging the SOF/frame number on

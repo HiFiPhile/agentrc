@@ -37,7 +37,9 @@ failed to allocate its bounce buffer and left the core halted.
 Connect with the matching toolchain's GDB (`arm-none-eabi-gdb <flashed.elf>` for ARM), then `target remote :2331` for
 J-Link or `target remote :3333` for OpenOCD (`target extended-remote` keeps the server across a detach, used in
 `espressif.md`). For an autopsy, use `monitor halt`; for a fresh start only, use `monitor reset halt`, `load`, then
-`continue`.
+`continue`. On RP2040, start openocd with `-c 'gdb memory_map disable'` for anything but flashing: building gdb's memory
+map probes the flash through ROM calls that leave XIP off (`rp2xxx.c` in 0.12.0+dev-g0ce743125), and the core resumed
+after that faulted into lockup (verified 2026-10-16 raspberry_pi_pico).
 
 Script JLinkGDBServer sessions with `-singlerun` — the server exits with the connection, and back-to-back relaunches
 race the probe handle and hang. Symbols need the firmware's DWARF: check the project's release configuration keeps it.
@@ -58,12 +60,32 @@ watch  <port's transfer bookkeeping field>  # HW watchpoint (Cortex-M: ~4; Espre
 break <the USB ISR>                         # works, but see warning below
 ```
 
-**Hardware budget — read it off the chip** (Cortex-M FPB/DWT, verified: F407/M4 = 6 bp + 4 wp, rp2040/M0+ = 4 + 2; M7
-typically 8/4; Espressif: `espressif.md`, Attach, "Breakpoint budgets"):
+On a Cortex-M rig board, `autopsy.py` runs the read-only part of this as one bounded session and checks that each core
+is left as found (`--help`); `--out` keeps gdb's values (`gdb.log`), its errors (`gdb.err`) and the server's log:
+
+```bash
+python3 <skill dir>/scripts/autopsy.py --hil-config <file> --board <name> [--interface swd --speed 4000] \
+  --elf <flashed.elf> --out <new dir> [--expr '<state table>' ...] [--dump <addr> <len> <new file> ...]
+#   exit 0 done and the end state as found, 1 an expression or dump failed, 2 usage, 3 probe, server or gdb
+#   session failure, interrupted, or a core not left as found
+```
+
+Both servers halt at attach (openocd's `gdb-attach` default is `halt 1000`) and neither resumes at detach; openocd's
+gdb connect also removes every breakpoint and watchpoint (`gdb_server.c` in 0.12.0+dev-g0ce743125). A JLinkGDBServer
+started with `-singlerun` exits at the detach, and its close restarts the core unless
+`monitor exec SetRestartOnClose = 0` came first (the J-Link close behaviour in `techniques.md`, PC-sampling). An SMP
+`monitor resume` restored both RP2040 cores only after `monitor foreach t [target names] {$t arp_poll}`; without it
+core1 stayed halted and openocd's next poll halted core0 again (verified 2026-10-16 raspberry_pi_pico). An openocd
+server did not stop on SIGINT there; SIGTERM stopped it.
+
+**Hardware budget — read it off the chip** (Cortex-M FPB/DWT, verified with `--budget` 2026-10-16: F407/M4 = 6 bp + 4
+wp, F723 and RT1064/M7 = 8 + 4, rp2040/M0+ and F072/M0 = 4 + 2; Espressif: `espressif.md`, Attach, "Breakpoint
+budgets"): `probe_state.py --budget` reads both without halting (`techniques.md`, "Probe state"); from an open gdb
+session:
 
 ```gdb
 p ((*(unsigned*)0xE0002000)>>4) & 0xF   # FPB NUM_CODE = hw breakpoints (M7 adds bits[14:12])
-p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparators
+p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparators (UNKNOWN while DEMCR.TRCENA is 0)
 ```
 
 - `hbreak`/`thbreak` force a hardware breakpoint (software breaks in flash need flash-breakpoint support — J-Link has
@@ -100,10 +122,12 @@ p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparat
   files + `SetMonModeDebug=1`; not set up here: <https://kb.segger.com/Monitor_Mode_Debugging> (untested).
 
 While halted the device answers **nothing**: host control transfers time out in ~5 s and the OS may reset/re-enumerate —
-after `continue`, the bus traffic shows recovery, not the original bug. Prefer one halt for a post-mortem dump over
-stepping through live USB traffic. When the probe shares that host, the stalled enumeration can block it too: halting
-pico2_etm_trace stalled the host's enumeration for ~30 s (`device not accepting address`, error -62) and JLinkExe
-blocked at "Connecting to J-Link" meanwhile. verified 2026-09-18.
+after `continue`, the bus traffic shows recovery, not the original bug. A bus-powered board may not stay halted at all:
+Linux's hub driver, failing to enumerate it, logged `attempt power cycle` and power-cycled the port, which rebooted the
+board about 35 s after the halt (verified 2026-10-16 raspberry_pi_pico on ci.lan; DHCSR then read running). Prefer one
+halt for a post-mortem dump over stepping through live USB traffic. When the probe shares that host, the stalled
+enumeration can block it too: halting pico2_etm_trace stalled the host's enumeration for ~30 s (`device not accepting
+address`, error -62) and JLinkExe blocked at "Connecting to J-Link" meanwhile. verified 2026-09-18.
 
 ## J-Link Commander sessions
 
@@ -111,6 +135,7 @@ blocked at "Connecting to J-Link" meanwhile. verified 2026-09-18.
   halted: resume it from a new session. verified 2026-10-12 mimxrt1060_evk.
 - `JLinkExe` can crash in `libjlinkarm` at the probe connect, before the target connect (SIGSEGV; once a glibc
   double-free abort); the cause is unknown. verified 2026-10-12 htpc, mimxrt1060_evk: 2 of 94 sessions of TinyUF2's HIL
-  runner.
+  runner; 2026-10-16 ci.lan, stm32f407disco's J-Link OB, V9.78: a double-free abort then a SIGSEGV on consecutive
+  sessions, the next ones clean. A script driving it reports the crash and retries nothing; rerun the session.
 - Keep the probe off the hub of a device that hangs mid-write: the xHCI keeps retrying its enumeration, and a J-Link
   there stalled for ~80 s. verified 2026-10-12 lpcxpresso55s69 (that the hub is the cause is a hypothesis).

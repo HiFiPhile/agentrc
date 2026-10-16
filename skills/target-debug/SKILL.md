@@ -48,8 +48,8 @@ A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it 
 | `vid_pid`       | the probe model's USB IDs, openocd only | `--vid-pid` |
 
 A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and `--speed` stay explicit; on
-the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` takes J-Link entries only;
-`probe_state.py` reads only the HIL config and takes `jlink` and `openocd` entries. `etm_capture.py` does not read it —
+the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` and `probe_state.py` take
+`jlink` and `openocd` entries; `probe_state.py` reads only the HIL config. `etm_capture.py` does not read it —
 a J-Trace is one probe moved between boards, named with `--probe`.
 
 ## Delegated sessions
@@ -91,10 +91,9 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
   in `runs` and counts toward the repetition ceiling; a state read or run-state observation that does not invoke the
   reproducer costs time, not a repetition. A `runs` row aggregates identical attempts and splits where purpose,
   firmware, conditions or outcome differ. An early decisive observation may settle the claim; otherwise a shortened
-  capture is partial evidence and cannot establish a pass that needs the full exposure. Anchor every state reading with
-  the backend's validity check (Cortex-M: DHCSR; Espressif: a console banner baseline taken at port open, before the
-  attach, `espressif.md`, Attach, Anchors) and record whether attaching halted or reset the target; a post-reset
-  snapshot is never the failure state.
+  capture is partial evidence and cannot establish a pass that needs the full exposure. Anchor every state reading as
+  Warnings, "A register snapshot without a validity anchor lies", says, and record whether attaching halted or reset the
+  target; a post-reset snapshot is never the failure state.
 - **Host.** Leave the host as found: never clear kernel logs (`dmesg -C`) or other shared history, and restore every
   setting you change (dynamic debug, module parameters). Anchor kernel-log reads on raw kernel timestamps
   (`dmesg --time-format raw`) and take the clock mapping from a kernel event you caused at a known wall time: line
@@ -126,9 +125,9 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
 
 ## Rig discipline — lock first, always
 
-On a shared rig, an ordinary session holds the project's board lock for the WHOLE manual session (instrument, build,
-flash, capture, GDB), forcing it only under a scoped forced-lock recovery (Delegated sessions' Lock), and never stops
-its CI runner. Rigs and benches run many identical probes:
+The board lock rules are Delegated sessions' Lock, for a manual session too: held for the WHOLE session (instrument,
+build, flash, capture, GDB), forced only under a scoped forced-lock recovery, the CI runner never stopped. Rigs and
+benches run many identical probes:
 
 - Select the probe by serial: J-Link `-SelectEmuBySN <uid>`, its GDB server `-select usb=<uid>`, OpenOCD
   `-c 'adapter serial <uid>'`; a probe without one by `adapter usb location` (`espressif.md`, Attach).
@@ -158,20 +157,22 @@ The Core column says where a technique exists; a row that names a core family do
 
 Each technique's recipe, read when you reach for it (files beside this one):
 
-- PC-sampling: `techniques.md`, "PC-sampling" — `pc_sample.py`, reading the histogram, native probes by hand.
-- Probe-state snapshot (DHCSR anchor, PCSR samples, image read-back for Cleanup's verification): `techniques.md`, "Probe
-  state" — `probe_state.py`.
+- PC-sampling: `techniques.md`, "PC-sampling" — `pc_sample.py` over J-Link or OpenOCD, reading the histogram, the
+  explicit halting fallback for a core without a usable PCSR.
+- Probe-state snapshot (DHCSR anchor, PCSR samples, breakpoint budget, symbol reads, region saves, image read-back for
+  Cleanup's verification): `techniques.md`, "Probe state" — `probe_state.py`.
 - SWO exception trace, hardware PC-sampling, DWT data trace: `swo-dwt.md`.
 - Vector catch and the fault registers: `fault-autopsy.md`.
 - RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code, the `nm` check, the GDB dump.
 - SystemView: the project's `sysview` skill.
-- Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands, the drain model; the channel itself is the
-  `rtt` skill's.
+- Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands (`console_capture.py` for a UART), the drain
+  model; the channel itself is the `rtt` skill's.
 - Chip and family constraints (flash reads, reset domains, probe misreads): `families.md`; Espressif chips:
   `espressif.md`.
-- dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch sessions, the hardware breakpoint budget,
-  watchpoints, FreeRTOS threads, J-Link Commander quirks.
-- USB enumeration or transfer bugs: capture both sides at once by default — `techniques.md`, "USB: dual-side capture".
+- dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch sessions, the halted autopsy
+  (`autopsy.py`), the hardware breakpoint budget, watchpoints, FreeRTOS threads, J-Link Commander quirks.
+- USB enumeration or transfer bugs: capture both sides at once by default — `techniques.md`, "USB: dual-side capture"
+  (`dual_capture.py`).
 - Manuals (J-Link UM08001, OpenOCD, GDB): `techniques.md`, "Manuals".
 
 ## Warnings
@@ -180,17 +181,15 @@ Each technique's recipe, read when you reach for it (files beside this one):
   pull-up, the host's stuck URBs stay stuck and a wedged DUT stays wedged — recover the Linux host side (the rig's own
   procedure; its HIL contract names it). A probe reset disconnects only when the reset it issues reaches the USB
   controller or its PHY: check the part (`families.md`: DWC2, STM32F4).
-- **A bug that vanishes under logging is not fixed**: treat it as timing-sensitive until the ring buffer reproduces it,
-  and if it vanishes under GDB too, move down to PC-sampling; the added code's own effect on stack, layout and ordering
-  is the alternative to rule out.
+- **A bug that vanishes under logging is not fixed**: timing-sensitive until the ring buffer reproduces it, and the
+  added code's own effect on stack, layout and ordering is the alternative to rule out.
 - **A logging write path that polls a full FIFO blocks** (worst perturbation, including inside the ISR; which driver
   does what: `techniques.md` "Log capture", `espressif.md` "Console"); RTT is much cheaper but not free; verbose logging
   multiplies both.
 - **`pkill -f PATTERN` matches its own caller**: the pattern is in your shell's (or ssh's) command line, so it kills the
   command running it. Bracket one character (`pkill -f '[J]LinkGDBServer'`) or kill by PID; an openocd-esp32 server is
   ended with `shutdown`, never killed (`espressif.md`, Attach).
-- Flash/GDB only with the board lock held; a hold refused because CI is mid-test on that board means wait, and force
-  only under an explicitly scoped forced-lock recovery (Delegated sessions' Lock).
+- Flash/GDB only with the board lock held (Delegated sessions' Lock: a refused hold means wait, never force).
 - **Instrumentation is temporary**: before `release`, restore the pinned restoration firmware or cleanup state as
   Delegated sessions' Cleanup says (the next CI run must not inherit a debug build) and revert the instrumentation diff.
   Handing the diff over with the diagnosis preserves the evidence; it does not count as cleanup.
@@ -199,12 +198,12 @@ Each technique's recipe, read when you reach for it (files beside this one):
   DHCSR (0xE000EDF0: bit 17 S_HALT, bit 25 S_RESET_ST) with every snapshot; Espressif: `espressif.md`, Attach, Anchors,
   since the USB device number survives a core reset there. Cross-check against something the device demonstrably still
   does.
-- **"Flash OK" can lie** (silent no-op — old firmware keeps running). When behavior contradicts the flashed code:
-  `objcopy -O binary fw.elf /tmp/fw.bin`, then `verifybin /tmp/fw.bin,<flash-base>` (J-Link, verified) or `verify_image`
-  (OpenOCD); on mismatch reflash before debugging further. Espressif: `esptool verify-flash` with the image and offset
-  from the build's `flasher_args.json` (`espressif.md`), never the objcopy output, since the flashed image is esptool's
-  `elf2image` output. Some targets need a particular halt state before flash reads (RP2040: a flash-resident halt);
-  `families.md` has them.
+- **"Flash OK" can lie** (silent no-op — old firmware keeps running). When behavior contradicts the flashed code, read
+  the image back: `probe_state.py --verify <flashed.elf>` (J-Link and OpenOCD boards, `techniques.md` "Probe state"), on
+  RP2040 `rp2040_verify.py` instead, since its flash reads need a flash-resident halt that `probe_state.py` does not
+  establish (`families.md`); on mismatch reflash before debugging further. Espressif: `esp_verify.py` over the build's
+  `flasher_args.json` (`espressif.md`, "After an abnormal end"), never an objcopy of the ELF, since the flashed image is
+  esptool's `elf2image` output.
 - **A marginal link can fake a deterministic firmware bug** — down to failing the same test at the same iteration twice.
   "USB disconnect" in dmesg on a freshly re-cabled port (high devnum = churn) points at the plug before the code: first
   sustained bulk traffic is when a bad contact drops. Before declaring a regression, re-run the OLD build on the SAME

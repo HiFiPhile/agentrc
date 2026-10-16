@@ -12,9 +12,9 @@ board, firmware and tools it names.
 | Chip      | Cores            | gdb                      | JTAG route and config | Breakpoints ("Breakpoint budgets") | JTAG while the firmware's USB runs | Flash, reset, console on the measured boards | Bootloader offset |
 | --------- | ---------------- | ------------------------ | --- | --- | --- | --- | --- |
 | ESP32-S2  | Xtensa LX7, 1    | `xtensa-esp32s2-elf-gdb` | pads only; Kaluga: its FT2232HL, `-f interface/ftdi/esp32s2_kaluga_v1.cfg -c 'adapter usb location <loc>' -f target/esp32s2.cfg` | 2 instruction + 2 data; the third `hbreak` refused; data breakpoints untested | pads | Kaluga: UART by `by-path` for flash and console | 0x1000 |
-| ESP32-S3  | Xtensa LX7, 2    | `xtensa-esp32s3-elf-gdb` | USJ `board/esp32s3-builtin.cfg` only until the app starts OTG; pads `board/esp32s3-ftdi.cfg` once the eFuses route them | 2 + 2; the third refused (Metro); data breakpoints untested | no over the USJ on the measured internal-PHY boards, yes over pads | DevKitC-1: CP2102N (UART0, EN, boot strap); Metro: images over JTAG, UART0 on a header only | 0x0 |
+| ESP32-S3  | Xtensa LX7, 2    | `xtensa-esp32s3-elf-gdb` | USJ `board/esp32s3-builtin.cfg` only until the app starts OTG; pads `board/esp32s3-ftdi.cfg` once the eFuses route them | 2 + 2; the third refused (Metro, with and without the end-of-stack watchpoint); data breakpoints untested | no over the USJ on the measured internal-PHY boards, yes over pads | DevKitC-1: CP2102N (UART0, EN, boot strap); Metro: images over JTAG, UART0 on a header only | 0x0 |
 | ESP32-P4  | RISC-V HP 2 + LP | `riscv32-esp-elf-gdb`    | USJ `board/esp32p4-builtin.cfg -c 'adapter serial <MAC>'` | 3 triggers per HP core, breakpoints and watchpoints shared; firmware may hold one; watchpoint insertion untested | yes, USJ and HS OTG on their own PHYs | Function-EV: USJ CDC or the CP2102N on J20 for flash and reset; the 2026-10-16 runs captured the console on the USJ CDC | 0x2000 |
-| ESP32-S31 | RISC-V HP 2 + LP | `riscv32-esp-elf-gdb`    | USJ `board/esp32s31-builtin.cfg -c 'adapter serial <MAC>'` | 4 triggers per HP core, all four inserted; coexistence with a firmware watchpoint unchecked | yes | CoreBoard: USJ CDC for flash, reset and console (its CP2102N receive path was unusable, 2026-10-14) | 0x2000 |
+| ESP32-S31 | RISC-V HP 2 + LP | `riscv32-esp-elf-gdb`    | USJ `board/esp32s31-builtin.cfg -c 'adapter serial <MAC>'` | 4 triggers per HP core, all four inserted; coexistence with a firmware watchpoint unmeasured, its attach panicking ("The end-of-stack watchpoint") | yes | CoreBoard: USJ CDC for flash, reset and console (its CP2102N receive path was unusable, 2026-10-14) | 0x2000 |
 
 Pins, PHYs and their citations: "The USB ports per chip". The bootloader offset is the ROM's
 (`ESP_ROM_BOOTLOADER_OFFSET_FLASH` in IDF's `components/esp_rom/<chip>/esp_rom_caps.h`). Board wiring, recovery and what
@@ -87,6 +87,16 @@ openocd -c 'set ESP_FLASH_SIZE 0' -c 'set ESP_RTOS FreeRTOS' \
 (gdb) continue
 ```
 
+`esp_session.py` runs the read-only part as one bounded session and ends it the way Leave says even when gdb dies
+(`--help`; runs in `projects/tinyusb.md`):
+
+```bash
+python3 <skill dir>/scripts/esp_session.py inspect --out <new dir> --board-cfg board/<chip>-builtin.cfg \
+  --adapter-serial <MAC> --rtos FreeRTOS --gdb <arch gdb> --elf <flashed.elf> --anchor <console capture> [--expr ...]
+#   budget: --at <location> ... instead of --expr; recover: the route only (init; shutdown);
+#   a server left running after exit 3: leave --receipt <out>/receipt.json
+```
+
 - Server initialization examines the cores and leaves them running (S2, S3, P4, S31 measured 2026-10-16); a telnet
   `halt` or the gdb connect halts them. Keep the three apart in a record: examination, gdb connect and a deliberate halt
   each change state differently.
@@ -111,7 +121,8 @@ openocd -c 'set ESP_FLASH_SIZE 0' -c 'set ESP_RTOS FreeRTOS' \
 ### Breakpoint budgets
 
 Count from the target's own evidence; nothing carries across chips. The probe procedure (`always-inserted`, where the
-refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s.
+refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s; `esp_session.py budget --at <location> ...` runs it
+with the cleanup outside gdb (builds without the end-of-stack watchpoint, 2026-10-16: P4 exactly 3, S31 exactly 4).
 
 - RISC-V: openocd prints `Found N triggers` per core (P4: 3, which TRM 6567 §2.11.3.2 p161 says, and once "four"; S31:
   4), breakpoints and watchpoints share them, and firmware can hold one (the end-of-stack watchpoint held one of the
@@ -157,16 +168,19 @@ refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s.
 
 In this order, since an esptool reset before the first step started the boot loop (P4 and S31, 2026-10-16):
 
-1. A fresh openocd `init; shutdown`, after a killed openocd and after a `shutdown` that logged "could not remove
-   watchpoint" errors. `shutdown` is meant to clear the debug module (`esp_common.cfg:340-343` writes DM control 0 as a
-   pre-shutdown command), yet on both the P4 and the S31 such a shutdown was followed, at the next esptool reset, by the
-   Breakpoint reboot loop until `init; shutdown` ended it; the residual state was not established.
-2. Verify the build image through a non-writing route before reprogramming:
-   `esptool --chip <c> --port /dev/serial/by-id/<port> verify-flash <offset> <bin>`, image and offset from the build's
-   `flasher_args.json`, never an objcopy of the ELF (verified 2026-10-15 P4, S2); without such a port (Metro S3), report
-   verification pending, or restore and verify the pinned image under `SKILL.md`'s Delegated sessions, Cleanup. With
-   flash support off the known writer, the flash-breakpoint fallback, is absent; that does not stand in for the
-   verification Cleanup requires.
+1. A fresh openocd `init; shutdown` (`esp_session.py recover`), after a killed openocd and after a `shutdown` that
+   logged "could not remove watchpoint" errors. `shutdown` is meant to clear the debug module (`esp_common.cfg:340-343`
+   writes DM control 0 as a pre-shutdown command), yet on both the P4 and the S31 such a shutdown was followed, at the
+   next esptool reset, by the Breakpoint reboot loop until `init; shutdown` ended it; the residual state was not
+   established.
+2. Verify the build image through a non-writing route before reprogramming: `esp_verify.py --manifest
+   <build>/flasher_args.json --chip <c> --port /dev/serial/by-id/<port> --before <reset> --after <reset>` (`--help`),
+   never an objcopy of the ELF. A failure before esptool's command runs (the connect, a wrong `--chip`, the stub upload)
+   can leave the chip in the ROM loader, since esptool skips `--after` then (the report's `chipState`; the P4 came back
+   on a reset from the USJ's lines, 2026-10-16). Without such a port, use a forced download boot where the board has one
+   (the Metro S3: "ESP32-S3"), else report verification pending, or restore and verify the pinned image under
+   `SKILL.md`'s Delegated sessions, Cleanup. With flash support off the known writer, the flash-breakpoint fallback, is
+   absent; that does not stand in for the verification Cleanup requires.
 3. Reset or reflash as the cleanup requires ("Resets").
 
 ### The end-of-stack watchpoint (RISC-V)
@@ -184,6 +198,11 @@ v1.0) and espressif_s31_function_core with tinyusb cdc_msc_freertos ea1d867ce (w
   that reset is unresolved. An earlier stock-build attach on the P4 (2026-10-15) had been clean (`projects/tinyusb.md`).
 - The watchpoint held one of the P4's three triggers (inferred from matched builds, `projects/tinyusb.md`); the S31
   inserted four either way, with concurrent allocation unchecked, so why it shows no shortfall is open.
+- Through `esp_session.py` (S31, 2026-10-16) two attaches of two panicked at the examination: cpu0 halted in the
+  semihosting call of `esp_cpu_set_breakpoint` (`cpu.c:91`) after the panic handler's "Setting breakpoint at <pc> and
+  returning". The session ended with both cores running, and the next attach, 8 s later, found both halted (when and why
+  they halted is not established; the panic handler's breakpoint is the likely cause). Its budget, exactly 4, was taken
+  in that state, so it does not measure coexistence with the watchpoint.
 - After `shutdown`, the next esptool reset started the Breakpoint boot loop ("After an abnormal end").
 
 The same example rebuilt with the option off, same boards, tools and recipe, passed every criterion of the recipe
@@ -193,8 +212,8 @@ traffic with no kernel message, and a clean `shutdown` with the device still ans
 not bound the panic rate. The S2 and S3 runs with the option on showed neither the attach panics nor the service loss:
 on Xtensa the watchpoint is a register write (`cpu.c:146`), which openocd's `wp` does not list since it shows the
 watchpoints openocd set. To build an IDF app without it: `idf.py reconfigure` creates the project's `sdkconfig` (IDF 6.1
-`project.cmake:104`; a project may set `SDKCONFIG` elsewhere, `projects/`); set the option to `n` there, then
-`idf.py build` (a project's `sdkconfig.defaults` only seeds that file).
+`project.cmake:104`; a project may set `SDKCONFIG` elsewhere, `projects/`); set the option to `n` there, then `idf.py
+build` (a project's `sdkconfig.defaults` only seeds that file).
 
 ## Resets
 
@@ -228,14 +247,16 @@ back as reset cause 1, power-on (Metro, 2026-10-16).
   `CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG` (boot log and `ESP_LOG*` also on the USJ CDC). Name ports by
   `/dev/serial/by-id` or `by-path`, never `ttyACM<N>`/`ttyUSB<N>`, which drift within one boot. The capture recipe is
   `techniques.md` "Log capture".
-- Opening the USJ CDC, a CP2102N or an ESP-Prog channel B wired to EN with DTR/RTS asserted can reset the chip: set the
-  control lines before opening, as the capture tool allows, and still expect one: a pyserial open of the USJ CDC with
-  `dtr=rts=False` set before `open()` reset the P4 and the S31 (`rst:0x17 CHIP_USB_UART_RESET`, 2026-10-16). Open it
-  before the baseline (Attach, "Before attaching").
+- Opening the USJ CDC, a CP2102N or an ESP-Prog channel B wired to EN can reset the chip, since Linux raises DTR and RTS
+  at every open: measure it (`console_capture.py --mark 'rst:0x[0-9a-f]+'`, `techniques.md` "Log capture") rather than
+  assume either way, and open before the baseline (Attach, "Before attaching"). A pyserial open of the USJ CDC with
+  `dtr=rts=False` set before `open()` reset the P4 and the S31 (`rst:0x17 CHIP_USB_UART_RESET`); `console_capture.py`
+  opens reset neither, nor the Metro S3 through ESP-Prog channel B (2026-10-16).
 - openocd on the USJ's JTAG interface and a console on its CDC coexist: every 2026-10-16 P4 and S31 attach ran with the
   console open.
 - The USJ CDC is a console only while the USJ exists (on the measured S3 boards it disappears when the firmware starts
-  USB, "ESP32-S3"), and when a reset makes the USJ re-enumerate, the capture misses the beginning of the boot log.
+  USB, "ESP32-S3"), and when a reset makes the USJ re-enumerate, the capture misses the beginning of the boot log. A
+  USJ-driven reset of the P4 (DTR low with RTS high) did not: the open capture kept the whole ROM banner (2026-10-16).
 
 ### Console perturbation
 
@@ -318,14 +339,19 @@ under Attach and in `projects/tinyusb.md`.
 - Metro ESP32-S3 rev B (`DIS_USB_JTAG` burned 2026-10-15; from its rev B schematic through `read-pcb`): Cortex 2x5
   header X2 = pad JTAG, ESP-Prog cable pin-compatible, X2 pin 10 = EN; IO39/42 shared with the ICSP header and the
   microSD socket, IO40/41 are the D1/D0 header pins; UART0 only on header JP2, pin 1 TXD0, no USB-UART bridge. Under an
-  OTG app esptool has no port to this board: images go over JTAG (`program_esp`, "Verify OK" on 2026-10-16).
+  OTG app esptool has no onboard port to this board: images go over JTAG (`program_esp`, "Verify OK" on 2026-10-16). An
+  external UART on JP2, here ESP-Prog channel B, has EN but not IO0 (`--before default-reset` boots the app: "Wrong boot
+  mode detected (0x8)"), so verification goes through a forced download boot: over JTAG, halt, set `FORCE_DOWNLOAD_BOOT`
+  ("Reset domains") and `reset run`; then `esp_verify.py --before no-reset --after hard-reset` on channel B matched
+  every image (esptool 5.5.0). Its hard reset clears the bit but pulses RTS with DTR still asserted from the open, so EN
+  stays high and the chip stays in the loader: pulse EN afterwards (RTS asserted, DTR deasserted).
 - ESP-Prog on the Metro: `board/esp32s3-ftdi.cfg`, `adapter serial <FTDI EEPROM serial>`, JTAG PWR SEL and PROG PWR SEL
   on 3.3 V. Its JTAG header carries no reset (pin 10 NC, so X2 pin 10 EN stays unconnected; guide book 6576 p10), and
   `ESP_EN` on PROG pin 1 also gates the probe's own JTAG buffers through an inverter, with its pull-up R7 drawn NC
   (guide p14: R7 in Fig. 7, the inverter and buffers in Fig. 8): wire PROG pin 1 to the board's EN. On that FT2232
   channel B UART (`if01`) RTS asserted with DTR deasserted pulls EN low (measured; matches the guide's Fig. 7 table,
-  p14), and opening the port reset the chip once even with `dtr=rts=False` set before and after the open. PROG pin 5
-  `ESP_RXD` listens to the target's TXD (measured 2026-10-16: pin 3 captured nothing).
+  p14); a pyserial open reset the chip once even with `dtr=rts=False` set before and after the open ("Console" for the
+  opens that did not). PROG pin 5 `ESP_RXD` listens to the target's TXD (measured 2026-10-16: pin 3 captured nothing).
 - Metro attach (cdc_msc_freertos and cdc_msc_throughput on OTG, 2026-10-16): the recipe passed under traffic with no DUT
   USB reset, disconnect or error logged (`projects/tinyusb.md`). The exception: after the `program_esp` session that
   reprogrammed the app (ended with `reset exit`), every attach read the scan chain as all ones, through a USB
