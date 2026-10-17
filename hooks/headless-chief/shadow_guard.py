@@ -31,7 +31,7 @@ from shadows import project, refusal  # noqa: E402
 
 
 def main():
-    why = refusal(project(json.load(sys.stdin.buffer))[0], 'restart the session')
+    why = refusal(project(json.load(sys.stdin.buffer), timeout=6)[0], 'restart the session')   # a hung git denies, not times out
     if why:
         print(why, file=sys.stderr)
         return 2

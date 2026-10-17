@@ -85,15 +85,18 @@ SHELLS = {'sh', 'bash', 'zsh', 'dash'}
 # Windows programs a bash command can start that run a command line of their own: powershell reads bare words
 # as -Command, cmd runs /k too, start and the terminals run their arguments
 FOREIGN_SHELLS = {'cmd', 'powershell', 'pwsh', 'wsl', 'start', 'winpty', 'mintty', 'conhost', 'git-bash', 'git-cmd',
-                  'forfiles', 'cscript', 'wscript', 'schtasks', 'mshta', 'rundll32', 'runas', 'explorer'}
-# Windows writers whose targets this does not read, and the mounts and drive aliases resolve() cannot see
-WINDOWS_WRITERS = {'robocopy', 'xcopy', 'fsutil', 'certutil', 'expand', 'mklink', 'mount', 'subst'}
+                  'forfiles', 'cscript', 'wscript', 'schtasks', 'mshta', 'rundll32', 'runas', 'explorer', 'wt', 'wmic',
+                  'pcalua', 'msiexec', 'regsvr32', 'bitsadmin', 'sc'}
+# Windows writers whose targets this does not read, and the mounts, shares and drive aliases resolve() cannot see
+WINDOWS_WRITERS = {'robocopy', 'xcopy', 'fsutil', 'certutil', 'expand', 'mklink', 'mount', 'subst', 'net', 'mountvol',
+                   'replace', 'esentutl', 'extrac32', 'makecab', 'attrib', 'icacls', 'takeown', 'compact'}
 # WSL distro launchers, which a bash command word reaches by name through WindowsApps
 DISTROS = re.compile(r'(ubuntu[\d.]*|debian|kali(-linux)?|opensuse[\w.-]*|sles[\w.-]*|suse[\w.-]*|fedora[\w.-]*|arch(linux)?|'
-                     r'alpine|oraclelinux[\w.-]*|almalinux[\w.-]*|wsl\w*)')
+                     r'alpine|oraclelinux[\w.-]*|almalinux[\w.-]*|pengwin[\w.-]*|centos[\w.-]*|rocky(linux)?[\w.-]*|'
+                     r'gentoo|nixos|openeuler[\w.-]*|amazonlinux[\w.-]*|wsl\w*)')
 # MSYS /dev entries that are never a file, placed without asking cygpath
 DEVICES = re.compile(r'/dev/(null|tty|console|stdin|stdout|stderr|fd/\d+)')
-CYGPATH_BUDGET = time.monotonic() + 6   # every cygpath call of one hook run, well inside its 10 s timeout
+DEADLINE = time.monotonic() + 6   # the whole check, well inside Claude Code's 10 s hook timeout
 MAPPED = {}   # posix path -> cygpath -m's answer, None when it had none
 KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}'}
 # file writers: every named path counts, only the last for a copy, all but the first for a mode change
@@ -178,7 +181,10 @@ class Guard:
     def inside(self, path):
         """Is this absolute path in the worktree, chief's own directory apart; the worktree is read once, on first use."""
         if self.root is None:
-            root, chief = project(self.payload)
+            try:
+                root, chief = project(self.payload, timeout=remaining())
+            except subprocess.TimeoutExpired:
+                raise Denied(TOO_LONG) from None
             self.root, self.chief = resolved(root), chief and resolved(chief)
         p = resolved(path)
         return p.is_relative_to(self.root) and not (self.chief and p.is_relative_to(self.chief))
@@ -224,6 +230,7 @@ class Guard:
                 seg.append(t)
 
     def segment(self, words, depth):
+        remaining()
         for k, w in enumerate(words[:-1]):
             if w in REDIRECTS and not (w == '>&' and words[k + 1].isdigit()):
                 self.writes(words[k + 1], 'the redirect')
@@ -259,10 +266,15 @@ class Guard:
             raise Denied(f'`{cmd}` runs a command line this guard cannot follow; run it as plain bash words, or dispatch it to a unit')
         if cmd in WINDOWS_WRITERS:
             raise Denied(f'`{cmd}` writes or maps paths this guard cannot follow on Windows; dispatch the step to a unit')
-        if cmd == 'ln' or (cmd == 'cp' and any(re.fullmatch(r'-[a-zA-Z]*[ls][a-zA-Z]*|--link|--symbolic-link', a) for a in args)):
-            targets = written(cmd, args)
-            for source in (a for a in args if not a.startswith('-') and a not in targets):
-                if not self.outside(source):
+        sources = []
+        if cmd in ('ln', 'link') or (cmd == 'cp' and links(args)):
+            targets = [] if cmd == 'link' else written(cmd, args)   # link, unlisted as a writer, names its target too
+            sources = [a for a in args if not a.startswith('-') and a not in targets]
+        elif cmd == 'rsync':
+            sources = [a.split('=', 1)[1] if '=' in a else args[k + 1] for k, a in enumerate(args)
+                       if re.fullmatch(r'--(link|copy|compare)-dest(=.*)?', a) and ('=' in a or k + 1 < len(args))]
+        for source in sources:
+            if not self.outside(source):
                     raise Denied(f'`{cmd}` would link {source.translate(UNQUOTED)}: on Windows a link to the task worktree is a '
                                  'path this guard cannot follow; a link names a literal absolute source outside it')
 
@@ -297,6 +309,28 @@ class Guard:
             if len(positional) <= 1 and not flags & {'-d', '--delete'}:
                 return
         raise Denied(f'`git {sub}` changes the repository; chief only reads it: dispatch a writer, or the workflow that owns the step')
+
+
+def links(args):
+    """Does a cp make links: --link or --symbolic-link, abbreviated as getopt allows, or l or s in a short option
+    cluster before the letter that takes the rest as its value."""
+    for a in args:
+        if a == '--':
+            break
+        if re.match(r'--(l|sy)|-[^-St]*[ls]', a):
+            return True
+    return False
+
+
+TOO_LONG = 'checking this call took too long; split the command, or name its paths as drive paths (C:/...)'
+
+
+def remaining():
+    """Seconds left of the run's deadline; past it the call is denied, as Claude Code would let it pass at its timeout."""
+    left = DEADLINE - time.monotonic()
+    if left <= 0:
+        raise Denied(TOO_LONG)
+    return left
 
 
 def program(word):
@@ -338,13 +372,12 @@ def wsl(word, cmd):
 def cygpath(posix):
     """posix as MSYS bash maps it (`cygpath -m`), None when it cannot; past the run's budget the call is denied."""
     if posix not in MAPPED:
-        exe, left = on_path('cygpath', ('.exe',)), CYGPATH_BUDGET - time.monotonic()
-        if left <= 0:
-            raise Denied('placing the paths through cygpath took too long; name them as drive paths (C:/...)')
+        # the first cygpath on PATH: another MSYS install than the bash running the command may mount / elsewhere
+        exe = on_path('cygpath', ('.exe',))
         try:
-            got = exe and subprocess.run([exe, '-m', posix], capture_output=True, encoding='utf-8', timeout=left)
+            got = exe and subprocess.run([exe, '-m', posix], capture_output=True, encoding='utf-8', timeout=remaining())
         except subprocess.TimeoutExpired:
-            raise Denied('placing the paths through cygpath took too long; name them as drive paths (C:/...)') from None
+            raise Denied(TOO_LONG) from None
         except (OSError, ValueError, subprocess.SubprocessError):
             got = None
         MAPPED[posix] = got.stdout.strip() if got and not got.returncode else None
@@ -356,20 +389,22 @@ def absolute(path):
     /-rooted path is named both as MSYS bash maps it and as Windows reads it, and only a drive-letter path with no
     other `:` is absolute: a device or UNC form can reach the worktree by a name its resolved path does not start
     with, and Python 3.12 resolves a stream name (`a.c:s`) to a relative path."""
+    remaining()
     if os.name != 'nt':
         return [path] if os.path.isabs(path) else []
+    if '..' in re.split(r'[\\/]', path):
+        return []   # Cygwin follows a link before a later `..` (/dev/fd/../cwd): no folding tells where it lands
     if path.startswith('/') and not path.startswith('//'):
-        posix = posixpath.normpath(path)   # bash folds `..` before it maps the path
+        posix = posixpath.normpath(path)   # `.` and repeated slashes only
         native = absolute(os.path.abspath(path))
         if m := re.match(r'/([a-zA-Z])(/|$)', posix):
             mapped = f'{m.group(1)}:/{posix[3:]}'
         elif DEVICES.fullmatch(posix):
             return native   # no file for bash
-        elif (mapped := cygpath(posix)) is None:
+        elif re.match(r'/(dev|proc)(/|$)', posix):
+            return []   # links to anywhere: /dev/fd, /proc/self/cwd, /proc/cygdrive
+        elif (mapped := cygpath(posix)) is None or (mapped.startswith('/') and not mapped.startswith('//')):
             return []   # no bash mapping to judge it by
-        elif mapped.startswith('/') and not mapped.startswith('//'):
-            # cygpath leaves only MSYS's own entries /-rooted: a /dev or /proc one is no file, anything else unknown
-            return native if re.match(r'/(dev|proc)(/|$)', mapped) else []
         bash = absolute(mapped)
         return bash + native if bash and native else []
     p = PureWindowsPath(path)

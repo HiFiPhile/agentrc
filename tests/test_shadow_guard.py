@@ -1,4 +1,5 @@
 """Tests for hooks/headless-chief/shadow_guard.py, run as Claude Code runs it: hook JSON on stdin."""
+import importlib.util
 import json
 import os
 import subprocess
@@ -6,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'shadow_guard.py'
 
@@ -128,6 +130,23 @@ class ShadowGuard(unittest.TestCase):
         self.local('workflows', 'pr-babysit.js', 'old')
         self.assert_denied(self.hook(run_in=self.project), '.claude/workflows/pr-babysit.js')
         self.assertFalse((self.root / 'ran').exists(), "the project's git.exe ran")
+
+    @unittest.skipUnless(os.name == 'nt', 'shadows.on_path walks PATH on Windows only')
+    def test_a_relative_path_entry_is_no_place_to_find_a_program(self):
+        # a relative entry resolves against the hook's working directory, the project
+        spec = importlib.util.spec_from_file_location('shadows', SCRIPT.parents[2] / 'skills' / 'headless-chief' / 'scripts' / 'shadows.py')
+        shadows = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shadows)
+        (self.project / 'bin').mkdir()
+        for exe in (self.project / 'git.exe', self.project / 'bin' / 'git.exe'):
+            exe.write_bytes(b'')
+        cwd = os.getcwd()
+        os.chdir(self.project)
+        self.addCleanup(os.chdir, cwd)
+        with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['.', 'bin', '\\bin', ''])}):
+            self.assertIsNone(shadows.on_path('git', ('.exe',)))
+        with mock.patch.dict(os.environ, {'PATH': str(self.project / 'bin')}):
+            self.assertEqual(Path(shadows.on_path('git', ('.exe',))), self.project / 'bin' / 'git.exe')
 
 
 if __name__ == '__main__':

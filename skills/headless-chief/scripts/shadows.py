@@ -6,7 +6,7 @@ branch's stale copy of an agentrc entry runs in place of the installed one.
 import filecmp
 import os
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 AGENTRC = Path(__file__).resolve().parents[3]   # the agentrc checkout this module runs from
 KINDS = {'workflows': '.js', 'agents': '.md'}
@@ -15,20 +15,21 @@ FOLD = str.casefold if os.name == 'nt' else str   # NTFS names match without cas
 
 def on_path(name, exts):
     """Windows: the program as PATH alone finds it, the first of exts in each directory, else None; shutil.which and
-    CreateProcess try the working directory, a contributor's checkout, first. Elsewhere the name, as execvp finds it."""
+    CreateProcess try the working directory, a contributor's checkout, first, as does a relative PATH entry.
+    Elsewhere the name, as execvp finds it."""
     if os.name != 'nt':
         return name
     for d in os.environ.get('PATH', '').split(os.pathsep):
         for e in exts:
             p = os.path.join(d, name + e)
-            if d and os.path.isfile(p):
+            if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(p):
                 return p
     return None
 
 
-def project(payload):
+def project(payload, timeout=None):
     """The hook session's project top level and its chief directory (`git rev-parse --git-path chief`),
-    absolute; outside a repository, the start directory and None."""
+    absolute; outside a repository, the start directory and None. A git slower than timeout raises TimeoutExpired."""
     # the session's project, not a directory a Bash cd moved the payload's cwd to; its GIT_* would name another repository
     start = os.environ.get('CLAUDE_PROJECT_DIR') or payload.get('cwd') or '.'
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
@@ -36,7 +37,7 @@ def project(payload):
     if git is None:
         raise FileNotFoundError('git is not on PATH')
     got = subprocess.run([git, '-C', start, 'rev-parse', '--show-toplevel', '--path-format=absolute', '--git-path', 'chief'],
-                         capture_output=True, env=env)
+                         capture_output=True, env=env, timeout=timeout)
     if got.returncode:
         return Path(start), None
     top, chief = map(os.fsdecode, got.stdout.splitlines())   # git prints the path's bytes: UTF-8 on Windows

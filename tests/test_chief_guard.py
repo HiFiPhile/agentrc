@@ -288,10 +288,22 @@ class ChiefGuard(unittest.TestCase):
         self.assert_denied('tee /dev/tty; git push', 'changes the repository')
         self.assertLess(time.monotonic() - started, 5)
         for c in ('tee /dev/tty', 'echo x > /dev/stderr', 'git log >/dev/console', 'tee /dev/fd/2', 'cat /etc/hosts > /dev/stdout',
-                  'echo x > /dev/../dev/tty', 'echo x > /proc/cpuinfo'):
+                  'echo x > /dev//tty', 'echo x > /dev/./null'):
             self.assert_allowed(c)
         self.assert_denied('echo x > /dev/sda', 'literal absolute path')   # cygpath names a disk device
         self.assert_denied(f'echo x > /dev/..{self.msys()}/src/a.c', 'literal absolute path')
+
+    @needs_msys
+    @unittest.skipUnless(os.name == 'nt', 'Cygwin path resolution')
+    def test_links_under_dev_and_proc_and_any_dotdot_are_denied(self):
+        # Cygwin follows /dev/fd and /proc/self/cwd before a later `..`: /dev/fd/../cwd is bash's working directory
+        for c in ('echo hi > /dev/fd/../cwd/x', 'touch /dev/fd/../cwd/x', 'rm -rf /dev/fd/../cwd/.git', 'cp /c/tmp/a /dev/fd/../cwd/x',
+                  'echo x > /proc/self/cwd/../../x', 'echo x > /proc/self/cwd/src/a.c', 'echo x > /proc/cygdrive/e/x',
+                  'echo x > /proc/cpuinfo', 'echo x > /dev/shm/x', 'echo x > /dev/fd/2/x', 'echo x > /dev/../dev/tty',
+                  "echo x > 'C:/tmp/l/../x'", 'echo x > /tmp/../tmp/x'):
+            self.assert_denied(c, 'literal absolute path')
+        self.assert_denied(None, 'literal absolute path', tool='Write', file_path='/dev/fd/../cwd/x')
+        self.assert_denied('ln -s /dev/fd/../cwd/src /tmp/l', 'cannot follow')
 
     def msys(self):
         return '/' + self.wt[0].lower() + self.wt[2:]   # E:/x as Git Bash names it: /e/x
@@ -317,7 +329,7 @@ class ChiefGuard(unittest.TestCase):
             time.sleep(kw['timeout'])
             raise subprocess.TimeoutExpired(args, kw['timeout'])
         guard, calls = self.module(), []
-        guard.CYGPATH_BUDGET = time.monotonic() + 0.5
+        guard.DEADLINE = time.monotonic() + 0.5
         started = time.monotonic()
         with mock.patch.object(guard, 'on_path', lambda name, exts: name + '.exe'), mock.patch.object(subprocess, 'run', slow):
             code, err = self.main(guard, 'echo a > /usr/x; echo b > /usr/y')
@@ -326,9 +338,33 @@ class ChiefGuard(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 2)
             self.assertEqual(len(calls), 1)
             self.assertLessEqual(calls[0], 0.5)
-            guard.CYGPATH_BUDGET = time.monotonic()
+            guard.DEADLINE = time.monotonic()
             self.assertEqual(self.main(guard, 'echo a > /usr/z')[0], 2, 'a spent budget denies before asking')
         self.assertEqual(len(calls), 1)
+
+    def test_one_deadline_covers_the_whole_check(self):
+        # Claude Code lets a hook that outlives its 10 s timeout pass: a slow git or a long command denies first
+        guard, calls, real = self.module(), [], subprocess.run
+
+        def slow(args, **kw):
+            if not os.path.basename(args[0]).startswith('git'):
+                return real(args, **kw)
+            calls.append(kw.get('timeout'))
+            time.sleep(kw['timeout'])
+            raise subprocess.TimeoutExpired(args, kw['timeout'])
+        guard.DEADLINE = time.monotonic() + 0.5
+        started = time.monotonic()
+        with mock.patch.object(subprocess, 'run', slow):
+            code, err = self.main(guard, f'echo x > {self.wt}/r.md')
+        self.assertEqual(code, 2)
+        self.assertIn('took too long', err)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertLessEqual(calls[0], 0.5)
+        guard.DEADLINE = time.monotonic()
+        code, err = self.main(guard, 'git status')
+        self.assertEqual(code, 2, 'a spent deadline denies before the next segment')
+        self.assertIn('took too long', err)
 
     @needs_msys
     @unittest.skipUnless(os.name == 'nt', 'MSYS links and mounts')
@@ -338,9 +374,15 @@ class ChiefGuard(unittest.TestCase):
                   f'ln {self.msys()}/src/a.c /tmp/a.c', 'ln -s src /tmp/l', f'ln -s -t /tmp {self.wt}/src',
                   f'cp -s {self.wt}/src/a.c /tmp/a.c', f'cp -al {self.wt}/src /tmp/s', f'cp --link {self.wt}/src/a.c /tmp/a.c',
                   'MSYS=winsymlinks:nativestrict ln -s /tmp/a /tmp/b', 'export MSYS=winsymlinks:native',
-                  'env CYGWIN=winsymlinks:lnk ln -s /tmp/a /tmp/b'):
+                  'env CYGWIN=winsymlinks:lnk ln -s /tmp/a /tmp/b',
+                  # getopt abbreviations and clusters, coreutils link, rsync's reference directories
+                  f'cp --l {self.wt}/src/a.c /tmp/a.c', f'cp --lin {self.wt}/src/a.c /tmp/a.c', f'cp --sym {self.wt}/src/a.c /tmp/a.c',
+                  f'cp -lS.bak {self.wt}/src/a.c /tmp/a.c', f'cp -sS~ {self.wt}/src/a.c /tmp/a.c', f'link {self.wt}/src/a.c /tmp/a.c',
+                  f'link /tmp/a {self.wt}/src/b.c', f'rsync -a --link-dest={self.wt}/src /tmp/a/ /tmp/b/',
+                  f'rsync -a --copy-dest {self.wt} /tmp/a/ /tmp/b/', f'rsync -a --compare-dest={self.msys()} /tmp/a/ /tmp/b/'):
             self.assert_denied(c, 'cannot follow')
-        for c in ('ln -s /tmp/a /tmp/b', f'cp {self.wt}/src/a.c /tmp/a.c', 'MSYS=noglob git status'):
+        for c in ('ln -s /tmp/a /tmp/b', f'cp {self.wt}/src/a.c /tmp/a.c', 'MSYS=noglob git status', 'cp -aS.bal /tmp/a /tmp/b',
+                  f'cp --sparse=always {self.wt}/src/a.c /tmp/a.c', 'link /tmp/a /tmp/b', 'rsync -a --link-dest=/tmp/prev /tmp/a/ /tmp/b/'):
             self.assert_allowed(c)
 
     @needs_msys
@@ -354,12 +396,14 @@ class ChiefGuard(unittest.TestCase):
                   f"'{system}\\System32\\bash.exe' -c 'git status'", f"'{system.as_posix().upper()}/SYSTEM32/BASH.EXE' -c x",
                   f'/{system.as_posix()[0].lower()}{system.as_posix()[2:]}/System32/bash.exe -c x', './bash -c x',
                   'ubuntu2204.exe run git push', 'debian run x', 'kali x', 'opensuse-leap-15.5 run x', 'wslconfig /l',
-                  f"'{apps.as_posix()}/MicrosoftCorporationII.WindowsSubsystemForLinux.exe' x"):
+                  f"'{apps.as_posix()}/MicrosoftCorporationII.WindowsSubsystemForLinux.exe' x",
+                  'wt git push', 'wmic process call create x', 'msiexec /i x.msi', 'sc.exe create x', 'pengwin run x'):
             self.assert_denied(c, 'cannot follow')
         for c in ('robocopy /tmp E:/x', 'xcopy a b', 'fsutil hardlink create a b', 'certutil -decode a b', 'expand a b',
-                  'mklink /j a b', 'Robocopy.exe a b'):
+                  'mklink /j a b', 'Robocopy.exe a b', "net use Z: '\\\\host\\share'", 'mountvol X: /d', 'replace a b',
+                  'attrib +r src/a.c', 'icacls src /deny x:W'):
             self.assert_denied(c, 'cannot follow')
-        for c in ("bash -c 'git status'", "/usr/bin/bash -c 'git status'", 'python3 -V'):
+        for c in ("bash -c 'git status'", "/usr/bin/bash -c 'git status'", 'python3 -V', 'ssh host true'):
             self.assert_allowed(c)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows drops trailing dots, spaces and a :stream from a file name')
