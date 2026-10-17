@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -73,6 +74,46 @@ class CodexWeeklyTest(unittest.TestCase):
         self.assertEqual(codex_usage.weekly({'rateLimits': {'primary': window(7, 10000)}})['usedPercent'], 7)
         self.assertIsNone(codex_usage.weekly({'rateLimits': {'limitId': 'gpt-x', 'primary': window(7, 10080)}}))
         self.assertIsNone(codex_usage.weekly({'rateLimits': {'primary': window(7, 300)}}))
+
+
+CODEX_STUB = """import json, subprocess, sys, time
+sys.stdin.readline()
+print(json.dumps({'id': 2, 'result': {'rateLimits': {'primary': {'usedPercent': 7, 'windowDurationMins': 10080}}}}),
+      flush=True)
+time.sleep(2)
+open(sys.argv[1], 'w').close()
+"""
+
+
+@unittest.skipUnless(os.name == 'nt', 'POSIX runs codex by name and kills it alone, as before')
+class CodexProcessTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        (self.dir / 'bin').mkdir()
+        (self.dir / 'stub.py').write_text(CODEX_STUB)
+        self.late = self.dir / 'late'
+
+    def test_codex_is_found_on_path_alone(self):
+        (self.dir / 'codex.exe').write_text('never run')
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', str(self.dir / 'bin')])}), \
+                    mock.patch.object(codex_usage.subprocess, 'Popen') as popen:
+                self.assertIsNone(codex_usage.read_rate_limits())
+        finally:
+            os.chdir(cwd)
+        popen.assert_not_called()
+
+    def test_codex_dies_with_its_children(self):
+        (self.dir / 'bin' / 'codex.cmd').write_text(f'@"{sys.executable}" "{self.dir / "stub.py"}" "{self.late}"\n')
+        with mock.patch.dict(os.environ, {'PATH': str(self.dir / 'bin')}):
+            result = codex_usage.read_rate_limits()
+        self.assertEqual(codex_usage.weekly(result)['usedPercent'], 7)
+        time.sleep(2.5)
+        self.assertFalse(self.late.exists(), 'node under codex.cmd outlived the read')
 
 
 class RenderTest(unittest.TestCase):
@@ -425,6 +466,46 @@ class PrRefreshTest(unittest.TestCase):
             self.refresh()
         self.assertEqual(self.cache()['prs'], ['o/r#1', 'o/r#2', 'o/s#3'])
         self.assertEqual(len(self.calls()), 1)
+
+    def test_a_publish_waits_out_a_reader_of_the_cache(self):
+        self.answer(self.all())
+        self.refresh()
+        reader = open(self.cache_dir / f'{SID}.json', 'rb')  # as a render reads it
+        self.addCleanup(reader.close)
+        threading.Timer(0.3, reader.close).start()
+        prs.publish(self.cache_dir / f'{SID}.json', {'prs': ['o/r#9']})
+        self.assertEqual(self.cache(), {'prs': ['o/r#9']})
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX replaces a file that is open')
+    def test_a_cache_held_open_throughout_leaves_the_refresh_whole(self):
+        self.answer(self.all())
+        self.refresh()
+        self.age()
+        with open(self.cache_dir / f'{SID}.json', 'rb'):
+            self.refresh()  # neither publish lands, and the worker still polls once
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(sorted(os.listdir(self.cache_dir)), ['.lock', f'{SID}.json'], 'no temp file left')
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locks are Windows only')
+    def test_the_refresh_lock_is_released_before_its_handle_closes(self):
+        self.answer(self.all())
+        with mock.patch.object(prs.msvcrt, 'locking', wraps=prs.msvcrt.locking) as locking:
+            self.refresh()
+        self.assertEqual([c.args[1] for c in locking.call_args_list], [prs.msvcrt.LK_NBLCK, prs.msvcrt.LK_UNLCK])
+
+    def test_a_hung_refresh_worker_exits_by_its_deadline(self):
+        hang = ('import importlib.util, sys, time\n'
+                'spec = importlib.util.spec_from_file_location("prs", sys.argv[1])\n'
+                'prs = importlib.util.module_from_spec(spec)\n'
+                'spec.loader.exec_module(prs)\n'
+                'prs.WORKER_S = 1\n'
+                'prs.refresh = lambda *args: time.sleep(60)\n'
+                'sys.exit(prs.main(["statusline-prs.py", "refresh", sys.argv[2], sys.argv[3], "none"]))\n')
+        start = time.monotonic()
+        done = subprocess.run([sys.executable, '-c', hang, str(ROOT / 'statusline-prs.py'), str(self.cache_dir), SID],
+                              capture_output=True, timeout=30)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertNotEqual(done.returncode, 0, 'killed by the watchdog, not finished')
 
     def test_a_held_lock_makes_a_second_refresher_leave_without_writing(self):
         self.answer(self.all())

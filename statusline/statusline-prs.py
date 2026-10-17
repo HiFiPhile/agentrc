@@ -18,6 +18,7 @@ it held leaves without writing, so a later render retries (best effort, no fairn
 sweep removes caches, temp files a killed worker left and the per-session `.lock` files of the
 earlier scheme once idle for KEEP_S; a resumed session rebuilds its cache from the transcript.
 """
+import contextlib
 import datetime
 import json
 import os
@@ -144,7 +145,17 @@ def render(cache):
 def publish(path, cache):
     tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
     tmp.write_text(json.dumps(cache))
-    os.replace(tmp, path)
+    if os.name != 'nt':
+        os.replace(tmp, path)
+        return
+    # Windows refuses the replace while a render reads the cache: retry, then leave it to the next publish
+    for _ in range(50):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.02)
+    tmp.unlink(missing_ok=True)
 
 
 def query(prs):
@@ -206,13 +217,15 @@ def refresh(cache_dir, session_id, transcript):
     The lock stays held to the last publish; attempt_at is wall-clock, so it cannot exclude a worker."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / f'{session_id}.json'
-    with open(cache_dir / '.lock', 'a') as lock:
+    with open(cache_dir / '.lock', 'a') as lock, contextlib.ExitStack() as held:
         try:
             if fcntl:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             else:  # msvcrt locks are mandatory and per handle: lock a byte past the (empty) content
                 os.lseek(lock.fileno(), 1 << 30, os.SEEK_SET)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                # unlocked before the close, which frees it only "after a delay"; nothing moves the position
+                held.callback(msvcrt.locking, lock.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             return
         cache, now = load(path), time.time()
@@ -287,5 +300,6 @@ def main(argv):
 
 
 if __name__ == '__main__':
-    sys.stdout.reconfigure(encoding='utf-8')  # the glyphs; Windows stdout defaults to its ANSI code page
+    if os.name == 'nt':
+        sys.stdout.reconfigure(encoding='utf-8')  # the glyphs; Windows stdout defaults to its ANSI code page
     sys.exit(main(sys.argv))
