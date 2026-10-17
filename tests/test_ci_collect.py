@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -809,6 +810,7 @@ class FailuresTest(unittest.TestCase):
         c = self.entries(JOB.format(3))[0]
         self.assertNotIn('\\', c['log'], 'a path the judge may paste into a shell')
         self.assertIn('naïve ✓ 😀', Path(c['log']).read_text(encoding='utf-8'))
+        self.assertNotIn(b'\r', Path(c['log']).read_bytes(), 'lines end in \\n on Windows too')
 
     def test_the_detail_lists_the_prs_changed_paths(self):
         rc, r = self.main(JOB.format(3))
@@ -1358,11 +1360,21 @@ class VerdictsTest(unittest.TestCase):
             for held in r['left']:
                 self.assertEqual(self.joined(held), next(e for e in entries if e['link'] == held['link']), 'each fits one page')
     def test_remember_refuses_what_is_not_a_list_of_verdicts(self):
-        for text in (b'["\xff"]', 'not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}]),
+        # strict UTF-8: no BOM, no encoded surrogate (which once crashed the write, leaving its temp file)
+        for text in (b'["\xff"]', b'\xef\xbb\xbf[]', b'[{"link": "\xed\xa0\x80", "bucket": "fail", "failures": []}]', 'not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}]),
                      json.dumps([{'link': 'x', 'bucket': 'fail', 'patch': [7]}]), json.dumps([{'link': 'x', 'bucket': 'fail', 'failures': [], 'patch': []}])):
             rc, r = self.main('remember', stdin=text)
             self.assertEqual(rc, 1, text)
             self.assertIn('verdicts on stdin', r['error'])
+        self.assertFalse(collect.evidence_dir('o/r', 5, HEAD).exists() and any(collect.evidence_dir('o/r', 5, HEAD).iterdir()), 'nothing written')
+
+    def test_remember_waits_out_a_reader_holding_the_verdicts_open(self):
+        self.main('remember', stdin=json.dumps([self.ENTRY]))
+        held = open(collect.evidence_dir('o/r', 5, HEAD) / 'verdicts.json', 'rb')  # Windows: os.replace onto it fails
+        self.addCleanup(held.close)
+        threading.Timer(0.2, held.close).start()
+        self.assertEqual(self.main('remember', stdin=json.dumps([{**self.ENTRY, 'link': JOB.format(4)}]))[0], 0)
+        self.assertEqual(len(self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))[1]['verdicts']), 2)
 
 
 if __name__ == '__main__':

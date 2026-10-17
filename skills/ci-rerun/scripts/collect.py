@@ -400,9 +400,20 @@ def stored_verdicts(folder):
         raise Failed(f'verdicts.json: {e}')
 
 
-def remember(repo, pr, head, text):
+def replace(src, dst):
+    """os.replace; on Windows retried while a reader still holds dst open, which fails it there."""
+    for _ in range(50 if os.name == 'nt' else 0):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            time.sleep(0.02)
+    os.replace(src, dst)
+
+
+def remember(repo, pr, head, data):
     try:
-        entries = json.loads(text)
+        # strict UTF-8 first: json.loads(bytes) would take a BOM, UTF-16/32 and encoded surrogates
+        entries = json.loads(data.decode('utf-8'))
     except ValueError as e:
         raise Failed(f'verdicts on stdin: {e}')
     if not (isinstance(entries, list) and all(isinstance(e, dict) and sorted(e) in (['bucket', 'failures', 'link'], ['bucket', 'link', 'patch']) and
@@ -416,7 +427,7 @@ def remember(repo, pr, head, text):
         stored[e['link']] = patched(stored.get(e['link']), e) if 'patch' in e else e
     tmp = folder / f'verdicts.json.{time.time_ns()}'
     tmp.write_text(json.dumps(stored, ensure_ascii=False), encoding='utf-8')
-    tmp.replace(folder / 'verdicts.json')
+    replace(tmp, folder / 'verdicts.json')
     return {'head': head}
 
 
@@ -675,7 +686,7 @@ def cells(failed, base_rows):
 
 def save(folder, name, lines):
     path = folder / name
-    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')  # \n on Windows too: a judge reads it by line
     return path.as_posix()
 
 

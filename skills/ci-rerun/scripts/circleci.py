@@ -21,6 +21,7 @@ v2 one, no token needed.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -134,7 +135,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    # what it prints carries remote text, which a Windows console code page cannot always encode
-    sys.stdout.reconfigure(encoding='utf-8')
-    sys.stderr.reconfigure(encoding='utf-8')
+    if os.name == 'nt':  # what it prints carries remote text, which a Windows console code page cannot always encode
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())
