@@ -15,6 +15,8 @@ nothing or times out proceed. State lives in $CLAUDE_CONFIG_DIR/credit-guard/:
 usage.json (the shared reading), readings.log (every fetch, for tuning
 HEADROOM) and sessions/<session_id>.off (the session's guard is off).
 """
+import contextlib
+import errno
 import json
 import math
 import os
@@ -94,6 +96,7 @@ def trust_window(now, used, prev):
     return max(window, FLOOR)
 
 
+@contextlib.contextmanager
 def locked(d):
     """The held usage lock; raises after LOCK_WAIT so the hook still answers before its timeout."""
     f = (d / 'usage.lock').open('w')
@@ -107,14 +110,26 @@ def locked(d):
             else:
                 try:
                     msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                except OSError:
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EDEADLOCK):  # held elsewhere; anything else is a failure
+                        f.close()
+                        raise
                     raise BlockingIOError from None
-            return f
+            break
         except BlockingIOError:
             if time.monotonic() > deadline:
                 f.close()
                 raise TimeoutError('usage lock busy')
             time.sleep(0.1)
+    try:
+        yield f
+    finally:
+        try:
+            if not fcntl:  # Windows frees the lock of a closed handle only "after a delay"
+                os.lseek(f.fileno(), 1 << 30, os.SEEK_SET)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            f.close()
 
 
 def load(d):
@@ -140,8 +155,8 @@ def store(d, used, now, prev):
     log = d / 'readings.log'
     if log.exists() and log.stat().st_size > LOG_MAX:
         log.replace(d / 'readings.log.1')
-    with log.open('a') as f:
-        f.write(json.dumps({**rec, 'time': time.strftime('%F %T')}) + '\n')
+    with log.open('a', newline='\n') as f:  # not %F %T: MSYS2's Python formats them as nothing
+        f.write(json.dumps({**rec, 'time': time.strftime('%Y-%m-%d %H:%M:%S')}) + '\n')
     return rec
 
 
