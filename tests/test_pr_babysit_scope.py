@@ -86,6 +86,19 @@ class ScopeCheckTest(unittest.TestCase):
         self.assertEqual(out['accepted'], [])
         self.assertEqual([(r['path'], r['why']) for r in out['refused']], [(p, 'not a plain repository-relative path') for p in paths])
 
+    @unittest.skipUnless(os.name == 'nt', 'POSIX checks a symlink out as one, refused as reached through a symbolic link')
+    def test_a_symlink_checked_out_as_a_file_is_refused(self):
+        self.git('config', 'core.symlinks', 'false')
+        (self.repo / 'src' / 'link.c').write_text('a.c')
+        blob = subprocess.run(['git', 'hash-object', '-w', 'src/link.c'], cwd=self.repo, env=self.env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        self.git('update-index', '--add', '--cacheinfo', f'120000,{blob},src/link.c')
+        self.git('commit', '-qm', 'link')
+        code, out = self.check('src/link.c', 'src/a.c')
+        self.assertEqual(code, 0)
+        self.assertEqual(out['accepted'], [{'path': 'src/a.c', 'kind': 'existing'}])
+        self.assertEqual(out['refused'], [{'path': 'src/link.c', 'why': 'not a regular file in the index'}])
+
     def test_it_runs_only_from_the_checkout_top(self):
         code, out = self.check('a.c', cwd=self.repo / 'src')
         self.assertEqual(code, 2)

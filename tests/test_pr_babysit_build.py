@@ -1,4 +1,5 @@
 """Tests for pr-babysit's build.py against fake build commands in a temp repository."""
+import importlib.util
 import json
 import os
 import subprocess
@@ -6,8 +7,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'build.py'
+spec = importlib.util.spec_from_file_location('pr_babysit_build', SCRIPT)
+build = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build)
 
 
 class BuildTest(unittest.TestCase):
@@ -140,6 +145,50 @@ class BuildTest(unittest.TestCase):
                 self.assertNotEqual(out['exit'], 0, command)
                 exit = out['exit']
             self.assertEqual((code, out['stage'], out['exit'], out['setup'], out['requires']), (0, 'build', exit, '', []), command)
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX runs bash by name, as execvp finds it')
+    def test_bash_comes_from_path_alone_never_system32s_wsl_launcher_or_the_cwd(self):
+        root = self.repo.parent / 'Windows'
+        (root / 'System32').mkdir(parents=True)
+        real = self.repo.parent / 'Git' / 'bin'
+        real.mkdir(parents=True)
+        for exe in (root / 'System32' / 'bash.exe', real / 'bash.exe', self.repo / 'bash.exe'):
+            exe.write_bytes(b'')
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, cwd)
+        on_path = lambda *dirs: {'SystemRoot': str(root), 'PATH': os.pathsep.join(map(str, dirs))}
+        with mock.patch.dict(os.environ, on_path(root / 'System32', '.', real)):
+            self.assertEqual(Path(build.bash()), real / 'bash.exe')
+        with mock.patch.dict(os.environ, on_path(root / 'System32', '.', '')), self.assertRaisesRegex(build.Unusable, 'no bash.exe on PATH'):
+            build.bash()
+
+    @unittest.skipUnless(os.name == 'nt', "POSIX runs bash by name; the checkout's bash.bat is a Windows hijack")
+    def test_a_checkouts_bash_bat_or_a_system32_first_path_never_runs(self):
+        (self.repo / 'bash.bat').write_text('@echo hijacked> hijacked\n')
+        env = {k: v for k, v in self.env.items() if k.upper() not in ('PATH', 'NODEFAULTCURRENTDIRECTORYINEXEPATH')}
+        system32 = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')
+        self.env = {**env, 'PATH': os.pathsep.join([system32, os.environ['PATH']])}  # where `where bash` finds WSL's first
+        code, out = self.run_script('--path=.', '--command', 'true')
+        self.assertEqual((code, out.get('stage'), out.get('exit')), (0, 'build', 0), out)
+        self.assertFalse((self.repo / 'hijacked').exists())
+        empty = self.repo.parent / 'empty'
+        empty.mkdir()
+        self.env = {**env, 'PATH': str(empty)}
+        code, out = self.run_script('--path=.', '--command', 'true')
+        self.assertEqual(code, 2)
+        self.assertIn('no bash.exe on PATH', out['error'])
+        self.assertFalse((self.repo / 'hijacked').exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows temp dirs sit under the user name, which may hold a blank')
+    def test_a_temp_dir_a_blank_would_split_is_refused_before_anything_is_made(self):
+        spaced = self.repo.parent / 'John Smith'
+        spaced.mkdir()
+        self.env.update(TMP=str(spaced), TEMP=str(spaced))
+        code, out = self.run_script('--path=.', '--command', 'touch <BUILD>/out')
+        self.assertEqual(code, 2, out)
+        self.assertIn('point TMP and TEMP at a plain path', out['error'])
+        self.assertEqual(list(spaced.iterdir()), [])
 
     def test_refusals(self):
         for argv, why in [

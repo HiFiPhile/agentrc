@@ -1044,6 +1044,9 @@ test('the committer gets the claims without their hints, and the message on stdi
   assert.doesNotMatch(commit, /hint:|rewrite it all/)
   assert.match(commit, /The fixes: \["src\/a\.c:\d+ /)
   assert.match(commit, /commits\.py commit 'src\/a\.c' < '<that file>'; rm -f '<that file>'`/)
+  const quoted = calls.filter(c => c.prompt.includes("'<that file>'"))
+  assert.ok(quoted.some(c => c.label.startsWith('reply')) || quoted.length > 1, 'more than the commit quotes its file')
+  for (const c of quoted) assert.match(c.prompt, /a new temporary file[^:]*, a name without quotes/, c.label)
 })
 
 test('an unresolved build contract, or a build that did not run, blocks the batch as unverifiable, a failed build as unverified', async () => {
@@ -5589,7 +5592,8 @@ test('a protected path the PR already carries is adopted; one this run would pub
 })
 
 test('an uncanonicalizable adopted path fails the audit', async () => {
-  for (const path of ['../outside.c', '/tmp/absolute.c', 'C:/tmp/absolute.c', 'C:\\tmp\\absolute.c', ' src/leading.c', 'src/trailing.c ']) {
+  for (const path of ['../outside.c', '/tmp/absolute.c', 'C:/tmp/absolute.c', 'C:\\tmp\\absolute.c', 'C:tmp\\drive-relative.c',
+    '\\\\host\\share\\unc.c', ' src/leading.c', 'src/trailing.c ']) {
     const state = adoptionState()
     const { result } = await run({
       args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
@@ -6558,6 +6562,10 @@ test('stateRef loads the saved state as checksummed chunks, exactly', async () =
   const windows = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\me\\tasks\\w1.output' })
   assert.match(windows.calls[0].prompt, /state_transfer\.py 'C:\/Users\/me\/tasks\/w1\.output'\n/, 'a Windows path, spelled with slashes')
   assert.equal(windows.result.state.cyclesUsed, 2)
+  // launch_result.py's path on a host whose user name has a blank: single-quoted, it stays one word.
+  const spaced = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\John Smith\\tasks\\w1.output' })
+  assert.match(spaced.calls[0].prompt, /state_transfer\.py 'C:\/Users\/John Smith\/tasks\/w1\.output'\n/)
+  assert.equal(spaced.result.state.cyclesUsed, 2)
 })
 
 test('a state whose cycles are spent loads, then stops before preflight', async () => {
@@ -6709,8 +6717,9 @@ test('stateRef is refused when malformed or given with state', async () => {
   await assert.rejects(run({ args: { stateRef: { outputFile: '/x', digest: stateDigest }, state } }), /state or stateRef, not both/)
   await assert.rejects(run({ args: { stateRef: { outputFile: 'rel/x', digest: stateDigest } } }), /stateRef must be/)
   await assert.rejects(run({ args: { stateRef: { outputFile: '/x', digest: 'nothex!!' } } }), /stateRef must be/)
-  for (const outputFile of ['/tmp/$(printf injected).output', '/tmp/`id`.output', "/tmp/a'b.output", '/tmp/a b.output', '/tmp/../etc/x',
-    'C:\\a b.output', "C:\\a'b.output", 'C:\\tmp\\..\\x', 'C:rel\\x', 'CD:/x']) {
+  for (const outputFile of ['/tmp/$(printf injected).output', '/tmp/`id`.output', "/tmp/a'b.output", '/tmp/a"b.output', '/tmp/../etc/x',
+    "C:\\a'b.output", 'C:\\tmp\\..\\x', 'C:rel\\x', 'CD:/x',
+    '\\\\host\\share\\w.output', '//host/share/w.output', '//./pipe/x', '\\\\.\\pipe\\x', '\\\\?\\C:\\x', 'C://host/x']) {
     await assert.rejects(run({ args: { stateRef: { outputFile, digest: stateDigest } } }), /stateRef must be/, outputFile)
   }
 })

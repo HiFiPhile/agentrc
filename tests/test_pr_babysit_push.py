@@ -20,12 +20,14 @@ ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 
 
 
 def run_gh_as(stub):
-    """Patch subprocess.run so `gh ...` runs stub under this Python, never a gh found on PATH."""
+    """Patch subprocess.run so `gh ...` runs stub under this Python, never a gh found on PATH; anything but git fails."""
     real = subprocess.run
 
     def run(argv, *a, **kw):
         if argv[0] == 'gh':
             argv = [sys.executable, str(stub), *argv[1:]]
+        elif argv[0] not in ('git', sys.executable):
+            raise AssertionError(f'{argv[0]} must not run in this test: only git, and gh as the stub')
         return real(argv, *a, **kw)
     return mock.patch.object(subprocess, 'run', run)
 

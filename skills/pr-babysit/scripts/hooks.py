@@ -51,9 +51,14 @@ def status_paths(records):
 
 
 def index_mode(f):
-    """The mode git add gives f on Windows, which has no exec bit: a tracked file keeps its index mode, a new one is 644."""
-    staged = git('--literal-pathspecs', 'ls-files', '-s', '-z', '--', f).split('\0')[0]
-    return staged[3:6] if staged.startswith('100') else '644'
+    """The mode git add gives f with core.fileMode false, Windows' default (true there is unsupported): a tracked
+    file keeps its index mode, a new one is 644. A symlink (120000) checked out as a file stays 644, as os.access
+    reports it on POSIX, so it never matches ls-tree's 000 and its commit is refused."""
+    for entry in git('--literal-pathspecs', 'ls-files', '-s', '-z', '--', f).split('\0'):
+        meta, _, path = entry.partition('\t')
+        if path == f and meta.startswith('100'):
+            return meta[3:6]
+    return '644'
 
 
 def snapshot(paths, records):

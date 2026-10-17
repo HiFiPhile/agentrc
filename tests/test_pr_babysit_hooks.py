@@ -137,6 +137,19 @@ class HooksTest(unittest.TestCase):
         self.assertEqual({f: snap[f][0] for f in staged}, {'a.txt': '755', 'new.txt': '644'})
         self.assertEqual({f: snap[f][0] for f in staged}, staged, 'what git add commits')
 
+    def test_a_symlink_checked_out_as_a_file_never_snapshots_as_the_mode_it_commits(self):
+        self.configure()
+        self.git('config', 'core.symlinks', 'false')  # Windows' default: the link is a file holding its target
+        (self.repo / 'link').write_text('a.txt')
+        self.git('update-index', '--add', '--cacheinfo', f"120000,{self.git('hash-object', '-w', 'link').strip()},link")
+        self.git('commit', '-qm', 'link')
+        (self.repo / 'link').write_text('b.txt')
+        code, out = self.run_script('link')
+        self.assertEqual(code, 0)
+        self.git('add', '--', 'link')
+        self.assertTrue(self.git('ls-files', '-s', '--', 'link').startswith('120000 '), 'git add keeps the symlink')
+        self.assertEqual(self.snap(out['snapshotAfter'])['link'][0], '644', "never ls-tree's 000: the workflow refuses its commit")
+
     @unittest.skipIf(os.name == 'nt', 'Windows file names are Unicode: none is not UTF-8')
     def test_a_status_that_is_not_utf8_is_an_error(self):
         self.configure()

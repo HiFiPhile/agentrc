@@ -364,6 +364,18 @@ class CommitsTest(unittest.TestCase):
         code, out, err = sys.modules['facts'].attempt(sys.executable, '-c', "import sys; sys.stdout.buffer.write('é ✓ 修复'.encode())")
         self.assertEqual((code, out, err), (0, 'é ✓ 修复', ''))
 
+    def test_attempt_sends_its_input_byte_for_byte_and_reads_newlines_as_text_mode_does(self):
+        echo = "import sys; sys.stdout.buffer.write(repr(sys.stdin.buffer.read()).encode() + b'\\r\\n' + 'é'.encode())"
+        code, out, _ = sys.modules['facts'].attempt(sys.executable, '-c', echo, input='a\nb ✓\n')
+        self.assertEqual((code, out), (0, repr('a\nb ✓\n'.encode()) + '\né'), 'Windows text-mode stdin once wrote \\r\\n')
+
+    def test_a_leading_bom_does_not_hide_an_attribution_subject(self):
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin='﻿Co-Authored-By: Claude <x@y>\n\nFix\n')
+        self.assertEqual((code, out['committed']), (0, True), out)
+        self.assertEqual(self.git('log', '-1', '--format=%B'), 'Co-Authored-By: Claude <x@y>\n\nFix\n\n', 'the BOM is not committed')
+        self.assertIn('carries attribution', self.refusal('head', '--parent', self.base, 'a.c'))
+
     def test_commit_refused_by_a_hook_is_not_committed(self):
         self.hook('echo "trailing whitespace fixed in a.c" >&2\nexit 1')
         self.write('a.c', 'changed\n')
