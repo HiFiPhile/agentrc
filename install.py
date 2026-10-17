@@ -88,8 +88,10 @@ def links(kind, name):
 
 def canonical(path):
     """Comparable absolute path text, including dead Windows symlink targets."""
-    value = os.path.normcase(os.path.abspath(os.path.normpath(path)))
-    return value[4:] if os.name == 'nt' and value.startswith('\\\\?\\') else value
+    value = os.fspath(path)
+    if os.name == 'nt':  # stripped first: MSYS2's Python normalizes its \ to /
+        value = value.removeprefix('\\\\?\\')
+    return os.path.normcase(os.path.abspath(os.path.normpath(value)))
 
 
 def target(path):
@@ -148,7 +150,8 @@ def link(src, dst):
             refuse(f'{dst} was not a link; what was there is now in {aside}')
         staging.rmdir()
     try:
-        os.symlink(src, dst)  # never overwrites
+        # never overwrites; a relative Windows link resolves only with \, which MSYS2's Python does not write
+        os.symlink(str(src).replace('/', '\\') if os.name == 'nt' else src, dst)
     except FileExistsError:
         refuse(f'{dst} appeared while installing; move it aside first')
     print(f'{dst} -> {src}')
@@ -189,7 +192,8 @@ def hook_entry(hook, name):
 
 
 def quote_command(path):
-    return subprocess.list2cmdline([str(path)]) if os.name == 'nt' else shlex.quote(str(path))
+    """For the shell Claude Code runs hooks in, bash also on Windows: there a backslash is an escape."""
+    return shlex.quote(Path(path).as_posix())
 
 
 def strip(hooks, name):
@@ -215,7 +219,7 @@ def plan_settings(names, install, statusline):
     link moves, so a settings file of the wrong shape refuses instead of
     leaving a half job."""
     path = settings()
-    before = path.read_text() if path.exists() else ''
+    before = path.read_text(encoding='utf-8') if path.exists() else ''
     data = json.loads(before) if before else {}
     if names:
         hooks = data.setdefault('hooks', {})
@@ -244,9 +248,9 @@ def write_settings(before, after):
     path = settings()
     backup = path.with_name(path.name + '.before-agentrc')
     if before and not backup.exists():
-        backup.write_text(before)
+        backup.write_text(before, encoding='utf-8')
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(after)
+    path.write_text(after, encoding='utf-8')
     print(f'updated {path}')
 
 
@@ -254,7 +258,7 @@ def write_settings(before, after):
 
 def herdr_plugins():
     """(id, directory) of every plugins/* herdr plugin."""
-    return [(tomllib.loads(toml.read_text())['id'], toml.parent)
+    return [(tomllib.loads(toml.read_text(encoding='utf-8'))['id'], toml.parent)
             for toml in sorted((REPO / 'plugins').glob('*/herdr-plugin.toml'))]
 
 
@@ -322,6 +326,8 @@ def main(argv=None):
     parser.add_argument('--statusline', action='store_true', help='the Claude Code status line')
     parser.add_argument('--herdr-plugin', action='store_true', help='every plugins/* herdr plugin, through herdr')
     args = parser.parse_args(argv)
+    if args.herdr_plugin and os.name == 'nt':
+        refuse('--herdr-plugin: herdr runs on Linux and macOS only')
     chosen = selection(parser, args)
     pairs = [(kind, pair) for kind, name in chosen for pair in links(kind, name)]
     herdr_steps = plan_herdr(args.action == 'install') if args.herdr_plugin else []
