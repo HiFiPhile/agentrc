@@ -3,6 +3,8 @@ import importlib.util
 import io
 import json
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -15,6 +17,8 @@ publish = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(publish)
 
 REPO, ME = 'o/r', 'hathach'
+# A gh stand-in that echoes stdin and appends UTF-8 text: a real process, so the pipe decoding is the script's own.
+ECHO = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read() + ' ✓ 修复'.encode())"
 
 
 class FakeGitHub:
@@ -98,6 +102,13 @@ class FakeGitHub:
         raise KeyError(path)
 
 
+class GhTest(unittest.TestCase):
+    def test_gh_output_is_read_as_utf8(self):
+        real = subprocess.run
+        with mock.patch.object(publish.subprocess, 'run', lambda argv, **kw: real([sys.executable, '-c', ECHO], **kw)):
+            self.assertEqual(publish.gh(['api'], '{"title": "é"}'), (0, '{"title": "é"} ✓ 修复', ''))
+
+
 class PublishTest(unittest.TestCase):
     def setUp(self):
         self.fake = FakeGitHub()
@@ -109,7 +120,7 @@ class PublishTest(unittest.TestCase):
 
     def body(self, text='Evidence: run 42 failed.\n\nOriginating PR: https://github.com/o/r/pull/7\n'):
         f = Path(self.tmp.name) / f'body{len(list(Path(self.tmp.name).iterdir()))}.md'
-        f.write_text(text)
+        f.write_text(text, encoding='utf-8')
         return str(f)
 
     def run_script(self, *argv, allow=(REPO,)):

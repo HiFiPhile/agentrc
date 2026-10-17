@@ -49,7 +49,7 @@ class Refused(Exception):
 
 
 def gh(args, stdin=None):
-    r = subprocess.run(['gh', *args], input=stdin, capture_output=True, text=True)
+    r = subprocess.run(['gh', *args], input=stdin, capture_output=True, encoding='utf-8')
     return r.returncode, r.stdout, r.stderr
 
 
