@@ -319,16 +319,19 @@ class RtdBashTest(unittest.TestCase):
     def test_bash_comes_from_path_alone_never_system32s_wsl_launcher_or_the_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, real, cwd = Path(tmp) / 'Windows', Path(tmp) / 'Git' / 'bin', Path(tmp) / 'checkout'
-            for exe in (root / 'System32' / 'bash.exe', real / 'bash.exe', cwd / 'bash.exe', cwd / 'bash.bat'):
+            for exe in (root / 'System32' / 'bash.exe', real / 'bash.exe', cwd / 'bash.exe', cwd / 'bash.bat',
+                        cwd / 'bin' / 'bash.exe', cwd / 'rooted' / 'bash.exe'):
                 exe.parent.mkdir(parents=True, exist_ok=True)
                 exe.write_bytes(b'')
+            rooted = os.path.splitdrive(cwd / 'rooted')[1]  # no drive: the cwd's drive decides
             was = os.getcwd()
             os.chdir(cwd)
             try:
                 on_path = lambda *dirs: {'SystemRoot': str(root), 'PATH': os.pathsep.join(map(str, dirs))}
                 with mock.patch.dict(os.environ, on_path(root / 'System32', '.', real)):
                     self.assertEqual(Path(rtd.bash()), real / 'bash.exe')
-                with mock.patch.dict(os.environ, on_path(root / 'System32', '.', '')), self.assertRaisesRegex(rtd.Failed, 'no bash.exe is on PATH'):
+                with mock.patch.dict(os.environ, on_path(root / 'System32', '.', 'bin', rooted, '')), self.assertRaisesRegex(rtd.Failed, 'no bash.exe is on PATH'):
+                    os.environ.pop('NoDefaultCurrentDirectoryInExePath', None)
                     rtd.bash()
             finally:
                 os.chdir(was)

@@ -29,6 +29,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import PureWindowsPath
 
 BUILD = re.compile(r'^(https://app\.readthedocs\.(?:org|com))/projects/([\w-]+)/builds/(\d+)/?$')
 
@@ -53,7 +54,7 @@ def bash():
     wsl = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'bash.exe'))
     for d in os.environ.get('PATH', '').split(os.pathsep):
         path = os.path.join(d, 'bash.exe')
-        if os.path.isabs(d) and os.path.isfile(path) and os.path.normcase(os.path.normpath(path)) != wsl:
+        if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(path) and os.path.normcase(os.path.normpath(path)) != wsl:
             return path
     raise Failed('RTD_TOKEN is not in the environment and no bash.exe is on PATH for a login shell (System32 holds only WSL)')
 
