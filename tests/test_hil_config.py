@@ -99,6 +99,12 @@ class Resolver(Config):
                                    capture_output=True, text=True, env=env)
                 self.assertEqual((r.returncode, r.stdout.strip()), (0, BOARDS[0]['flasher']['uid']), r.stderr)
 
+    def test_a_config_saved_with_a_bom_is_read(self):   # Windows PowerShell 5 and older Notepad write one
+        self.config.write_bytes(b'\xef\xbb\xbf' + json.dumps({'boards': BOARDS}).encode())
+        for name, mod in MODULES.items():
+            with self.subTest(script=name):
+                self.assertEqual(mod.hil_flasher(self.config, 'k64f'), BOARDS[0]['flasher'])
+
     def test_a_board_resolves_or_is_refused_the_same_way_in_both(self):
         for name, mod in MODULES.items():
             for board, want in RESOLVE_CASES:
