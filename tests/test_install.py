@@ -1,11 +1,14 @@
+import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'install.py'
@@ -34,8 +37,18 @@ else:
 json.dump(state, open(os.environ['STUB_STATE'], 'w'))
 '''
 SKILLS = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
+spec = importlib.util.spec_from_file_location('install', SCRIPT)
+install = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(install)
 SKILL = SKILLS[0]
 SKILL_HOOKS = [s for s in SKILLS if (ROOT / 'hooks' / s / 'hooks.json').exists()]
+
+
+def guard_command(script):
+    """The settings command of a Python hook: under the installing interpreter on Windows, where bash may find no
+    python3 and a hook that cannot start lets the call through."""
+    command = shlex.quote(script.as_posix())
+    return f'{shlex.quote(Path(sys.executable).as_posix())} {command}' if os.name == 'nt' else command
 
 
 class InstallTest(unittest.TestCase):
@@ -113,7 +126,7 @@ class InstallTest(unittest.TestCase):
         (self.claude / 'settings.json').write_text(json.dumps(before))
         self.ok('install', '--skill')
         launcher = (self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate').as_posix()  # bash runs it, also on Windows
-        guards = [(self.claude / 'hooks' / 'headless-chief' / g).as_posix() for g in ('shadow_guard.py', 'chief_guard.py')]
+        guards = [guard_command(self.claude / 'hooks' / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')]
         data = self.settings()
         self.assertEqual(data['model'], 'x')
         self.assertEqual(self.commands(data), {'SessionStart': ['other'], 'Stop': ['other-stop', launcher],
@@ -168,6 +181,54 @@ class InstallTest(unittest.TestCase):
             {'hooks': [{'type': 'command', 'command': command}]} for command in old]}}))
         self.ok('install', '--skill')
         self.assertEqual(self.commands(self.settings())['Stop'], [Path(launcher).as_posix()])
+
+    def test_a_home_with_quotes_or_spaces_keeps_one_entry_per_hook(self):
+        for name in ("O'Brien", "O'Brien Doe", 'John Doe'):
+            with self.subTest(name):
+                home = self.home / name
+                claude = home / '.claude'
+                claude.mkdir(parents=True)
+                launcher = claude / 'hooks' / 'simplify-gate' / 'simplify-gate'
+                guard = claude / 'hooks' / 'headless-chief' / 'chief_guard.py'
+                # forms earlier versions wrote: bash quoting of the native path, and list2cmdline on Windows
+                old = [shlex.quote(str(launcher))] + ([subprocess.list2cmdline([str(launcher)])] if os.name == 'nt' else [])
+                old_guard = [shlex.quote(str(guard))] + ([subprocess.list2cmdline([str(guard)])] if os.name == 'nt' else [])
+                (claude / 'settings.json').write_text(json.dumps({'hooks': {
+                    'Stop': [{'hooks': [{'type': 'command', 'command': c}]} for c in old],
+                    'PreToolUse': [{'hooks': [{'type': 'command', 'command': c}]} for c in old_guard]}}))
+                env = {**os.environ, 'HOME': str(home), 'USERPROFILE': str(home)}
+                for _ in range(2):
+                    done = subprocess.run([sys.executable, str(SCRIPT), 'install', '--skill'], capture_output=True,
+                                          text=True, env=env)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    data = json.loads((claude / 'settings.json').read_text())
+                    self.assertEqual(self.commands(data)['Stop'], [shlex.quote(launcher.as_posix())])
+                    self.assertEqual(self.commands(data)['PreToolUse'].count(guard_command(guard)), 1)
+                    self.assertEqual(len(self.commands(data)['PreToolUse']), 2, 'each guard once')
+                done = subprocess.run([sys.executable, str(SCRIPT), 'remove', '--skill'], capture_output=True,
+                                      text=True, env=env)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertNotIn('hooks', json.loads((claude / 'settings.json').read_text()))
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX runs a Python hook by its shebang')
+    def test_a_python_hook_names_this_interpreter_for_bash_on_windows(self):
+        self.ok('install', '--skill')
+        guard = self.claude / 'hooks' / 'headless-chief' / 'chief_guard.py'
+        command = self.commands(self.settings())['PreToolUse'][1]
+        self.assertEqual(command, guard_command(guard))
+        done = subprocess.run([shutil.which('bash'), '-c', f"printf '%s\n' {command}"], capture_output=True, text=True)
+        self.assertEqual(done.stdout.splitlines(), [Path(sys.executable).as_posix(), guard.as_posix()])
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX needs no privilege to link')
+    def test_no_symlink_privilege_refuses_before_touching_anything(self):
+        def no_privilege(*args, **kwargs):
+            raise OSError(None, 'A required privilege is not held by the client', None, 1314)
+
+        with mock.patch.dict(os.environ, {'HOME': str(self.home), 'USERPROFILE': str(self.home)}),                 mock.patch.object(install.os, 'symlink', no_privilege), mock.patch('sys.stderr') as err,                 self.assertRaises(SystemExit) as done:
+            install.main(['install', '--skill', '--claude-md'])
+        self.assertEqual(done.exception.code, 1)
+        self.assertIn('Developer Mode', ''.join(c.args[0] for c in err.write.call_args_list))
+        self.assertEqual(os.listdir(self.home), [], 'nothing created')
 
     def test_a_dead_link_of_ours_is_pruned_and_foreign_links_and_content_stay(self):
         (self.claude / 'skills').mkdir(parents=True)

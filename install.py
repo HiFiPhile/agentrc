@@ -120,6 +120,12 @@ def preflight(pairs):
     """Every destination must be absent, a symlink or an empty directory; every
     directory linked into, and each missing one's ancestors, must be a real
     directory or absent."""
+    if os.name == 'nt' and pairs:  # links need Developer Mode or an elevated shell: find out before the first
+        with tempfile.TemporaryDirectory() as probe:
+            try:
+                os.symlink('target', os.path.join(probe, 'link'))
+            except OSError as err:
+                refuse(f'cannot create symlinks ({err.strerror}); turn on Developer Mode or run elevated')
     for _, dst in pairs:
         for parent in dst.parents:
             if parent.is_dir():
@@ -181,19 +187,28 @@ def prune(kind):
 def hook_entry(hook, name):
     """Is this settings entry ours: does the command run out of the linked hook
     directory?"""
-    try:
-        words = shlex.split(hook.get('command', ''), posix=os.name != 'nt')
-    except ValueError:
-        return False
     root = Path.home() / '.claude' / 'hooks' / name
-    # only absolute words: a relative one would resolve against the cwd
-    paths = [p for p in (word.strip('"\'') for word in words) if os.path.isabs(p)]
-    return any(inside(p, root) for p in paths)
+    # bash quoting as written now; on Windows also the list2cmdline form earlier versions wrote
+    for posix in (True, False) if os.name == 'nt' else (True,):
+        try:
+            words = shlex.split(hook.get('command', ''), posix=posix)
+        except ValueError:
+            continue
+        # only absolute words: a relative one would resolve against the cwd
+        paths = [p for p in (word.strip('"\'') for word in words) if os.path.isabs(p)]
+        if any(inside(p, root) for p in paths):
+            return True
+    return False
 
 
 def quote_command(path):
-    """For the shell Claude Code runs hooks in, bash also on Windows: there a backslash is an escape."""
-    return shlex.quote(Path(path).as_posix())
+    """For the shell Claude Code runs hooks in, bash also on Windows: there a backslash is an escape. On
+    Windows a Python hook names this interpreter: bash may find no python3 there, and a hook that cannot
+    start lets the call through."""
+    command = shlex.quote(Path(path).as_posix())
+    if os.name == 'nt' and Path(path).suffix == '.py':
+        command = f'{shlex.quote(Path(sys.executable).as_posix())} {command}'
+    return command
 
 
 def strip(hooks, name):
