@@ -109,10 +109,11 @@ def find_tool(name):
     if os.name != 'nt' or os.path.dirname(name):
         return name if shutil.which(name) else None
     # Windows: PATH only; shutil.which and CreateProcess search the cwd (perhaps a checkout) first
-    exe = name if name.lower().endswith('.exe') else name + '.exe'
+    exts = ('',) if name.lower().endswith(('.exe', '.cmd', '.bat')) else ('.exe', '.cmd', '.bat')
     for directory in os.environ.get('PATH', '').split(os.pathsep):
-        if directory and os.path.isfile(os.path.join(directory, exe)):
-            return os.path.join(directory, exe)
+        for ext in exts:
+            if directory and os.path.isfile(os.path.join(directory, name + ext)):
+                return os.path.join(directory, name + ext)
     return None
 
 
@@ -120,14 +121,18 @@ def run_tool(command, env, timeout):
     if os.name != 'nt':
         return subprocess.run(command, capture_output=True, text=True, errors='replace', env=env, timeout=timeout)
     # Windows: UTF-8 both ways, not the ANSI code page, and a timeout kills the tree: a venv python.exe is a
-    # launcher whose child interpreter holds the pipes, so killing the launcher alone leaves communicate() waiting
+    # launcher whose child interpreter holds the pipes, so killing the launcher alone leaves communicate() waiting.
+    # A standalone (PyInstaller) esptool.exe ignores PYTHONIOENCODING and still writes the ANSI code page.
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
                           errors='replace', env={**env, 'PYTHONIOENCODING': 'utf-8'}) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             taskkill = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
-            subprocess.run([taskkill, '/T', '/F', '/PID', str(proc.pid)], capture_output=True)
+            try:
+                subprocess.run([taskkill, '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass    # still kill the tool itself, or Popen's exit waits on it
             proc.kill()
             exc.stdout, exc.stderr = proc.communicate()
             raise

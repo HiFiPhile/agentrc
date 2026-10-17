@@ -68,6 +68,10 @@ if mode == 'hang':
     pathlib.Path(os.environ['FAKE_CALL'] + '.child').write_text(str(child.pid))
     print('Connected to ESP32-P4 on /dev/serial/by-id/fake:', flush=True)
     time.sleep(30)
+if mode == 'hang_alone':
+    print('Connected to ESP32-P4 on /dev/serial/by-id/fake:', flush=True)
+    import time
+    time.sleep(30)
 if mode == 'native':
     sys.stdout.buffer.write(b'esptool \\xff\\xfe not UTF-8\\r\\n')
     sys.stdout.flush()
@@ -229,6 +233,15 @@ class VerifyTest(unittest.TestCase):
         if NT:    # the whole tree: its child held the pipes
             self.assertFalse(alive(int(child.read_text())))
 
+    @unittest.skipUnless(NT, 'taskkill')
+    def test_an_unlaunchable_taskkill_still_kills_the_tool(self):
+        for key in [k for k in self.env if k.upper() == 'SYSTEMROOT']:
+            del self.env[key]
+        code, result = self.run_cli('--timeout', '1', SYSTEMROOT=str(self.root / 'nowhere'), FAKE_MODE='hang_alone')
+        self.assertEqual(code, 3, result)
+        self.assertIn('did not finish within 1 s', result['error'])
+        self.assertIn('Connected to', result['stdout'])
+
     @staticmethod
     def reap(pid):
         if alive(pid):
@@ -347,6 +360,22 @@ class VerifyTest(unittest.TestCase):
         code, result = self.run_cli(cwd=str(self.root / 'cwd'), PATH=str(self.root / 'bin'))
         self.assertEqual(code, 0, result)
         self.assertEqual(result['command'][0], os.path.join(self.root, 'bin', 'esptool.exe'))
+
+    @unittest.skipUnless(NT, 'Windows batch files')
+    def test_cmd_and_bat_tools_on_path(self):
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        for name in ('esptool.cmd', 'other.bat'):
+            (bin_dir / name).write_text(f'@"{native(sys.executable)}" "{native(str(self.tool))}" %*\n',
+                                        encoding='ascii')
+        self.env.pop('ESP_VERIFY_ESPTOOL')
+        for command, found in ((None, 'esptool.cmd'), ('esptool.cmd', 'esptool.cmd'), ('other', 'other.bat'),
+                               ('other.bat', 'other.bat')):
+            with self.subTest(command=command):
+                env = {'PATH': str(bin_dir), **({'ESP_VERIFY_ESPTOOL': command} if command else {})}
+                code, result = self.run_cli(**env)
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result['command'][0], os.path.join(bin_dir, found))
 
     def test_settings_conflict_or_unsafe_option_is_refused(self):
         self.data['flash_settings']['flash_mode'] = 'qio'
