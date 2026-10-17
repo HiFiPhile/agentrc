@@ -17,7 +17,7 @@ from shadows import project, refusal  # noqa: E402
 
 
 def main():
-    why = refusal(project(json.load(sys.stdin))[0], 'restart the session')
+    why = refusal(project(json.load(sys.stdin.buffer))[0], 'restart the session')
     if why:
         print(why, file=sys.stderr)
         return 2
@@ -25,4 +25,5 @@ def main():
 
 
 if __name__ == '__main__':
+    sys.stderr.reconfigure(encoding='utf-8')   # the reason names paths, whatever the locale
     sys.exit(main())

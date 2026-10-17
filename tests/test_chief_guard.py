@@ -1,6 +1,7 @@
 """Tests for hooks/headless-chief/chief_guard.py, run as Claude Code runs it: hook JSON on stdin."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -8,15 +9,17 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'chief_guard.py'
+# Windows judges a /tmp path as MSYS bash maps it, through cygpath; without one it is denied
+needs_msys = unittest.skipIf(os.name == 'nt' and not shutil.which('cygpath'), 'no cygpath to map /tmp')
 
 
-@unittest.skipIf(os.name == 'nt', 'the hook ships for POSIX sessions')
 class ChiefGuard(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         self.root = Path(td.name).resolve()
         self.project = self.root / 'wt'
+        self.wt = self.project.as_posix()   # as a bash command names it: an unquoted backslash is an escape
         (self.project / 'src').mkdir(parents=True)
         (self.project / 'src' / 'a.c').write_text('int a;\n')
         # GIT_* from a calling hook would point git at another repository
@@ -28,8 +31,8 @@ class ChiefGuard(unittest.TestCase):
                  'tool_input': {'command': command} if tool == 'Bash' else {'file_path': file_path, 'content': 'x'}}
         if agent_id:
             event['agent_id'] = agent_id
-        return subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(event), env=self.env,
-                              capture_output=True, text=True, timeout=30)
+        return subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(event, ensure_ascii=False), env=self.env,
+                              capture_output=True, encoding='utf-8', timeout=30)
 
     def assert_denied(self, command, *named, **kw):
         r = self.hook(command, **kw)
@@ -74,6 +77,7 @@ class ChiefGuard(unittest.TestCase):
                   "printf '%s\\n' https://github.com/o/r/issues/1#c2 > src/a.c", 'echo a#b; git push'):
             self.assert_denied(c)
 
+    @needs_msys
     def test_quoted_words_are_data(self):
         self.assert_allowed("git log --grep='git push' --oneline")
         self.assert_allowed('echo "git commit"')
@@ -83,6 +87,7 @@ class ChiefGuard(unittest.TestCase):
         self.assert_allowed("cat > /tmp/r.md <<'EOF'\n# it's a title\nEOF")
         self.assert_allowed('grep -c "a;b|c" src/a.c && echo \\> done')
 
+    @needs_msys
     def test_heredoc_body_is_data_but_its_line_counts(self):
         self.assert_allowed("cat > /tmp/brief.md <<'EOF'\ngit push\ngh pr merge 1\nEOF")
         self.assert_denied("cat > src/x.md <<'EOF'\nhello\nEOF", 'literal absolute path')
@@ -107,9 +112,9 @@ class ChiefGuard(unittest.TestCase):
         self.assert_allowed('python3 ~/.claude/skills/pr-babysit/scripts/launch_result.py --output /tmp/o')
 
     def test_writes_inside_the_worktree_are_denied(self):
-        for c in (f'echo x > {self.project}/a', f'rm {self.project}/src/a.c', f'mv /tmp/a {self.project}/src/',
-                  f'cp /tmp/a {self.project}/src/b.c', f'printf x | tee {self.project}/src/a.c',
-                  f'git diff --output={self.project}/p.patch', f'chmod --reference=/bin/sh {self.project}/src/a.c'):
+        for c in (f'echo x > {self.wt}/a', f'rm {self.wt}/src/a.c', f'mv /tmp/a {self.wt}/src/',
+                  f'cp /tmp/a {self.wt}/src/b.c', f'printf x | tee {self.wt}/src/a.c',
+                  f'git diff --output={self.wt}/p.patch', f'chmod --reference=/bin/sh {self.wt}/src/a.c'):
             self.assert_denied(c, 'literal absolute path')
         self.assert_denied(None, 'literal absolute path', tool='Write', file_path=str(self.project / 'src' / 'new.c'))
 
@@ -121,6 +126,7 @@ class ChiefGuard(unittest.TestCase):
                   'chmod 600 src/a.c', 'echo x > ~/chief-note.md', 'echo x > "$HOME/chief-note.md"'):
             self.assert_denied(c, 'literal absolute path')
 
+    @needs_msys
     def test_writes_outside_the_worktree_pass(self):
         for c in ('echo x > /tmp/out.md', 'git log > /tmp/log 2>&1', 'git status 2>/dev/null', 'cp src/a.c /tmp/a.c',
                   'mkdir -p /tmp/chief-run', 'rm -f /tmp/x', "sed 's/a/b/' src/a.c", 'cat src/a.c >&2',
@@ -137,15 +143,15 @@ class ChiefGuard(unittest.TestCase):
             self.assert_denied(c, 'in place')
 
     def test_home_and_tmpdir_are_not_expanded(self):
-        for c in (f'TMPDIR={self.project}; printf done > "$TMPDIR/r.md"', f'HOME={self.project} && printf done > "$HOME/r.md"',
-                  f'export HOME={self.project}; printf done > ~/r.md', f"bash -c 'TMPDIR={self.project}; printf x > $TMPDIR/r'"):
+        for c in (f'TMPDIR={self.wt}; printf done > "$TMPDIR/r.md"', f'HOME={self.wt} && printf done > "$HOME/r.md"',
+                  f'export HOME={self.wt}; printf done > ~/r.md', f"bash -c 'TMPDIR={self.wt}; printf x > $TMPDIR/r'"):
             self.assert_denied(c, 'literal absolute path')
 
     def test_chief_directory_inside_a_primary_checkout_is_writable(self):
         chief = self.project / '.git' / 'chief'
-        self.assert_allowed(f'mkdir -p {chief} && git log > {chief}/u1-commit-check.txt')
+        self.assert_allowed(f'mkdir -p {chief.as_posix()} && git log > {chief.as_posix()}/u1-commit-check.txt')
         self.assert_allowed(None, tool='Write', file_path=str(chief / 'brief.md'))
-        self.assert_denied(f'echo x > {self.project}/.git/config', 'literal absolute path')
+        self.assert_denied(f'echo x > {self.wt}/.git/config', 'literal absolute path')
 
     def test_combined_shell_flags_and_xargs_values(self):
         self.assert_denied("bash -lc 'git push origin HEAD'", 'changes the repository')
@@ -156,11 +162,13 @@ class ChiefGuard(unittest.TestCase):
         self.assert_denied('gh api repos/o/r/issues -ftitle=x', 'non-GET')
         self.assert_denied('gh api repos/o/r/issues -Ftitle=x', 'non-GET')
 
+    @needs_msys
     def test_unquoted_heredoc_substitutions_run(self):
         self.assert_denied("cat > /tmp/r.md <<EOF\n$(git push origin HEAD)\nEOF", 'changes the repository')
         self.assert_denied("cat > /tmp/r.md <<EOF\n'`git push`'\nEOF", 'changes the repository')
         self.assert_allowed("cat > /tmp/r.md <<'EOF'\n$(git push origin HEAD)\nEOF")
 
+    @needs_msys
     def test_single_quoted_substitutions_are_data(self):
         self.assert_allowed("printf '%s\\n' '$(git push)' > /tmp/chief-report.md")
         self.assert_allowed("grep -n '`git push`' /tmp/notes.md")
@@ -171,6 +179,53 @@ class ChiefGuard(unittest.TestCase):
 
     def test_an_unparsable_command_is_denied(self):
         self.assert_denied('echo "unterminated', 'cannot parse')
+
+    def test_a_non_ascii_worktree_is_still_the_worktree(self):
+        # git names it in UTF-8: read in a locale's encoding (GBK) the guard crashed or missed it, and an erroring hook passes
+        self.project = self.root / 'wt-ü✓'
+        (self.project / 'src').mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env)
+        self.assert_denied(f"printf x > '{self.project.as_posix()}/src/a.c'", 'literal absolute path')
+        self.assert_denied(None, 'literal absolute path', tool='Write', file_path=str(self.project / 'src' / 'ü.c'))
+        self.assert_allowed(f"printf x > '{self.root.as_posix()}/ü-report.md'")
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows path forms')
+    def test_windows_forms_of_a_worktree_path_are_denied(self):
+        msys = '/' + self.wt[0].lower() + self.wt[2:]   # E:/x as Git Bash names it: /e/x
+        native = str(self.project)
+        for c in (f'echo x > {msys}/src/a.c', f'rm {msys}/src/a.c', f'cp /tmp/a {msys}/src/', f'echo x > /c/..{msys}/src/a.c',
+                  f"echo x > '{native}\\src\\a.c'", f"echo x > '{self.wt.upper()}/SRC/A.C'", f"echo x > '//?/{self.wt}/src/a.c'",
+                  f"echo x > '//./{self.wt}/src/a.c'", f"echo x > '{self.wt}/src/a.c:s'", "echo x > '//host/share/a.c'"):
+            self.assert_denied(c, 'literal absolute path')
+        for path in (f'{msys}/src/b.c', f'//?/{self.wt}/src/b.c', f'{native}\\src\\b.c'):
+            self.assert_denied(None, 'literal absolute path', tool='Write', file_path=path)
+        self.assert_allowed(f'echo x > /{self.wt[0].lower()}/chief-report-elsewhere.md')
+        self.assert_allowed(f"echo x > '{self.root.as_posix()}/chief-report.md'")
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows has no /tmp of its own')
+    def test_a_tmp_path_without_cygpath_is_denied(self):
+        # bash maps /tmp through its mount table; with no cygpath to read it, the target cannot be placed
+        self.env['PATH'] = os.pathsep.join(d for d in self.env['PATH'].split(os.pathsep) if d and not shutil.which('cygpath', path=d))
+        self.assert_denied('echo x > /tmp/out.md', 'literal absolute path')
+        self.assert_allowed(f"echo x > '{self.root.as_posix()}/out.md'")
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows finds a program without case or .exe')
+    def test_windows_command_names_are_matched_without_case_or_suffix(self):
+        for c in ('git.exe push', 'GIT push', 'Git.Exe commit -m x', '"C:/Program Files/Git/cmd/git.exe" push',
+                  'env.exe git push', 'TIMEOUT.EXE 60 git push', 'GIT_DIR=E:/x/.git git push'):
+            self.assert_denied(c, 'changes the repository')
+        self.assert_denied('gh.exe pr merge 1', 'not a read')
+        self.assert_denied('py -3 E:/x/push.py --pr 1', 'inside its workflow')
+        self.assert_denied('python.exe E:/x/PUSH.PY --pr 1', 'inside its workflow')
+        self.assert_allowed('git.exe status')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows shells a bash command can start')
+    def test_windows_shells_are_denied(self):
+        native = str(self.project)
+        for c in (f"cmd //c del '{native}\\src\\a.c'", f"cmd /k 'del {native}\\src\\a.c'", 'cmd.exe /C dir',
+                  f"powershell -Command Set-Content '{native}\\src\\a.c' x", f"powershell Remove-Item '{native}\\src\\a.c'",
+                  'pwsh -c "git push"', 'wsl git push', "bash -c 'cmd /c dir'", 'xargs powershell'):
+            self.assert_denied(c, 'cannot follow')
 
 
 if __name__ == '__main__':

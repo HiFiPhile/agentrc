@@ -19,7 +19,7 @@ def project(payload):
     start = os.environ.get('CLAUDE_PROJECT_DIR') or payload.get('cwd') or '.'
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
     got = subprocess.run(['git', '-C', start, 'rev-parse', '--show-toplevel', '--path-format=absolute', '--git-path', 'chief'],
-                         capture_output=True, text=True, env=env)
+                         capture_output=True, encoding='utf-8', env=env)
     if got.returncode:
         return Path(start), None
     top, chief = got.stdout.splitlines()

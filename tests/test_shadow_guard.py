@@ -10,7 +10,6 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'shadow_guard.py'
 
 
-@unittest.skipIf(os.name == 'nt', 'the hook ships for POSIX sessions')
 class ShadowGuard(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()
@@ -21,7 +20,7 @@ class ShadowGuard(unittest.TestCase):
         # GIT_* from a calling hook would point git at another repository
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ('CLAUDE_CONFIG_DIR', 'CLAUDE_PROJECT_DIR') and not k.startswith('GIT_')}
-        self.env['HOME'] = str(self.root)
+        self.env['HOME'] = self.env['USERPROFILE'] = str(self.root)   # Path.home() reads USERPROFILE on Windows
         subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env)
 
     def installed(self, kind, name, content):
@@ -40,8 +39,8 @@ class ShadowGuard(unittest.TestCase):
 
     def hook(self, tool='Workflow', cwd=None, **env):
         event = {'hook_event_name': 'PreToolUse', 'tool_name': tool, 'cwd': str(cwd or self.project)}
-        return subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(event), env={**self.env, **env},
-                              capture_output=True, text=True, timeout=30)
+        return subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(event, ensure_ascii=False), env={**self.env, **env},
+                              capture_output=True, encoding='utf-8', timeout=30)
 
     def assert_denied(self, r, *named):
         self.assertEqual(r.returncode, 2, r.stderr)
@@ -80,6 +79,15 @@ class ShadowGuard(unittest.TestCase):
         self.assert_denied(self.hook(cwd=self.root, CLAUDE_PROJECT_DIR=str(self.project)), '.claude/workflows/pr-babysit.js')
         self.assertEqual(self.hook(cwd=self.root).returncode, 0, 'without CLAUDE_PROJECT_DIR the cwd decides')
 
+    def test_a_non_ascii_project_is_read_as_utf_8(self):
+        # hook JSON is UTF-8; read in a locale's encoding (GBK) the cwd named no directory and nothing was denied
+        self.project = self.root / 'wt-ü✓'
+        subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env)
+        self.installed('workflows', 'pr-babysit.js', 'new')
+        self.local('workflows', 'pr-babysit.js', 'old')
+        self.assert_denied(self.hook(), '.claude/workflows/pr-babysit.js')
+
+    @unittest.skipIf(os.name == 'nt', 'chmod(0) does not make a Windows directory unreadable')
     @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root reads any directory')
     def test_an_unreadable_directory_denies_without_merge_advice(self):
         self.installed('agents', 'code-writer.md', 'new')

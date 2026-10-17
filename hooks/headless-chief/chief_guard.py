@@ -9,21 +9,26 @@ script chief runs may still write or publish, and the grants in agents/chief.md 
 A write target passes only as a literal absolute path outside the worktree, so no shell state
 needs tracking; chief's own directory, `git rev-parse --git-path chief`, passes even inside a
 primary checkout. Exit 2 denies; a command it cannot parse is denied too, since Claude Code lets
-an erroring hook pass.
+an erroring hook pass. On Windows, where Git Bash runs the command, a /-rooted path is judged both as
+bash maps it and as Windows reads it, command names match without case or .exe, and cmd, PowerShell
+and wsl, whose command lines this cannot follow, are denied.
 """
 import json
 import sys
 
 if __name__ == '__main__':
     # every session's Bash and Write reach this hook: leave before importing the rest
-    PAYLOAD = json.load(sys.stdin)
+    PAYLOAD = json.load(sys.stdin.buffer)
     if PAYLOAD.get('agent_type') != 'chief' or PAYLOAD.get('agent_id'):
         sys.exit(0)
 
 import os  # noqa: E402
+import posixpath  # noqa: E402
 import re  # noqa: E402
 import shlex  # noqa: E402
-from pathlib import Path  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+from pathlib import Path, PureWindowsPath  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'skills' / 'headless-chief' / 'scripts'))
 from shadows import project  # noqa: E402
@@ -55,6 +60,7 @@ GH_READ = {
 GH_WITH_VALUE = {'-R', '--repo', '-H', '--header', '-q', '--jq', '-t', '--template', '--hostname', '-p', '--preview'}
 # workflow-only publishers: Sonar marking rides markSonar, the PR push rides autoPush
 WORKFLOW_ONLY = {'push.py', 'sonar.py'}
+PY_LAUNCHERS = {'py'} if os.name == 'nt' else set()
 # command prefixes that run the next word: name -> its options that take a value
 WRAPPERS = {
     'command': set(), 'builtin': set(), 'nohup': set(), 'exec': {'-a'}, 'time': {'-f', '-o'},
@@ -64,6 +70,8 @@ WRAPPERS = {
               '--max-chars', '--delimiter', '--eof', '--arg-file'},
 }
 SHELLS = {'sh', 'bash', 'zsh', 'dash'}
+# Windows interpreters a bash command can start: powershell reads bare words as -Command, cmd runs /k too
+FOREIGN_SHELLS = {'cmd', 'powershell', 'pwsh', 'wsl'}
 KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}'}
 # file writers: every named path counts, only the last for a copy, all but the first for a mode change
 WRITERS_ALL = {'rm', 'rmdir', 'mv', 'touch', 'mkdir', 'truncate', 'tee', 'shred', 'unlink'}
@@ -156,7 +164,7 @@ class Guard:
         path = path.translate(UNQUOTED)
         if path == '/dev/null':
             return
-        if UNKNOWN in path or '$' in path or not os.path.isabs(path) or self.inside(path):
+        if UNKNOWN in path or '$' in path or not (places := absolute(path)) or any(self.inside(p) for p in places):
             raise Denied(f'{why} would write {path}: chief writes only its artifacts, named by a literal absolute path '
                          'outside the task worktree; a worktree change goes to a writer')
 
@@ -195,7 +203,9 @@ class Guard:
         words = unwrap([w for k, w in enumerate(words) if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
         if not words:
             return
-        cmd, args = os.path.basename(words[0]), words[1:]
+        cmd, args = program(os.path.basename(words[0])), words[1:]
+        if os.name == 'nt' and cmd in FOREIGN_SHELLS:
+            raise Denied(f'`{cmd}` runs a command line this guard cannot follow; run it as plain bash words, or dispatch it to a unit')
         if cmd in SHELLS:
             for k, a in enumerate(args):
                 if re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', a):
@@ -206,7 +216,8 @@ class Guard:
             self.git(args)
         elif cmd == 'gh':
             gh(args)
-        elif cmd in WORKFLOW_ONLY or (cmd.startswith('python') and any(os.path.basename(a) in WORKFLOW_ONLY for a in args)):
+        elif cmd in WORKFLOW_ONLY or ((cmd.startswith('python') or cmd in PY_LAUNCHERS)
+                                      and any(program(os.path.basename(a)) in WORKFLOW_ONLY for a in args)):
             raise Denied('this publisher runs only inside its workflow (autoPush, markSonar)')
         elif cmd in ('sed', 'perl') and any(re.match(r'-[a-zA-Z]*i|--in-place', a) for a in args):
             raise Denied(f'`{cmd}` in place edits a file; chief writes its artifacts whole with Write, and a worktree change goes to a writer')
@@ -246,13 +257,48 @@ class Guard:
         raise Denied(f'`git {sub}` changes the repository; chief only reads it: dispatch a writer, or the workflow that owns the step')
 
 
+def program(word):
+    """A command word as Windows finds its program: without case or an executable suffix; elsewhere the word itself."""
+    if os.name != 'nt':
+        return word
+    return re.sub(r'\.(exe|com|bat|cmd)$', '', os.path.basename(word).lower())
+
+
+def absolute(path):
+    """The absolute paths a write target can name, [] when it is not absolute or cannot be placed. On Windows a
+    /-rooted path is named both as MSYS bash maps it and as Windows reads it, and only a drive-letter path with no
+    other `:` is absolute: a device or UNC form can reach the worktree by a name its resolved path does not start
+    with, and Python 3.12 resolves a stream name (`a.c:s`) to a relative path."""
+    if os.name != 'nt':
+        return [path] if os.path.isabs(path) else []
+    if path.startswith('/') and not path.startswith('//'):
+        posix = posixpath.normpath(path)   # bash folds `..` before it maps the path
+        if m := re.match(r'/([a-zA-Z])(/|$)', posix):
+            mapped = f'{m.group(1)}:/{posix[3:]}'
+        else:
+            cygpath = shutil.which('cygpath')
+            try:
+                got = cygpath and subprocess.run([cygpath, '-m', posix], capture_output=True, encoding='utf-8', timeout=5)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return []
+            if not got or got.returncode:
+                return []   # no bash mapping to judge it by
+            mapped = got.stdout.strip()
+        bash, native = absolute(mapped), absolute(os.path.abspath(path))
+        return bash + native if bash and native else []
+    p = PureWindowsPath(path)
+    return [path] if re.fullmatch(r'[A-Za-z]:', p.drive) and p.root and ':' not in path[2:] else []
+
+
 def unwrap(words):
     """The command a word list runs, past assignments, keywords and wrappers with their options."""
     while words:
         w = words[0]
         if ASSIGNMENT.match(w) or w in KEYWORDS:
             words = words[1:]
-        elif w == 'command' and any(re.fullmatch(r'-[pvV]*[vV][pvV]*', o) for o in options(words[1:])):
+            continue
+        w = program(w)
+        if w == 'command' and any(re.fullmatch(r'-[pvV]*[vV][pvV]*', o) for o in options(words[1:])):
             return []  # looks the names up, runs none
         elif w in WRAPPERS:
             words = words[1:]
@@ -342,4 +388,5 @@ def main(payload):
 
 
 if __name__ == '__main__':
+    sys.stderr.reconfigure(encoding='utf-8')   # the reason names paths, whatever the locale
     sys.exit(main(PAYLOAD))
