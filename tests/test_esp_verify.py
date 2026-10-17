@@ -11,7 +11,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills/target-debug/scripts/esp_verify.py'
 SPEC = importlib.util.spec_from_file_location('esp_verify', SCRIPT)
@@ -72,6 +74,9 @@ if mode == 'hang_alone':
     print('Connected to ESP32-P4 on /dev/serial/by-id/fake:', flush=True)
     import time
     time.sleep(30)
+if mode == 'ansi':
+    # a standalone (PyInstaller) esptool.exe: the ANSI code page, whatever PYTHONIOENCODING says
+    sys.stdout.reconfigure(encoding='mbcs')
 if mode == 'native':
     sys.stdout.buffer.write(b'esptool \\xff\\xfe not UTF-8\\r\\n')
     sys.stdout.flush()
@@ -241,6 +246,16 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(code, 3, result)
         self.assertIn('did not finish within 1 s', result['error'])
         self.assertIn('Connected to', result['stdout'])
+        # a child that holds the pipes outlives the tool's own kill: the wait for its output is bounded
+        child = Path(str(self.call) + '.child')
+        self.addCleanup(lambda: child.exists() and self.reap(int(child.read_text())))
+        t0 = time.monotonic()
+        code, result = self.run_cli('--timeout', '1', SYSTEMROOT=str(self.root / 'nowhere'), FAKE_MODE='hang')
+        self.assertLess(time.monotonic() - t0, 1 + esp_verify.KILLED_DRAIN_S + 5)
+        self.assertEqual(code, 3, result)
+        self.assertIn('did not finish within 1 s', result['error'])
+        self.assertIsNone(result['tool_exit'])
+        self.assertTrue(alive(int(child.read_text())))    # what taskkill would have ended
 
     @staticmethod
     def reap(pid):
@@ -253,9 +268,20 @@ class VerifyTest(unittest.TestCase):
         temp.mkdir()
         code, result = self.run_cli(FAKE_MODE='native', TMPDIR=str(temp), TEMP=str(temp), TMP=str(temp))
         self.assertEqual(code, 0, result)
-        self.assertIn('\ufffd', result['stdout'])
+        self.assertIn(' not UTF-8\n', result['stdout'])    # the stray bytes' line, read as ANSI
         self.assertNotIn('\r', result['stdout'])
         self.assertIn('\u0151', result['stdout'])
+
+    @unittest.skipUnless(NT, 'the ANSI code page')
+    def test_ansi_output_of_a_standalone_esptool_exe_matches(self):
+        # a snapshot path in the ANSI code page, echoed in it: e9 in cp1252, a8 a6 in cp936, neither UTF-8
+        temp = self.root / 'tmp \u00e9'
+        temp.mkdir()
+        self.assertRaises(UnicodeDecodeError, str(temp).encode('mbcs').decode, 'utf-8')
+        code, result = self.run_cli(FAKE_MODE='ansi', TMPDIR=str(temp), TEMP=str(temp), TMP=str(temp))
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result['status'], 'match')
+        self.assertIn(f"against '{temp}", result['stdout'])
 
     def test_a_refusal_before_the_tool_says_nothing_of_the_chip(self):
         self.files['0x2004'] = 'app space [1].bin'

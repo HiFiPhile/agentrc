@@ -64,6 +64,7 @@ HEADER = re.compile(r"Verifying (0x[0-9a-f]+) \(([0-9]+)\) bytes at "
 VERDICTS = {'Verification successful (digest matched).': 'match',
             'Verification failed (digest mismatch).': 'mismatch'}
 MISMATCH_ERROR = 'ERROR: A fatal error occurred: Verification failed.'
+KILLED_DRAIN_S = 5    # Windows: how long a killed esptool's output may take to reach EOF
 
 
 class JsonParser(argparse.ArgumentParser):
@@ -117,14 +118,27 @@ def find_tool(name):
     return None
 
 
+def decode_nt(output):
+    """Tool output as text, line by line: UTF-8 (PYTHONIOENCODING), else the ANSI code page, which a
+    standalone (PyInstaller) esptool.exe writes whatever PYTHONIOENCODING says; newlines as text mode reads."""
+    if output is None:
+        return None
+    lines = []
+    for line in output.splitlines(keepends=True):
+        try:
+            lines.append(line.decode('utf-8'))
+        except UnicodeDecodeError:
+            lines.append(line.decode('mbcs', errors='replace'))
+    return ''.join(lines).replace('\r\n', '\n').replace('\r', '\n')
+
+
 def run_tool(command, env, timeout):
     if os.name != 'nt':
         return subprocess.run(command, capture_output=True, text=True, errors='replace', env=env, timeout=timeout)
-    # Windows: UTF-8 both ways, not the ANSI code page, and a timeout kills the tree: a venv python.exe is a
-    # launcher whose child interpreter holds the pipes, so killing the launcher alone leaves communicate() waiting.
-    # A standalone (PyInstaller) esptool.exe ignores PYTHONIOENCODING and still writes the ANSI code page.
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
-                          errors='replace', env={**env, 'PYTHONIOENCODING': 'utf-8'}) as proc:
+    # Windows: a timeout kills the tree: a venv python.exe is a launcher whose child interpreter holds the
+    # pipes, so killing the launcher alone leaves communicate() waiting.
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          env={**env, 'PYTHONIOENCODING': 'utf-8'}) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -134,9 +148,15 @@ def run_tool(command, env, timeout):
             except (OSError, subprocess.TimeoutExpired):
                 pass    # still kill the tool itself, or Popen's exit waits on it
             proc.kill()
-            exc.stdout, exc.stderr = proc.communicate()
+            try:
+                exc.stdout, exc.stderr = proc.communicate(timeout=KILLED_DRAIN_S)
+            except subprocess.TimeoutExpired:
+                # a descendant taskkill missed holds the pipes: their reader threads return the output only at
+                # EOF, and closing a pipe one of them reads blocks as well, so Popen's exit must not close them
+                proc.stdout = proc.stderr = None
+            exc.stdout, exc.stderr = decode_nt(exc.stdout), decode_nt(exc.stderr)
             raise
-    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    return subprocess.CompletedProcess(command, proc.returncode, decode_nt(stdout), decode_nt(stderr))
 
 
 def as_text(output):
