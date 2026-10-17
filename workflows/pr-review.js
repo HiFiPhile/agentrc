@@ -52,7 +52,7 @@ if (!Array.isArray(args.groups) || !args.groups.length || !args.groups.every(pla
 // A Windows drive path reads with slashes; any other path stays exactly as given.
 const slashed = (p) => typeof p === 'string' && /^[A-Za-z]:[\\/]/.test(p) ? p.replace(/\\/g, '/') : p
 const factsDir = slashed(args.factsDir)
-if (!(typeof factsDir === 'string' && /^(\/|[A-Za-z]:\/)[A-Za-z0-9._/@+ -]*$/.test(factsDir) && !factsDir.includes('..'))) fail('factsDir must be an absolute path')
+if (!(typeof factsDir === 'string' && /^(\/|[A-Za-z]:\/)[A-Za-z0-9._/@+ -]*$/.test(factsDir) && !factsDir.includes('..'))) fail('factsDir must be an absolute path (on Windows its drive form, C:/...)')
 for (const k of ['hardwareRelevant', 'autoPost']) if (typeof args[k] !== 'boolean') fail(`${k} must be true or false`)
 const VERDICTS = ['pass', 'fail', 'not-run']
 const REGRESSION = ['verified', 'none', 'unknown']
