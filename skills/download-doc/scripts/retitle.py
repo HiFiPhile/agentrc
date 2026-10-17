@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import os
 import pathlib
 import re
 import sqlite3
@@ -187,6 +188,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    for stream in (sys.stdout, sys.stderr):
-        stream.reconfigure(encoding="utf-8", errors="replace")  # titles, and the warning signs
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # titles, and the warning signs
     sys.exit(main())

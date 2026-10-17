@@ -212,8 +212,27 @@ class GuiDetection(unittest.TestCase):
 
     def test_the_process_list_is_read_on_this_os(self):
         # It once walked /proc on Windows too, and every sync.py command died in blockers().
+        # Only its shape: a PID-namespaced container may show no other process.
         listed = list(doclib.Library._cmdlines())
-        self.assertTrue(listed and all(argv and isinstance(argv[0], str) for argv in listed))
+        self.assertIsInstance(listed, list)
+        self.assertTrue(all(argv and isinstance(argv[0], str) for argv in listed), listed[:3])
+
+    @unittest.skipUnless(os.name == 'nt', 'tasklist is how Windows lists its processes')
+    def test_a_process_list_tasklist_cannot_give_is_a_blocker_not_no_gui(self):
+        def missing(argv, **kw):
+            raise FileNotFoundError(2, 'The system cannot find the file specified', 'tasklist')
+        runs = {'no tasklist': missing,
+                'exit 1': lambda argv, **kw: subprocess.CompletedProcess(argv, 1, '', 'ERROR: Access denied.'),
+                'ERROR line': lambda argv, **kw: subprocess.CompletedProcess(argv, 0, 'ERROR: Invalid query\r\n', '')}
+        lib = doclib.Library.__new__(doclib.Library)
+        lib.server = ('http://localhost:8080', 'u', 'pw')  # even when an open GUI would not block
+        for name, run in runs.items():
+            with self.subTest(name), unittest.mock.patch.object(doclib.subprocess, 'run', run):
+                blockers = lib.blockers()
+                self.assertEqual(len(blockers), 1, blockers)
+                self.assertIn('cannot list processes to check for the Calibre GUI', blockers[0])
+                with self.assertRaisesRegex(RuntimeError, 'cannot list processes'):
+                    doclib.Library._gui_running()
 
     @unittest.skipUnless(os.name == 'nt', 'tasklist is how Windows lists its processes')
     def test_on_windows_the_gui_is_calibre_exe_alone(self):
@@ -518,11 +537,12 @@ class PageOneText(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.pdf = Path(tmp.name) / 'es.pdf'
-        # StandardEncoding: 0xD0 is an em dash, 0xA8 a currency sign
-        self.pdf.write_bytes(pdf_with('ES0182 Rev 3 \xd0 STM32\xa8 errata'))
+        # StandardEncoding: 0xD0 is an em dash, 0xA8 a currency sign, 0xE8 Ł, whose UTF-8
+        # 0xC5 0x81 a cp1252 locale cannot decode either
+        self.pdf.write_bytes(pdf_with('ES0182 Rev 3 \xd0 STM32\xa8 \xe8 errata'))
 
     def test_page1_text_keeps_the_page_and_its_non_ascii_text(self):
-        self.assertIn('ES0182 Rev 3 — STM32¤ errata', doclib.page1_text(self.pdf))
+        self.assertIn('ES0182 Rev 3 — STM32¤ Ł errata', doclib.page1_text(self.pdf))
 
     def test_retitle_reads_the_number_off_such_a_page(self):
         self.assertEqual(retitle.from_pdf(self.pdf), ('ES0182', 'both', None))

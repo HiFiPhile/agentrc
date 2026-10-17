@@ -508,11 +508,19 @@ class Library:
     @staticmethod
     def _cmdlines():
         """Every other process's argv, as strings; one that exits mid-walk is skipped.
-        On Windows only each program's image name: tasklist shows no arguments."""
+        On Windows only each program's image name: tasklist shows no arguments. A list
+        it cannot give is a RuntimeError, never an empty one that reads as "no GUI"."""
         me = os.getpid()
         if os.name == "nt":
-            p = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
-                               encoding="utf-8", errors="replace")
+            try:
+                p = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
+                                   encoding="utf-8", errors="replace")
+            except OSError as e:
+                raise RuntimeError(f"cannot list processes to check for the Calibre GUI: {e}") from e
+            if p.returncode != 0 or re.search(r"^ERROR:", p.stdout or "", re.M):
+                why = (p.stderr or p.stdout or "").strip()[:160]
+                raise RuntimeError("cannot list processes to check for the Calibre GUI: "
+                                   f"tasklist exit {p.returncode}: {why}")
             for row in csv.reader((p.stdout or "").splitlines()):
                 if len(row) > 1 and row[1].isdigit() and int(row[1]) != me:
                     yield [row[0]]
@@ -561,15 +569,20 @@ class Library:
         """Reasons an import would be unsafe right now. Report these and let the
         user clear them — killing someone's GUI or sync job is not ours to do."""
         out = []
-        gui = self._gui_running()
+        try:
+            gui = self._gui_running()
+        except RuntimeError as e:  # Windows: tasklist failed, so an open GUI cannot be ruled out
+            return [str(e)]
         if gui and not self.server:
             out.append("The Calibre GUI is open and holds the library's write lock — "
                        "close it before importing.")
         # With content-server credentials configured, an open GUI is not a blocker:
         # _run writes through its server instead of competing for the lock. Reporting
         # it anyway made sync.py refuse imports that would have succeeded.
-        # Linux only by name and arguments: on Windows it is FreeFileSync_x64.exe, and
-        # _cmdlines() has no arguments there to find the calibre-library batch in.
+        # Linux only: it needs the program's arguments to find the calibre-library batch.
+        # On Windows _cmdlines() has image names alone (FreeFileSync_x64.exe,
+        # RealTimeSync.exe), and blocking on the name would let a resident RealTimeSync
+        # refuse every import, so there the mirror goes unseen: SKILL.md says to pause it.
         if self._running("FreeFileSync_x86_64", "calibre-library"):
             out.append("A FreeFileSync calibre-library mirror is running — importing "
                        "now races the sync to omv, and calibredb may report a "
