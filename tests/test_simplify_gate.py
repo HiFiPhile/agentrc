@@ -1,17 +1,12 @@
-import os
-import unittest
-
-if os.name == 'nt':
-    raise unittest.SkipTest('simplify-gate requires POSIX file locking')
-
-import fcntl
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -54,10 +49,10 @@ class Session:
         self.on_codex = None  # runs while the fake Codex is 'running'
 
     def fake_run(self, cmd, **kw):
-        if cmd[0] != 'codex':
+        if Path(cmd[0]).stem.lower() != 'codex':  # the hook runs codex by its full path where it finds one
             return REAL_RUN(cmd, **kw)
         self.calls.append(cmd)
-        self.prompts.append(kw['input'])
+        self.prompts.append(kw['input'].decode('utf-8'))  # the bytes Codex reads
         if self.on_codex:
             self.on_codex()
         if not self.results:
@@ -166,9 +161,47 @@ class GateTest(unittest.TestCase):
         (self.root / 'blob.bin').write_bytes(b'\0\1\2')
         self.review()
         patch = self.s.prompts[0]
-        self.assertIn(f'+{outside}', patch)
+        self.assertIn(f'+{outside.as_posix()}', patch)
         self.assertNotIn('nope', patch)
         self.assertIn('[binary blob', patch)
+        self.s.prompt()
+        sh(self.root, 'git', 'add', 'deps')
+        self.assertEqual(self.s.stop(), {}, 'the link is snapshotted as git stores it')
+
+    def test_modes_are_the_ones_git_records(self):
+        (self.root / 'run.sh').write_text('old\n')
+        os.chmod(self.root / 'run.sh', 0o755)
+        sh(self.root, 'git', 'add', 'run.sh')
+        sh(self.root, 'git', 'update-index', '--chmod=+x', 'run.sh')  # git for Windows reads no exec bit
+        sh(self.root, 'git', 'commit', '-qm', 'script')
+        self.new_turn()
+        (self.root / 'run.sh').write_text('new\n')
+        (self.root / 'x.bat').write_text('@echo off\n')  # executable to os.stat on Windows, 100644 to git
+        self.review()
+        self.assertIn('Path: "run.sh"; mode 100755 -> 100755', self.s.prompts[0])
+        self.assertIn('Path: "x.bat"; mode None -> 100644', self.s.prompts[0])
+        self.s.prompt()
+        sh(self.root, 'git', 'add', '-A')
+        self.assertEqual(self.s.stop(), {}, 'staging changes no mode')
+
+    def test_non_ascii_text_reaches_codex_and_comes_back(self):
+        text = 'caf\u00e9 \u2714 \u0151'  # outside the Windows ANSI code pages
+        (self.root / 'a.txt').write_bytes(f'{text}\n'.encode())
+        seen = Path(self.tmp.name) / 'stdin'
+        code = ('import sys; open(sys.argv[1], "wb").write(sys.stdin.buffer.read()); '
+                'open(sys.argv[2], "w", encoding="utf-8").write(sys.argv[3])')
+        result = json.dumps({'findings': [{**FINDING, 'problem': text}]}, ensure_ascii=False)
+
+        def child_codex(cmd, **kw):  # a real child, so the prompt crosses a pipe as the hook encodes it
+            if Path(cmd[0]).stem.lower() != 'codex':
+                return REAL_RUN(cmd, **kw)
+            return REAL_RUN([sys.executable, '-c', code, str(seen), cmd[cmd.index('-o') + 1], result], **kw)
+        self.s.fake_run = child_codex
+        reply = self.s.stop(f'wrote {text}')
+        self.assertIn(f'a.txt:1: {text}', reply['reason'])
+        prompt = seen.read_bytes().decode('utf-8')
+        self.assertIn(f'+{text}\n', prompt)
+        self.assertIn(f'wrote {text}', prompt)
 
     def test_a_submodule_is_left_out_of_scope_but_its_pointer_renders(self):
         sub = make_repo(Path(self.tmp.name) / 'sub')
@@ -195,7 +228,7 @@ class GateTest(unittest.TestCase):
         sh(wt, 'git', 'commit', '-qm', 'wt')
         self.review()
         patch = self.s.prompts[0]
-        self.assertIn('Path: ".worktrees/task/a.txt"', patch)
+        self.assertIn('Path: ".worktrees/task/a.txt"', patch, 'worktree prefixes are posix paths')
         self.assertIn('-a\n+in worktree\n', patch, 'an edit, not a creation')
         self.assertIn('-c\n', patch, 'the deletion is kept')
 
@@ -240,6 +273,7 @@ class GateTest(unittest.TestCase):
         self.assertIn('+b\n', self.s.prompts[0], 'rendered as stored')
         self.assertNotIn('-a', self.s.prompts[0])
 
+    @unittest.skipIf(os.name == 'nt', 'newline, quote and tab are not allowed in Windows file names')
     def test_awkward_path_names_are_recorded(self):
         names = ['line\nbreak.txt', '"quoted".txt', 'tab\tbed.txt']
         for n in names:
@@ -503,7 +537,7 @@ class GateTest(unittest.TestCase):
         self.write('a.txt', 'a2\n')
         def take_state_lock():
             with (self.s.directory / 'lock').open('w') as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if Stop still holds it
+                gate.lock_exclusive(lock, block=False)  # raises if Stop still holds it
         self.s.on_codex = take_state_lock
         self.assertIn('no findings', self.review()['systemMessage'])
 
@@ -653,7 +687,7 @@ class PruneTest(unittest.TestCase):
             **gate.new_state(), 'cursor': {'files': entries, 'trees': ['']}, **state}))
         (directory / 'lock').touch()
         for name in files:
-            (directory / name).write_text('log\n')
+            (directory / name).write_bytes(b'log\n')  # untranslated: sizes are asserted
         self.age(directory, age_days)
         return directory
 
@@ -839,7 +873,7 @@ class PruneTest(unittest.TestCase):
         for lock in ('lock', 'review.lock'):
             directory = self.session(lock, age_days=40, blobs=[(sha, content)], files=['codex-1-0.log'])
             with open(directory / lock, 'a') as held:
-                fcntl.flock(held, fcntl.LOCK_EX)
+                gate.lock_exclusive(held)
                 report = self.prune(apply=True)
             self.assertIn(f'busy (skipped): 1\n  {directory}', report)
             self.assertTrue((directory / 'codex-1-0.log').exists())
@@ -909,10 +943,20 @@ class ActivationTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_hook(self, cwd, payload, project=None, **extra):
-        env = {**os.environ, 'XDG_CACHE_HOME': str(self.base / 'cache'), 'CLAUDE_PROJECT_DIR': str(project or cwd)}
+        stub = self.base / 'bin'  # a codex that fails, ahead of any real one
+        stub.mkdir(exist_ok=True)
+        if os.name == 'nt':
+            (stub / 'codex.bat').write_text('@exit /b 1\n')
+        else:
+            (stub / 'codex').write_text('#!/bin/sh\nexit 1\n')
+            (stub / 'codex').chmod(0o755)
+        env = {**os.environ, 'XDG_CACHE_HOME': str(self.base / 'cache'), 'CLAUDE_PROJECT_DIR': str(project or cwd),
+               'PATH': f'{stub}{os.pathsep}{os.environ["PATH"]}'}
         env.pop('COWORK_TURN', None)  # the suite itself may run inside a cowork turn
         env.update(extra)
-        return subprocess.run([str(WRAPPER)], input=json.dumps({'session_id': 's', 'cwd': str(cwd), **payload}),
+        # Windows cannot exec a shebang script; Claude Code runs hook commands through bash there.
+        wrapper = [shutil.which('sh'), WRAPPER.as_posix()] if os.name == 'nt' else [str(WRAPPER)]
+        return subprocess.run(wrapper, input=json.dumps({'session_id': 's', 'cwd': str(cwd), **payload}),
                               capture_output=True, text=True, env=env, check=True)
 
     def test_wrapper_runs_the_gate_only_where_the_marker_exists(self):
@@ -960,6 +1004,17 @@ class ActivationTest(unittest.TestCase):
         state = json.loads(next((self.base / 'cache' / 'agentrc' / 'simplify-gate').glob('*/state.json')).read_text())
         self.assertEqual(state['errors'], [])
         self.assertIsNotNone(state['cursor'])
+
+    def test_a_utf8_payload_is_read_as_utf8(self):
+        prompt = {'session_id': 's', 'cwd': str(self.root), 'hook_event_name': 'UserPromptSubmit',
+                  'prompt': 'caf\u00e9 \u2714 \u0151'}
+        env = {**os.environ, 'XDG_CACHE_HOME': str(self.base / 'cache'), 'CLAUDE_PROJECT_DIR': str(self.root)}
+        env.pop('COWORK_TURN', None)
+        env.pop('PYTHONUTF8', None)
+        run = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(prompt, ensure_ascii=False).encode(),
+                             capture_output=True, env=env)
+        self.assertEqual(run.returncode, 0, run.stderr.decode(errors='replace'))
+        self.assertTrue((self.base / 'cache').exists())
 
     def test_stop_reply_is_json_on_stdout(self):
         out = self.run_hook(self.root, {'hook_event_name': 'Stop', 'last_assistant_message': ''}).stdout
