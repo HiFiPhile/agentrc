@@ -1,4 +1,5 @@
 """Tests for pr-review's scripts: real git in temporary repositories, a fake GitHub behind gh."""
+import errno
 import importlib.util
 import json
 import os
@@ -501,11 +502,12 @@ class Ledger(Case):
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['open'], [])
         self.assertEqual(self.prepare()['mode'], 'full', 'a declined head is not a reviewed head')
 
-    def test_an_absolute_comment_path_is_refused(self):
+    def test_an_absolute_or_backslashed_comment_path_is_refused(self):
         r = self.result_for(self.p)
-        for path in ('/abs/src/core/a.c', 'C:/abs/src/core/a.c', 'C:\\abs\\src\\core\\a.c'):
+        for path in ('/abs/src/core/a.c', 'C:/abs/src/core/a.c', 'C:\\abs\\src\\core\\a.c', '\\\\srv\\share\\src\\core\\a.c',
+                     '\\src\\core\\a.c', 'C:src/core/a.c', 'src\\core\\a.c'):
             r['draft']['comments'][0]['path'] = path
-            with self.assertRaisesRegex(facts.Unusable, 'absolute path'):
+            with self.assertRaisesRegex(facts.Unusable, 'absolute path or a backslash', msg=path):
                 self.save(r)
 
     def test_carried_findings_keep_their_id(self):
@@ -1516,29 +1518,69 @@ class ResolveDue(unittest.TestCase):
 
 
 class Lock(unittest.TestCase):
-    def test_a_second_process_waits_for_the_holder(self):
+    def setUp(self):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
-        path = tmp / 'pr-review' / '7.json'
+        self.path = tmp / 'pr-review' / '7.json'
+
+    def test_a_second_process_waits_for_the_holder_to_leave_the_block(self):
         holder = subprocess.Popen(
             [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import ledger; from pathlib import Path\n'
-             'with ledger.locked(Path(sys.argv[2])):\n print("held", flush=True); sys.stdin.read()',
-             str(SCRIPTS), str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+             'with ledger.locked(Path(sys.argv[2])):\n print("held", flush=True); sys.stdin.readline()\n'
+             'print("released", flush=True); sys.stdin.read()',
+             str(SCRIPTS), str(self.path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.stdin.close)
         self.addCleanup(holder.stdout.close)
         self.assertEqual(holder.stdout.readline().strip(), 'held')
-        got = threading.Event()
+        got, again = threading.Event(), threading.Event()
 
         def take():
-            with ledger.locked(path):
+            with ledger.locked(self.path):
                 got.set()
+            with ledger.locked(self.path):
+                again.set()
         t = threading.Thread(target=take, daemon=True)
         t.start()
         self.assertFalse(got.wait(0.5), 'the lock was taken while another process held it')
-        holder.stdin.close()
-        self.assertTrue(got.wait(10), 'the lock was not taken once its holder exited')
+        holder.stdin.write('\n')
+        holder.stdin.flush()
+        self.assertEqual(holder.stdout.readline().strip(), 'released')
+        self.assertTrue(got.wait(10), 'the lock was not taken once its holder left the block')
+        self.assertTrue(again.wait(10), 'the lock was not taken again in the process that released it')
+        self.assertIsNone(holder.poll(), 'the holder is still alive: leaving the block released it, not exiting')
         t.join()
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locking')
+    def test_a_locking_error_that_is_not_contention_is_raised(self):
+        raised = []
+
+        def take():
+            try:
+                with ledger.locked(self.path):
+                    pass
+            except OSError as e:
+                raised.append(e.errno)
+        with mock.patch.object(ledger.msvcrt, 'locking', side_effect=OSError(errno.EBADF, 'bad file descriptor')):
+            t = threading.Thread(target=take, daemon=True)
+            t.start()
+            t.join(5)
+        self.assertEqual(raised, [errno.EBADF], 'retried as if the lock were held')
+
+
+class Store(unittest.TestCase):
+    def test_a_reader_holding_the_ledger_open_only_delays_the_write(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / '7.json'
+        path.write_text('{}\n', encoding='utf-8')
+        reader = open(path, encoding='utf-8')
+        self.addCleanup(reader.close)
+        later = threading.Timer(0.2, reader.close)
+        later.start()
+        self.addCleanup(later.join)
+        ledger.store(path, {'v': 1})
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8')), {'v': 1})
 
 
 class Result(unittest.TestCase):

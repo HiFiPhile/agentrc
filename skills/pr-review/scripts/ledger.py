@@ -50,6 +50,7 @@ stdout ends with one JSON line; {"error": ...} and exit 2 when the ledger or
 the output cannot be read, or they disagree.
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -149,6 +150,7 @@ def locked(path):
     with open(path.with_suffix('.lock'), 'a') as fd:
         if fcntl:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
         else:
             # msvcrt locks are mandatory and per handle: lock a byte past the content; LK_LOCK gives up after ~10 s.
             os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
@@ -156,14 +158,26 @@ def locked(path):
                 try:
                     msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
                     break
-                except OSError:
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EDEADLOCK):
+                        raise
                     time.sleep(0.05)
-        yield
+            try:
+                yield
+            finally:
+                # Windows may release a closed handle's lock only after a delay.
+                os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
+                msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def store(path, led):
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(led, indent=1, sort_keys=True) + '\n', encoding='utf-8')
+    for _ in range(49 if os.name == 'nt' else 0):
+        try:
+            return os.replace(tmp, path)
+        except PermissionError:  # Windows: a reader without the lock has the ledger open
+            time.sleep(0.02)
     os.replace(tmp, path)
 
 
@@ -505,8 +519,9 @@ def save(led, result, reason):
     same = [r for r in led['reviews'] if r['head'] == result['head'] and r['status'] == 'posted']
     if same and not reason:
         raise Unusable(f"{result['head']} was already reviewed and posted; a second review needs --reason")
-    if any(re.match(r'/|[A-Za-z]:[\\/]', str(c.get('path', ''))) for c in result['draft']['comments']):
-        raise Unusable('a draft comment has an absolute path; GitHub needs repository-relative paths')
+    # A backslash is a separator on Windows, where `\x`, `\\srv\x` and `C:x` are absolute too: refused on every OS.
+    if any(re.match(r'/|[A-Za-z]:', p) or '\\' in p for p in (str(c.get('path', '')) for c in result['draft']['comments'])):
+        raise Unusable('a draft comment has an absolute path or a backslash; GitHub needs repository-relative paths with /')
     findings = number(led, result)
     try:
         comments = [{'path': c['path'], 'line': c['line'], 'body': c['body'], 'findingId': findings[c['finding']]['id']}
