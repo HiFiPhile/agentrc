@@ -92,9 +92,8 @@ current directory, a PR checkout for many of them.
 `install.py` creates symlinks, which needs Developer Mode or an elevated shell.
 Linux only: `--herdr-plugin` (herdr runs on Linux and macOS), `lsusbt`,
 `usb-kernel-debug`, `hil`'s rig-host scripts, and the capture scripts of
-`usb-sniffer`, `etm-trace` and `target-debug` (`dual_capture.py`,
-`console_capture.py`). Tests skip the cases that need POSIX exec, `/proc` or file
-names NTFS refuses.
+`usb-sniffer`, `etm-trace` and `target-debug` (`dual_capture.py`). Tests skip the
+cases that need POSIX exec, `/proc` or file names NTFS refuses.
 
 ## Skills
 

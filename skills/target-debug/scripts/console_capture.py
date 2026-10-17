@@ -36,6 +36,7 @@ import argparse
 import bisect
 import datetime
 import errno
+import fcntl
 import itertools
 import json
 import math
@@ -45,14 +46,9 @@ import select
 import signal
 import struct
 import sys
+import termios
 import time
-
-try:
-    import fcntl
-    import termios
-    import tty
-except ImportError:  # Windows: main() refuses
-    termios = None
+import tty
 
 DRIFTING = re.compile(r'/dev/tty(ACM|USB)[0-9]+')
 MAX_MARKS = 20
@@ -120,8 +116,6 @@ def main(argv=None):
     p.add_argument('--mark', action='append', default=[], metavar='REGEX',
                    help='report where this pattern occurs, with its time after the open (repeatable)')
     a = p.parse_args(argv)
-    if termios is None:
-        p.error(f'POSIX-only (termios); this is {sys.platform}')
     if DRIFTING.fullmatch(a.port):
         p.error(f'--port {a.port}: ttyACM/ttyUSB numbers drift; name it by /dev/serial/by-id or by-path')
     if not os.path.exists(a.port):
