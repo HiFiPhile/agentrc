@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 try:
     import fcntl
@@ -131,11 +131,11 @@ def replace(source, target):
 
 def on_path(name, exts):
     """Windows: `name` from PATH alone, not the cwd, which shutil.which and
-    CreateProcess search first, a checkout that may be a contributor's."""
+    CreateProcess search first, a checkout that may be a contributor's, as does a relative PATH entry."""
     for directory in os.environ.get('PATH', '').split(os.pathsep):
         for ext in exts:
             path = os.path.join(directory, name + ext)
-            if directory and os.path.isfile(path):
+            if PureWindowsPath(directory).drive and PureWindowsPath(directory).root and os.path.isfile(path):
                 return path
 
 

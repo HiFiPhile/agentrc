@@ -579,15 +579,18 @@ class GateTest(unittest.TestCase):
             self.assertEqual(gate.codex_exe(), 'codex', 'POSIX execs it by name, as before')
             return
         base = Path(self.tmp.name)
-        for name in ('cwd/codex.exe', 'first/codex.cmd', 'second/codex.exe', 'second/codex.cmd'):
-            (base / name).parent.mkdir(exist_ok=True)
+        for name in ('cwd/codex.exe', 'cwd/bin/codex.exe', 'cwd/rooted/codex.exe', 'first/codex.cmd',
+                     'second/codex.exe', 'second/codex.cmd'):
+            (base / name).parent.mkdir(parents=True, exist_ok=True)
             (base / name).write_text('never run')
         first, second = str(base / 'first'), str(base / 'second')
+        rooted = os.path.splitdrive(base / 'cwd' / 'rooted')[1]  # no drive: the cwd's drive decides
         cwd = os.getcwd()
         os.chdir(base / 'cwd')
         try:
-            with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', first, second])}):
-                self.assertEqual(gate.codex_exe(), os.path.join(first, 'codex.cmd'), 'PATH order, never the cwd')
+            with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', '.', 'bin', rooted, first, second])}):
+                os.environ.pop('NoDefaultCurrentDirectoryInExePath', None)
+                self.assertEqual(gate.codex_exe(), os.path.join(first, 'codex.cmd'), 'PATH order, never the cwd or a relative entry')
         finally:
             os.chdir(cwd)
         with mock.patch.dict(os.environ, {'PATH': second}):
