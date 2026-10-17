@@ -85,6 +85,20 @@ class Resolver(Config):
                              inspect.getsource(getattr(MODULES['pc_sample'], func)), func)
         self.assertEqual(MODULES['rtt'].HIL_PROBE_ROUTES, MODULES['pc_sample'].HIL_PROBE_ROUTES)
 
+    def test_a_config_is_read_as_utf8_whatever_the_locale(self):
+        # U+A000 leaves a stray 0x80 that GBK cannot decode, U+0141 a 0x81 that cp1252 cannot
+        self.config.write_text(json.dumps({'boards': [{**BOARDS[0], 'note': 'aꀀŁ'}]}, ensure_ascii=False),
+                               encoding='utf-8')
+        env = {k: v for k, v in os.environ.items() if k not in ('PYTHONUTF8', 'PYTHONIOENCODING')}
+        for name, script in SCRIPTS.items():
+            with self.subTest(script=name):
+                code = ('import importlib.util, sys; s = importlib.util.spec_from_file_location("m", sys.argv[1]); '
+                        'm = importlib.util.module_from_spec(s); s.loader.exec_module(m); '
+                        'print(m.hil_flasher(sys.argv[2], "k64f")["uid"])')
+                r = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', code, str(script), str(self.config)],
+                                   capture_output=True, text=True, env=env)
+                self.assertEqual((r.returncode, r.stdout.strip()), (0, BOARDS[0]['flasher']['uid']), r.stderr)
+
     def test_a_board_resolves_or_is_refused_the_same_way_in_both(self):
         for name, mod in MODULES.items():
             for board, want in RESOLVE_CASES:

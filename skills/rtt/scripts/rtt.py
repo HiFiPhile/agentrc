@@ -751,7 +751,7 @@ def hil_flasher(path, board):
     flasher.name must be there, what else is missing is the caller's to supply. Raises
     ValueError. Kept identical in rtt.py and pc_sample.py, which are copied around alone."""
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             config = json.load(f)
     except (OSError, ValueError) as e:
         raise ValueError(f'--hil-config {path}: {e}')
