@@ -36,7 +36,7 @@ VERDICTS = ('preserved', 'lost-A', 'lost-B', 'lost-both', 'inconclusive')
 
 
 def load(path):
-    return [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
+    return [json.loads(l) for l in Path(path).read_text(encoding='utf-8').splitlines() if l.strip()]
 
 
 def run(directory):
@@ -46,7 +46,7 @@ def run(directory):
     records = {v['id']: v for v in rows}
     if len(records) != len(rows):
         raise SystemExit(f'{d}: a case is recorded twice')
-    return records, load(d / 'calls.jsonl'), json.loads((d / 'env.json').read_text())
+    return records, load(d / 'calls.jsonl'), json.loads((d / 'env.json').read_text(encoding='utf-8'))
 
 
 def batched(calls):
@@ -194,14 +194,15 @@ def main(argv=None):
     if a.cmd == 'brief':
         sys.stdout.write(brief(corpus, single, batch))
         return 0
-    r = report(corpus, single, batch, json.loads(a.evidence.read_text()) if a.evidence else None,
+    r = report(corpus, single, batch, json.loads(a.evidence.read_text(encoding='utf-8')) if a.evidence else None,
                hashlib.sha256(Path(a.corpus).read_bytes()).hexdigest())
     text = json.dumps(r, indent=1)
     if a.out:
-        a.out.write_text(text + '\n')
+        a.out.write_text(text + '\n', encoding='utf-8')
     print(text)
     return 0 if r['pass'] else 1
 
 
 if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8')  # the brief quotes findings and verdicts
     sys.exit(main())
