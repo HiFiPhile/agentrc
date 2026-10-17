@@ -33,6 +33,7 @@ session; a core found halted ran at the next session; with the setting, a runnin
 board (CMSIS-DAP) is sampled through `probe_state.py`'s OpenOCD session, which also reports the other cores' DHCSR.
 `--halt-samples N` runs `probe_state.py`'s halting fallback (below) N times for a core with no usable PCSR, its PCs
 reported apart as halt reads (`--help`). ST-Link entries carry no OpenOCD configuration and are not covered.
+On Windows: the same, with `JLink.exe`/`openocd.exe` from PATH, never the current directory (unverified on hardware).
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
 
