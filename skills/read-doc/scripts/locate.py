@@ -27,6 +27,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -84,6 +85,18 @@ def split_pages(body):
     return pages
 
 
+def library_path(path):
+    """A manifest's path, '/'-separated on every OS: the index syncs with the library,
+    and manifests written on Windows before this held backslashes."""
+    return path.replace("\\", "/") if isinstance(path, str) else path
+
+
+def manifest(meta):
+    if isinstance(meta, dict) and "path" in meta:
+        meta["path"] = library_path(meta["path"])
+    return meta
+
+
 def read_header(bid):
     """Just the manifest, without reading the pages.
 
@@ -95,7 +108,7 @@ def read_header(bid):
             meta = json.loads(f.readline())
     except (OSError, ValueError):
         return None
-    return meta if isinstance(meta, dict) else None
+    return manifest(meta) if isinstance(meta, dict) else None
 
 
 def read_index(bid):
@@ -116,7 +129,7 @@ def read_index(bid):
     pages = split_pages(body)
     # Page count alone misses a body truncated inside its last page.
     intact = meta.get("pages") == len(pages) and meta.get("chars") == len(body)
-    return (meta, pages) if intact else (None, None)
+    return (manifest(meta), pages) if intact else (None, None)
 
 
 def is_current(meta, bid, src):
@@ -127,12 +140,23 @@ def is_current(meta, bid, src):
     return (meta.get("version") == VERSION and meta.get("extractor") == EXTRACTOR
             and meta.get("id") == bid and meta.get("size") == size
             and meta.get("mtime_ns") == mtime_ns
-            and meta.get("path") == os.path.relpath(src, LIB))
+            and library_path(meta.get("path")) == library_path(os.path.relpath(src, LIB)))
+
+
+def extractor():
+    """EXTRACTOR as run. On Windows, the pdftotext beside pdfinfo: Git for Windows
+    puts an xpdf one on PATH that writes Latin-1. EXTRACTOR stays the manifest's identity."""
+    cmd = list(EXTRACTOR)
+    if os.name == "nt" and cmd[0] == "pdftotext":
+        info = shutil.which("pdfinfo")
+        sibling = info and shutil.which("pdftotext", path=os.path.dirname(info))
+        cmd[0] = sibling or cmd[0]
+    return cmd
 
 
 def page_count(src):
     """Pages according to pdfinfo. Explicitly unavailable when it cannot say."""
-    done = subprocess.run(["pdfinfo", src], capture_output=True, text=True)
+    done = subprocess.run(["pdfinfo", src], capture_output=True, encoding="utf-8", errors="replace")
     m = re.search(r"^Pages:\s+(\d+)$", done.stdout, re.M)
     if done.returncode != 0 or not m:
         raise Unavailable(f"pdfinfo gave no page count for {os.path.basename(src)}"
@@ -151,7 +175,8 @@ def extract(bid, src):
     expected = page_count(src)
     tmp = text_path(bid) + f".tmp{os.getpid()}"
     try:
-        done = subprocess.run([*EXTRACTOR, src, tmp], capture_output=True, text=True)
+        done = subprocess.run([*extractor(), src, tmp], capture_output=True, encoding="utf-8",
+                              errors="replace")
         if done.returncode != 0:
             last = done.stderr.strip().splitlines()[-1:] or ["no diagnostic"]
             raise Unavailable(f"{bid}: pdftotext exit {done.returncode}: {last[0]}")
@@ -165,10 +190,10 @@ def extract(bid, src):
                               " read the pages themselves, `find` cannot search it")
         if stat_of(src) != before:
             raise Unavailable(f"{bid}: the source changed while it was being extracted")
-        meta = {"id": bid, "path": os.path.relpath(src, LIB), "size": before[0],
+        meta = {"id": bid, "path": os.path.relpath(src, LIB).replace(os.sep, "/"), "size": before[0],
                 "mtime_ns": before[1], "pages": pages, "chars": len(body),
                 "extractor": EXTRACTOR, "version": VERSION}
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(meta) + "\n" + body)
         os.replace(tmp, text_path(bid))
         return meta
@@ -484,7 +509,8 @@ def page_cmd(args):
               + ": a figure, scan or blank page)")
     span = f"{first}-{shown[-1]}" if shown[-1] > first else str(first)
     print("Tables, figures, register bitfields and access types are not reliable here: check them"
-          f" on the PDF page itself (Read {os.path.join(LIB, meta['path'])} with pages={span}).")
+          f" on the PDF page itself (Read {os.path.join(LIB, meta['path'].replace('/', os.sep))}"
+          f" with pages={span}).")
     return 1 if empty else 0
 
 
@@ -542,6 +568,8 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")  # titles and page text are not ASCII
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:
