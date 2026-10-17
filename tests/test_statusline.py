@@ -96,12 +96,16 @@ class CodexProcessTest(unittest.TestCase):
         self.late = self.dir / 'late'
 
     def test_codex_is_found_on_path_alone(self):
-        (self.dir / 'codex.exe').write_text('never run')
+        for exe in ('codex.exe', 'sub/codex.exe', 'rooted/codex.exe'):
+            (self.dir / exe).parent.mkdir(exist_ok=True)
+            (self.dir / exe).write_text('never run')
+        rooted = os.path.splitdrive(self.dir / 'rooted')[1]  # no drive: the cwd's drive decides
         cwd = os.getcwd()
         os.chdir(self.dir)
         try:
-            with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', str(self.dir / 'bin')])}), \
+            with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', '.', 'sub', rooted, str(self.dir / 'bin')])}), \
                     mock.patch.object(codex_usage.subprocess, 'Popen') as popen:
+                os.environ.pop('NoDefaultCurrentDirectoryInExePath', None)
                 self.assertIsNone(codex_usage.read_rate_limits())
         finally:
             os.chdir(cwd)
