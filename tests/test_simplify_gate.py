@@ -238,7 +238,7 @@ class GateTest(unittest.TestCase):
         self.assertNotIn('vendored', self.s.prompts[0])
         self.assertIn('+mine\n', self.s.prompts[0])
         self.new_turn()
-        sh(self.root / 'sub', 'git', 'commit', '-qam', 'bump')
+        sh(self.root / 'sub', 'git', '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qam', 'bump')  # the clone has no user.*, nor may HOME
         sh(self.root, 'git', 'add', 'sub')
         self.review()
         self.assertIn('[submodule at commit', self.s.prompts[-1])
@@ -583,8 +583,13 @@ class GateTest(unittest.TestCase):
             (base / name).parent.mkdir(exist_ok=True)
             (base / name).write_text('never run')
         first, second = str(base / 'first'), str(base / 'second')
-        with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', first, second])}):
-            self.assertEqual(gate.codex_exe(), os.path.join(first, 'codex.cmd'), 'PATH order, never the cwd')
+        cwd = os.getcwd()
+        os.chdir(base / 'cwd')
+        try:
+            with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', first, second])}):
+                self.assertEqual(gate.codex_exe(), os.path.join(first, 'codex.cmd'), 'PATH order, never the cwd')
+        finally:
+            os.chdir(cwd)
         with mock.patch.dict(os.environ, {'PATH': second}):
             self.assertEqual(gate.codex_exe(), os.path.join(second, 'codex.exe'), '.exe before .cmd')
         with mock.patch.dict(os.environ, {'PATH': str(base / 'none')}), self.assertRaises(FileNotFoundError):
