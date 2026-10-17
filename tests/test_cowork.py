@@ -155,7 +155,8 @@ def launcher(bin_dir, name, script):
     from pip._vendor.distlib.scripts import ScriptMaker
     source = bin_dir.parent / 'launch' / f'{name}.py'
     source.parent.mkdir(exist_ok=True)
-    source.write_text(f'#!python\nimport runpy\nrunpy.run_path({str(script)!r}, run_name="__main__")\n')
+    source.write_text(f'#!python\nimport runpy\nrunpy.run_path({str(script)!r}, run_name="__main__")\n',
+                      encoding='utf-8')
     maker = ScriptMaker(str(source.parent), str(bin_dir))
     maker.executable, maker.variants = sys.executable, {''}
     maker.make(source.name)
@@ -875,6 +876,113 @@ class CoworkTest(unittest.TestCase):
             with self.subTest(path=path), mock.patch.dict('os.environ', {'PATH': os.pathsep.join(map(str, path))}):
                 self.assertEqual(cowork.nt_cli(['codex', 'exec']), [str(found), 'exec'], 'PATH order, then .exe first')
 
+    @unittest.skipIf(os.name != 'nt', 'PATH entries are quoted, and relative ones searched, on Windows only')
+    def test_a_quoted_path_entry_is_its_directory_and_a_relative_one_is_skipped(self):
+        found = Path(self.tmp.name) / 'Program Files' / 'Codex'
+        found.mkdir(parents=True)
+        (found / 'codex.exe').touch()
+        (self.root / 'codex.exe').touch()  # the checkout, the working directory
+        for path, cwd, expected in ((f'"{found}"', self.root, found / 'codex.exe'),
+                                    (os.pathsep.join(('', self.root.name, str(found))), self.root.parent, found / 'codex.exe'),
+                                    ('.', self.root, None)):
+            with self.subTest(path=path), mock.patch.dict('os.environ', {'PATH': path}), contextlib.chdir(cwd):
+                if expected is None:
+                    with self.assertRaises(FileNotFoundError):
+                        cowork.nt_cli(['codex', 'exec'])
+                else:
+                    self.assertEqual(cowork.nt_cli(['codex', 'exec']), [str(expected), 'exec'])
+
+    @unittest.skipIf(os.name != 'nt', 'CreateProcess searches the current directory on Windows only')
+    def test_git_is_found_on_path_alone_never_in_the_checkout(self):
+        decoy = Path(self.tmp.name) / 'decoy'
+        decoy.write_text(f'open({str(Path(self.tmp.name) / "hijacked")!r}, "w").close()\nraise SystemExit(1)\n',
+                         encoding='utf-8')
+        launcher(self.root, 'git', decoy)  # a contributor's checkout
+        env = {k: v for k, v in os.environ.items() if k.lower() != 'nodefaultcurrentdirectoryinexepath'}
+        cowork.git_program.cache_clear()
+        try:
+            with mock.patch.dict('os.environ', env, clear=True):
+                code, _, reply, err = self.send('--no-edit', '--task', 'x')  # git_dir, the runner's and tree_state
+        finally:
+            cowork.git_program.cache_clear()
+        self.assertEqual((code, reply), (0, 'codex reply\nFiles touched: none\n'), err)
+        self.assertFalse((Path(self.tmp.name) / 'hijacked').exists())
+
+    @unittest.skipIf(os.name != 'nt', 'taskkill is Windows')
+    def test_taskkill_is_system32s_never_the_checkouts(self):
+        hijacked = Path(self.tmp.name) / 'hijacked'
+        decoy = Path(self.tmp.name) / 'decoy'
+        decoy.write_text(f'open({str(hijacked)!r}, "w").close()\n', encoding='utf-8')
+        launcher(self.root, 'taskkill', decoy)  # in the working directory, as the checkout is for `kill`
+        env = {k: v for k, v in os.environ.items() if k.lower() != 'nodefaultcurrentdirectoryinexepath'}
+        victim = subprocess.Popen(SLEEP)
+        try:
+            with mock.patch.dict('os.environ', env, clear=True):
+                cowork.kill_tree(victim.pid)
+            self.assertEqual(victim.wait(timeout=5), KILLED)
+            self.assertFalse(hijacked.exists())
+            for root, failure in (('', None), ('Windows', None), (os.environ['SystemRoot'], subprocess.TimeoutExpired('taskkill', 30)),
+                                  (os.environ['SystemRoot'], FileNotFoundError(2, 'gone'))):
+                with self.subTest(root=root, failure=failure), mock.patch.dict('os.environ', {'SystemRoot': root}), \
+                        mock.patch.object(cowork.subprocess, 'run', side_effect=failure) as ran, \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    cowork.kill_tree(victim.pid)  # reported, never raised
+                self.assertIn(f'cowork: taskkill of {victim.pid} failed: ', err.getvalue())
+                self.assertEqual(ran.called, failure is not None, 'a relative SystemRoot runs nothing')
+        finally:
+            if victim.poll() is None:
+                victim.kill()
+            victim.wait()
+
+    @unittest.skipIf(os.name != 'nt', 'the stand-ins are launchers on Windows only')
+    def test_a_launcher_runs_a_stand_in_under_a_non_ascii_path(self):
+        where = Path(self.tmp.name) / 'stubs ✔'
+        where.mkdir()
+        (where / 'probe').write_text("print('ran')\n", encoding='utf-8')
+        launcher(self.bin, 'probe', where / 'probe')
+        self.assertEqual(subprocess.run([str(self.bin / 'probe.exe')], capture_output=True, text=True).stdout, 'ran\n')
+
+    @unittest.skipIf(os.name != 'nt', 'job objects are Windows')
+    def test_what_the_cli_spawns_first_thing_is_in_its_job(self):
+        early = Path(self.tmp.name) / 'early.pid'
+        self.codex_does(f'import subprocess; open({str(early)!r}, "w").write(str(subprocess.Popen({SLEEP!r}).pid))')
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        (box / 'codex-x.jsonl').touch()
+        assign, nt_job, jobs, ran_first = cowork.kernel32.AssignProcessToJobObject, cowork.nt_job, [], []
+
+        def late_assign(job, process):  # give a CLI that is not suspended the time to spawn
+            deadline = time.monotonic() + 2
+            while not early.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            ran_first.append(early.exists())
+            return assign(job, process)
+
+        def keep(child):
+            jobs.append(nt_job(child))
+            return jobs[-1]
+        with holding(box / 'codex-x.lock') as lock, \
+                mock.patch.object(cowork.kernel32, 'AssignProcessToJobObject', late_assign), \
+                mock.patch.object(cowork, 'nt_job', keep), mock.patch.dict('os.environ', {'FAKE_GATE': str(self.gate)}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            cowork.write_side(box, model='gpt-6-astra', effort='medium')
+            runner = threading.Thread(target=cowork.run, args=('codex', box, self.root, 'codex-x', False, lock.fileno()))
+            runner.start()
+            try:
+                until(lambda: early.exists() and early.read_text())
+                pid = int(early.read_text())
+                until(lambda: ran_first)
+                self.assertEqual(ran_first, [False], 'the CLI ran nothing before it joined')
+                cowork.kernel32.TerminateJobObject(jobs[0], 1)
+                until(lambda: gone(pid), timeout=5)
+            finally:
+                self.gate.touch()  # a CLI the job did not take finishes
+                runner.join(timeout=10)
+                if early.exists() and early.read_text() and not gone(int(early.read_text())):
+                    subprocess.run(['taskkill', '/F', '/PID', early.read_text()], capture_output=True)
+        cowork.kernel32.CloseHandle(jobs[0])
+
     @unittest.skipIf(os.name != 'nt', 'cmd.exe runs batch files on Windows only')
     def test_a_batch_file_cli_runs_but_never_with_an_argument_cmd_would_reparse(self):
         (self.bin / 'claude.exe').unlink()  # an npm install: claude.cmd only
@@ -966,6 +1074,22 @@ class CoworkTest(unittest.TestCase):
                     self.assertIn('delivered, but', err)
                     (box / 'codex-x.jsonl').unlink()
 
+    @unittest.skipIf(os.name != 'nt', 'an open file blocks its removal on Windows only')
+    def test_a_lock_still_open_elsewhere_keeps_the_request_whole_and_readable(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        for ext, body in (('exit', b'0\n'), ('reply', b'done\nFiles touched: none\n'), ('lock', b''), ('err', b''),
+                          ('jsonl', b'')):
+            (box / f'codex-x.{ext}').write_bytes(body)
+        with (box / 'codex-x.lock').open():  # a reader, say a virus scanner: not a holder of the request
+            code, out, err = self.run_cli('read', 'codex-x')
+            self.assertEqual((code, out), (0, 'done\nFiles touched: none\n'))
+            self.assertIn('the request is kept whole', err)
+            self.assertEqual(self.leftovers('codex-x'), ['.err', '.exit', '.jsonl', '.lock', '.reply'])
+        code, out, err = self.run_cli('read', 'codex-x')
+        self.assertEqual((code, out, err), (0, 'done\nFiles touched: none\n', receipt('codex-x')), 'not "died"')
+        self.assertEqual(self.leftovers('codex-x'), [])
+
     @unittest.skipIf(os.name != 'nt', 'os.replace onto an open file fails on Windows only')
     def test_setting_the_default_waits_out_a_reader_of_the_preference_file(self):
         self.assertEqual(self.run_cli('default', 'astra')[0], 0)
@@ -1005,7 +1129,7 @@ class CoworkTest(unittest.TestCase):
         real, seen = subprocess.run, []
 
         def recording(*args, **kwargs):
-            if args[0][0] == 'git':
+            if args[0][0] == cowork.git_program():
                 seen.append(kwargs)
             return real(*args, **kwargs)
         with mock.patch.object(cowork.subprocess, 'run', recording):

@@ -47,6 +47,7 @@ import argparse
 import contextlib
 import datetime
 import errno
+import functools
 import json
 import os
 import re
@@ -57,7 +58,7 @@ import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 try:
     import fcntl
@@ -101,9 +102,35 @@ def die(message, code=FAILED):
     sys.exit(code)
 
 
+def nt_on_path(name, exts):
+    """Windows: `name` as PATH alone finds it, the first of `exts` in each
+    directory, else None. shutil.which and CreateProcess would try the
+    working directory, the checkout, first, as would a relative entry; a
+    quoted entry is the directory it quotes."""
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        d = d.strip('"')
+        if PureWindowsPath(d).drive and PureWindowsPath(d).root:
+            for e in exts:
+                if os.path.isfile(os.path.join(d, name + e)):
+                    return os.path.join(d, name + e)
+    return None
+
+
+@functools.cache
+def git_program():
+    """git: on Windows the git.exe that PATH alone finds, so a git.exe in the
+    checkout never runs; elsewhere the name, as execvp finds it."""
+    if os.name != 'nt':
+        return 'git'
+    found = nt_on_path('git', ('.exe',))
+    if found is None:
+        die('git is not on PATH as git.exe')
+    return found
+
+
 def git_dir():
     try:
-        out = subprocess.run(['git', 'rev-parse', '--show-toplevel', '--git-dir'],
+        out = subprocess.run([git_program(), 'rev-parse', '--show-toplevel', '--git-dir'],
                              check=True, capture_output=True, text=True, encoding=GIT_ENCODING).stdout.split('\n')
     except subprocess.CalledProcessError:
         die('not inside a git checkout')
@@ -112,7 +139,7 @@ def git_dir():
 
 
 def git(cwd, *args, check=True):
-    done = subprocess.run(['git', *args], cwd=cwd, capture_output=True, text=True, encoding=GIT_ENCODING)
+    done = subprocess.run([git_program(), *args], cwd=cwd, capture_output=True, text=True, encoding=GIT_ENCODING)
     if check and done.returncode:
         die(f'git {args[0]} in {cwd}: {done.stderr.strip()}')
     return done
@@ -253,10 +280,13 @@ if fcntl is None:  # Windows: open handles, msvcrt locks and a job object stand 
              (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)),
             ('CloseHandle', wintypes.BOOL, (wintypes.HANDLE,))):
         getattr(kernel32, _name).restype, getattr(kernel32, _name).argtypes = _restype, _argtypes
+    ntdll = ctypes.WinDLL('ntdll')
+    ntdll.NtResumeProcess.restype, ntdll.NtResumeProcess.argtypes = ctypes.c_long, (wintypes.HANDLE,)  # NTSTATUS
     GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_DELETE, OPEN_EXISTING = 0x80000000, 1, 4, 3
     INVALID_HANDLE_VALUE, ERROR_SHARING_VIOLATION = wintypes.HANDLE(-1).value, 32
     PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
     JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK = 9, 0x800
+    CREATE_SUSPENDED = 0x4
 
     class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):  # BREAKAWAY_OK is an extended limit
         _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64), ('PerJobUserTimeLimit', ctypes.c_int64),
@@ -337,14 +367,14 @@ def nt_detach(argv, cwd, handle, stderr):
 
 
 def nt_cli(argv):
-    """argv with its program found on PATH alone, an .exe before a .cmd or
-    .bat: shutil.which and CreateProcess would try the checkout first, where
-    a contributor's claude.cmd may sit. A batch file runs through cmd.exe,
-    which reparses what list2cmdline quoted (BatBadBut): refused when any
-    argument, the checkout path included, has a character it would expand."""
+    """argv with its program found on PATH alone (nt_on_path), an .exe before
+    a .cmd or .bat: shutil.which and CreateProcess would try the checkout
+    first, where a contributor's claude.cmd may sit. A batch file runs
+    through cmd.exe, which reparses what list2cmdline quoted (BatBadBut):
+    refused when any argument, the checkout path included, has a character
+    it would expand."""
     exts = ('.exe', '.cmd', '.bat')
-    program = next((p for d in os.environ.get('PATH', '').split(os.pathsep) if d
-                    for p in (os.path.join(d, argv[0] + e) for e in exts) if os.path.isfile(p)), None)
+    program = nt_on_path(argv[0], exts)
     if program is None:
         raise FileNotFoundError(f'{argv[0]} is not on PATH as {", ".join(argv[0] + e for e in exts)}')
     if program.lower().endswith(('.cmd', '.bat')) and any(set(arg) & set('%^&|<>!"') for arg in (program, *argv[1:])):
@@ -354,21 +384,31 @@ def nt_cli(argv):
 
 
 def nt_job(child):
-    """A job holding the CLI's tree, so one call kills it all; None if the
-    child cannot join one. The CLI starts before it joins, so what it spawns
-    in that instant stays outside. A tool may still leave by asking for
+    """A job holding the CLI's tree, so one call kills it all. The CLI starts
+    suspended (CREATE_SUSPENDED) and is resumed only once it has joined, so
+    nothing it spawns starts outside; one that cannot join, or resume, is
+    terminated and the failure raised. A tool may still leave by asking for
     breakaway, as on POSIX one may leave the process group with setsid."""
     job = kernel32.CreateJobObjectW(None, None)
-    if not job:
-        return None
-    limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION(LimitFlags=JOB_OBJECT_LIMIT_BREAKAWAY_OK)
-    if not kernel32.SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits),
-                                            ctypes.sizeof(limits)):
-        print(f'cowork: the CLI\'s job refused breakaway for its tools (error {ctypes.get_last_error()})',
-              file=sys.stderr)
-    if not kernel32.AssignProcessToJobObject(job, int(child._handle)):
-        kernel32.CloseHandle(job)
-        return None
+    try:
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error(), 'cowork: no job object for the CLI')
+        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION(LimitFlags=JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+        if not kernel32.SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits),
+                                                ctypes.sizeof(limits)):
+            print(f'cowork: the CLI\'s job refused breakaway for its tools (error {ctypes.get_last_error()})',
+                  file=sys.stderr)
+        if not kernel32.AssignProcessToJobObject(job, int(child._handle)):
+            raise ctypes.WinError(ctypes.get_last_error(), 'cowork: the CLI could not join its job object')
+        status = ntdll.NtResumeProcess(int(child._handle))
+        if status:
+            raise OSError(f'cowork: could not resume the CLI (NTSTATUS {status & 0xffffffff:#010x})')
+    except BaseException:
+        child.kill()
+        child.wait()
+        if job:
+            kernel32.CloseHandle(job)
+        raise
     return job
 
 
@@ -437,10 +477,16 @@ def state(box, request):
 
 
 def remove(box, request):
-    """Remove a request's files; on Windows, all that can go even when one is
-    still open elsewhere (then raised), so no half of it reads as a request."""
+    """Remove a request's files, its lock first: until the lock goes it is a
+    request, so a lock that cannot go keeps the rest, readable, and raises.
+    Then, on Windows, all else that can go even when one is still open
+    elsewhere (then raised); no half of it reads as a request."""
+    lock = box / f'{request}.lock'
+    retry(lambda: lock.unlink(missing_ok=True))
     stuck = None
     for leftover in box.glob(f'{request}.*'):
+        if leftover == lock:  # may stay listed until a prober's handle closes
+            continue
         try:
             retry(leftover.unlink)
         except PermissionError as failure:
@@ -588,8 +634,15 @@ def kill_tree(pid, job=None):
     once, all but a tool that asked to break away, which taskkill took while
     its parent lived."""
     if fcntl is None:
-        subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
+        # System32's, by full path: CreateProcess would try the working directory, the checkout, first
+        taskkill = os.path.join(os.environ.get('SystemRoot', ''), 'System32', 'taskkill.exe')
+        try:
+            if not (PureWindowsPath(taskkill).drive and PureWindowsPath(taskkill).root):
+                raise OSError(f'SystemRoot names no absolute directory: {taskkill}')
+            subprocess.run([taskkill, '/F', '/T', '/PID', str(pid)], capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as failure:
+            print(f'cowork: taskkill of {pid} failed: {failure}', file=sys.stderr)
         if job:
             kernel32.TerminateJobObject(job, 1)
         return
@@ -640,9 +693,9 @@ def run(side, box, host, request, no_edit, lock_fd):
             stdin.write(prompt.encode())
             stdin.seek(0)
             if fcntl is None:
-                child = nt_popen(nt_cli(argv), msvcrt.get_osfhandle(lock_fd), cwd=root, stdin=stdin, stdout=out,
-                                 env=env)
-                job = nt_job(child)
+                child = nt_popen(nt_cli(argv), msvcrt.get_osfhandle(lock_fd), CREATE_SUSPENDED, cwd=root, stdin=stdin,
+                                 stdout=out, env=env)
+                job = nt_job(child)  # resumes it
             else:
                 child = subprocess.Popen(argv, cwd=root, stdin=stdin, stdout=out, env=env,
                                          start_new_session=True, pass_fds=(lock_fd,))
@@ -802,7 +855,7 @@ def tree_state(root):
     An unborn or detached HEAD and a missing index are states; any other
     failure raises."""
     def git(*args, ok=(0,), **env):
-        done = subprocess.run(['git', *args], cwd=root, capture_output=True, text=True, encoding=GIT_ENCODING,
+        done = subprocess.run([git_program(), *args], cwd=root, capture_output=True, text=True, encoding=GIT_ENCODING,
                               errors='replace' if GIT_ENCODING else None, env={**os.environ, **env})
         if done.returncode not in ok:
             raise SnapshotError(f'could not verify the tree: git {" ".join(args)}: '
@@ -911,8 +964,10 @@ def deliver(box, request, out=None):
         except PermissionError as failure:  # on Windows, a file still open: delivered all the same
             if os.name != 'nt':
                 raise
+            kept = ('the request is kept whole: read it again once it lets go' if failure.filename == str(lock)
+                    else 'remove what is left of the request once it lets go')
             print(f'cowork request {request}: delivered, but {failure.filename} is still open in another process; '
-                  f'remove what is left of the request once it lets go', file=sys.stderr, flush=True)
+                  f'{kept}', file=sys.stderr, flush=True)
     return code
 
 
