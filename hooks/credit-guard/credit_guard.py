@@ -15,7 +15,6 @@ nothing or times out proceed. State lives in $CLAUDE_CONFIG_DIR/credit-guard/:
 usage.json (the shared reading), readings.log (every fetch, for tuning
 HEADROOM) and sessions/<session_id>.off (the session's guard is off).
 """
-import fcntl
 import json
 import math
 import os
@@ -23,6 +22,12 @@ import re
 import sys
 import time
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows; a failed import would exit 1, which lets the turn through
+    fcntl = None
+    import msvcrt
 
 URL = 'https://api.anthropic.com/api/oauth/usage'
 HTTP_TIMEOUT = 5  # seconds
@@ -41,7 +46,7 @@ def state_dir():
 
 def fetch():
     import urllib.request  # here, not at the top: it costs ~17 ms on every hook call
-    creds = json.loads((state_dir().parent / '.credentials.json').read_text())
+    creds = json.loads((state_dir().parent / '.credentials.json').read_text(encoding='utf-8'))
     req = urllib.request.Request(URL, headers={'Authorization': f"Bearer {creds['claudeAiOauth']['accessToken']}",
                                                'anthropic-beta': 'oauth-2025-04-20'})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
@@ -93,9 +98,17 @@ def locked(d):
     """The held usage lock; raises after LOCK_WAIT so the hook still answers before its timeout."""
     f = (d / 'usage.lock').open('w')
     deadline = time.monotonic() + LOCK_WAIT
+    if not fcntl:  # msvcrt locks are mandatory and per handle: lock a byte past the (empty) content
+        os.lseek(f.fileno(), 1 << 30, os.SEEK_SET)
     while True:
         try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fcntl:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    raise BlockingIOError from None
             return f
         except BlockingIOError:
             if time.monotonic() > deadline:
@@ -216,7 +229,7 @@ def handle(event, now=None):
 def main():
     event = {}
     try:
-        event = json.load(sys.stdin)
+        event = json.load(sys.stdin.buffer)
         out = handle(event)
     except Exception as e:  # noqa: BLE001 - see the module docstring: a failed hook must not let a turn through
         name = event.get('hook_event_name') if isinstance(event, dict) else None
