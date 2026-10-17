@@ -26,6 +26,7 @@ import collections
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -198,11 +199,12 @@ def main(argv=None):
                hashlib.sha256(Path(a.corpus).read_bytes()).hexdigest())
     text = json.dumps(r, indent=1)
     if a.out:
-        a.out.write_text(text + '\n', encoding='utf-8')
+        a.out.write_text(text + '\n', encoding='utf-8', newline='\n')
     print(text)
     return 0 if r['pass'] else 1
 
 
 if __name__ == '__main__':
-    sys.stdout.reconfigure(encoding='utf-8')  # the brief quotes findings and verdicts
+    if os.name == 'nt':  # the brief quotes findings and verdicts
+        sys.stdout.reconfigure(encoding='utf-8')
     sys.exit(main())

@@ -125,7 +125,7 @@ def main(argv=None):
         if room(cl):
             take(cl)
     sample = [{**c, 'cluster': i, 'tags': sorted(tag[c['id']])} for i, cl in enumerate(picked) for c in cl]
-    with a.out.open('w', encoding='utf-8') as f:
+    with a.out.open('w', encoding='utf-8', newline='\n') as f:
         for c in sample:
             f.write(json.dumps(c) + '\n')
     print(f'{len(sample)}/{a.total} cases in {len(picked)} clusters, seed {a.seed}: ' +

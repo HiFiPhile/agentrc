@@ -34,7 +34,7 @@ PROMPT = re.compile(r'Adversarially verify ONE review finding about (?P<dir>.*?)
 SCOPE = re.compile(r'The checkout is at [0-9a-f]{40}\. Judge only what `git diff ([0-9a-f]{40}) ([0-9a-f]{40})')
 HARNESS = 'The computed task text follows:\n'
 REPOS = {'tinyusb': 'hathach/tinyusb', 'agentrc': 'hathach/agentrc'}
-DRIVE = re.compile(r'[A-Za-z]:[\\/]')  # a Windows absolute path, either slash
+WINDOWS = re.compile(r'[A-Za-z]:|\\')  # a Windows absolute path: a drive (with or without a slash), UNC or root-relative
 
 
 def events(path):
@@ -68,7 +68,7 @@ def origin(where):
 def worktree_of(file, project):
     """The prefix of an absolute path that is the session's working directory, or None without exactly one."""
     # A Windows path may use either slash, and its drive letter's case need not match the directory name's.
-    win = DRIVE.match(file)
+    win = WINDOWS.match(file)
     parts = re.split(r'[\\/]', file) if win else file.split('/')
     same = (lambda a, b: a.lower() == b.lower()) if win else str.__eq__
     roots = ['/'.join(parts[:i]) for i in range(2, len(parts)) if same(re.sub(r'[^A-Za-z0-9]', '-', '/'.join(parts[:i])), project)]
@@ -128,7 +128,7 @@ def cases(path, skipped):
             continue
         finding = json.loads(m.group('finding'))
         file, worktree = finding['file'], None
-        if file.startswith('/') or DRIVE.match(file):
+        if file.startswith('/') or WINDOWS.match(file):
             # a run that names itself had code-audit normalize its paths: an absolute one breaks that contract
             if named:
                 skipped['absolute path in a run that names itself'] += 1
@@ -138,8 +138,7 @@ def cases(path, skipped):
                 skipped['absolute path outside the session worktree'] += 1
                 continue
             file = file[len(worktree) + 1:]
-            if DRIVE.match(worktree):
-                file = file.replace('\\', '/')
+        file = file.replace('\\', '/')  # a separator wherever the scanner ran, as code-audit reads it
         yield {
             'id': hashlib.sha1(json.dumps([repo, head, prompt]).encode()).hexdigest()[:12],
             'repo': repo, 'pr': pr, 'head': head, 'base': scope.group(1) if scope else None,
@@ -162,7 +161,7 @@ def main(argv=None):
         for path in sorted(root.glob('*/*/subagents/workflows/*/journal.jsonl')):
             for c in cases(path, skipped):
                 seen.setdefault(c['id'], c)
-    with a.out.open('w', encoding='utf-8') as f:
+    with a.out.open('w', encoding='utf-8', newline='\n') as f:
         for c in seen.values():
             f.write(json.dumps(c) + '\n')
     real = sum(1 for c in seen.values() if c['verifier'].get('real'))

@@ -23,7 +23,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, relative, resolve } from 'node:path'
+import { join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 
@@ -53,7 +53,7 @@ if (!Number.isInteger(jobs) || jobs < 1) fail(`--jobs must be a positive integer
 const only = opt.only ? new Set(opt.only.split(',')) : null
 if (existsSync(out)) fail(`${out} exists: a run writes a new directory, so no two experiments share one`)
 let CLAUDE = ['claude']
-if (process.env.REPLAY_CLAUDE) {
+if (process.env.REPLAY_CLAUDE !== undefined) {  // set but empty is a mistake, not a request for the real claude
   try { CLAUDE = JSON.parse(process.env.REPLAY_CLAUDE) } catch { CLAUDE = null }
   if (!Array.isArray(CLAUDE) || !CLAUDE.length || !CLAUDE.every(a => typeof a === 'string' && a)) fail('REPLAY_CLAUDE must be a JSON array of nonempty strings')
 }
@@ -103,6 +103,7 @@ for (const [key, dir] of trees) if (!clean(dir, JSON.parse(key)[1])) fail(`${dir
 
 const sha256 = (data) => createHash('sha256').update(data).digest('hex')
 const fileDigest = (p) => existsSync(p) ? sha256(readFileSync(realpathSync(p))) : null
+// Names are `/`-separated on every host, so env.json compares across them.
 const treeDigest = (root) => {
   if (!existsSync(root)) return null
   const h = createHash('sha256')
@@ -112,7 +113,7 @@ const treeDigest = (root) => {
       const p = join(dir, name)
       const st = statSync(p)
       if (st.isDirectory()) walk(p)
-      else h.update(`${relative(root, p)}\0${st.size}\0${st.size < 1 << 20 ? sha256(readFileSync(p)) : ''}\n`)
+      else h.update(`${relative(root, p).split(sep).join('/')}\0${st.size}\0${st.size < 1 << 20 ? sha256(readFileSync(p)) : ''}\n`)
     }
   }
   walk(realpathSync(root))

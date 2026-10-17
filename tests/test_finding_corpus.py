@@ -65,6 +65,7 @@ class Extract(unittest.TestCase):
         printed = io.StringIO()
         with redirect_stdout(printed):
             extract.main([str(self.root / 'projects'), '--out', str(out)])
+        self.assertNotIn(b'\r', out.read_bytes(), 'one LF-terminated line a case on every OS')
         return [json.loads(l) for l in out.read_text(encoding='utf-8').splitlines()], printed.getvalue()
 
     def test_a_case_is_the_prompt_and_model_its_transcript_recorded(self):
@@ -104,6 +105,23 @@ class Extract(unittest.TestCase):
         self.assertEqual([(c['repo'], c['pr'], c['path'], c['worktree']) for c in cases],
                          [('hathach/tinyusb', 12, 'src/class/x.c', 'e:\\mcu\\tinyusb\\.worktrees\\pr-review-12')])
         self.assertIn('1 verdict(s), absolute path outside the session worktree', printed)
+
+    def test_every_backslash_is_a_separator_and_a_unc_rooted_or_drive_relative_path_is_absolute(self):
+        top = 'E:\\mcu\\tinyusb\\.worktrees\\pr-review-12'
+        at = lambda file, why='w': prompt(finding={**FINDING, 'file': file, 'why': why}, directory='src/class')
+        self.journal('E--mcu-tinyusb--worktrees-pr-review-12', [
+            ('verify:d0x0:0', REAL, at('src\\class\\x.c'), OPUS),
+            ('verify:d0x0:1', REAL, at('\\\\srv\\share\\x.c'), OPUS),
+            ('verify:d0x0:2', REAL, at('\\x.c'), OPUS),
+            ('verify:d0x0:3', REAL, at('C:x.c'), OPUS),
+        ], check={'head': HEAD, 'top': top})
+        unc = '\\\\srv\\share\\tinyusb\\.worktrees\\pr-review-13'
+        self.journal('--srv-share-tinyusb--worktrees-pr-review-13', [
+            ('verify:d0x0:0', REAL, at(unc + '\\src\\y.c', 'unc'), OPUS),
+        ], check={'head': HEAD, 'top': unc})
+        cases, printed = self.run_it()
+        self.assertEqual(sorted((c['pr'], c['path'], c['worktree']) for c in cases), [(12, 'src/class/x.c', None), (13, 'src/y.c', unc)])
+        self.assertIn('3 verdict(s), absolute path outside the session worktree', printed)
 
     def test_the_worktree_is_the_prefix_the_project_directory_encodes(self):
         top = '/home/u/src/tinyusb/.worktrees/pr-review-12'
@@ -225,6 +243,7 @@ class Sample(unittest.TestCase):
             src.write_text('\n'.join(map(json.dumps, cases)) + '\n')
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                 rc = sample.main(['--cases', str(src), '--out', str(out), '--seed', '7', '--total', str(total)])
+            self.assertNotIn(b'\r', out.read_bytes(), 'one LF-terminated line a case on every OS')
             return rc, err.getvalue(), [json.loads(l) for l in out.read_text(encoding='utf-8').splitlines()]
 
     def test_every_pr_is_sampled_and_the_total_is_filled(self):
@@ -531,6 +550,15 @@ class Replay(unittest.TestCase):
         calls = [json.loads(l) for l in (out / 'calls.jsonl').read_text(encoding='utf-8').splitlines()]
         self.assertTrue(all(c['structured'] is None and c['error'].startswith('success: {') for c in calls))
 
+    def test_the_skills_digest_names_a_file_with_slashes(self):
+        skill = self.root / 'home' / '.claude' / 'skills' / 'x'
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_bytes(b'hi\n')
+        out, _ = self.replay('single', self.corpus())
+        env = json.loads((out / 'env.json').read_text(encoding='utf-8'))
+        line = '\0'.join(('x/SKILL.md', '3', hashlib.sha256(b'hi\n').hexdigest())) + '\n'
+        self.assertEqual(env['before']['skills'], hashlib.sha256(line.encode()).hexdigest())
+
     def test_nothing_is_spent_on_a_run_that_cannot_be_scored(self):
         corpus = self.corpus()
         _, err = self.replay('single', corpus, '--jobs', '0', ok=False)
@@ -547,6 +575,12 @@ class Replay(unittest.TestCase):
         gone.write_text(''.join(json.dumps({**r, 'base': 'f' * 40}) + '\n' for r in rows))
         _, err = self.replay('single', gone, ok=False)
         self.assertIn(f"o/r {'f' * 40}: not in", err)
+        stand_in = self.env['REPLAY_CLAUDE']
+        for bad in ('', 'claude', '[]', '[""]'):
+            self.env['REPLAY_CLAUDE'] = bad
+            _, err = self.replay('single', corpus, ok=False)
+            self.assertIn('REPLAY_CLAUDE must be a JSON array of nonempty strings', err, repr(bad))
+        self.env['REPLAY_CLAUDE'] = stand_in
         self.assertFalse((self.root / 'fake.log').exists(), 'no verifier was started')
         self.replay('single', Path('corpus.jsonl'), '--worktrees', 'wt2', out='relative')
         self.assertTrue((self.root / 'relative' / 'verdicts.jsonl').exists(), 'relative paths resolve against the caller')

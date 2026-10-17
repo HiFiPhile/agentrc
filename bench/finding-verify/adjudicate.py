@@ -13,6 +13,7 @@ adjudicator's name, the names distinct.
 import argparse
 import collections
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -142,7 +143,7 @@ def main(argv=None):
         sys.stdout.write(brief(sample, a.clusters, checkouts))
         return 0
     corpus = merge(sample, a.a, a.b, a.lead)
-    with a.out.open('w', encoding='utf-8') as f:
+    with a.out.open('w', encoding='utf-8', newline='\n') as f:
         for c in corpus:
             f.write(json.dumps(c) + '\n')
     by = collections.Counter(c['truth']['status'] for c in corpus)
@@ -151,5 +152,6 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    sys.stdout.reconfigure(encoding='utf-8')  # the brief quotes findings and code
+    if os.name == 'nt':  # the brief quotes findings and code
+        sys.stdout.reconfigure(encoding='utf-8')
     sys.exit(main())
