@@ -25,6 +25,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -50,8 +51,9 @@ def token():
     value = os.environ.get('RTD_TOKEN')
     if not value:
         try:
-            value = subprocess.run(['bash', '-lc', 'printf %s "$RTD_TOKEN"'],
-                                   capture_output=True, text=True, timeout=10).stdout.strip()
+            # which: a bare 'bash' on Windows is System32's WSL launcher
+            value = subprocess.run([shutil.which('bash') or 'bash', '-lc', 'printf %s "$RTD_TOKEN"'],
+                                   capture_output=True, encoding='utf-8', errors='replace', timeout=10).stdout.strip()
         except (OSError, subprocess.SubprocessError) as e:
             raise Failed(f'RTD_TOKEN is not in the environment and the login shell failed: {e}')
     if not value:
@@ -152,4 +154,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    # what it prints carries remote text, which a Windows console code page cannot always encode
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
     sys.exit(main())

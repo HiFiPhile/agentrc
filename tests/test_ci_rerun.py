@@ -3,6 +3,9 @@ import importlib.util
 import io
 import http.server
 import json
+import os
+import subprocess
+import sys
 import threading
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
@@ -273,6 +276,20 @@ class RtdTest(unittest.TestCase):
         rc, _, err = self.main('log', URL.format(1))
         self.assertEqual((rc, self.keys), (2, set()))
         self.assertIn('not a single token', err)
+
+    def test_the_login_shell_is_the_bash_on_path(self):
+        """Windows resolves a bare 'bash' to System32's WSL launcher before PATH."""
+        del rtd.os.environ['RTD_TOKEN']
+        run = mock.Mock(return_value=mock.Mock(stdout='tok'))
+        with mock.patch.object(rtd.subprocess, 'run', run), mock.patch.object(rtd.shutil, 'which', lambda name: f'/opt/{name}'):
+            self.main('log', URL.format(1))
+        self.assertEqual((run.call_args.args[0][:2], self.keys), (['/opt/bash', '-lc'], {'tok'}))
+
+    def test_a_refusal_prints_utf8_whatever_the_console(self):
+        done = subprocess.run([sys.executable, str(SCRIPTS / 'rtd.py'), 'log', 'https://example.org/修复/🙂'],
+                              capture_output=True, env={**os.environ, 'RTD_TOKEN': 'k'})
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('修复/🙂: not a build URL', done.stderr.decode('utf-8'))
 
     def test_a_login_shell_that_hangs_is_a_setup_error(self):
         del rtd.os.environ['RTD_TOKEN']

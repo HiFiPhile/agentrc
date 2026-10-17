@@ -377,6 +377,11 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(e.exception.code, 2)
 
 
+def stdin_of(data):
+    """A stdin holding data, text sent as UTF-8."""
+    return io.TextIOWrapper(io.BytesIO(data if isinstance(data, bytes) else data.encode('utf-8')), encoding='utf-8')
+
+
 def log(*lines):
     """An Actions job log as the API returns it: timestamps, ANSI colour, a NUL per line."""
     return ''.join(f'2026-09-24T17:35:56.3154101Z \x1b[36m{line}\x1b[0m\x00\n' for line in lines)
@@ -799,12 +804,18 @@ class FailuresTest(unittest.TestCase):
         self.assertIn('moved', out.getvalue())
         self.assertNotEqual(rc, 0)
 
+    def test_a_log_is_saved_as_utf8(self):
+        self.logs['3'] = log(*STEP, 'naïve ✓ 😀')
+        c = self.entries(JOB.format(3))[0]
+        self.assertNotIn('\\', c['log'], 'a path the judge may paste into a shell')
+        self.assertIn('naïve ✓ 😀', Path(c['log']).read_text(encoding='utf-8'))
+
     def test_the_detail_lists_the_prs_changed_paths(self):
         rc, r = self.main(JOB.format(3))
         self.assertEqual(json.loads(Path(r['detail']).read_text())['changed'], ['src/host/msc.c', 'test/hil/tiny usb.json'], 'a path with a space stays one path')
 
     def remember_on(self, head, failures, link=JOB.format(3)):
-        with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps([{'link': link, 'bucket': 'fail', 'failures': failures}]))):
+        with mock.patch.object(sys, 'stdin', stdin_of(json.dumps([{'link': link, 'bucket': 'fail', 'failures': failures}]))):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(collect.main(['remember', '--repo', 'o/r', '--pr', '5', '--head', head]), 0)
 
@@ -1212,7 +1223,7 @@ class VerdictsTest(unittest.TestCase):
 
     def main(self, command, *argv, stdin=''):
         out = io.StringIO()
-        with redirect_stdout(out), mock.patch('sys.stdin', io.StringIO(stdin)):
+        with redirect_stdout(out), mock.patch('sys.stdin', stdin_of(stdin)):
             rc = collect.main([command, '--repo', 'o/r', '--pr', '5', '--head', HEAD, *argv])
         self.printed = out.getvalue()
         return rc, unsealed(self.printed)
@@ -1221,7 +1232,8 @@ class VerdictsTest(unittest.TestCase):
         return {**self.ENTRY, 'link': link.format(n), 'failures': [{**self.ENTRY['failures'][0], 'firstError': 'x' * size}]}
 
     def test_recall_returns_what_was_remembered_unchanged_and_skips_unknown_links(self):
-        self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY])), (0, {'head': HEAD}))
+        # Raw UTF-8 on stdin, stored as UTF-8 whatever the locale: 😀 is in no Windows code page.
+        self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY], ensure_ascii=False)), (0, {'head': HEAD}))
         rc, r = self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))
         self.assertEqual((rc, r['verdicts']), (0, [self.ENTRY]))
 
@@ -1346,7 +1358,7 @@ class VerdictsTest(unittest.TestCase):
             for held in r['left']:
                 self.assertEqual(self.joined(held), next(e for e in entries if e['link'] == held['link']), 'each fits one page')
     def test_remember_refuses_what_is_not_a_list_of_verdicts(self):
-        for text in ('not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}]),
+        for text in (b'["\xff"]', 'not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}]),
                      json.dumps([{'link': 'x', 'bucket': 'fail', 'patch': [7]}]), json.dumps([{'link': 'x', 'bucket': 'fail', 'failures': [], 'patch': []}])):
             rc, r = self.main('remember', stdin=text)
             self.assertEqual(rc, 1, text)
