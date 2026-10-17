@@ -44,7 +44,8 @@ keeps the levels the open left, guessed from the saved control modes when the dr
 them; `low` then clears RTS before DTR (EscapeCommFunction), since DTR low with RTS high holds an
 Espressif chip in reset (esptool's reset is DTR off, RTS on). At the end the saved DCB and
 COMMTIMEOUTS go back, except the DTR/RTS control, which keeps the levels the lines have then, so
-the restore moves no line, like tcsetattr; whether the open or the close moves them is the
+the restore moves no line, like tcsetattr (equal XON/XOFF characters, which SetCommState refuses,
+go back as 0x11/0x13); whether the open or the close moves them is the
 driver's choice, as HUPCL is on Linux. A read waits at most 50 ms, which bounds the end at
 --seconds and at Ctrl-C or Ctrl-Break. Another process cannot signal the script (TerminateProcess
 skips the restore and the summary): to stop it early, start it with CREATE_NEW_PROCESS_GROUP and
@@ -241,8 +242,11 @@ def nt_close(h):
 
 
 def nt_hold(saved, lines):
-    """A copy of DCB saved whose DTR/RTS control holds the lines at levels lines (None: as saved)."""
+    """A copy of DCB saved whose DTR/RTS control holds the lines at levels lines (None: as saved), and whose
+    XON/XOFF characters SetCommState takes: some drivers report equal ones, which it refuses."""
     d = type(saved).from_buffer_copy(saved)
+    if d.XonChar == d.XoffChar:
+        d.XonChar, d.XoffChar = b'\x11', b'\x13'
     if lines is not None:
         d.fDtrControl = DTR_CONTROL_ENABLE if lines['dtr'] else DTR_CONTROL_DISABLE
         d.fRtsControl = RTS_CONTROL_ENABLE if lines['rts'] else RTS_CONTROL_DISABLE
@@ -260,7 +264,6 @@ def nt_raw(saved, baud, lines):
     d.fBinary = 1
     d.fParity = d.fOutxCtsFlow = d.fOutxDsrFlow = d.fDsrSensitivity = 0
     d.fOutX = d.fInX = d.fErrorChar = d.fNull = d.fAbortOnError = 0
-    d.XonChar, d.XoffChar = b'\x11', b'\x13'    # some drivers report equal ones, which SetCommState refuses
     return d
 
 

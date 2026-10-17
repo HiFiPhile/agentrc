@@ -297,6 +297,8 @@ class FakePort:
         self._h(h)
         before = self.lines()
         self._call('nt_set_state', bytes(d), before)
+        if d.XonChar == d.XoffChar:
+            raise ctypes.WinError(87)    # SetCommState refuses equal XON/XOFF characters
         self.state = self.m.DCB.from_buffer_copy(d)
         if self.stores_baud:
             self.state.BaudRate = self.stores_baud
@@ -410,6 +412,8 @@ class WindowsBackendTest(unittest.TestCase):
         _, restored, before = self.calls('nt_set_state')[-1]
         want = self.m.DCB.from_buffer_copy(self.port.saved_state)
         want.fDtrControl, want.fRtsControl = int(before[0]), int(before[1])    # ENABLE 1 / DISABLE 0
+        if want.XonChar == want.XoffChar:    # as saved, unless SetCommState would refuse them
+            want.XonChar, want.XoffChar = b'\x11', b'\x13'
         self.assertEqual(restored, bytes(want))
         self.assertEqual(self.calls('nt_close')[-1][1], before)
         self.assertEqual(self.calls('nt_set_timeouts')[-1][1], self.port.saved_timeouts)
@@ -442,6 +446,16 @@ class WindowsBackendTest(unittest.TestCase):
         self.assertTrue(out['baseline'].startswith('none'))
         self.assertNotIn('otherOpeners', out)
         self.assertEqual(set(self.port.reached), {(True, False)})    # no line ever moved
+        self.assert_restored_and_closed(out)
+
+    def test_distinct_xon_xoff_characters_are_kept(self):
+        self.port.state.XonChar, self.port.state.XoffChar = b'\x01', b'\x02'
+        self.port.saved_state = bytes(self.port.state)
+        rc, out, err = self.run_main(seconds='0.1')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.configured().XonChar, self.configured().XoffChar), (b'\x01', b'\x02'))
+        restored = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[-1][1])
+        self.assertEqual((restored.XonChar, restored.XoffChar), (b'\x01', b'\x02'))
         self.assert_restored_and_closed(out)
 
     def test_leave_without_a_line_report_follows_the_saved_control_modes(self):
