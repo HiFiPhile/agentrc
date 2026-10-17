@@ -1,14 +1,22 @@
+import contextlib
+import ctypes
+import importlib.util
+import io
 import json
 import os
 import signal
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
 import unittest
 from pathlib import Path
+
+try:
+    import termios
+except ImportError:  # Windows: only the Win32 backend cases run
+    termios = None
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'console_capture.py'
 
@@ -198,6 +206,370 @@ sys.exit(m.main(sys.argv[1:]))
         rc, _, err = self.run_cli('--seconds', '1', '--lines', 'leave', port=str(self.d / 'nope'))
         self.assertEqual(rc, 2)
         self.assertIn('no such device', err)
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location('console_capture_nt', str(SCRIPT))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class NoKernel32:
+    def __getattr__(self, name):
+        raise AssertionError(f'a test reached the real kernel32.{name}')
+
+
+class FakePort:
+    """The module's Win32 layer over a port that exists only here: its DCB, timeouts and lines."""
+
+    def __init__(self, m):
+        self.m = m
+        self.log = []
+        self.handle = 0x7FFE_1234_5678_0040    # a 64-bit handle value
+        self.exists = {'COM7', 'COM12'}
+        self.open_error = None
+        self.state = m.DCB(DCBlength=ctypes.sizeof(m.DCB), BaudRate=9600, ByteSize=7, Parity=2, StopBits=2,
+                           fParity=1, fOutxCtsFlow=1, fOutxDsrFlow=1, fDsrSensitivity=1, fOutX=1, fInX=1,
+                           fErrorChar=1, fNull=1, fAbortOnError=1, fDtrControl=m.DTR_CONTROL_HANDSHAKE,
+                           fRtsControl=m.RTS_CONTROL_TOGGLE, XonChar=b'\x11', XoffChar=b'\x13', EofChar=b'\x1a')
+        self.timeouts = m.COMMTIMEOUTS(10, 20, 30, 40, 50)
+        self.saved_state, self.saved_timeouts = bytes(self.state), bytes(self.timeouts)
+        self.dtr, self.rts = True, False    # as the open left them
+        self.reports_lines = True
+        self.reads = []                     # bytes (b'' = a timeout), an exception, or a callable returning bytes
+        self.fail = {}                      # wrapper name -> [exception or None per call]
+
+    def patch(self):
+        for name in ('nt_port_exists', 'nt_open', 'nt_get_state', 'nt_set_state', 'nt_get_timeouts',
+                     'nt_set_timeouts', 'nt_escape', 'nt_lines', 'nt_read', 'nt_close'):
+            setattr(self.m, name, getattr(self, name))
+
+    def _call(self, name, *args):
+        self.log.append((name, *args))
+        queue = self.fail.get(name)
+        if queue:
+            e = queue.pop(0)
+            if e is not None:
+                raise e
+
+    def names(self):
+        return [c[0] for c in self.log]
+
+    def nt_port_exists(self, name):
+        return name in self.exists
+
+    def nt_open(self, device):
+        self._call('nt_open', device)
+        if self.open_error:
+            raise self.open_error
+        return self.handle
+
+    def _h(self, h):
+        assert h == self.handle, h
+
+    def nt_get_state(self, h):
+        self._h(h)
+        self._call('nt_get_state')
+        return self.m.DCB.from_buffer_copy(self.state)
+
+    def nt_set_state(self, h, d):
+        self._h(h)
+        self._call('nt_set_state', bytes(d))
+        self.state = self.m.DCB.from_buffer_copy(d)
+        # SetCommState drives DTR/RTS per the control modes (handshake and toggle left alone here)
+        if d.fDtrControl in (0, 1):
+            self.dtr = bool(d.fDtrControl)
+        if d.fRtsControl in (0, 1):
+            self.rts = bool(d.fRtsControl)
+
+    def nt_get_timeouts(self, h):
+        self._h(h)
+        self._call('nt_get_timeouts')
+        return self.m.COMMTIMEOUTS.from_buffer_copy(self.timeouts)
+
+    def nt_set_timeouts(self, h, t):
+        self._h(h)
+        self._call('nt_set_timeouts', bytes(t))
+        self.timeouts = self.m.COMMTIMEOUTS.from_buffer_copy(t)
+
+    def nt_escape(self, h, func):
+        self._h(h)
+        self._call('nt_escape', func)
+        if func == self.m.CLRDTR:
+            self.dtr = False
+        elif func == self.m.CLRRTS:
+            self.rts = False
+
+    def nt_lines(self, h):
+        self._h(h)
+        self._call('nt_lines')
+        return {'dtr': self.dtr, 'rts': self.rts} if self.reports_lines else None
+
+    def nt_read(self, h, n):
+        self._h(h)
+        t = self.timeouts
+        assert (t.ReadIntervalTimeout, t.ReadTotalTimeoutMultiplier) == (self.m.MAXDWORD, self.m.MAXDWORD)
+        ms = t.ReadTotalTimeoutConstant
+        assert 1 <= ms <= self.m.READ_POLL_MS, ms
+        self._call('nt_read', ms)
+        item = self.reads.pop(0) if self.reads else b''
+        if isinstance(item, BaseException):
+            raise item
+        if callable(item):
+            return item()
+        if not item:
+            time.sleep(ms / 1000)
+            return b''
+        time.sleep(0.05)
+        return item[:n]
+
+    def nt_close(self, h):
+        self._h(h)
+        self._call('nt_close')
+
+
+@unittest.skipUnless(os.name == 'nt', 'the Win32 backend; the POSIX one has the pty cases')
+class WindowsBackendTest(unittest.TestCase):
+    """The plumbing of the Win32 backend against a fake of its kernel32 layer, not a real port."""
+
+    def setUp(self):
+        self.m = load_module()
+        self.assertIsNone(self.m.termios)
+        self.m._k32 = NoKernel32()
+        self.port = FakePort(self.m)
+        self.port.patch()
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGBREAK):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.d = Path(self._dir.name)
+        self.out = self.d / 'cap.bin'
+
+    def run_main(self, *args, port='COM7', baud='115200', seconds='0.3', lines='leave'):
+        argv = ['--port', port, '--baud', baud, '--seconds', seconds, '--lines', lines, '--out', str(self.out), *args]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                rc = self.m.main(argv)
+            except SystemExit as e:
+                rc = e.code
+        return rc, json.loads(stdout.getvalue()) if stdout.getvalue().strip() else None, stderr.getvalue()
+
+    def calls(self, name):
+        return [c for c in self.port.log if c[0] == name]
+
+    def assert_restored_and_closed(self, out):
+        self.assertTrue(out['terminalRestored'])
+        self.assertEqual(self.port.names()[-3:], ['nt_set_state', 'nt_set_timeouts', 'nt_close'])
+        self.assertEqual(self.calls('nt_set_state')[-1][1], self.port.saved_state)
+        self.assertEqual(self.calls('nt_set_timeouts')[-1][1], self.port.saved_timeouts)
+
+    def test_raw_8n1_at_the_baud_then_the_saved_settings_back(self):
+        rc, out, err = self.run_main(baud='921600', seconds='0.2')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['device'], '\\\\.\\COM7')
+        self.assertEqual(self.port.log[0], ('nt_open', '\\\\.\\COM7'))
+        configured = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[0][1])
+        self.assertEqual((configured.BaudRate, configured.ByteSize, configured.Parity, configured.StopBits),
+                         (921600, 8, 0, 0))
+        self.assertEqual(configured.fBinary, 1)
+        for flag in ('fParity', 'fOutxCtsFlow', 'fOutxDsrFlow', 'fDsrSensitivity', 'fOutX', 'fInX', 'fErrorChar',
+                     'fNull', 'fAbortOnError'):
+            self.assertEqual(getattr(configured, flag), 0, flag)
+        # leave: the levels the open left, as plain enable/disable (no handshake, no toggle)
+        self.assertEqual((configured.fDtrControl, configured.fRtsControl), (1, 0))
+        self.assertEqual((configured.XonChar, configured.EofChar), (b'\x11', b'\x1a'))
+        self.assertEqual(out['lines'], {'policy': 'leave', 'afterSetup': {'dtr': True, 'rts': False}})
+        self.assertNotIn('nt_escape', self.port.names())
+        self.assertEqual(out['ended'], 'time')
+        self.assertTrue(out['baseline'].startswith('none'))
+        self.assertNotIn('otherOpeners', out)
+        self.assert_restored_and_closed(out)
+
+    def test_leave_without_a_line_report_follows_the_saved_control_modes(self):
+        self.port.reports_lines = False
+        rc, out, err = self.run_main(seconds='0.1')
+        self.assertEqual(rc, 0, err)
+        configured = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[0][1])
+        # DTR handshake idles high, RTS toggle idles low
+        self.assertEqual((configured.fDtrControl, configured.fRtsControl), (1, 0))
+        self.assertIsNone(out['lines']['afterSetup'])
+
+    def test_lines_low_clears_both_after_the_configuration(self):
+        self.port.rts = True
+        rc, out, err = self.run_main(lines='low', seconds='0.1')
+        self.assertEqual(rc, 0, err)
+        names = self.port.names()
+        self.assertEqual(names[:7], ['nt_open', 'nt_get_state', 'nt_get_timeouts', 'nt_lines', 'nt_set_state',
+                                     'nt_escape', 'nt_escape'])
+        self.assertEqual(self.calls('nt_escape'), [('nt_escape', self.m.CLRDTR), ('nt_escape', self.m.CLRRTS)])
+        self.assertEqual(names[7:9], ['nt_lines', 'nt_set_timeouts'])
+        self.assertEqual(out['lines'], {'policy': 'low', 'afterSetup': {'dtr': False, 'rts': False}})
+        self.assert_restored_and_closed(out)
+
+    def test_lines_low_refused_when_the_driver_cannot_clear_them(self):
+        self.port.fail['nt_escape'] = [ctypes.WinError(1)]
+        rc, out, err = self.run_main(lines='low')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('--lines low refused', out['error'])
+        self.assertNotIn('nt_read', self.port.names())
+        self.assertEqual(self.port.names()[-2:], ['nt_set_timeouts', 'nt_close'])
+        self.assertTrue(out['terminalRestored'])
+
+    def test_chunks_times_and_marks(self):
+        self.port.reads = [b'', b'ESP-ROM:esp32p4\r\nrst:0x17 (CHIP_USB_UART_RESET)\r\n', b'', b'\x00\xff binary\n']
+        t0 = time.monotonic()
+        rc, out, err = self.run_main('--mark', r'rst:0x[0-9a-f]+', seconds='0.6')
+        elapsed = time.monotonic() - t0
+        self.assertEqual(rc, 0, err)
+        data = self.out.read_bytes()
+        self.assertEqual(data, b'ESP-ROM:esp32p4\r\nrst:0x17 (CHIP_USB_UART_RESET)\r\n\x00\xff binary\n')
+        self.assertEqual((out['bytes'], out['chunks']), (len(data), 2))
+        self.assertEqual(out['ended'], 'time')
+        self.assertEqual(out['baseline'], 'the open')
+        times = [json.loads(line) for line in Path(out['times']).read_text(encoding='utf-8').splitlines()]
+        self.assertEqual([(t['offset'], t['len']) for t in times], [(0, 49), (49, 10)])
+        self.assertGreater(times[0]['t'], 0.05)
+        self.assertLess(times[0]['t'], times[1]['t'])
+        self.assertEqual(out['firstByteAt'], times[0]['t'])
+        self.assertEqual(out['marks'], [{'pattern': r'rst:0x[0-9a-f]+', 'offset': 17, 't': times[0]['t'],
+                                         'text': 'rst:0x17'}])
+        self.assertGreaterEqual(elapsed, 0.6)
+        self.assertLess(elapsed, 0.6 + 0.5)
+        polls = [c[1] for c in self.calls('nt_read')]
+        self.assertTrue(all(1 <= ms <= self.m.READ_POLL_MS for ms in polls), polls)
+        self.assert_restored_and_closed(out)
+
+    def test_each_chunk_time_is_written_as_it_arrives(self):
+        times = Path(str(self.out) + '.times')
+        seen = []
+        self.port.reads = [b'boot\n', lambda: (seen.append(times.read_bytes()), b'')[1]]
+        rc, out, err = self.run_main(seconds='0.2')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([json.loads(line)['len'] for line in seen[0].decode().splitlines()], [5])
+
+    def test_ctrl_c_and_ctrl_break_end_the_capture_and_restore(self):
+        for sig in (signal.SIGINT, signal.SIGBREAK):
+            with self.subTest(sig=sig):
+                self.setUp()
+                self.port.reads = [b'boot\n', lambda: (signal.raise_signal(sig), b'')[1]]
+                rc, out, err = self.run_main(seconds='10')
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(out['ended'], f'signal {int(sig)}')
+                self.assertEqual(self.out.read_bytes(), b'boot\n')
+                self.assert_restored_and_closed(out)
+
+    def test_a_busy_port_is_refused_without_its_holder(self):
+        for code in (5, 32):    # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+            with self.subTest(code=code):
+                self.setUp()
+                self.port.open_error = ctypes.WinError(code)
+                rc, out, err = self.run_main()
+                self.assertEqual(rc, 3, err)
+                self.assertIn('COM7: busy', out['error'])
+                self.assertNotIn('otherOpeners', out)
+                self.assertNotIn('terminalRestored', out)
+                self.assertEqual(self.port.names(), ['nt_open'])
+                self.assertEqual(self.out.read_bytes(), b'')
+
+    def test_another_open_failure_is_not_busy(self):
+        self.port.open_error = ctypes.WinError(2)
+        rc, out, err = self.run_main()
+        self.assertEqual(rc, 3, err)
+        self.assertNotIn('busy', out['error'])
+
+    def test_a_rejected_configuration_still_restores(self):
+        self.port.fail['nt_set_state'] = [ctypes.WinError(87)]    # the driver refuses the rate
+        rc, out, err = self.run_main(baud='12345678')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('COM7: ', out['error'])
+        self.assertNotIn('nt_read', self.port.names())
+        self.assert_restored_and_closed(out)
+
+    def test_a_read_error_fails_and_restores(self):
+        self.port.reads = [b'boot\n', ctypes.WinError(87)]
+        rc, out, err = self.run_main(seconds='5')
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(out['bytes'], 5)
+        self.assertIn('COM7: ', out['error'])
+        self.assert_restored_and_closed(out)
+
+    def test_the_device_going_away_ends_the_capture(self):
+        self.port.reads = [b'boot\n', ctypes.WinError(1167)]    # ERROR_DEVICE_NOT_CONNECTED
+        self.port.fail['nt_set_state'] = [None, ctypes.WinError(1167)]
+        self.port.fail['nt_set_timeouts'] = [None, ctypes.WinError(1167)]
+        rc, out, err = self.run_main(seconds='5')
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(out['ended'], 'device gone')
+        self.assertFalse(out['terminalRestored'])
+        self.assertIn('restoring the port settings', out['error'])
+        self.assertEqual(self.port.names()[-3:], ['nt_set_state', 'nt_set_timeouts', 'nt_close'])    # both tried
+        self.assertEqual(self.out.read_bytes(), b'boot\n')
+
+    def test_port_names_and_refusals(self):
+        for port, device in (('COM7', 'COM7'), ('com7', 'COM7'), ('\\\\.\\COM7', 'COM7'), ('\\\\.\\com12', 'COM12')):
+            with self.subTest(port=port):
+                self.setUp()
+                rc, out, err = self.run_main(port=port, seconds='0.05')
+                self.assertEqual(rc, 0, err)
+                self.assertEqual((out['port'], out['device']), (port, '\\\\.\\' + device))
+                self.assertEqual(self.port.log[0], ('nt_open', '\\\\.\\' + device))
+        for kw, want in (({'port': '/dev/ttyACM0'}, 'COM<n>'), ({'port': '/dev/serial/by-id/x'}, 'COM<n>'),
+                         ({'port': 'COM0'}, 'COM<n>'), ({'port': 'COM7x'}, 'COM<n>'),
+                         ({'port': 'COM9'}, 'no such device'), ({'baud': '0'}, 'not a rate'),
+                         ({'baud': str(1 << 32)}, 'not a rate'), ({'seconds': '0'}, '--seconds')):
+            with self.subTest(kw=kw):
+                self.setUp()
+                rc, out, err = self.run_main(**kw)
+                self.assertEqual(rc, 2, err)
+                self.assertIn(want, err)
+                self.assertIsNone(out)
+                self.assertEqual(self.port.log, [])
+                self.assertFalse(self.out.exists())
+        self.out.write_bytes(b'old')
+        rc, _, err = self.run_main()
+        self.assertEqual(rc, 2)
+        self.assertIn('never overwrites', err)
+        self.assertEqual(self.out.read_bytes(), b'old')
+        self.assertEqual(self.port.log, [])
+
+
+@unittest.skipUnless(os.name == 'nt', 'kernel32')
+class Win32LayerTest(unittest.TestCase):
+    """The ctypes declarations against real kernel32 on a plain file: no COM port is opened."""
+
+    def setUp(self):
+        self.m = load_module()
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / 'plain.bin'
+        self.path.write_bytes(b'abc')
+
+    def test_dcb_layout_matches_winbase_h(self):
+        m = self.m
+        self.assertEqual(ctypes.sizeof(m.DCB), 28)
+        raw = bytes(m.DCB(fDtrControl=2, fRtsControl=3, fAbortOnError=1, ByteSize=8, StopBits=2))
+        self.assertEqual(int.from_bytes(raw[8:12], 'little'), 2 << 4 | 3 << 12 | 1 << 14)
+        self.assertEqual((raw[18], raw[20]), (8, 2))
+        self.assertIs(m._k32.CreateFileW.restype, ctypes.wintypes.HANDLE)
+
+    def test_wrappers_on_a_plain_file(self):
+        m = self.m
+        h = m.nt_open(str(self.path))
+        try:
+            self.assertGreater(h, 0)
+            with self.assertRaises(OSError) as busy:    # opened without sharing, as a comm port must be
+                m.nt_open(str(self.path))
+            self.assertEqual(busy.exception.winerror, m.ERROR_SHARING_VIOLATION)
+            self.assertEqual(m.nt_read(h, 16), b'abc')
+            self.assertIsNone(m.nt_lines(h))
+            with self.assertRaises(OSError) as e:
+                m.nt_get_state(h)
+            self.assertIsNotNone(e.exception.winerror)
+        finally:
+            m.nt_close(h)
+        self.assertFalse(m.nt_port_exists('NO_SUCH_DOS_DEVICE_4f1c'))
 
 
 if __name__ == '__main__':

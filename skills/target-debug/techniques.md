@@ -126,6 +126,10 @@ python3 <skill dir>/scripts/console_capture.py --port /dev/serial/by-id/<port> -
   --lines low --out <new file> [--mark '<reset banner regex>']
 ```
 
+On Windows the port is `--port COM<n>` (a COM number stays with its device; `Get-PnpDevice -Class Ports` lists
+them); Windows opens a port exclusively, so one another program holds is refused as busy without naming the holder.
+That backend is unverified on hardware.
+
 Opening a port raises DTR and RTS, which can reset an Espressif chip (`espressif.md`, "Console"): `--mark` reports
 where a reset banner shows up, so a reset at the open is measured rather than assumed. Clients share the port's
 settings and its input: a second reader takes bytes from the first, and changes to the settings need coordinating (a
