@@ -63,8 +63,10 @@ def _resolve_exe(name: str) -> str:
         return name
     base, ext = os.path.splitext(name)
     for d in os.environ.get('PATH', '').split(os.pathsep):
+        if not (os.path.isabs(d) and os.path.splitdrive(d)[0]):
+            continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
         for e in (ext,) if ext else ('.exe', '.cmd', '.bat'):
-            if os.path.isabs(d) and os.path.isfile(os.path.join(d, base + e)):   # not '.' either
+            if os.path.isfile(os.path.join(d, base + e)):
                 return os.path.join(d, base + e)
     raise FileNotFoundError(errno.ENOENT, f'{name} not on PATH', name)
 

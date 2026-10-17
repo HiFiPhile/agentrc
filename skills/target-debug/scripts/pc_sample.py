@@ -54,9 +54,11 @@ def which(name):
         return shutil.which(name)
     exts = [''] if os.path.splitext(name)[1].lower() in ('.exe', '.cmd', '.bat') else ['.exe', '.cmd', '.bat']
     for d in os.environ.get('PATH', '').split(os.pathsep):
+        if not (os.path.isabs(d) and os.path.splitdrive(d)[0]):
+            continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
         for e in exts:
             path = os.path.join(d, name + e)
-            if d and os.path.isfile(path):
+            if os.path.isfile(path):
                 return path
     return None
 

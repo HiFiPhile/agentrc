@@ -387,6 +387,21 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(code, 0, result)
         self.assertEqual(result['command'][0], os.path.join(self.root, 'bin', 'esptool.exe'))
 
+    @unittest.skipUnless(NT, 'Windows PATH lookup')
+    def test_a_path_entry_without_drive_and_root_is_not_searched(self):
+        # '.', 'bin' and '\bin' name directories of the cwd or its drive: a checkout's esptool.exe
+        cwd = self.root / 'cwd'
+        (cwd / 'bin').mkdir(parents=True)
+        for d in (cwd, cwd / 'bin'):
+            (d / 'esptool.exe').write_bytes(b'')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
+        for entry in ('.', 'bin', os.path.splitdrive(str(cwd))[1]):
+            with self.subTest(entry=entry), mock.patch.dict(os.environ, {'PATH': entry}):
+                self.assertIsNone(esp_verify.find_tool('esptool'))
+        with mock.patch.dict(os.environ, {'PATH': str(cwd / 'bin')}):
+            self.assertEqual(esp_verify.find_tool('esptool'), os.path.join(cwd / 'bin', 'esptool.exe'))
+
     @unittest.skipUnless(NT, 'Windows batch files')
     def test_cmd_and_bat_tools_on_path(self):
         bin_dir = self.root / 'bin'

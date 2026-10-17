@@ -112,8 +112,10 @@ def find_tool(name):
     # Windows: PATH only; shutil.which and CreateProcess search the cwd (perhaps a checkout) first
     exts = ('',) if name.lower().endswith(('.exe', '.cmd', '.bat')) else ('.exe', '.cmd', '.bat')
     for directory in os.environ.get('PATH', '').split(os.pathsep):
+        if not (os.path.isabs(directory) and os.path.splitdrive(directory)[0]):
+            continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
         for ext in exts:
-            if directory and os.path.isfile(os.path.join(directory, name + ext)):
+            if os.path.isfile(os.path.join(directory, name + ext)):
                 return os.path.join(directory, name + ext)
     return None
 

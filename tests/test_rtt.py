@@ -1087,6 +1087,26 @@ class RttPlatformLifecycle(unittest.TestCase):
         self.assertEqual(taskkill.call_count, 2)   # both rungs fell through to the tree kill
         self.assertTrue(proc.killed)
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows PATH lookup')
+    def test_a_path_entry_without_drive_and_root_is_not_searched(self):
+        # '.', 'bin' and '\bin' name directories of the cwd or its drive: a checkout's JLink.exe
+        with tempfile.TemporaryDirectory() as d:
+            cwd = Path(d) / 'checkout'
+            for sub in (cwd, cwd / 'bin'):
+                sub.mkdir(parents=True)
+                (sub / 'JLink.exe').write_bytes(b'')
+            prev = os.getcwd()
+            os.chdir(cwd)
+            try:
+                for entry in ('.', 'bin', os.path.splitdrive(str(cwd))[1]):
+                    with self.subTest(entry=entry), mock.patch.dict(os.environ, {'PATH': entry}):
+                        with self.assertRaisesRegex(FileNotFoundError, 'not on PATH'):
+                            rtt._resolve_exe('JLink')
+                with mock.patch.dict(os.environ, {'PATH': str(cwd / 'bin')}):
+                    self.assertEqual(rtt._resolve_exe('JLink'), os.path.join(cwd / 'bin', 'JLink.exe'))
+            finally:
+                os.chdir(prev)
+
     @unittest.skipUnless(os.name == 'nt', 'Windows CreateProcess search order')
     def test_probe_tools_come_from_path_never_the_cwd(self):
         # CreateProcess searches python's dir and the cwd before PATH: a checkout's

@@ -274,6 +274,24 @@ class CliTest(unittest.TestCase):
             with self.assertRaisesRegex(probe_state.ToolError, f'{JLINK} not found'):
                 probe_state.tool('PROBE_STATE_JLINK_EXE_UNSET', 'JLinkExe', 'JLink.exe')
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows PATH lookup')
+    def test_a_path_entry_without_drive_and_root_is_not_searched(self):
+        # '.', 'bin' and '\bin' name directories of the cwd or its drive: a checkout's tools
+        cwd = Path(self._dir.name) / 'checkout'
+        for d in (cwd, cwd / 'bin'):
+            d.mkdir(parents=True)
+            (d / 'fake-addr2line.exe').write_bytes(b'')
+            (d / JLINK).write_bytes(b'')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
+        for entry in ('.', 'bin', os.path.splitdrive(str(cwd))[1]):
+            with self.subTest(entry=entry), mock.patch.dict(os.environ, {'PATH': entry}):
+                self.assertIsNone(pc_sample.which('fake-addr2line'))
+                with self.assertRaisesRegex(probe_state.ToolError, f'{JLINK} not found'):
+                    probe_state.tool('PROBE_STATE_JLINK_EXE_UNSET', 'JLinkExe', 'JLink.exe')
+        with mock.patch.dict(os.environ, {'PATH': str(cwd / 'bin')}):
+            self.assertEqual(pc_sample.which('fake-addr2line'), os.path.join(cwd / 'bin', 'fake-addr2line.exe'))
+
     def test_raw_never_overwrites(self):
         raw = Path(self._dir.name) / 'pcs.txt'
         raw.write_text('earlier run')
