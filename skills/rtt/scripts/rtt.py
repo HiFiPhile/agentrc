@@ -29,6 +29,7 @@ strip_banner. One self-contained file, stdlib only: it is copied to rigs as is.
 """
 import argparse
 import contextlib
+import errno
 import json
 import math
 import os
@@ -70,17 +71,43 @@ def _termination_signals() -> tuple:
     return tuple(getattr(signal, name) for name in names if hasattr(signal, name))
 
 
+def _console_break(proc) -> bool:
+    """Windows' SIGTERM: CTRL_BREAK_EVENT to the server's own process group (_spawn
+    makes it one). The event travels only through a console the caller shares, and
+    the server inherits ours, so send it only where it is attached to our console:
+    with none (a detached caller) it got its own or none. False = not delivered."""
+    import ctypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    pids = (ctypes.c_uint32 * 256)()
+    n = kernel32.GetConsoleProcessList(pids, len(pids))
+    if n > len(pids):   # the list outgrew the buffer: n is the size it needs
+        pids = (ctypes.c_uint32 * n)()
+        n = kernel32.GetConsoleProcessList(pids, len(pids))
+    if not 0 < n <= len(pids) or proc.pid not in pids[:n]:
+        return False
+    try:
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+    except OSError:
+        return False
+    return True
+
+
 def _terminate_process_group(proc, force: bool) -> None:
     """Stop the server and anything it spawned, on POSIX or Windows."""
     if IS_WINDOWS:
         if proc.poll() is not None:
+            return
+        # force=False is SIGTERM's counterpart: a break the server may handle or die of
+        # in an orderly way; the caller's wait observes which, then escalates. Where no
+        # break reaches the server, only the tree kill below is left.
+        if not force and _console_break(proc):
             return
         # Enumerate and stop the tree while the parent still exists. TerminateProcess
         # (Popen.terminate/kill) reaches only the direct child, and taskkill cannot find
         # the descendants by their former parent after that process has exited.
         # /F is required for console children: without it taskkill can retire the
         # parent first and leave its child alive, after which /PID can no longer find
-        # the tree. POSIX retains its graceful-then-force ladder below.
+        # the tree.
         cmd = ['taskkill', '/PID', str(proc.pid), '/T', '/F']
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -184,11 +211,14 @@ def nm_rtt_addr(elf: str, nm: str = None, stop=None) -> int:
     try:
         cmd = [nm, elf]
         if stop is None:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # errors='replace': an undecodable byte must not crash the check (on Windows
+            # its reader thread died and left stdout/stderr None)
+            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=30)
         else:
             if stop():
                 raise _StopCapture
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    errors='replace')
             try:
                 deadline = time.monotonic() + 30
                 while True:
@@ -451,16 +481,15 @@ class _SocketRtt:
         proc = getattr(self, '_proc', None)
         if proc:
             if proc.poll() is None:
-                if IS_WINDOWS:
-                    # taskkill must see the live parent to enumerate its descendants.
-                    _terminate_process_group(proc, force=False)
-                else:
-                    self._gentle_stop(proc)
+                # the same ladder on every OS: the server's own exit first (it owns the
+                # probe, and killed mid-session it can leave the target halted)
+                self._gentle_stop(proc)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5)
         if proc and proc.poll() is None:
             # The server owns a separate POSIX session or Windows process group.
-            # Retire it before returning so it cannot hold the probe for the next run.
+            # Retire it before returning so it cannot hold the probe for the next run;
+            # SIGTERM or, on Windows, CTRL_BREAK first, then the kill.
             _terminate_process_group(proc, force=False)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
@@ -609,8 +638,9 @@ class OpenocdRtt(_SocketRtt):
 
     def _gentle_stop(self, proc) -> None:
         # no stdin channel to ask openocd to exit, and it keeps its listener up after
-        # the client disconnects: go straight to the group takedown instead of blocking
-        # the base class's 5 s wait on a process that has no reason to leave
+        # the client disconnects: go straight to the group takedown (SIGTERM, or
+        # CTRL_BREAK on Windows) instead of blocking the base class's 5 s wait on a
+        # process that has no reason to leave
         _terminate_process_group(proc, force=False)
 
 
@@ -1036,10 +1066,12 @@ def main() -> int:
                 break
     except KeyboardInterrupt:
         pass
-    except BrokenPipeError:
+    except OSError as e:
         # downstream consumer (head/grep -m) closed the pipe: a normal way to end a
         # capture, not an error. Point stdout at devnull so interpreter shutdown does
-        # not raise on the final implicit flush.
+        # not raise on the final implicit flush. Windows reports that write as EINVAL.
+        if not (isinstance(e, BrokenPipeError) or IS_WINDOWS and e.errno == errno.EINVAL):
+            raise
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     finally:
         # from here on the cleanup is committed: a late TERM, or a second Ctrl-C, landing
@@ -1055,4 +1087,9 @@ def main() -> int:
 
 
 if __name__ == '__main__':
+    if IS_WINDOWS:
+        # messages, help and server log tails in UTF-8, not the ANSI code page (target
+        # bytes go to stdout.buffer untouched)
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())

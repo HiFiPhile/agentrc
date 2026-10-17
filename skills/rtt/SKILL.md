@@ -38,8 +38,9 @@ python3 <skill dir>/scripts/rtt.py --backend jlink --probe <serial> --device <JL
 #   alone never proves target output
 ```
 
-Windows is supported by the script (`JLink.exe` default, process trees retired
-with `taskkill`) but unverified on hardware. `RTT_JLINK_EXE` and `RTT_OPENOCD_EXE`
+Windows is supported by the script (`JLink.exe` default; teardown sends Commander
+`exit`, then CTRL_BREAK to the server's process group when it shares the console,
+then `taskkill`s the tree) but unverified on hardware. `RTT_JLINK_EXE` and `RTT_OPENOCD_EXE`
 override the server executables on any platform, as `RTT_NM` does for nm.
 
 `--device` is the J-Link device name of the MCU. Always pass the probe
