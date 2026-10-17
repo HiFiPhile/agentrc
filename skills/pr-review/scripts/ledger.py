@@ -50,15 +50,21 @@ stdout ends with one JSON line; {"error": ...} and exit 2 when the ledger or
 the output cannot be read, or they disagree.
 """
 
-import fcntl
 import hashlib
 import json
 import os
 import re
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, git, report, run  # noqa: E402
@@ -140,8 +146,18 @@ def load(path, repo, pr):
 @contextmanager
 def locked(path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix('.lock'), 'w') as fd:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with open(path.with_suffix('.lock'), 'a') as fd:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            # msvcrt locks are mandatory and per handle: lock a byte past the content; LK_LOCK gives up after ~10 s.
+            os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
+            while True:
+                try:
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
         yield
 
 
@@ -489,7 +505,7 @@ def save(led, result, reason):
     same = [r for r in led['reviews'] if r['head'] == result['head'] and r['status'] == 'posted']
     if same and not reason:
         raise Unusable(f"{result['head']} was already reviewed and posted; a second review needs --reason")
-    if any(str(c.get('path', '')).startswith('/') for c in result['draft']['comments']):
+    if any(re.match(r'/|[A-Za-z]:[\\/]', str(c.get('path', ''))) for c in result['draft']['comments']):
         raise Unusable('a draft comment has an absolute path; GitHub needs repository-relative paths')
     findings = number(led, result)
     try:
@@ -538,7 +554,7 @@ def collect(argv):
     path = ledger_path(repo, a.pr)
     snapshot = read_snapshot(a.threads, a.pr) if getattr(a, 'threads', None) else None
     if a.cmd == 'show':
-        return {'ledger': str(path), **show(load(path, repo, a.pr), a.finding, a.draft, snapshot, a.pending)}
+        return {'ledger': path.as_posix(), **show(load(path, repo, a.pr), a.finding, a.draft, snapshot, a.pending)}
     if a.cmd == 'disputes':
         if not FULL_SHA.match(a.head):
             raise Unusable('--head must be a full SHA')
@@ -552,7 +568,7 @@ def collect(argv):
         led = load(path, repo, a.pr)
         out = save(led, result, a.reason)
         store(path, led)
-    return {'ledger': str(path), **out}
+    return {'ledger': path.as_posix(), **out}
 
 
 if __name__ == '__main__':
