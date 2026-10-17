@@ -89,6 +89,19 @@ test('args that would change the verdict silently are refused before any agent',
   for (const a of bad) await assert.rejects(run(a), /args|must/, JSON.stringify(a))
 })
 
+test('a Windows factsDir and checkout top are read with slashes; a POSIX path stays exactly as given', async () => {
+  const file = `C:/Users/me/ledger/7/threads-${H}.json`
+  for (const factsDir of ['C:\\Users\\me\\ledger\\7', 'C:/Users/me/ledger/7']) {
+    const { result, calls, audits } = await run({ ...BASE, factsDir }, { threads: { file, count: 0 }, check: { ...pinned(BASE), top: 'E:/w' } })
+    assert.equal(result.verdict.event, 'APPROVE', factsDir)
+    assert.ok(calls.find(c => c.label === 'threads').prompt.includes(`--out '${file}'`), factsDir)
+    assert.equal(audits[0].root, 'E:/w')
+  }
+  for (const factsDir of ['/tmp/a\\b', 'C:rel', 'C:/x/../y', 'C:\\x\\..\\y', 'C:/x\'y']) {
+    await assert.rejects(run({ ...BASE, factsDir }), /factsDir must be an absolute path/, factsDir)
+  }
+})
+
 test('a failed, moved-head or unidentified check stops before any review work', async () => {
   const { repo, pr, ...unnamed } = pinned(BASE)
   for (const check of [null, { error: 'head moved: expected b' }, { ok: true, head: OLD, ci: { state: 'green' } }, unnamed, { ...pinned(BASE), repo: 'o/other' }, { ...pinned(BASE), pr: 8 }]) {
