@@ -93,7 +93,9 @@ def lock_exclusive(file, block=True):
             try:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 return
-            except OSError:
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EDEADLOCK):  # held elsewhere; anything else is a failure
+                    raise
                 if not block:
                     raise BlockingIOError(f'{file} is locked') from None
                 time.sleep(0.05)  # LK_LOCK gives up after ~10 s, so poll instead
@@ -101,15 +103,76 @@ def lock_exclusive(file, block=True):
         os.lseek(fd, pos, os.SEEK_SET)
 
 
+def release(file):
+    """Close what lock_exclusive locked (an fd or a file object), unlocking it
+    first on Windows, which frees a closed handle's lock only "after a delay"."""
+    try:
+        if not fcntl:
+            fd = file if isinstance(file, int) else file.fileno()
+            os.lseek(fd, 1 << 30, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        if isinstance(file, int):
+            os.close(file)
+        else:
+            file.close()
+
+
+def replace(source, target):
+    """os.replace; on Windows retried while another process has `target` open
+    (a prune reading state.json unlocked, an indexer), which refuses it."""
+    for _ in range(50 if os.name == 'nt' else 0):
+        try:
+            return os.replace(source, target)
+        except PermissionError:
+            time.sleep(0.02)
+    return os.replace(source, target)
+
+
+def on_path(name, exts):
+    """Windows: `name` from PATH alone, not the cwd, which shutil.which and
+    CreateProcess search first, a checkout that may be a contributor's."""
+    for directory in os.environ.get('PATH', '').split(os.pathsep):
+        for ext in exts:
+            path = os.path.join(directory, name + ext)
+            if directory and os.path.isfile(path):
+                return path
+
+
+def codex_exe():
+    if os.name != 'nt':
+        return 'codex'
+    found = on_path('codex', ('.exe', '.cmd', '.bat'))
+    if not found:
+        raise FileNotFoundError('codex is not on PATH')
+    return found
+
+
+def run_tree(cmd, input, timeout, **kwargs):
+    """subprocess.run; on Windows a timeout kills the whole tree: npm's
+    codex.cmd runs cmd.exe, then node, which could still write the -o file."""
+    if os.name != 'nt':
+        return subprocess.run(cmd, input=input, timeout=timeout, **kwargs)
+    with subprocess.Popen(cmd, stdin=subprocess.PIPE, **kwargs) as process:
+        try:
+            process.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            taskkill = os.path.join(os.environ.get('SystemRoot', 'C:/Windows'), 'System32', 'taskkill.exe')
+            subprocess.run([taskkill, '/T', '/F', '/PID', str(process.pid)], capture_output=True)
+            process.wait()
+            raise
+    return subprocess.CompletedProcess(cmd, process.returncode)
+
+
 # --- snapshots ---------------------------------------------------------------
 
-def blob_id(tree, blobs, name, content, mode):
+def blob_id(tree, blobs, name, content, mode, filtered):
     """Store the captured bytes as git would, conversion and clean filters
-    applied for a regular file, and return the id. Hashing what was read, not
-    the path again, keeps the id and the content one snapshot. The stored form
-    is copied out at once: the object is unreachable, and a gc before the
-    review renders it would prune it."""
-    filters = [] if mode == '120000' else ['--path', name]
+    applied when `filtered` (read from a file, not a link), and return the
+    id. Hashing what was read, not the path again, keeps the id and the
+    content one snapshot. The stored form is copied out at once: the object
+    is unreachable, and a gc before the review renders it would prune it."""
+    filters = ['--path', name] if filtered else []
     sha = subprocess.check_output(['git', '-C', str(tree), 'hash-object', '-w', '--stdin', *filters],
                                   input=content, stderr=subprocess.PIPE).decode().strip()
     keep_blob(tree, blobs, [mode, sha], content)
@@ -223,17 +286,19 @@ def snapshot_tree(tree, blobs):
             target = os.readlink(path)
             if os.name == 'nt':  # as git for Windows records a link
                 target = target.removeprefix('\\\\?\\').replace('\\', '/')
-            content, mode = os.fsencode(target), '120000'
+            content, mode, filtered = os.fsencode(target), '120000', False
         elif path.is_file():
-            content = path.read_bytes()
-            if os.name == 'nt':  # no exec bit to read (core.fileMode false): git keeps the index mode
-                mode = files[name][0] if files.get(name, [''])[0] in ('100644', '100755') else '100644'
+            content, filtered = path.read_bytes(), True
+            if os.name == 'nt':
+                # No exec bit to read (core.fileMode false), and a link checked out as a plain
+                # file (core.symlinks false): git keeps the index mode, and still filters the bytes.
+                mode = files[name][0] if files.get(name, [''])[0] in ('100644', '100755', '120000') else '100644'
             else:
                 mode = '100755' if path.stat().st_mode & 0o111 else '100644'
         else:
             files.pop(name, None)
             continue
-        files[name] = [mode, blob_id(tree, blobs, name, content, mode)]
+        files[name] = [mode, blob_id(tree, blobs, name, content, mode, filtered)]
     return files
 
 
@@ -390,8 +455,8 @@ def review(root, directory, job):
         output.unlink(missing_ok=True)
         try:
             with (directory / f'codex-{os.getpid()}-{attempt}.log').open('w') as log:
-                run = subprocess.run(
-                    [shutil.which('codex') or 'codex', 'exec', '-C', str(root), '--sandbox', 'read-only',
+                run = run_tree(
+                    [codex_exe(), 'exec', '-C', str(root), '--sandbox', 'read-only',
                      '-c', 'approval_policy="never"', '-c', f'model_reasoning_effort="{options["effort"]}"',
                      '-m', options['model'],
                      # Memories, plugins and the skills index are ~8k tokens a challenger never uses; AGENTS.md stays.
@@ -462,11 +527,11 @@ def stop(root, directory, state, payload):
     changes = coalesce(state['batches'])
     if not changes:
         state['batches'], state['open_turn'] = [], False
-        lock.close()
+        release(lock)
         return reply(state), None
     if state['rounds'] >= ROUNDS:
         state['open_turn'] = False
-        lock.close()
+        release(lock)
         return reply(state, f'round limit reached; {len(state["batches"])} batch(es) of edits after '
                             f'challenge {ROUNDS} stay queued for the next turn'), None
     state['rounds'] += 1
@@ -547,8 +612,8 @@ class Locked:
         path = self.directory / 'state.json'
         temporary = path.with_suffix('.tmp')
         temporary.write_text(json.dumps(self.state))
-        temporary.replace(path)
-        self.lock.close()
+        replace(temporary, path)
+        release(self.lock)
 
 
 def handle(root, directory, payload):
@@ -588,7 +653,7 @@ def handle(root, directory, payload):
         with Locked(directory) as state:
             return finish(root, directory, state, job, findings, error, skipped)
     finally:
-        job['lock'].close()
+        release(job['lock'])
 
 
 # --- retention ----------------------------------------------------------------
@@ -658,9 +723,13 @@ def held(path, create):
         return
     try:
         lock_exclusive(fd, block=False)
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
         yield
     finally:
-        os.close(fd)
+        release(fd)
 
 
 class Pruner:

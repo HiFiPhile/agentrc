@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import json
 import os
@@ -5,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -65,7 +67,8 @@ class Session:
 
     def event(self, name, **fields):
         payload = {'session_id': 's1', 'cwd': str(self.root), 'hook_event_name': name, **fields}
-        with mock.patch.object(gate.subprocess, 'run', self.fake_run):
+        # codex_exe would find none on Windows: no codex is on the test's PATH
+        with mock.patch.object(gate, 'run_tree', self.fake_run), mock.patch.object(gate, 'codex_exe', lambda: 'codex'):
             return gate.handle(self.root, self.directory, payload)
 
     def prompt(self, text='next'):
@@ -183,6 +186,27 @@ class GateTest(unittest.TestCase):
         self.s.prompt()
         sh(self.root, 'git', 'add', '-A')
         self.assertEqual(self.s.stop(), {}, 'staging changes no mode')
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX reads the mode from the file system, as before')
+    def test_a_link_checked_out_as_a_file_keeps_its_mode_and_filters(self):
+        sh(self.root, 'git', 'config', 'core.symlinks', 'false')
+        sh(self.root, 'git', 'config', 'filter.up.clean', 'tr a-z A-Z')  # git filters the file standing in for a link
+        (self.root / '.gitattributes').write_text('link filter=up\n')
+        sha = subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=self.root, input=b'C.TXT', check=True,
+                             capture_output=True).stdout.decode().strip()
+        sh(self.root, 'git', 'update-index', '--add', '--cacheinfo', f'120000,{sha},link')
+        (self.root / 'link').write_bytes(b'c.txt')  # as git checks the link out
+        sh(self.root, 'git', 'add', '.gitattributes')
+        sh(self.root, 'git', 'commit', '-qm', 'link')
+        self.new_turn()
+        (self.root / 'link').write_bytes(b'a.txt')
+        self.review()
+        self.assertIn('Path: "link"; mode 120000 -> 120000', self.s.prompts[0])
+        self.assertIn('+A.TXT', self.s.prompts[0])
+        self.s.prompt()
+        sh(self.root, 'git', 'add', 'link')
+        self.assertEqual(sh(self.root, 'git', 'ls-files', '-s', 'link').split()[0], '120000')
+        self.assertEqual(self.s.stop(), {}, 'staging changes neither mode nor blob')
 
     def test_non_ascii_text_reaches_codex_and_comes_back(self):
         text = 'caf\u00e9 \u2714 \u0151'  # outside the Windows ANSI code pages
@@ -541,6 +565,58 @@ class GateTest(unittest.TestCase):
         self.s.on_codex = take_state_lock
         self.assertIn('no findings', self.review()['systemMessage'])
 
+    def test_the_state_is_written_while_another_process_reads_it(self):
+        reader = open(self.s.directory / 'state.json', 'rb')  # as prune reads it, before it locks
+        self.addCleanup(reader.close)
+        threading.Timer(0.3, reader.close).start()
+        with gate.Locked(self.s.directory) as state:
+            state['notes'] = ['written']
+        self.assertEqual(self.s.state()['notes'], ['written'])
+        self.assertFalse((self.s.directory / 'state.tmp').exists())
+
+    def test_codex_is_found_on_path_alone(self):
+        if os.name != 'nt':
+            self.assertEqual(gate.codex_exe(), 'codex', 'POSIX execs it by name, as before')
+            return
+        base = Path(self.tmp.name)
+        for name in ('cwd/codex.exe', 'first/codex.cmd', 'second/codex.exe', 'second/codex.cmd'):
+            (base / name).parent.mkdir(exist_ok=True)
+            (base / name).write_text('never run')
+        first, second = str(base / 'first'), str(base / 'second')
+        with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', first, second])}):
+            self.assertEqual(gate.codex_exe(), os.path.join(first, 'codex.cmd'), 'PATH order, never the cwd')
+        with mock.patch.dict(os.environ, {'PATH': second}):
+            self.assertEqual(gate.codex_exe(), os.path.join(second, 'codex.exe'), '.exe before .cmd')
+        with mock.patch.dict(os.environ, {'PATH': str(base / 'none')}), self.assertRaises(FileNotFoundError):
+            gate.codex_exe()
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX kills the direct child alone, as it always has')
+    def test_a_timed_out_codex_is_killed_with_its_children(self):
+        late = Path(self.tmp.name) / 'late'
+        child = f'import time; time.sleep(2); open({str(late)!r}, "w").close()'
+        parent = f'import subprocess, sys, time; subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(30)'
+        with self.assertRaises(subprocess.TimeoutExpired):
+            gate.run_tree([sys.executable, '-c', parent], input=b'', timeout=1,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2.5)
+        self.assertFalse(late.exists(), 'a grandchild, as node under codex.cmd, outlived the timeout')
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locks are Windows only')
+    def test_a_lock_failure_other_than_contention_is_not_waited_out(self):
+        failure = OSError(errno.EBADF, 'bad file descriptor')
+        with (self.s.directory / 'lock').open('w') as lock, \
+                mock.patch.object(gate.msvcrt, 'locking', side_effect=[failure, AssertionError('retried')]), \
+                self.assertRaises(OSError) as raised:
+            gate.lock_exclusive(lock)
+        self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locks are Windows only')
+    def test_a_lock_is_released_before_its_handle_closes(self):
+        with mock.patch.object(gate.msvcrt, 'locking', wraps=gate.msvcrt.locking) as locking:
+            with gate.Locked(self.s.directory):
+                pass
+        self.assertEqual([c.args[1] for c in locking.call_args_list], [gate.msvcrt.LK_NBLCK, gate.msvcrt.LK_UNLCK])
+
     def test_edits_made_during_a_clean_review_are_reviewed_next(self):
         self.write('a.txt', 'a2\n')
         self.s.on_codex = lambda: self.write('b.txt', 'written during the review\n')
@@ -803,6 +879,16 @@ class PruneTest(unittest.TestCase):
         self.assertTrue((linked_blob / 'blobs' / sha).exists())
         self.assertTrue((self.cache / 'linked-session').is_symlink())
         self.assertFalse((real / 'codex-1-0.log').exists(), 'the real session is pruned once, by its own name')
+
+    def test_a_symlinked_lock_file_is_refused_without_o_nofollow(self):
+        directory = self.session('linked-lock')
+        (directory / 'lock').unlink()
+        (directory / 'lock').symlink_to(self.base / 'elsewhere')
+        with mock.patch.object(gate.os, 'O_NOFOLLOW', 0, create=True), self.assertRaises(OSError) as raised:
+            with gate.held(directory / 'lock', True):
+                pass
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
+        self.assertFalse((self.base / 'elsewhere').exists(), 'nothing created through the link')
 
     def test_a_symlinked_store_is_reported_and_left_alone(self):
         outside = self.base / 'outside'
