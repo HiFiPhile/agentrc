@@ -108,6 +108,12 @@ class GhTest(unittest.TestCase):
         with mock.patch.object(publish.subprocess, 'run', lambda argv, **kw: real([sys.executable, '-c', ECHO], **kw)):
             self.assertEqual(publish.gh(['api'], '{"title": "é"}'), (0, '{"title": "é"} ✓ 修复', ''))
 
+    def test_a_byte_gh_prints_that_is_not_utf8_is_replaced_not_raised(self):
+        real = subprocess.run
+        stray = "import sys; sys.stdout.buffer.write(b'ok \\xff'); sys.stderr.buffer.write(b'err \\xfe'); sys.exit(1)"
+        with mock.patch.object(publish.subprocess, 'run', lambda argv, **kw: real([sys.executable, '-c', stray], **kw)):
+            self.assertEqual(publish.gh(['api']), (1, 'ok �', 'err �'))
+
 
 class PublishTest(unittest.TestCase):
     def setUp(self):
