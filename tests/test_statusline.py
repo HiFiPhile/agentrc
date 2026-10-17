@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,31 @@ def window(used, mins):
     return {'usedPercent': used, 'windowDurationMins': mins, 'resetsAt': 1}
 
 
+def make_stub(bin_dir, name, source):
+    """`name` on `bin_dir`, running the Python `source`: a shebang script, or on Windows, which
+    cannot exec one, a launcher exe, so no real `name` further down PATH ever runs instead."""
+    script = bin_dir / name
+    if os.name != 'nt':
+        script.write_text(f'#!{sys.executable}\n{source}')
+        script.chmod(0o755)
+        return
+    try:
+        from pip._vendor.distlib.scripts import ScriptMaker
+    except ImportError:
+        raise unittest.SkipTest('no distlib to build a stub launcher') from None
+    source_dir = bin_dir.parent / f'{name}-source'
+    source_dir.mkdir()
+    (source_dir / name).write_text(f'#!python\n{source}')
+    maker = ScriptMaker(str(source_dir), str(bin_dir))
+    maker.executable = sys.executable
+    maker.make(name)
+    if not (bin_dir / f'{name}.exe').is_file():
+        raise AssertionError(f'no {name}.exe stub')
+
+
+BASH = shutil.which('bash') or 'bash'  # a bare 'bash' finds WSL's launcher in System32 first on Windows
+
+
 class CodexWeeklyTest(unittest.TestCase):
     def test_the_codex_bucket_wins_and_either_slot_may_hold_the_week(self):
         result = {'rateLimitsByLimitId': {
@@ -54,9 +80,9 @@ class RenderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             payload = {'workspace': {'current_dir': f'{home}/code'}, 'model': {'display_name': 'Opus (1M context)'},
                        'effort': {'level': 'high'}, 'context_window': {'used_percentage': 12}}
-            done = subprocess.run(['bash', str(ROOT / 'statusline.sh')], input=json.dumps(payload),
-                                  capture_output=True, text=True,
-                                  env={**os.environ, 'HOME': home, 'CLAUDE_CONFIG_DIR': home})
+            done = subprocess.run([BASH, str(ROOT / 'statusline.sh')], input=json.dumps(payload),
+                                  capture_output=True, encoding='utf-8',
+                                  env={**os.environ, 'HOME': home, 'USERPROFILE': home, 'CLAUDE_CONFIG_DIR': home})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('~/code', done.stdout)
         self.assertIn('Opus', done.stdout)
@@ -70,9 +96,7 @@ class RenderTest(unittest.TestCase):
             (home / '.claude').mkdir()
             os.symlink(ROOT / 'statusline-prs.py', home / '.claude' / 'statusline-prs.py')
             (home / 'bin').mkdir()
-            (home / 'bin' / 'gh').write_text(  # holds the worker in gh until the test releases it
-                '#!/bin/sh\ntouch "$HOME/entered"\nwhile [ ! -e "$HOME/go" ]; do sleep 0.05; done\n')
-            (home / 'bin' / 'gh').chmod(0o755)
+            make_stub(home / 'bin', 'gh', HELD_GH)  # holds the worker in gh until the test releases it
             transcript = home / 't.jsonl'
             transcript.write_text(json.dumps(link(7, 'o/r')) + '\n')
             (home / 'statusline-prs').mkdir()
@@ -82,10 +106,11 @@ class RenderTest(unittest.TestCase):
             payload = {'workspace': {'current_dir': str(home)}, 'session_id': SID, 'transcript_path': str(transcript)}
             try:
                 # a render that waited for the held gh would outlast this timeout (GH_TIMEOUT_S is longer)
-                done = subprocess.run(['bash', str(ROOT / 'statusline.sh')], input=json.dumps(payload),
-                                      capture_output=True, text=True, timeout=prs.GH_TIMEOUT_S / 2,
-                                      env={**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(home),
-                                           'PATH': f"{home / 'bin'}:{os.environ['PATH']}"})
+                done = subprocess.run([BASH, str(ROOT / 'statusline.sh')], input=json.dumps(payload),
+                                      capture_output=True, encoding='utf-8', timeout=prs.GH_TIMEOUT_S / 2,
+                                      env={**os.environ, 'HOME': str(home), 'USERPROFILE': str(home),
+                                           'CLAUDE_CONFIG_DIR': str(home), 'STUB_DIR': str(home),
+                                           'PATH': f"{home / 'bin'}{os.pathsep}{os.environ['PATH']}"})
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertIn('#7✓', plain(done.stdout))
                 deadline = time.monotonic() + 10
@@ -180,11 +205,21 @@ class PrRenderTest(unittest.TestCase):
             self.assertEqual(prs.render({'prs': 'x', 'status': []}), '')
 
 
-STUB_GH = """#!/bin/sh
-echo "$@" >> "$STUB_DIR/calls"
-[ -n "$STUB_SLEEP" ] && sleep "$STUB_SLEEP"
-cat "$STUB_DIR/answer"
-exit "${STUB_RC:-0}"
+HELD_GH = """import os, time
+home = os.environ['STUB_DIR']
+open(os.path.join(home, 'entered'), 'w').close()
+while not os.path.exists(os.path.join(home, 'go')):
+    time.sleep(0.05)
+"""
+STUB_GH = """import os, sys, time
+d = os.environ['STUB_DIR']
+with open(os.path.join(d, 'calls'), 'a') as calls:
+    calls.write(' '.join(sys.argv[1:]) + '\\n')
+if os.environ.get('STUB_SLEEP'):
+    time.sleep(float(os.environ['STUB_SLEEP']))
+with open(os.path.join(d, 'answer')) as answer:
+    sys.stdout.write(answer.read())
+sys.exit(int(os.environ.get('STUB_RC') or 0))
 """
 
 
@@ -199,10 +234,8 @@ class PrRefreshTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         (self.dir / 'bin').mkdir()
-        gh = self.dir / 'bin' / 'gh'
-        gh.write_text(STUB_GH)
-        gh.chmod(0o755)
-        env = mock.patch.dict(os.environ, {'PATH': f"{self.dir / 'bin'}:{os.environ['PATH']}",
+        make_stub(self.dir / 'bin', 'gh', STUB_GH)
+        env = mock.patch.dict(os.environ, {'PATH': f"{self.dir / 'bin'}{os.pathsep}{os.environ['PATH']}",
                                            'STUB_DIR': str(self.dir)})
         env.start()
         self.addCleanup(env.stop)
@@ -363,8 +396,9 @@ class PrRefreshTest(unittest.TestCase):
             os.utime(self.cache_dir / name, (mtime, mtime))
         (self.cache_dir / 'dir-3.json').mkdir()
         os.utime(self.cache_dir / 'dir-3.json', (old, old))
-        os.symlink(self.dir / 'answer', self.cache_dir / 'link-4.json')
-        os.utime(self.cache_dir / 'link-4.json', (old, old), follow_symlinks=False)
+        if os.name != 'nt':  # Windows cannot set a symlink's own times
+            os.symlink(self.dir / 'answer', self.cache_dir / 'link-4.json')
+            os.utime(self.cache_dir / 'link-4.json', (old, old), follow_symlinks=False)
         self.refresh()
         self.assertEqual(sorted(os.listdir(self.cache_dir)),
                          ['.lock', f'{SID}.json', 'dir-3.json', 'live-2.json', 'live-2.json.4243.tmp', 'live-6.lock',
@@ -396,7 +430,11 @@ class PrRefreshTest(unittest.TestCase):
         self.answer(self.all())
         self.cache_dir.mkdir()
         with open(self.cache_dir / '.lock', 'a') as held:
-            prs.fcntl.flock(held, prs.fcntl.LOCK_EX)
+            if prs.fcntl:
+                prs.fcntl.flock(held, prs.fcntl.LOCK_EX)
+            else:  # as refresh() locks on Windows, through another handle
+                os.lseek(held.fileno(), 1 << 30, os.SEEK_SET)
+                prs.msvcrt.locking(held.fileno(), prs.msvcrt.LK_NBLCK, 1)
             self.refresh()
         self.assertFalse((self.cache_dir / f'{SID}.json').exists())
         self.assertEqual(self.calls(), [])

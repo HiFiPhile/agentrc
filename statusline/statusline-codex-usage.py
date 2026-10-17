@@ -4,16 +4,16 @@
 Codex 0.154 exposes rate limits only through the app-server JSON-RPC
 (`account/rateLimits/read`); there is no `codex usage` subcommand.
 """
-import json, subprocess, sys
+import json, shutil, subprocess, sys
 
 WEEK_MINS = 10080
 WEEK_MIN, WEEK_MAX = 9576, 10584   # codex TUI treats +/-5% of a week as weekly
 
 
 def read_rate_limits(timeout=25):
-    p = subprocess.Popen(["codex", "-c", "analytics.enabled=false", "app-server"], stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                         text=True, bufsize=1)
+    p = subprocess.Popen([shutil.which("codex") or "codex", "-c", "analytics.enabled=false", "app-server"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         encoding="utf-8", errors="replace", bufsize=1)
     try:
         def send(o):
             p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
