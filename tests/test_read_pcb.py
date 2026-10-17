@@ -1,6 +1,7 @@
 """Tests for the read-pcb skill's pcb.py: EAGLE and KiCad schematics load into
 one model, every pin keeps its own identity, and a source that cannot give a
 complete, unambiguous answer is refused with a named reason."""
+import errno
 import io
 import os
 import re
@@ -735,6 +736,32 @@ class FindIn(Repos):
         with self.assertRaises(SystemExit) as e, redirect_stderr(io.StringIO()):
             pcb.main(['find'])
         self.assertEqual(e.exception.code, 2)
+
+
+@unittest.skipUnless(os.name == 'nt', 'msvcrt locks; flock is freed when the cache lock file closes')
+class WindowsLock(unittest.TestCase):
+    def test_the_lock_is_freed_when_the_block_ends_not_after_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'repo.lock')
+            with open(path, 'w') as held, open(path, 'w') as other:
+                with pcb.exclusive(held):
+                    pass
+                os.lseek(other.fileno(), 1 << 30, os.SEEK_SET)
+                pcb.msvcrt.locking(other.fileno(), pcb.msvcrt.LK_NBLCK, 1)  # raises if still held
+                pcb.msvcrt.locking(other.fileno(), pcb.msvcrt.LK_UNLCK, 1)
+
+    def test_a_lock_error_other_than_contention_is_raised_not_retried(self):
+        calls = []
+
+        def locking(fd, mode, n):
+            calls.append(mode)
+            if len(calls) > 1:
+                raise AssertionError('retried a lock that cannot succeed')
+            raise OSError(errno.EBADF, 'Bad file descriptor')
+        with tempfile.TemporaryFile() as fh, unittest.mock.patch.object(pcb.msvcrt, 'locking', locking):
+            with self.assertRaises(OSError) as e, pcb.exclusive(fh):
+                pass
+        self.assertEqual(e.exception.errno, errno.EBADF)
 
 
 class Cache(Repos, Refusals):

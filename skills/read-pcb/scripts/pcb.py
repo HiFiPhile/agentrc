@@ -25,7 +25,9 @@ Exit 0 result, 1 nothing matched, 2 bad usage or a sheet that is not a root,
 3 source unavailable, unsupported or malformed, or an incomplete find.
 """
 import argparse
+import contextlib
 import datetime
+import errno
 import os
 import posixpath
 import re
@@ -501,8 +503,8 @@ class Cache:
                                 "read-pcb", repo)
         os.makedirs(os.path.dirname(self.dir), exist_ok=True)
         with open(self.dir + ".lock", "w") as lock:
-            exclusive(lock)  # one clone or fetch at a time; FETCH_HEAD is shared
-            self._sync()
+            with exclusive(lock):  # one clone or fetch at a time; FETCH_HEAD is shared
+                self._sync()
 
     def _sync(self):
         if not os.path.isdir(os.path.join(self.dir, ".git")):
@@ -554,18 +556,28 @@ class Cache:
         return f"@ {self.sha[:12]} | cache {self.dir}, origin HEAD fetched {self.fetched}"
 
 
+@contextlib.contextmanager
 def exclusive(fh):
-    """Hold an exclusive lock on fh until it is closed."""
+    """Hold an exclusive lock on fh for the block."""
     if fcntl:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        fcntl.flock(fh, fcntl.LOCK_EX)  # freed when fh closes
+        yield
         return
-    os.lseek(fh.fileno(), 1 << 30, os.SEEK_SET)  # Windows locks are mandatory: a byte past any content
+    fd = fh.fileno()
+    os.lseek(fd, 1 << 30, os.SEEK_SET)  # Windows locks are mandatory: a byte past any content
     while True:
         try:
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-            return
-        except OSError:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            break
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EDEADLOCK):
+                raise
             time.sleep(0.05)  # LK_LOCK gives up after ~10 s
+    try:
+        yield
+    finally:
+        os.lseek(fd, 1 << 30, os.SEEK_SET)  # Windows frees a closed handle's lock only after a delay
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 def tag(data):
@@ -845,8 +857,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    for stream in (sys.stdout, sys.stderr):
-        stream.reconfigure(encoding="utf-8", errors="replace")  # part values and net names are not ASCII
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # part values and net names are not ASCII
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:
