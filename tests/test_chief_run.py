@@ -28,14 +28,14 @@ d = pathlib.Path(os.environ['FAKE_DIR'])
 (d / 'cwd').write_text(os.getcwd())
 (d / 'pid').write_text(str(os.getpid()))
 (d / 'stdin.txt').write_bytes(sys.stdin.buffer.read())
-for line in (d / 'stream.jsonl').read_text(encoding='utf-8').splitlines(keepends=True):
-    if line.startswith('#gate '):   # hold here until the test creates the named file
-        gate, deadline = d / line.split()[1], time.monotonic() + 10
+for line in (d / 'stream.jsonl').read_bytes().splitlines(keepends=True):
+    if line.startswith(b'#gate '):   # hold here until the test creates the named file
+        gate, deadline = d / line.split()[1].decode(), time.monotonic() + 10
         while not gate.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         continue
-    sys.stdout.write(line)
-    sys.stdout.flush()
+    sys.stdout.buffer.write(line)   # bytes: Windows text mode would turn each newline into CRLF
+    sys.stdout.buffer.flush()
 sys.stderr.write('fake stderr\n')
 if os.environ.get('FAKE_SIGNAL'):
     os.kill(os.getpid(), int(os.environ['FAKE_SIGNAL']))
@@ -56,7 +56,28 @@ def result(body='chief: stage · done', is_error=False, subtype='success'):
     return {'type': 'result', 'subtype': subtype, 'is_error': is_error, 'result': body}
 
 
-@unittest.skipIf(os.name == 'nt', 'headless-chief requires /proc and POSIX signals')
+def alive(pid):
+    if os.name != 'nt':
+        return Path(f'/proc/{pid}').exists()
+    import ctypes   # os.kill(pid, 0) would terminate it on Windows
+    kernel32 = ctypes.WinDLL('kernel32')
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
+    if not handle:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0x102   # WAIT_TIMEOUT: still running
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def kill(pid):
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/T', '/F', '/PID', str(pid)], capture_output=True)
+    else:
+        os.kill(pid, signal.SIGKILL)
+
+
 class ChiefRun(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()
@@ -66,8 +87,17 @@ class ChiefRun(unittest.TestCase):
         self.fake.mkdir()
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        (self.bin / 'claude').write_text(FAKE)
-        (self.bin / 'claude').chmod(0o755)
+        if os.name == 'nt':
+            # Windows cannot exec a shebang file: a real claude.exe launcher runs the fake, found before any real claude
+            from pip._vendor.distlib.scripts import ScriptMaker
+            (self.fake / 'claude').write_text(FAKE)
+            maker = ScriptMaker(str(self.fake), str(self.bin))
+            maker.executable = sys.executable
+            maker.make('claude')
+            self.assertTrue((self.bin / 'claude.exe').is_file())
+        else:
+            (self.bin / 'claude').write_text(FAKE)
+            (self.bin / 'claude').chmod(0o755)
         self.worktree = self.root / 'wt'
         self.worktree.mkdir()
         self.task = self.root / 'task.md'
@@ -77,7 +107,9 @@ class ChiefRun(unittest.TestCase):
         # with no CLAUDE_CONFIG_DIR, the user scope is HOME/.claude
         self.env = {**{k: v for k, v in os.environ.items() if k != 'CLAUDE_CONFIG_DIR'},
                     'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'FAKE_DIR': str(self.fake),
-                    'CLAUDECODE': '1', 'HERDR_PANE_ID': 'p1', 'HERDR_ENV': '1', 'HOME': str(self.root)}
+                    'CLAUDECODE': '1', 'HERDR_PANE_ID': 'p1', 'HERDR_ENV': '1', 'HOME': str(self.root),
+                    'USERPROFILE': str(self.root)}   # Path.home() on Windows
+        self.assertEqual(Path(shutil.which('claude', path=self.env['PATH'])).parent, self.bin, 'the fake comes before any real claude')
 
     def stream(self, *events):
         self.fake.joinpath('stream.jsonl').write_text(
@@ -95,7 +127,7 @@ class ChiefRun(unittest.TestCase):
     def start(self, *argv, **kw):
         proc = subprocess.Popen(list(argv) or self.argv(), env=self.env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
-        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        self.addCleanup(lambda: proc.poll() is None and (kill(proc.pid), proc.wait()))   # its tree: Windows keeps claude
         return proc
 
     def wait_until(self, what, ok):
@@ -226,7 +258,9 @@ class ChiefRun(unittest.TestCase):
             ('prompt blocked by a hook', (init(), {**result('UserPromptSubmit operation blocked by hook:\nx'), 'num_turns': 0}),
              {}, 1, 'no model turn; see stream.jsonl', False),
             ('claude failed', (init(), result()), {'FAKE_RC': '3'}, 3, 'claude exited 3', True),
-            ('claude killed', (init(), result()), {'FAKE_SIGNAL': str(sig)}, 128 + sig, f'claude killed by signal {sig}', True),
+            ('claude killed', (init(), result()), {'FAKE_SIGNAL': str(sig)}, 128 + sig, f'claude killed by signal {sig}', True)
+            if os.name != 'nt' else   # Windows ends a process with an exit code, never a signal
+            ('claude killed', (init(), result()), {'FAKE_SIGNAL': str(sig)}, sig, f'claude exited {sig}', True),
         ]
         for name, events, env, want, reason, report in cases:
             with self.subTest(name):
@@ -310,6 +344,7 @@ class ChiefRun(unittest.TestCase):
         (self.fake / 'go').touch()
         self.assertEqual(proc.wait(timeout=10), 0)
 
+    @unittest.skipIf(os.name == 'nt', 'Windows delivers no SIGTERM; test_ending_claude_on_windows_finishes_the_run')
     def test_a_sigterm_to_the_launcher_stops_chief_and_finishes_the_run(self):
         self.stream(init(), text('m1', 'chief: stage · live'), '#gate never\n', result())
         proc = self.start()
@@ -321,15 +356,27 @@ class ChiefRun(unittest.TestCase):
         self.assertFalse(Path(f'/proc/{pid}').exists(), 'chief outlived the launcher')
         self.assertTrue(self.texts()[-1].startswith(f'launcher: exit {128 + sig} (claude killed by signal {sig})'), self.texts())
 
+    @unittest.skipUnless(os.name == 'nt', 'the Windows way to stop a run')
+    def test_ending_claude_on_windows_finishes_the_run(self):
+        self.stream(init(), text('m1', 'chief: stage · live'), '#gate never\n', result())
+        proc = self.start()
+        self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
+        started = next(t for t in self.texts() if t.startswith('launcher: started pid '))
+        kill(int(started.split()[3].rstrip(',')))   # taskkill /T /F on the started pid, as SKILL.md says
+        self.assertEqual(proc.wait(timeout=10), 1)
+        self.assertFalse(alive(int((self.fake / 'pid').read_text())), 'chief outlived the launcher')
+        self.assertTrue(self.texts()[-1].startswith('launcher: exit 1 (claude exited 1)'), self.texts())
+
     def test_it_returns_at_once_and_the_launcher_runs_on_in_its_own_session(self):
         self.stream(init(), text('m1', 'chief: stage · live'), '#gate go\n', result())
         r = self.run_it(detached=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         pid = int(r.stdout.split('launcher pid ')[1].split(',')[0])
-        self.addCleanup(lambda: Path(f'/proc/{pid}').exists() and os.kill(pid, signal.SIGKILL))
+        self.addCleanup(lambda: alive(pid) and kill(pid))
         self.assertIn(str(self.out / 'progress.log'), r.stdout)
         self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
-        self.assertNotEqual(os.getsid(pid), os.getsid(0), 'a caller ending its process group does not reach it')
+        if hasattr(os, 'getsid'):   # Windows: DETACHED_PROCESS and a new process group stand for the session
+            self.assertNotEqual(os.getsid(pid), os.getsid(0), 'a caller ending its process group does not reach it')
         (self.fake / 'go').touch()
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 0 (result ok)'))
         self.assertEqual((self.out / 'report.md').read_text(encoding='utf-8'), 'chief: stage · done\n')
@@ -337,12 +384,15 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual((r.returncode, r.stdout), (2, ''), 'an argument it refuses is refused before it detaches')
         self.assertIn('exists', r.stderr)
 
-    def test_a_launcher_that_fails_detached_still_writes_its_exit_line(self):
+    @unittest.skipIf(os.name == 'nt', 'chmod(0) leaves a Windows file readable')
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root reads any file')
+    def test_an_unreadable_task_is_refused_before_it_detaches(self):
         self.task.chmod(0)
         r = self.run_it(detached=True)
         self.assertEqual((r.returncode, self.out.exists()), (2, False), 'an unreadable task is refused before it detaches')
         self.assertIn('cannot be read', r.stderr)
-        self.task.chmod(0o644)
+
+    def test_a_launcher_that_fails_detached_still_writes_its_exit_line(self):
         failing = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import chief_run\n'
                    'def launch(a, task):\n    chief_run.Progress(a.out / "progress.log").line("launcher: started")\n    raise RuntimeError("boom")\n'
                    'chief_run.launch = launch\nsys.exit(chief_run.main(sys.argv[1:]))')
@@ -350,7 +400,7 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 1'))
         self.assertEqual(self.progress(), [(1, 'launcher: started'), (2, 'launcher: exit 1 (launcher failed: RuntimeError: boom) · report none')])
-        self.assertIn('RuntimeError: boom', (self.out / 'stderr.log').read_text())
+        self.assertIn('RuntimeError: boom', (self.out / 'stderr.log').read_text(encoding='utf-8', errors='replace'))
 
     def test_a_launcher_that_fails_while_chief_runs_stops_chief_before_its_exit_line(self):
         self.stream(init(), 'not json\n', '#gate never\n', result())
@@ -361,7 +411,7 @@ class ChiefRun(unittest.TestCase):
         r = subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 1 (launcher failed: OSError: disk full)'))
-        self.assertFalse(Path(f'/proc/{int((self.fake / "pid").read_text())}').exists(), 'chief stopped before the exit line')
+        self.assertFalse(alive(int((self.fake / 'pid').read_text())), 'chief stopped before the exit line')
 
     def test_a_claude_that_cannot_start_is_recorded(self):
         empty = self.root / 'empty'
@@ -371,6 +421,7 @@ class ChiefRun(unittest.TestCase):
         self.assertTrue(self.texts()[-1].startswith('launcher: exit 127 (could not start claude: '), self.texts())
         self.assertIn(b'could not start claude', (self.out / 'stderr.log').read_bytes())
 
+    @unittest.skipIf(os.name == 'nt', 'reads /proc; test_a_second_launch_in_the_worktree_is_refused covers Windows')
     def test_a_worktree_with_a_running_chief_is_refused(self):
         self.stream('#gate never\n')
         self.start('sleep', '30', cwd=self.worktree)          # in the worktree, but not a chief
@@ -387,6 +438,44 @@ class ChiefRun(unittest.TestCase):
         self.stream(init(), result())
         r = self.run_it(worktree=elsewhere)
         self.assertEqual(r.returncode, 0, f'another worktree is not blocked: {r.stderr}')
+
+    def git_worktree(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        subprocess.run(['git', 'init', '-q', str(self.worktree)], check=True, env=env)
+
+    def test_a_second_launch_in_the_worktree_is_refused(self):
+        self.git_worktree()
+        self.stream(init(), text('m1', 'chief: stage · live'), '#gate go\n', result())
+        proc = self.start()
+        self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
+        first, self.out = self.out, self.root / 'run2'
+        for detached in (False, True):
+            r = self.run_it(detached=detached)
+            self.assertEqual((r.returncode, r.stdout), (2, ''), r.stderr)
+            self.assertIn(f'a chief already runs in {self.worktree}', r.stderr)
+            self.assertFalse(self.out.exists())
+        (self.fake / 'go').touch()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.out = first
+        self.assertTrue(self.logged('launcher: exit 0 (result ok)'))
+        self.out = self.root / 'run3'
+        self.assertEqual(self.run_it().returncode, 0, 'the lock goes with its launcher')
+
+    @unittest.skipUnless(os.name == 'nt', 'the Windows launcher takes the run lock after its caller checked it')
+    def test_a_detached_launcher_that_loses_the_lock_writes_its_exit_line(self):
+        self.git_worktree()
+        self.stream(init(), text('m1', 'chief: stage · live'), '#gate go\n', result())
+        proc = self.start()
+        self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
+        first, self.out = self.out, self.root / 'run2'
+        self.out.mkdir()   # as its caller left it
+        (self.fake / 'argv.json').unlink()
+        r = subprocess.run(self.argv('--_detached', detached=True), env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertRegex(self.texts()[-1], r'^launcher: exit 2 \(a chief already runs in .*run\.lock\) · report none$')
+        self.assertFalse((self.fake / 'argv.json').exists(), 'no second claude started')
+        (self.fake / 'go').touch()
+        self.assertEqual(proc.wait(timeout=10), 0, 'the first run went on')
 
     def installed(self, kind, name, content, root=None, scope=None):
         """An agentrc entry linked into the user scope as install.py links it."""
@@ -479,6 +568,7 @@ class ChiefRun(unittest.TestCase):
         (self.worktree / '.claude' / 'agents' / 'code-writer.md').symlink_to(outside / 'code-writer.md')
         self.assert_refused(self.run_it(), ['.claude/workflows/pr-babysit.js', '.claude/agents/code-writer.md'])
 
+    @unittest.skipIf(os.name == 'nt', 'chmod(0) does not make a Windows directory unreadable')
     @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root reads any directory')
     def test_an_unreadable_project_or_installed_directory_is_refused_without_merge_advice(self):
         self.stream(init(), result())

@@ -140,7 +140,7 @@ def seconds(t0, t1):
 
 def meta_of(meta_path):
     try:
-        return json.loads(meta_path.read_text())
+        return json.loads(meta_path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return {}
 
@@ -318,7 +318,7 @@ def timeline(session, walls):
 def record_of(session, run):
     """A run's record beside the transcripts, or {}."""
     try:
-        r = json.loads((session / 'workflows' / f'{run}.json').read_text())
+        r = json.loads((session / 'workflows' / f'{run}.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return {}
     return r if isinstance(r, dict) else {}
@@ -504,4 +504,5 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8')   # labels are claude's UTF-8 text, whatever the locale
     sys.exit(main())

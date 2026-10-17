@@ -30,7 +30,8 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    skill's hook denies `Workflow` and `Agent` calls in such a worktree for
    interactive sessions too. The `launcher: exit` line in `progress.log` is
    the end of the run;
-   `kill <launcher pid>` stops it early.
+   `kill <launcher pid>` stops it early. On Windows, `taskkill /T /F /PID <pid>` on the `launcher: started pid`
+   line's pid does (exit line `claude exited 1`), and only a chief chief_run started counts as running there.
 3. **Watch** with Monitor on `tail -n +1 -F <dir>/progress.log`, its
    description, on every arm, the target, such as `chief hathach/tinyusb#3988
    babysit`. Each line is
@@ -65,7 +66,7 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    | 1 | no final result, an error result, or one without text |
    | 2 | bad arguments, `--out` already exists, a chief already runs in the worktree, or its `.claude` shadows agentrc's installed copies or cannot be read |
    | 127 | `claude` could not start |
-   | other | claude's own status; 128 + N when killed by signal N |
+   | other | claude's own status; 128 + N when killed by signal N (not on Windows) |
 
 Leave the worktree to chief until it exits; remaining in-scope work goes into
 its task. A signal to the launcher is passed

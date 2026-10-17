@@ -13,13 +13,14 @@ The exit line ends with that total, or `cost none (<why>)`.
 A status line is the first line of one of chief's own messages (agents/chief.md);
 a note is a progress note, joined onto one line, that chief's model returns as a `thinking`
 block. It returns at once and leaves the launcher in its own session, so no caller's
-command timeout ends the run; --foreground runs it in place. Exit codes and usage are
-in SKILL.md.
+command timeout ends the run; --foreground runs it in place. Windows has no fork: there
+the launcher is this command run again, detached. Exit codes and usage are in SKILL.md.
 """
 import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +33,10 @@ import run_cost  # noqa: E402
 from shadows import refusal  # noqa: E402
 
 MARKER = 'chief: '
+HELD = []   # the run.lock this launcher holds until it exits
+
+if os.name == 'nt':
+    import msvcrt
 
 
 def fail(msg):
@@ -54,6 +59,8 @@ class Progress:
 def running_chiefs(worktree):
     """Pids of `--agent chief` processes whose working directory is the worktree:
     a second chief there would write the same checkout."""
+    if os.name == 'nt':
+        return []   # no /proc: lock_held covers the chiefs chief_run starts
     want, pids = worktree.resolve(), []
     for proc in Path('/proc').iterdir():
         if not proc.name.isdigit():
@@ -67,6 +74,40 @@ def running_chiefs(worktree):
         except OSError:
             continue   # gone, or not ours to read
     return pids
+
+
+def lock_held(worktree, keep, wait=0.0):
+    """Windows, where another process's cwd cannot be read: the worktree's `<git-path chief>/run.lock` when
+    another launcher holds it, else None after taking it, kept for this process's lifetime when keep. It sees
+    only chiefs chief_run starts, not interactive ones; elsewhere, and outside a repository, None."""
+    if os.name != 'nt':
+        return None
+    try:
+        got = subprocess.run(['git', '-C', str(worktree), 'rev-parse', '--path-format=absolute', '--git-path', 'chief'],
+                             capture_output=True, encoding='utf-8', env={k: v for k, v in os.environ.items() if not k.startswith('GIT_')})
+    except OSError:
+        return None
+    if got.returncode:
+        return None
+    path = Path(got.stdout.strip()) / 'run.lock'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f, deadline = path.open('ab'), time.monotonic() + wait
+    os.lseek(f.fileno(), 1 << 30, os.SEEK_SET)   # msvcrt locks are mandatory: lock a byte past any content
+    while True:
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                f.close()
+                return path
+            time.sleep(0.05)
+    if keep:
+        HELD.append(f)
+    else:
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        f.close()
+    return None
 
 
 def child_env():
@@ -131,7 +172,10 @@ def main(argv=None):
     p.add_argument('--task-file', required=True, type=Path)
     p.add_argument('--permission-mode')
     p.add_argument('--foreground', action='store_true')
+    p.add_argument('--_detached', action='store_true', help=argparse.SUPPRESS)   # Windows: the launcher, run again
     a = p.parse_args(argv)
+    if a._detached:
+        detached(a, lambda: detached_launch(a))
     if a.out.exists():
         fail(f'{a.out} exists; each run needs a new directory')
     if not a.worktree.is_dir():
@@ -140,6 +184,8 @@ def main(argv=None):
         fail(f'{a.task_file} is not a file')
     if pids := running_chiefs(a.worktree):
         fail(f'a chief already runs in {a.worktree} (pid {", ".join(map(str, pids))})')
+    if held := lock_held(a.worktree, keep=a.foreground):
+        fail(f'a chief already runs in {a.worktree} (its launcher holds {held})')
     if why := refusal(a.worktree, 'relaunch with a new --out'):
         fail(why)
     try:
@@ -149,6 +195,14 @@ def main(argv=None):
     a.out.mkdir(parents=True)
     if a.foreground:
         return launch(a, task)
+    if os.name == 'nt':
+        # no fork: this process's own command line runs again as the launcher, without a console or the caller's group
+        task.close()
+        with (a.out / 'stderr.log').open('ab') as log:
+            pid = subprocess.Popen([sys.executable, *sys.orig_argv[1:], '--_detached'], stdin=subprocess.DEVNULL, stdout=log,
+                                   stderr=log, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP).pid
+        print(f'chief_run: launcher pid {pid}, progress {a.out / "progress.log"}')
+        return 0
     if pid := os.fork():
         print(f'chief_run: launcher pid {pid}, progress {a.out / "progress.log"}')
         return 0
@@ -158,9 +212,14 @@ def main(argv=None):
         os.dup2(opened, fd)
         os.close(opened)
     os.dup2(1, 2)
+    detached(a, lambda: launch(a, task))
+
+
+def detached(a, run):
+    """Run the launcher nobody watches and exit with its code: the exit line must come whatever happens."""
     code = 1
     try:
-        code = launch(a, task)
+        code = run()
     except BaseException as e:   # noqa: BLE001 - nobody watches this process; the exit line must still come
         traceback.print_exc()
         Progress(a.out / 'progress.log').line(f'launcher: exit 1 (launcher failed: {type(e).__name__}: {e}) · report none')
@@ -169,8 +228,18 @@ def main(argv=None):
         os._exit(code)
 
 
+def detached_launch(a):
+    """Windows: the launcher run again; it takes the run lock its caller only checked."""
+    if held := lock_held(a.worktree, keep=True, wait=5):
+        Progress(a.out / 'progress.log').line(f'launcher: exit 2 (a chief already runs in {a.worktree}; its launcher holds {held}) · report none')
+        return 2
+    return launch(a, a.task_file.open('rb'))
+
+
 def launch(a, task):
-    cmd = ['claude', '-p', '--agent', 'chief', '--output-format', 'stream-json', '--verbose']
+    # Windows: CreateProcess would try only claude.exe, and System32 before PATH
+    claude = (shutil.which('claude') or 'claude') if os.name == 'nt' else 'claude'
+    cmd = [claude, '-p', '--agent', 'chief', '--output-format', 'stream-json', '--verbose']
     if a.permission_mode:
         cmd += ['--permission-mode', a.permission_mode]
 
@@ -185,15 +254,17 @@ def launch(a, task):
     with task, (a.out / 'stderr.log').open('ab') as err, \
             (a.out / 'stream.jsonl').open('ab') as stream:
         try:
-            child = subprocess.Popen(cmd, cwd=a.worktree, stdin=task, stdout=subprocess.PIPE, stderr=err,
-                                     env=child_env())
+            # a detached launcher has no console: CREATE_NO_WINDOW keeps claude's tools from opening windows
+            child = subprocess.Popen(cmd, cwd=a.worktree, stdin=task, stdout=subprocess.PIPE, stderr=err, env=child_env(),
+                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         except OSError as e:
             err.write(f'chief_run: could not start claude: {e}\n'.encode())
             progress.line(f'launcher: exit 127 (could not start claude: {e}) · report none')
             return 127
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
         try:
+            # Windows has no SIGHUP and can send claude no signal but termination
+            for sig in filter(None, (getattr(signal, n, None) for n in ('SIGTERM', 'SIGINT', 'SIGHUP', 'SIGBREAK'))):
+                signal.signal(sig, lambda signum, _frame: child.terminate() if os.name == 'nt' else child.send_signal(signum))
             progress.line(f'launcher: started pid {child.pid}, out {a.out}')
             for raw in iter(child.stdout.readline, b''):
                 stream.write(raw)
@@ -248,4 +319,6 @@ def launch(a, task):
 
 
 if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8')   # paths and refusals, whatever the locale
+    sys.stderr.reconfigure(encoding='utf-8')
     sys.exit(main())
