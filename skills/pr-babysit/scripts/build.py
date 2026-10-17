@@ -34,7 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import Parser, Unusable, checkout_top, git, report  # noqa: E402
@@ -73,7 +73,7 @@ def bash():
     wsl = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'bash.exe'))
     for d in os.environ.get('PATH', '').split(os.pathsep):
         path = os.path.join(d, 'bash.exe')
-        if os.path.isabs(d) and os.path.isfile(path) and os.path.normcase(os.path.normpath(path)) != wsl:
+        if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(path) and os.path.normcase(os.path.normpath(path)) != wsl:
             return path
     raise Unusable('no bash.exe on PATH (System32 holds only the WSL launcher)')
 
