@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from pathlib import PureWindowsPath
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from search import DB, LIB, log_lookup, norm, resolve, tag_list  # noqa: E402
@@ -143,11 +144,11 @@ def is_current(meta, bid, src):
 
 
 def on_path(name, path=None):
-    """Windows: the program in a PATH directory, not the one shutil.which and
-    CreateProcess find first in the current or python's own directory."""
+    """Windows: the program in an absolute PATH directory, not the one shutil.which and
+    CreateProcess find first in the current or python's own directory, nor a relative entry's."""
     for d in (os.environ.get("PATH", "") if path is None else path).split(os.pathsep):
         p = os.path.join(d, name + ".exe")
-        if d and os.path.isfile(p):
+        if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(p):
             return p
     return None
 

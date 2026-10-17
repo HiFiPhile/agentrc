@@ -430,10 +430,11 @@ class Extract(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows runs a program from the current directory before PATH')
     def test_pdfinfo_is_the_one_on_path_and_pdftotext_its_sibling(self):
         here, poppler = self.lib / 'here', self.lib / 'poppler'
-        for d in (here, poppler):
+        for d in (here, here / 'bin', here / 'rooted', poppler):
             d.mkdir()
             for name in ('pdfinfo.exe', 'pdftotext.exe'):
                 (d / name).write_bytes(b'')
+        rooted = os.path.splitdrive(here / 'rooted')[1]  # no drive: the cwd's drive decides
         seen = []
 
         def run(argv, **kw):
@@ -441,8 +442,10 @@ class Extract(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, 'Pages:          1\n', '')
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(here)
-        with unittest.mock.patch.dict(os.environ, {'PATH': str(poppler)}), \
+        # relative and drive-less entries resolve against the cwd
+        with unittest.mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['.', 'bin', rooted, str(poppler)])}), \
                 unittest.mock.patch.object(locate.subprocess, 'run', run):
+            os.environ.pop('NoDefaultCurrentDirectoryInExePath', None)
             self.assertEqual(locate.page_count(str(self.src)), 1)
             cmd = locate.extractor()
         self.assertEqual(seen, [str(poppler / 'pdfinfo.exe')])
