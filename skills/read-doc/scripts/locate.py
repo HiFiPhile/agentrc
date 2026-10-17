@@ -27,7 +27,6 @@ import contextlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -143,20 +142,51 @@ def is_current(meta, bid, src):
             and library_path(meta.get("path")) == library_path(os.path.relpath(src, LIB)))
 
 
+def on_path(name, path=None):
+    """Windows: the program in a PATH directory, not the one shutil.which and
+    CreateProcess find first in the current or python's own directory."""
+    for d in (os.environ.get("PATH", "") if path is None else path).split(os.pathsep):
+        p = os.path.join(d, name + ".exe")
+        if d and os.path.isfile(p):
+            return p
+    return None
+
+
+def pdfinfo():
+    if os.name != "nt":
+        return "pdfinfo"
+    found = on_path("pdfinfo")
+    if not found:
+        raise Unavailable("pdfinfo is not on PATH; install poppler")
+    return found
+
+
 def extractor():
-    """EXTRACTOR as run. On Windows, the pdftotext beside pdfinfo: Git for Windows
-    puts an xpdf one on PATH that writes Latin-1. EXTRACTOR stays the manifest's identity."""
-    cmd = list(EXTRACTOR)
+    """EXTRACTOR as run, asking for UTF-8: xpdf's pdftotext writes Latin-1 unless asked,
+    and Git for Windows puts one on PATH. On Windows, the pdftotext beside pdfinfo.
+    EXTRACTOR stays the manifest's identity."""
+    cmd = [*EXTRACTOR, "-enc", "UTF-8"]
     if os.name == "nt" and cmd[0] == "pdftotext":
-        info = shutil.which("pdfinfo")
-        sibling = info and shutil.which("pdftotext", path=os.path.dirname(info))
-        cmd[0] = sibling or cmd[0]
+        cmd[0] = on_path("pdftotext", os.path.dirname(pdfinfo())) or on_path("pdftotext")
+        if not cmd[0]:
+            raise Unavailable("pdftotext is not on PATH; install poppler")
     return cmd
+
+
+def retried(op, *args):
+    """op(*args); on Windows a reader or a scanner with the file open refuses it for a moment."""
+    for attempt in range(50):
+        try:
+            return op(*args)
+        except PermissionError:
+            if os.name != "nt" or attempt == 49:
+                raise
+            time.sleep(0.02)
 
 
 def page_count(src):
     """Pages according to pdfinfo. Explicitly unavailable when it cannot say."""
-    done = subprocess.run(["pdfinfo", src], capture_output=True, encoding="utf-8", errors="replace")
+    done = subprocess.run([pdfinfo(), src], capture_output=True, encoding="utf-8", errors="replace")
     m = re.search(r"^Pages:\s+(\d+)$", done.stdout, re.M)
     if done.returncode != 0 or not m:
         raise Unavailable(f"pdfinfo gave no page count for {os.path.basename(src)}"
@@ -195,7 +225,7 @@ def extract(bid, src):
                 "extractor": EXTRACTOR, "version": VERSION}
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(meta) + "\n" + body)
-        os.replace(tmp, text_path(bid))
+        retried(os.replace, tmp, text_path(bid))
         return meta
     finally:
         if os.path.exists(tmp):
@@ -371,7 +401,7 @@ def prune(db):
         m = re.fullmatch(r"(\d+)\.txt(?:\.tmp\d+)?", name)  # only names this script writes
         path = os.path.join(INDEX, name)
         if m and int(m.group(1)) not in alive and os.path.isfile(path):
-            os.remove(path)
+            retried(os.remove, path)
             removed += 1
     return removed
 
@@ -568,8 +598,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    for stream in (sys.stdout, sys.stderr):
-        stream.reconfigure(encoding="utf-8", errors="replace")  # titles and page text are not ASCII
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # titles and page text are not ASCII
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:

@@ -21,6 +21,7 @@ stderr by its id; history.py lists and shows them. READ_DOC_HISTORY=0 skips it.
 import argparse
 import collections
 import contextlib
+import errno
 import glob
 import json
 import os
@@ -209,7 +210,7 @@ LOCK_BYTE = 1 << 30
 
 
 def lock(fd):
-    """Hold an exclusive lock on fd until it is closed."""
+    """Hold an exclusive lock on fd until unlock() or close."""
     if fcntl:
         fcntl.flock(fd, fcntl.LOCK_EX)
         return
@@ -218,8 +219,18 @@ def lock(fd):
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             return
-        except OSError:
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EDEADLOCK):
+                raise
             time.sleep(0.05)  # LK_LOCK gives up after ~10 s
+
+
+def unlock(fd):
+    """Windows frees a closed handle's lock only after a delay; POSIX frees it at close."""
+    if not fcntl:
+        with contextlib.suppress(OSError):  # the record is written; closing frees it anyway
+            os.lseek(fd, LOCK_BYTE, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 def last_byte(fd, end):
@@ -247,12 +258,15 @@ def log_lookup(library, op, query, started, code, error, result):
         fd = os.open(HISTORY, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
         try:
             lock(fd)
-            end = os.lseek(fd, 0, os.SEEK_END)
-            if end and last_byte(fd, end) != b"\n":
-                line = b"\n" + line  # a writer killed mid-line must not swallow this record
-            view = memoryview(line)
-            while view:
-                view = view[os.write(fd, view):]
+            try:
+                end = os.lseek(fd, 0, os.SEEK_END)
+                if end and last_byte(fd, end) != b"\n":
+                    line = b"\n" + line  # a writer killed mid-line must not swallow this record
+                view = memoryview(line)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                unlock(fd)
         finally:
             os.close(fd)
     except OSError as e:
@@ -345,8 +359,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    for stream in (sys.stdout, sys.stderr):
-        stream.reconfigure(encoding="utf-8", errors="replace")  # titles carry ® and the like
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # titles carry ® and the like
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:
