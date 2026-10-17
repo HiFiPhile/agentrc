@@ -10,6 +10,20 @@ from pathlib import Path
 
 AGENTRC = Path(__file__).resolve().parents[3]   # the agentrc checkout this module runs from
 KINDS = {'workflows': '.js', 'agents': '.md'}
+FOLD = str.casefold if os.name == 'nt' else str   # NTFS names match without case
+
+
+def on_path(name, exts):
+    """Windows: the program as PATH alone finds it, the first of exts in each directory, else None; shutil.which and
+    CreateProcess try the working directory, a contributor's checkout, first. Elsewhere the name, as execvp finds it."""
+    if os.name != 'nt':
+        return name
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        for e in exts:
+            p = os.path.join(d, name + e)
+            if d and os.path.isfile(p):
+                return p
+    return None
 
 
 def project(payload):
@@ -18,11 +32,14 @@ def project(payload):
     # the session's project, not a directory a Bash cd moved the payload's cwd to; its GIT_* would name another repository
     start = os.environ.get('CLAUDE_PROJECT_DIR') or payload.get('cwd') or '.'
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-    got = subprocess.run(['git', '-C', start, 'rev-parse', '--show-toplevel', '--path-format=absolute', '--git-path', 'chief'],
-                         capture_output=True, encoding='utf-8', env=env)
+    git = on_path('git', ('.exe',))
+    if git is None:
+        raise FileNotFoundError('git is not on PATH')
+    got = subprocess.run([git, '-C', start, 'rev-parse', '--show-toplevel', '--path-format=absolute', '--git-path', 'chief'],
+                         capture_output=True, env=env)
     if got.returncode:
         return Path(start), None
-    top, chief = got.stdout.splitlines()
+    top, chief = map(os.fsdecode, got.stdout.splitlines())   # git prints the path's bytes: UTF-8 on Windows
     return Path(top), Path(chief)
 
 
@@ -36,12 +53,12 @@ def shadows(worktree):
     stale, scope = [], user_scope()
     for kind, suffix in KINDS.items():
         with os.scandir(AGENTRC / kind) as entries:
-            names = {e.name for e in entries if e.name.endswith(suffix)}
+            names = {FOLD(e.name) for e in entries if FOLD(e.name).endswith(suffix)}
         d = worktree / '.claude' / kind
         if not d.is_dir():
             continue
         with os.scandir(d) as entries:
-            candidates = sorted(e.name for e in entries if e.name in names)
+            candidates = sorted(e.name for e in entries if FOLD(e.name) in names)
         # an absent or dangling peer is no installed copy to shadow
         stale += [f'.claude/{kind}/{name}' for name in candidates
                   if (scope / kind / name).is_file() and not filecmp.cmp(d / name, scope / kind / name, shallow=False)]

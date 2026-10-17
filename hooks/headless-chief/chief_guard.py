@@ -9,29 +9,41 @@ script chief runs may still write or publish, and the grants in agents/chief.md 
 A write target passes only as a literal absolute path outside the worktree, so no shell state
 needs tracking; chief's own directory, `git rev-parse --git-path chief`, passes even inside a
 primary checkout. Exit 2 denies; a command it cannot parse is denied too, since Claude Code lets
-an erroring hook pass. On Windows, where Git Bash runs the command, a /-rooted path is judged both as
-bash maps it and as Windows reads it, command names match without case or .exe, and cmd, PowerShell
-and wsl, whose command lines this cannot follow, are denied.
+an erroring hook pass, and any error denies. On Windows, where Git Bash runs the command, a /-rooted
+path is judged both as bash maps it and as Windows reads it, command names match without case or .exe,
+and the programs whose command lines or links this cannot follow (cmd, PowerShell, WSL, mount, ...) are
+denied; it needs a native Windows Python there.
 """
 import json
+import os
 import sys
 
+
+def crashed(kind, value, tb):
+    """Claude Code lets a hook that errors pass: any uncaught exception denies instead."""
+    try:
+        print(f'chief guard: the check failed ({value!a}), so the call is denied', file=sys.stderr)
+        sys.stderr.flush()
+    finally:
+        os._exit(2)
+
+
 if __name__ == '__main__':
+    sys.excepthook = crashed
     # every session's Bash and Write reach this hook: leave before importing the rest
     PAYLOAD = json.load(sys.stdin.buffer)
     if PAYLOAD.get('agent_type') != 'chief' or PAYLOAD.get('agent_id'):
         sys.exit(0)
 
-import os  # noqa: E402
 import posixpath  # noqa: E402
 import re  # noqa: E402
 import shlex  # noqa: E402
-import shutil  # noqa: E402
 import subprocess  # noqa: E402
+import time  # noqa: E402
 from pathlib import Path, PureWindowsPath  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'skills' / 'headless-chief' / 'scripts'))
-from shadows import project  # noqa: E402
+from shadows import on_path, project  # noqa: E402
 
 GIT_READ = {
     'status', 'log', 'diff', 'show', 'rev-parse', 'rev-list', 'ls-files', 'ls-tree', 'ls-remote',
@@ -60,7 +72,7 @@ GH_READ = {
 GH_WITH_VALUE = {'-R', '--repo', '-H', '--header', '-q', '--jq', '-t', '--template', '--hostname', '-p', '--preview'}
 # workflow-only publishers: Sonar marking rides markSonar, the PR push rides autoPush
 WORKFLOW_ONLY = {'push.py', 'sonar.py'}
-PY_LAUNCHERS = {'py'} if os.name == 'nt' else set()
+PY_LAUNCHERS = {'py', 'pyw'} if os.name == 'nt' else set()
 # command prefixes that run the next word: name -> its options that take a value
 WRAPPERS = {
     'command': set(), 'builtin': set(), 'nohup': set(), 'exec': {'-a'}, 'time': {'-f', '-o'},
@@ -70,8 +82,19 @@ WRAPPERS = {
               '--max-chars', '--delimiter', '--eof', '--arg-file'},
 }
 SHELLS = {'sh', 'bash', 'zsh', 'dash'}
-# Windows interpreters a bash command can start: powershell reads bare words as -Command, cmd runs /k too
-FOREIGN_SHELLS = {'cmd', 'powershell', 'pwsh', 'wsl'}
+# Windows programs a bash command can start that run a command line of their own: powershell reads bare words
+# as -Command, cmd runs /k too, start and the terminals run their arguments
+FOREIGN_SHELLS = {'cmd', 'powershell', 'pwsh', 'wsl', 'start', 'winpty', 'mintty', 'conhost', 'git-bash', 'git-cmd',
+                  'forfiles', 'cscript', 'wscript', 'schtasks', 'mshta', 'rundll32', 'runas', 'explorer'}
+# Windows writers whose targets this does not read, and the mounts and drive aliases resolve() cannot see
+WINDOWS_WRITERS = {'robocopy', 'xcopy', 'fsutil', 'certutil', 'expand', 'mklink', 'mount', 'subst'}
+# WSL distro launchers, which a bash command word reaches by name through WindowsApps
+DISTROS = re.compile(r'(ubuntu[\d.]*|debian|kali(-linux)?|opensuse[\w.-]*|sles[\w.-]*|suse[\w.-]*|fedora[\w.-]*|arch(linux)?|'
+                     r'alpine|oraclelinux[\w.-]*|almalinux[\w.-]*|wsl\w*)')
+# MSYS /dev entries that are never a file, placed without asking cygpath
+DEVICES = re.compile(r'/dev/(null|tty|console|stdin|stdout|stderr|fd/\d+)')
+CYGPATH_BUDGET = time.monotonic() + 6   # every cygpath call of one hook run, well inside its 10 s timeout
+MAPPED = {}   # posix path -> cygpath -m's answer, None when it had none
 KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}'}
 # file writers: every named path counts, only the last for a copy, all but the first for a mode change
 WRITERS_ALL = {'rm', 'rmdir', 'mv', 'touch', 'mkdir', 'truncate', 'tee', 'shred', 'unlink'}
@@ -156,17 +179,21 @@ class Guard:
         """Is this absolute path in the worktree, chief's own directory apart; the worktree is read once, on first use."""
         if self.root is None:
             root, chief = project(self.payload)
-            self.root, self.chief = root.resolve(), chief and chief.resolve()
-        p = Path(path).resolve()
+            self.root, self.chief = resolved(root), chief and resolved(chief)
+        p = resolved(path)
         return p.is_relative_to(self.root) and not (self.chief and p.is_relative_to(self.chief))
 
-    def writes(self, path, why):
+    def outside(self, path):
+        """Is this word a literal absolute path outside the worktree."""
         path = path.translate(UNQUOTED)
         if path == '/dev/null':
-            return
-        if UNKNOWN in path or '$' in path or not (places := absolute(path)) or any(self.inside(p) for p in places):
-            raise Denied(f'{why} would write {path}: chief writes only its artifacts, named by a literal absolute path '
-                         'outside the task worktree; a worktree change goes to a writer')
+            return True
+        return not (UNKNOWN in path or '$' in path or not (places := absolute(path)) or any(self.inside(p) for p in places))
+
+    def writes(self, path, why):
+        if not self.outside(path):
+            raise Denied(f'{why} would write {path.translate(UNQUOTED)}: chief writes only its artifacts, named by a literal '
+                         'absolute path outside the task worktree; a worktree change goes to a writer')
 
     def command(self, command, depth=0):
         if depth > 3:
@@ -200,12 +227,14 @@ class Guard:
         for k, w in enumerate(words[:-1]):
             if w in REDIRECTS and not (w == '>&' and words[k + 1].isdigit()):
                 self.writes(words[k + 1], 'the redirect')
+        if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)=.*winsymlinks', w) for w in words):
+            raise Denied('winsymlinks makes links this guard cannot follow on Windows; dispatch the step to a unit')
         words = unwrap([w for k, w in enumerate(words) if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
         if not words:
             return
         cmd, args = program(os.path.basename(words[0])), words[1:]
-        if os.name == 'nt' and cmd in FOREIGN_SHELLS:
-            raise Denied(f'`{cmd}` runs a command line this guard cannot follow; run it as plain bash words, or dispatch it to a unit')
+        if os.name == 'nt':
+            self.windows(words[0], cmd, args)
         if cmd in SHELLS:
             for k, a in enumerate(args):
                 if re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', a):
@@ -223,6 +252,19 @@ class Guard:
             raise Denied(f'`{cmd}` in place edits a file; chief writes its artifacts whole with Write, and a worktree change goes to a writer')
         for path in written(cmd, args):
             self.writes(path, f'`{cmd}`')
+
+    def windows(self, word, cmd, args):
+        """Git Bash on Windows: what starts a command line, a writer or a link this guard cannot follow."""
+        if cmd in FOREIGN_SHELLS or wsl(word, cmd):
+            raise Denied(f'`{cmd}` runs a command line this guard cannot follow; run it as plain bash words, or dispatch it to a unit')
+        if cmd in WINDOWS_WRITERS:
+            raise Denied(f'`{cmd}` writes or maps paths this guard cannot follow on Windows; dispatch the step to a unit')
+        if cmd == 'ln' or (cmd == 'cp' and any(re.fullmatch(r'-[a-zA-Z]*[ls][a-zA-Z]*|--link|--symbolic-link', a) for a in args)):
+            targets = written(cmd, args)
+            for source in (a for a in args if not a.startswith('-') and a not in targets):
+                if not self.outside(source):
+                    raise Denied(f'`{cmd}` would link {source.translate(UNQUOTED)}: on Windows a link to the task worktree is a '
+                                 'path this guard cannot follow; a link names a literal absolute source outside it')
 
     def git(self, args):
         i = 0
@@ -258,10 +300,55 @@ class Guard:
 
 
 def program(word):
-    """A command word as Windows finds its program: without case or an executable suffix; elsewhere the word itself."""
+    """A command word as Windows finds its program: without case, an executable suffix, trailing dots and spaces or a
+    `:stream`, all of which Windows drops from a file name; elsewhere the word itself."""
     if os.name != 'nt':
         return word
-    return re.sub(r'\.(exe|com|bat|cmd)$', '', os.path.basename(word).lower())
+    name = os.path.basename(word).split(':')[0].rstrip('. ').lower()
+    return re.sub(r'\.(exe|com|bat|cmd)$', '', name).rstrip('. ')
+
+
+def resolved(path):
+    """Path(path).resolve(), on Windows without the `\\\\?\\` form it takes for a component ending in a dot or space."""
+    p = str(Path(path).resolve())
+    if os.name == 'nt' and (m := re.match(r'[\\/]{2}\?[\\/](UNC[\\/])?', p)):
+        p = p[:2] + p[m.end():] if m.group(1) else p[m.end():]
+    return Path(p)
+
+
+def within(path, root):
+    """Windows: is path, resolved, root or under it, without case."""
+    path, root = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.realpath(root))
+    return path == root or path.startswith(root.rstrip('\\/') + os.sep)
+
+
+def wsl(word, cmd):
+    """Windows: does this command word start WSL, System32's bash or a distro launcher (by name or under WindowsApps)."""
+    if DISTROS.fullmatch(cmd):
+        return True
+    if not re.search(r'[\\/]', word):
+        return False   # a bare name: Git Bash finds its own bash first
+    places = absolute(word.translate(UNQUOTED))
+    apps = os.environ.get('LOCALAPPDATA') and os.path.join(os.environ['LOCALAPPDATA'], 'Microsoft', 'WindowsApps')
+    system = os.environ.get('SystemRoot') or 'C:\\Windows'
+    return (cmd == 'bash' and (not places or any(within(p, system) for p in places))) or \
+        bool(apps and any(within(p, apps) for p in places))
+
+
+def cygpath(posix):
+    """posix as MSYS bash maps it (`cygpath -m`), None when it cannot; past the run's budget the call is denied."""
+    if posix not in MAPPED:
+        exe, left = on_path('cygpath', ('.exe',)), CYGPATH_BUDGET - time.monotonic()
+        if left <= 0:
+            raise Denied('placing the paths through cygpath took too long; name them as drive paths (C:/...)')
+        try:
+            got = exe and subprocess.run([exe, '-m', posix], capture_output=True, encoding='utf-8', timeout=left)
+        except subprocess.TimeoutExpired:
+            raise Denied('placing the paths through cygpath took too long; name them as drive paths (C:/...)') from None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            got = None
+        MAPPED[posix] = got.stdout.strip() if got and not got.returncode else None
+    return MAPPED[posix]
 
 
 def absolute(path):
@@ -273,18 +360,17 @@ def absolute(path):
         return [path] if os.path.isabs(path) else []
     if path.startswith('/') and not path.startswith('//'):
         posix = posixpath.normpath(path)   # bash folds `..` before it maps the path
+        native = absolute(os.path.abspath(path))
         if m := re.match(r'/([a-zA-Z])(/|$)', posix):
             mapped = f'{m.group(1)}:/{posix[3:]}'
-        else:
-            cygpath = shutil.which('cygpath')
-            try:
-                got = cygpath and subprocess.run([cygpath, '-m', posix], capture_output=True, encoding='utf-8', timeout=5)
-            except (OSError, ValueError, subprocess.SubprocessError):
-                return []
-            if not got or got.returncode:
-                return []   # no bash mapping to judge it by
-            mapped = got.stdout.strip()
-        bash, native = absolute(mapped), absolute(os.path.abspath(path))
+        elif DEVICES.fullmatch(posix):
+            return native   # no file for bash
+        elif (mapped := cygpath(posix)) is None:
+            return []   # no bash mapping to judge it by
+        elif mapped.startswith('/') and not mapped.startswith('//'):
+            # cygpath leaves only MSYS's own entries /-rooted: a /dev or /proc one is no file, anything else unknown
+            return native if re.match(r'/(dev|proc)(/|$)', mapped) else []
+        bash = absolute(mapped)
         return bash + native if bash and native else []
     p = PureWindowsPath(path)
     return [path] if re.fullmatch(r'[A-Za-z]:', p.drive) and p.root and ':' not in path[2:] else []
@@ -377,6 +463,8 @@ def main(payload):
     guard = Guard(payload)
     data = payload.get('tool_input') or {}
     try:
+        if sys.platform in ('cygwin', 'msys'):   # os.name 'posix' there would skip every Windows check
+            raise Denied(f'chief_guard needs a native Windows Python; this is {sys.platform}')
         if payload.get('tool_name') == 'Write':
             guard.writes(data.get('file_path', ''), 'this Write')
         elif payload.get('tool_name') == 'Bash':
@@ -388,5 +476,6 @@ def main(payload):
 
 
 if __name__ == '__main__':
-    sys.stderr.reconfigure(encoding='utf-8')   # the reason names paths, whatever the locale
+    if os.name == 'nt':
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')   # the reason names paths, whatever the locale
     sys.exit(main(PAYLOAD))

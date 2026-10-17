@@ -1,12 +1,17 @@
 """Tests for hooks/headless-chief/chief_guard.py, run as Claude Code runs it: hook JSON on stdin."""
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'chief_guard.py'
 # Windows judges a /tmp path as MSYS bash maps it, through cygpath; without one it is denied
@@ -26,13 +31,28 @@ class ChiefGuard(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if k != 'CLAUDE_PROJECT_DIR' and not k.startswith('GIT_')}
         subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env)
 
-    def hook(self, command=None, tool='Bash', agent_type='chief', agent_id=None, file_path=None):
+    def event(self, command=None, tool='Bash', agent_type='chief', agent_id=None, file_path=None):
         event = {'hook_event_name': 'PreToolUse', 'tool_name': tool, 'cwd': str(self.project), 'agent_type': agent_type,
                  'tool_input': {'command': command} if tool == 'Bash' else {'file_path': file_path, 'content': 'x'}}
         if agent_id:
             event['agent_id'] = agent_id
-        return subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(event, ensure_ascii=False), env=self.env,
-                              capture_output=True, encoding='utf-8', timeout=30)
+        return event
+
+    def hook(self, command=None, raw=None, **kw):
+        return subprocess.run([sys.executable, str(SCRIPT)], input=raw or json.dumps(self.event(command, **kw), ensure_ascii=False),
+                              env=self.env, capture_output=True, encoding='utf-8', timeout=30)
+
+    def module(self):
+        """The guard loaded in this process, its cygpath cache and budget fresh."""
+        spec = importlib.util.spec_from_file_location('chief_guard_under_test', SCRIPT)
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        return guard
+
+    def main(self, guard, command):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.dict(os.environ, self.env, clear=True):
+            return guard.main(self.event(command)), err.getvalue()
 
     def assert_denied(self, command, *named, **kw):
         r = self.hook(command, **kw)
@@ -208,6 +228,7 @@ class ChiefGuard(unittest.TestCase):
         self.env['PATH'] = os.pathsep.join(d for d in self.env['PATH'].split(os.pathsep) if d and not shutil.which('cygpath', path=d))
         self.assert_denied('echo x > /tmp/out.md', 'literal absolute path')
         self.assert_allowed(f"echo x > '{self.root.as_posix()}/out.md'")
+        self.assert_allowed('tee /dev/tty; echo x > /dev/stderr')   # a device needs no mapping
 
     @unittest.skipUnless(os.name == 'nt', 'Windows finds a program without case or .exe')
     def test_windows_command_names_are_matched_without_case_or_suffix(self):
@@ -226,6 +247,134 @@ class ChiefGuard(unittest.TestCase):
                   f"powershell -Command Set-Content '{native}\\src\\a.c' x", f"powershell Remove-Item '{native}\\src\\a.c'",
                   'pwsh -c "git push"', 'wsl git push', "bash -c 'cmd /c dir'", 'xargs powershell'):
             self.assert_denied(c, 'cannot follow')
+
+    def test_any_error_denies(self):
+        # Claude Code lets a hook that exits 1 pass: a payload or check it cannot handle must deny
+        for raw in ('not json', json.dumps({**self.event(), 'tool_input': 'git push'}), json.dumps(['chief']),
+                    json.dumps(self.event(['git', 'push']))):
+            with self.subTest(raw=raw):
+                r = self.hook(raw=raw)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn('chief guard: the check failed', r.stderr)
+                self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+
+    def test_a_cygwin_or_msys_python_denies_every_call(self):
+        # os.name is 'posix' there, so every Windows check would be skipped
+        guard = self.module()
+        for platform in ('cygwin', 'msys'):
+            with mock.patch.object(sys, 'platform', platform):
+                code, err = self.main(guard, 'git status')
+            self.assertEqual(code, 2)
+            self.assertIn(f'needs a native Windows Python; this is {platform}', err)
+        self.assertEqual(self.main(guard, 'git status')[0], 0)
+
+    @unittest.skipIf(os.name == 'nt' or sys.platform == 'darwin', 'NTFS and APFS names are Unicode')
+    def test_a_non_utf8_worktree_is_still_the_worktree(self):
+        # git prints the path's bytes: decoded strictly as UTF-8 the guard crashed instead of placing it
+        self.project = Path(os.fsdecode(os.fsencode(str(self.root)) + b'/wt-\xff'))
+        (self.project / 'src').mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env)
+        (self.root / 'link').symlink_to(self.project)   # an ASCII name for the payload, which is UTF-8 JSON
+        self.env['CLAUDE_PROJECT_DIR'] = str(self.project)
+        self.project = self.root / 'link'
+        self.assert_denied(None, 'literal absolute path', tool='Write', file_path=str(self.root / 'link' / 'src' / 'a.c'))
+        self.assert_allowed(None, tool='Write', file_path=str(self.root / 'report.md'))
+
+    @needs_msys
+    @unittest.skipUnless(os.name == 'nt', 'MSYS devices')
+    def test_msys_devices_are_outside_the_worktree_and_placed_at_once(self):
+        # cygpath names /dev/tty as itself: placing it recursed until RecursionError, an exit 1 that let `git push` pass
+        started = time.monotonic()
+        self.assert_denied('tee /dev/tty; git push', 'changes the repository')
+        self.assertLess(time.monotonic() - started, 5)
+        for c in ('tee /dev/tty', 'echo x > /dev/stderr', 'git log >/dev/console', 'tee /dev/fd/2', 'cat /etc/hosts > /dev/stdout',
+                  'echo x > /dev/../dev/tty', 'echo x > /proc/cpuinfo'):
+            self.assert_allowed(c)
+        self.assert_denied('echo x > /dev/sda', 'literal absolute path')   # cygpath names a disk device
+        self.assert_denied(f'echo x > /dev/..{self.msys()}/src/a.c', 'literal absolute path')
+
+    def msys(self):
+        return '/' + self.wt[0].lower() + self.wt[2:]   # E:/x as Git Bash names it: /e/x
+
+    @unittest.skipUnless(os.name == 'nt', 'cygpath is asked on Windows only')
+    def test_cygpath_answers_are_cached_and_share_one_deadline(self):
+        guard, calls, real = self.module(), [], subprocess.run
+
+        def fast(args, **kw):
+            if args[0] != 'cygpath.exe':
+                return real(args, **kw)
+            calls.append(kw['timeout'])
+            return subprocess.CompletedProcess(args, 0, 'C:/Program Files/Git/usr/x\n', '')
+        with mock.patch.object(guard, 'on_path', lambda name, exts: name + '.exe'), mock.patch.object(subprocess, 'run', fast):
+            self.assertEqual(self.main(guard, 'echo a > /usr/x; echo b > /usr/x; touch /usr/x')[0], 0)
+        self.assertEqual(len(calls), 1, 'one cygpath per path and run')
+        self.assertLessEqual(calls[0], 6)
+
+        def slow(args, **kw):
+            if args[0] != 'cygpath.exe':
+                return real(args, **kw)
+            calls.append(kw['timeout'])
+            time.sleep(kw['timeout'])
+            raise subprocess.TimeoutExpired(args, kw['timeout'])
+        guard, calls = self.module(), []
+        guard.CYGPATH_BUDGET = time.monotonic() + 0.5
+        started = time.monotonic()
+        with mock.patch.object(guard, 'on_path', lambda name, exts: name + '.exe'), mock.patch.object(subprocess, 'run', slow):
+            code, err = self.main(guard, 'echo a > /usr/x; echo b > /usr/y')
+            self.assertEqual(code, 2)
+            self.assertIn('took too long', err)
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(len(calls), 1)
+            self.assertLessEqual(calls[0], 0.5)
+            guard.CYGPATH_BUDGET = time.monotonic()
+            self.assertEqual(self.main(guard, 'echo a > /usr/z')[0], 2, 'a spent budget denies before asking')
+        self.assertEqual(len(calls), 1)
+
+    @needs_msys
+    @unittest.skipUnless(os.name == 'nt', 'MSYS links and mounts')
+    def test_windows_links_and_mounts_are_denied(self):
+        # resolve() cannot see an MSYS symlink, mount or subst drive: a link from outside into the worktree is a way in
+        for c in ('mount C:/x /mnt/x', 'subst X: E:/x', 'MOUNT.EXE -c /x', f'ln -s {self.wt}/src /tmp/l',
+                  f'ln {self.msys()}/src/a.c /tmp/a.c', 'ln -s src /tmp/l', f'ln -s -t /tmp {self.wt}/src',
+                  f'cp -s {self.wt}/src/a.c /tmp/a.c', f'cp -al {self.wt}/src /tmp/s', f'cp --link {self.wt}/src/a.c /tmp/a.c',
+                  'MSYS=winsymlinks:nativestrict ln -s /tmp/a /tmp/b', 'export MSYS=winsymlinks:native',
+                  'env CYGWIN=winsymlinks:lnk ln -s /tmp/a /tmp/b'):
+            self.assert_denied(c, 'cannot follow')
+        for c in ('ln -s /tmp/a /tmp/b', f'cp {self.wt}/src/a.c /tmp/a.c', 'MSYS=noglob git status'):
+            self.assert_allowed(c)
+
+    @needs_msys
+    @unittest.skipUnless(os.name == 'nt', 'Windows programs a bash command can start')
+    def test_windows_launchers_wsl_and_writers_are_denied(self):
+        apps = Path(os.environ.get('LOCALAPPDATA', 'C:/Users/x/AppData/Local')) / 'Microsoft' / 'WindowsApps'
+        system = Path(os.environ.get('SystemRoot', 'C:/Windows'))
+        for c in ('start notepad', 'START.EXE x', 'winpty git push', 'mintty -e git push', 'conhost cmd', 'git-bash -c x',
+                  'git-cmd.exe', 'forfiles /c "cmd /c del x"', 'cscript x.vbs', 'wscript x.js', 'schtasks /create /tn x',
+                  'mshta x.hta', 'rundll32 x.dll,y', 'runas /user:x cmd', 'explorer .',
+                  f"'{system}\\System32\\bash.exe' -c 'git status'", f"'{system.as_posix().upper()}/SYSTEM32/BASH.EXE' -c x",
+                  f'/{system.as_posix()[0].lower()}{system.as_posix()[2:]}/System32/bash.exe -c x', './bash -c x',
+                  'ubuntu2204.exe run git push', 'debian run x', 'kali x', 'opensuse-leap-15.5 run x', 'wslconfig /l',
+                  f"'{apps.as_posix()}/MicrosoftCorporationII.WindowsSubsystemForLinux.exe' x"):
+            self.assert_denied(c, 'cannot follow')
+        for c in ('robocopy /tmp E:/x', 'xcopy a b', 'fsutil hardlink create a b', 'certutil -decode a b', 'expand a b',
+                  'mklink /j a b', 'Robocopy.exe a b'):
+            self.assert_denied(c, 'cannot follow')
+        for c in ("bash -c 'git status'", "/usr/bin/bash -c 'git status'", 'python3 -V'):
+            self.assert_allowed(c)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows drops trailing dots, spaces and a :stream from a file name')
+    def test_windows_publisher_names_are_matched_as_windows_opens_them(self):
+        for c in ('python E:/x/push.py. --pr 1', "python 'E:/x/push.py ' --pr 1", "python 'E:/x/push.py::$DATA' --pr 1",
+                  'pyw E:/x/push.py --pr 1', 'pythonw E:/x/sonar.py.. --pr 1', 'E:/x/push.py. --pr 1'):
+            self.assert_denied(c, 'inside its workflow')
+        self.assert_denied('git.exe. push', 'changes the repository')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows names a path with a trailing dot or space in its \\\\?\\ form')
+    def test_a_component_with_a_trailing_dot_or_space_is_still_the_worktree(self):
+        for name in ('src. ', 'src.', 'src '):
+            # a file not there yet: resolve() names it \\?\C:\..., which no worktree path starts with
+            self.assert_denied(f"echo x > '{self.wt}/{name}/new.c'", 'literal absolute path')
+            self.assert_denied(None, 'literal absolute path', tool='Write', file_path=f'{self.project}\\{name}\\new.c')
 
 
 if __name__ == '__main__':
