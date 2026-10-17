@@ -248,6 +248,10 @@ class Manifest(unittest.TestCase):
             self.assertFalse(locate.is_current(meta, 7, self.src), field)
         self.assertFalse(locate.is_current(None, 7, self.src))
 
+    def test_an_index_from_before_pdftotext_was_asked_for_utf8_is_stale(self):
+        # version 2 ran pdftotext without -enc UTF-8: xpdf's Latin-1 came back as U+FFFD
+        self.assertFalse(locate.is_current(self.meta_for_src(version=2), 7, self.src))
+
     def test_a_body_that_lost_pages_is_rejected_rather_than_renumbered(self):
         (self.index / '7.txt').write_text(json.dumps({**self.META, 'pages': 5}) + '\n' + self.BODY)
         self.assertEqual(locate.read_index(7), (None, None))

@@ -40,7 +40,7 @@ from search import DB, LIB, log_lookup, norm, resolve, tag_list  # noqa: E402
 INDEX = os.path.join(LIB, ".read-doc")
 # pdftotext's output changes with its options; bump VERSION when either changes.
 EXTRACTOR = ["pdftotext", "-layout"]
-VERSION = 2
+VERSION = 3
 JOBS, MAX_JOBS = 4, 32
 CONTEXT, LIMIT, MAX_CHARS, MIN_CHARS = 2, 5, 4000, 80
 PAGE_CHARS = 10000  # a dense -layout manual page runs 4.5-5 KB; a cut page costs another round trip
