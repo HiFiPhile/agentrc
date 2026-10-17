@@ -875,6 +875,42 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertNotIn('\\', session['file'])    # OpenOCD takes a Windows path with forward slashes
         self.assertEqual(list(tmp.iterdir()), [])    # removed after the session
 
+    @unittest.skipUnless(os.name == 'nt', 'the ANSI code page of a program\'s arguments is a Windows matter')
+    def test_a_temp_path_outside_the_ansi_code_page(self):
+        # openocd.exe takes argv and opens files in the ANSI code page: a character outside it would arrive as '?'
+        odd = self.d / 'tmp_✔'
+        odd.mkdir()
+        self.assertTrue(os.path.samefile(probe_state.short_path(str(odd)), odd))    # the real helper: same dir
+        links = []
+
+        def short(path):    # an ASCII name for the same file stands in for its 8.3 form
+            links.append(self.d / f'short{len(links)}.tcl')
+            os.link(path, links[-1])
+            return str(links[-1])
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(tempfile, 'tempdir', str(odd)), \
+                mock.patch.object(probe_state, 'ansi_codec', return_value='cp1252'):
+            ocd = probe_state.OpenOCD('E6614C311B597D32', '-f target/x.cfg', None)
+            with mock.patch.object(probe_state, 'short_path', side_effect=short):
+                _, reads = ocd.batch(f'rd DHCSR 0x{probe_state.DHCSR:08x}', 30)
+            self.assertEqual(reads, [('DHCSR', 0x01010001)])
+            self.assertEqual(self.sessions()[-1]['file'], links[0].as_posix())
+            with mock.patch.object(probe_state, 'short_path', side_effect=lambda path: path):    # no 8.3 names
+                with self.assertRaisesRegex(probe_state.ToolError,
+                                            r'outside the ANSI code page \(cp1252\).*TEMP and TMP'):
+                    ocd.batch(f'rd DHCSR 0x{probe_state.DHCSR:08x}', 30)
+        self.assertEqual(len(self.sessions()), 1)    # refused before openocd ran
+        self.assertEqual(list(odd.iterdir()), [])    # and the script file removed either way
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX kill() runs no taskkill')
+    def test_a_hung_taskkill_still_kills_the_tool(self):
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(proc.wait)
+        with mock.patch.object(probe_state.subprocess, 'run',
+                               side_effect=subprocess.TimeoutExpired('taskkill', 10)) as taskkill:
+            probe_state.kill(proc)
+        self.assertEqual(taskkill.call_args.kwargs['timeout'], 10)
+        self.assertIsNotNone(proc.wait(10))
+
     def test_the_halting_fallback_is_labelled_apart(self):
         r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF',
                          FAKE_HALT_PCS='08003000,08003000,08004000')

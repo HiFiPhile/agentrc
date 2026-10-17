@@ -353,10 +353,38 @@ def kill(proc):
     if os.name == 'nt':
         try:
             subprocess.run([os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe'),
-                            '/T', '/F', '/PID', str(proc.pid)], capture_output=True)
-        except OSError:
+                            '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
             pass    # proc.kill() below still stops the tool itself
     proc.kill()
+
+
+def ansi_codec():
+    import ctypes    # Windows only, like the callers
+    return f'cp{ctypes.windll.kernel32.GetACP()}'
+
+
+def short_path(path):
+    """The 8.3 form of an existing path on Windows, or path itself when the volume has none."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    n = k32.GetShortPathNameW(path, None, 0)
+    buf = ctypes.create_unicode_buffer(n or 1)
+    return buf.value if n and k32.GetShortPathNameW(path, buf, n) else path
+
+
+def ansi_path(path):
+    """path as openocd.exe, a program of the ANSI code page, receives and opens it: as it is, else its 8.3 form;
+    a character outside that code page would reach it as '?'."""
+    codec = ansi_codec()
+    for form in (path, short_path(path)):
+        try:
+            form.encode(codec)
+            return form
+        except UnicodeEncodeError:
+            pass
+    raise ToolError(f'temporary file {path!r} is outside the ANSI code page ({codec}) openocd.exe takes its '
+                    f'arguments in, and has no 8.3 short name: set TEMP and TMP to a directory that is not')
 
 
 def stop_running():
@@ -581,7 +609,7 @@ class OpenOCD:
         try:
             with os.fdopen(fd, 'wb') as f:
                 f.write(self.script(body).encode())
-            name = path.replace('\\', '/') if os.name == 'nt' else path
+            name = ansi_path(path).replace('\\', '/') if os.name == 'nt' else path
             if '{' in name or '}' in name:
                 raise ToolError(f'temporary file {name!r} has a brace, which OpenOCD -f cannot quote: set TMPDIR')
             text = run(self.cmd + ['-f', name], timeout)
