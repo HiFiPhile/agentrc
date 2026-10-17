@@ -135,7 +135,9 @@ def serve():
         conn.setblocking(True)
     conn.sendall(b'hello from target\\r\\n')
     if mode == 'die_after_greet':
-        conn.close(); os._exit(0)
+        # a beat before exiting: dead before the client's post-connect check reads as
+        # a hijacked port (seen once under MSYS python3)
+        conn.close(); time.sleep(0.5); os._exit(0)
     if mode == 'tick':
         def tick():
             try:
@@ -971,7 +973,11 @@ class RttPlatformLifecycle(unittest.TestCase):
              mock.patch.object(rtt.subprocess, 'run') as taskkill:
             rtt._terminate_process_group(proc, force=False)
         taskkill.assert_called_once()
-        self.assertEqual(taskkill.call_args.args[0][:4], ['taskkill', '/PID', '123', '/T'])
+        cmd = taskkill.call_args.args[0]
+        # by full path, never a taskkill.exe in python's dir or the cwd
+        self.assertTrue(cmd[0].lower().endswith(os.path.join('system32', 'taskkill.exe').lower())
+                        or cmd[0].lower().endswith('system32/taskkill.exe'), cmd[0])
+        self.assertEqual(cmd[1:4], ['/PID', '123', '/T'])
         self.assertIn('/F', taskkill.call_args.args[0])
         self.assertTrue(proc.terminated)
 
@@ -1020,7 +1026,12 @@ class RttPlatformLifecycle(unittest.TestCase):
     def test_a_break_goes_only_to_a_server_on_our_console(self):
         code = ('import signal, sys, time; signal.signal(signal.SIGBREAK, lambda *_: sys.exit(7)); '
                 'print("ready", flush=True)\nwhile True: time.sleep(0.05)')
-        for flags, reaches in ((0, True), (subprocess.CREATE_NO_WINDOW, False)):   # own console
+        import ctypes
+        pids = (ctypes.c_uint32 * 1)()
+        own_console = ctypes.windll.kernel32.GetConsoleProcessList(pids, 1) > 0
+        for flags, reaches in ((subprocess.CREATE_NO_WINDOW, False), (0, True)):   # its own console; ours
+            if reaches and not own_console:
+                self.skipTest('this runner has no console for the server to share')
             proc = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE,
                                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | flags)
             try:
@@ -1036,6 +1047,76 @@ class RttPlatformLifecycle(unittest.TestCase):
                     proc.kill()
                 proc.wait()
                 proc.stdout.close()
+
+    def test_a_failing_break_still_lets_close_reach_the_tree_kill(self):
+        # e.g. close() from __del__ at interpreter exit, with ctypes half torn down
+        class AliveProc:
+            pid = 123
+            stdin = None
+            stdout = None
+            killed = False
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired('fake', timeout)
+
+            def send_signal(self, sig):
+                raise AssertionError('no break without a console check')
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                self.killed = True
+
+        broken = mock.Mock()
+        broken.WinDLL.side_effect = ImportError('sys.meta_path is None, Python is likely shutting down')
+        proc = AliveProc()
+        with mock.patch.dict(sys.modules, ctypes=broken), \
+             mock.patch.object(rtt, 'ctypes', broken, create=True):
+            self.assertFalse(rtt._console_break(proc))
+        con = rtt._SocketRtt()
+        con._proc = proc
+        with mock.patch.object(rtt, 'IS_WINDOWS', True), \
+             mock.patch.dict(sys.modules, ctypes=broken), \
+             mock.patch.object(rtt, 'ctypes', broken, create=True), \
+             mock.patch.object(rtt.subprocess, 'run') as taskkill:
+            con.close()
+        self.assertEqual(taskkill.call_count, 2)   # both rungs fell through to the tree kill
+        self.assertTrue(proc.killed)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows CreateProcess search order')
+    def test_probe_tools_come_from_path_never_the_cwd(self):
+        # CreateProcess searches python's dir and the cwd before PATH: a checkout's
+        # JLink.exe / openocd.exe must not run in place of the tool on PATH
+        source = ('import os, sys\n'
+                  'open(os.environ["WHO_RAN"], "a").write(os.environ["WHO"] + " ")\nsys.exit(1)\n')
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cwd, on_path, empty = root / 'checkout', root / 'bin', root / 'empty'
+            for sub in (cwd, on_path, empty):
+                sub.mkdir()
+            for name in ('JLink', 'openocd'):
+                make_stub(cwd, name, source.replace('os.environ["WHO"]', '"decoy"'))
+                make_stub(on_path, name, source.replace('os.environ["WHO"]', '"path"'))
+            who_ran = root / 'who_ran'
+            env = {k: v for k, v in os.environ.items()
+                   if k.upper() not in ('RTT_JLINK_EXE', 'RTT_OPENOCD_EXE', 'NODEFAULTCURRENTDIRECTORYINEXEPATH')}
+            env['WHO_RAN'] = str(who_ran)
+            runs = (('--backend', 'jlink', '--device', 'FAKE', *LINK, '--seconds', '1'),
+                    ('--backend', 'openocd', '--cfg', '-f x.cfg', '--addr', '0x20000000', '--seconds', '1'))
+            for path, ran in ((on_path, 'path path '), (empty, '')):
+                with contextlib_suppress(FileNotFoundError):
+                    who_ran.unlink()
+                for run in runs:
+                    r = subprocess.run([sys.executable, str(CLI), '--probe', '000', *run], cwd=cwd,
+                                       env=dict(env, PATH=str(path)), capture_output=True, timeout=60)
+                    self.assertEqual(r.returncode, 1, r.stderr)
+                    if not ran:
+                        self.assertIn(b'not on PATH', r.stderr)
+                self.assertEqual(who_ran.read_text() if who_ran.exists() else '', ran)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows process-tree semantics')
     def test_windows_close_reaps_a_real_child_process(self):
@@ -1095,7 +1176,7 @@ class RttPlatformLifecycle(unittest.TestCase):
 
         con = rtt._SocketRtt()
         with mock.patch.object(rtt.subprocess, 'Popen', return_value=DoneProc()):
-            con._spawn(['fake-server'])
+            con._spawn([sys.executable])
         log_name = con._log.name
         con._log.write(b'useful server failure')
         con._log.flush()

@@ -46,11 +46,32 @@ import time
 
 
 IS_WINDOWS = os.name == 'nt'
+if IS_WINDOWS:
+    import ctypes   # here, not at teardown: close() may run during interpreter shutdown
 
 
 def _tool_exe(env_name: str, posix_name: str, windows_name: str = None) -> str:
     """Return an overridable executable name without invoking a shell."""
     return os.environ.get(env_name, windows_name if IS_WINDOWS and windows_name else posix_name)
+
+
+def _resolve_exe(name: str) -> str:
+    """The program to start for `name`. Windows: a bare name is looked up on PATH only
+    (.exe first) -- CreateProcess would search python's dir and the cwd, where a
+    checkout's JLink.exe or openocd.exe would run instead. POSIX: execvp's lookup."""
+    if not IS_WINDOWS or os.path.dirname(name):
+        return name
+    base, ext = os.path.splitext(name)
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        for e in (ext,) if ext else ('.exe', '.cmd', '.bat'):
+            if os.path.isabs(d) and os.path.isfile(os.path.join(d, base + e)):   # not '.' either
+                return os.path.join(d, base + e)
+    raise FileNotFoundError(errno.ENOENT, f'{name} not on PATH', name)
+
+
+def _taskkill() -> str:
+    # by full path: a bare name would find a taskkill.exe in python's dir or the cwd first
+    return os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
 
 
 def _popen_group_options() -> dict:
@@ -75,19 +96,19 @@ def _console_break(proc) -> bool:
     """Windows' SIGTERM: CTRL_BREAK_EVENT to the server's own process group (_spawn
     makes it one). The event travels only through a console the caller shares, and
     the server inherits ours, so send it only where it is attached to our console:
-    with none (a detached caller) it got its own or none. False = not delivered."""
-    import ctypes
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    pids = (ctypes.c_uint32 * 256)()
-    n = kernel32.GetConsoleProcessList(pids, len(pids))
-    if n > len(pids):   # the list outgrew the buffer: n is the size it needs
-        pids = (ctypes.c_uint32 * n)()
-        n = kernel32.GetConsoleProcessList(pids, len(pids))
-    if not 0 < n <= len(pids) or proc.pid not in pids[:n]:
-        return False
+    with none (a detached caller) it got its own or none. False = not delivered, and
+    on any failure: the caller's ladder must always reach the tree kill."""
     try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        pids = (ctypes.c_uint32 * 256)()
+        n = kernel32.GetConsoleProcessList(pids, len(pids))
+        if n > len(pids):   # the list outgrew the buffer: n is the size it needs
+            pids = (ctypes.c_uint32 * n)()
+            n = kernel32.GetConsoleProcessList(pids, len(pids))
+        if not 0 < n <= len(pids) or proc.pid not in pids[:n]:
+            return False
         proc.send_signal(signal.CTRL_BREAK_EVENT)
-    except OSError:
+    except Exception:   # noqa: BLE001 - e.g. teardown from __del__ at interpreter exit
         return False
     return True
 
@@ -108,7 +129,7 @@ def _terminate_process_group(proc, force: bool) -> None:
         # /F is required for console children: without it taskkill can retire the
         # parent first and leave its child alive, after which /PID can no longer find
         # the tree.
-        cmd = ['taskkill', '/PID', str(proc.pid), '/T', '/F']
+        cmd = [_taskkill(), '/PID', str(proc.pid), '/T', '/F']
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=10, check=False)
@@ -314,8 +335,9 @@ class _SocketRtt:
         self._log = tempfile.NamedTemporaryFile(prefix='rtt-server-', suffix='.log',
                                                 delete=not IS_WINDOWS)
         try:
-            self._proc = subprocess.Popen(cmd, stdin=stdin, stdout=self._log,
-                                          stderr=subprocess.STDOUT, **_popen_group_options())
+            self._proc = subprocess.Popen([_resolve_exe(cmd[0]), *cmd[1:]], stdin=stdin,
+                                          stdout=self._log, stderr=subprocess.STDOUT,
+                                          **_popen_group_options())
         except FileNotFoundError as e:
             self.close()
             raise RttError(f'RTT console: {e.filename or cmd[0]} not on PATH') from e
@@ -678,7 +700,8 @@ def dump_ring(probe: str, device: str, addr: int, out_path: str, channel: int = 
         # same clean-exit contract as nm_rtt_addr/_spawn: a missing binary or a wedged
         # probe must not reach the CLI as a traceback
         try:
-            r = subprocess.run(jlink, input=script, capture_output=True, text=True, timeout=60)
+            r = subprocess.run([_resolve_exe(jlink[0]), *jlink[1:]], input=script, capture_output=True,
+                               text=True, timeout=60)
         except FileNotFoundError:
             raise SystemExit(f'{jlink[0]} not on PATH — the --dump route needs J-Link Commander')
         except subprocess.TimeoutExpired:
