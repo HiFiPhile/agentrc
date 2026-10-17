@@ -79,7 +79,7 @@ def collect(argv):
     os.close(fd)
     fd, stage_file = tempfile.mkstemp(prefix='stage-', dir=LOGS)
     os.close(fd)
-    build = tempfile.mkdtemp(prefix='pr-babysit-build-')
+    build = Path(tempfile.mkdtemp(prefix='pr-babysit-build-')).as_posix()  # C:/... survives an unquoted <BUILD>
 
     def cleanup():
         shutil.rmtree(build, ignore_errors=True)
@@ -93,7 +93,8 @@ def collect(argv):
         with open(log, 'ab') as out:
             out.write(''.join(f'$ {line}\n' for line in shell.splitlines()).encode())
             out.flush()
-            build_exit = subprocess.run(['bash', '-c', shell], cwd=top, stdout=out, stderr=subprocess.STDOUT,
+            # which: a bare 'bash' on Windows is System32's WSL launcher
+            build_exit = subprocess.run([shutil.which('bash') or 'bash', '-c', shell], cwd=top, stdout=out, stderr=subprocess.STDOUT,
                                         env={**os.environ, 'PR_BABYSIT_STAGE': stage_file}).returncode
         stage = Path(stage_file).read_text().strip()
         if stage not in STAGES:
@@ -104,7 +105,7 @@ def collect(argv):
         raise Unusable(f'{e}; cleanup left {retained}' if retained else str(e))
     return {'revision': revision, 'snapshot': snap, 'snapshotAfter': after, 'command': command,
             'setup': a.setup or '', 'requires': a.require, 'stage': stage,
-            'buildDir': build, 'exit': build_exit, 'log': log, 'retained': cleanup()}
+            'buildDir': build, 'exit': build_exit, 'log': Path(log).as_posix(), 'retained': cleanup()}
 
 
 if __name__ == '__main__':

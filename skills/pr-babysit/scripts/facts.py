@@ -50,7 +50,7 @@ def run(*argv, ok=(0,)):
 def attempt(*argv, input=None):
     """(exit status, stdout, stderr), replacing bad bytes: unlike run, a failure is part of the receipt."""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, errors='replace', input=input)
+        done = subprocess.run(argv, capture_output=True, encoding='utf-8', errors='replace', input=input)
     except FileNotFoundError:
         raise Unusable(f'{argv[0]} is not installed')
     return done.returncode, done.stdout, done.stderr

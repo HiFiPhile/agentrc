@@ -140,7 +140,7 @@ def chain_refusal(start, end, bases, found):
 
 def make(paths):
     try:
-        message = sys.stdin.read()
+        message = sys.stdin.buffer.read().decode('utf-8')
     except UnicodeDecodeError:
         raise Unusable('the message on stdin is not UTF-8')
     if not message.strip():

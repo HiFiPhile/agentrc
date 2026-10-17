@@ -41,7 +41,9 @@ def ignored(path):
 def classify(top, path):
     """(kind, None) or (None, why)."""
     parts = path.split('/')
-    if not path or path.startswith('/') or any(p in ('', '.', '..') for p in parts):
+    # on Windows a drive (C:), a backslash or an NTFS stream (a.c:x) would name a file outside the plain path
+    if (not path or path.startswith('/') or any(p in ('', '.', '..') for p in parts)
+            or (os.name == 'nt' and any(c in path for c in '\\:'))):
         return None, 'not a plain repository-relative path'
     full = os.path.join(top, path)
     # a path through a symbolic link is one git will not stage, wherever the link points

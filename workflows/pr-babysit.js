@@ -149,8 +149,9 @@ if (args.state != null && args.stateRef != null) throw new Error('pass state or 
 const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
 if (args.stateRef != null) {
   const ref = args.stateRef
-  // The path goes into a shell command.
-  if (!ref || typeof ref.outputFile !== 'string' || !/^\/[A-Za-z0-9._/-]+$/.test(ref.outputFile) || ref.outputFile.includes('..') ||
+  // The path goes into a shell command; a Windows one (C:\...) in its C:/... spelling.
+  const file = typeof ref?.outputFile === 'string' ? ref.outputFile.replace(/\\/g, '/') : ''
+  if (!/^(?:[A-Za-z]:)?\/[A-Za-z0-9._/-]+$/.test(file) || file.includes('..') ||
       !/^[0-9a-f]{8}$/.test(ref.digest || '')) {
     throw new Error('stateRef must be { outputFile: a plain absolute path ([A-Za-z0-9._/-]), digest: the result\'s 8-hex stateDigest }')
   }
@@ -198,7 +199,7 @@ if (args.stateRef != null) {
     const missing = length ? missingOf() : null
     const groups = missing ? groupsOf(missing, PER_CALL) : [null]
     const replies = await parallel(groups.map(asked => () => agent(
-      `Run exactly: python3 ${STATE_SCRIPT} '${ref.outputFile}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
+      `Run exactly: python3 ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `state:load#${++call}`, agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
@@ -649,7 +650,7 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 // saved receipt instead, so a reply that run posted is not reported as found there (#53).
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file and run ` +
-  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file> --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
+  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
 )
@@ -966,7 +967,7 @@ const nap = (ms) => new Promise(res => setTimeout(res, ms))
 const canon = (p) => {
   const s = String(p).replace(/\\/g, '/')
   if (s !== s.trim()) return ''
-  if (s.startsWith('/')) return ''
+  if (s.startsWith('/') || /^[A-Za-z]:\//.test(s)) return ''
   const out = []
   for (const seg of s.split('/')) {
     if (!seg || seg === '.') continue
@@ -1403,7 +1404,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
-    `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < <that file>; rm -f <that file>\`. ` +
+    `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\`. ` +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
     { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
@@ -1646,7 +1647,7 @@ const settleSonar = async (cycle, entry, ended) => {
   const receipt = `${pinned.receipts.trim()}/sonar-${cycle}-${fnv1a(JSON.stringify({ head: expectedHead, items }))}.json`
   const r = await relayOnce(
     `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file and run ` +
-    `\`python3 ${SONAR_SCRIPT} --pr ${args.pr} --head ${expectedHead} --manifest <that file> --receipt ${shq(receipt)}\` ` + relayed(SONAR) +
+    `\`python3 ${SONAR_SCRIPT} --pr ${args.pr} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}\` ` + relayed(SONAR) +
     ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`,
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
   if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }
@@ -1781,7 +1782,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const collect = (label, command, schema, payload) => {
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file and ' : ''}` +
-      `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}${payload ? ' < <that file>' : ''}\` ` +
+      `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}${payload ? " < '<that file>'" : ''}\` ` +
       'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
       (payload ? `\n${JSON.stringify(payload)}` : '')
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema }

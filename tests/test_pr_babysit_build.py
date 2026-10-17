@@ -42,10 +42,12 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual((out['revision'], out['exit']), (self.base, 1))
         self.assertIn(out['buildDir'], out['command'])
+        self.assertNotIn('\\', out['buildDir'], 'a Windows dir is spelled C:/..., which bash reads unquoted')
         self.assertNotIn('<BUILD>', out['command'])
         self.assertEqual(out['retained'], [])
         self.assertFalse(os.path.exists(out['buildDir']))
         self.assertIn('$ grep -q', Path(out['log']).read_text(), 'the log is kept')
+        self.assertNotIn('\\', out['log'])
 
     def test_the_snapshot_follows_uncommitted_and_untracked_changes(self):
         snaps = []
@@ -55,6 +57,7 @@ class BuildTest(unittest.TestCase):
             snaps.append(self.run_script('--path=.', '--command', 'true')[1]['snapshot'])
         self.assertEqual(len(set(snaps)), 4)
 
+    @unittest.skipIf(os.name == 'nt', 'Windows has no directory permission bits to keep a removal out')
     def test_a_retained_build_dir_is_reported(self):
         code, out = self.run_script('--path=.', '--command', 'mkdir <BUILD>/ro && touch <BUILD>/ro/f && chmod 555 <BUILD>/ro')
         self.addCleanup(lambda: subprocess.run(['rm', '-rf', out['buildDir']]))
@@ -73,6 +76,7 @@ class BuildTest(unittest.TestCase):
         code, out = self.run_script('--path=src.c', '--command', 'echo y > other.c && touch <BUILD>/o')
         self.assertEqual(out['snapshot'], out['snapshotAfter'], 'a path outside the candidate may change')
 
+    @unittest.skipIf(os.name == 'nt', 'NTFS forbids : and * in a file name')
     def test_a_path_named_like_pathspec_magic_snapshots_only_itself(self):
         (self.repo / ':(top)*').write_text('odd')
         snap = lambda: self.run_script('--path=:(top)*', '--command', 'true')[1]['snapshot']
@@ -85,6 +89,7 @@ class BuildTest(unittest.TestCase):
         code, out = self.run_script('--path=-weird', '--command=true')
         self.assertEqual((code, out['exit']), (0, 0), out)
 
+    @unittest.skipIf(os.name == 'nt', 'chmod cannot make a file unreadable on Windows')
     def test_a_filesystem_error_is_reported_and_cleaned_up(self):
         if os.geteuid() == 0:
             self.skipTest('root reads an unreadable file')
@@ -103,7 +108,7 @@ class BuildTest(unittest.TestCase):
         (tools / 'bin').mkdir(parents=True)
         (tools / 'bin' / 'idf.py').write_text('#!/bin/sh\necho idf "$@"\n')
         os.chmod(tools / 'bin' / 'idf.py', 0o755)
-        (tools / 'export.sh').write_text(f'export PATH="{tools}/bin:$PATH"\n')
+        (tools / 'export.sh').write_text('export PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin:$PATH"\n')
         return tools / 'export.sh'
 
     def test_setup_reaches_the_build_and_its_tools_are_checked_after_it(self):
@@ -131,6 +136,9 @@ class BuildTest(unittest.TestCase):
     def test_a_build_that_fails_or_kills_its_shell_is_a_build_failure(self):
         for command, exit in (('exit 3', 3), ('kill -9 $$', -9)):
             code, out = self.run_script('--path=.', '--command', command)
+            if os.name == 'nt' and exit < 0:  # Windows reports no signal, only a failing status
+                self.assertNotEqual(out['exit'], 0, command)
+                exit = out['exit']
             self.assertEqual((code, out['stage'], out['exit'], out['setup'], out['requires']), (0, 'build', exit, '', []), command)
 
     def test_refusals(self):
