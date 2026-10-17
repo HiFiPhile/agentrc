@@ -221,7 +221,12 @@ class NoKernel32:
 
 
 class FakePort:
-    """The module's Win32 layer over a port that exists only here: its DCB, timeouts and lines."""
+    """The module's Win32 layer over a port that exists only here: its DCB, timeouts and lines.
+
+    The DTR/RTS levels are modelled: every state the lines may pass through is kept in `reached`, and
+    a SetCommState that moves both lines may pass through either intermediate state (kernel32 picks
+    the order), so (DTR low, RTS high), which resets an Espressif chip, shows up if any step allows it.
+    """
 
     def __init__(self, m):
         self.m = m
@@ -232,13 +237,18 @@ class FakePort:
         self.state = m.DCB(DCBlength=ctypes.sizeof(m.DCB), BaudRate=9600, ByteSize=7, Parity=2, StopBits=2,
                            fParity=1, fOutxCtsFlow=1, fOutxDsrFlow=1, fDsrSensitivity=1, fOutX=1, fInX=1,
                            fErrorChar=1, fNull=1, fAbortOnError=1, fDtrControl=m.DTR_CONTROL_HANDSHAKE,
-                           fRtsControl=m.RTS_CONTROL_TOGGLE, XonChar=b'\x11', XoffChar=b'\x13', EofChar=b'\x1a')
+                           fRtsControl=m.RTS_CONTROL_TOGGLE, XonLim=2048, XoffLim=512, EofChar=b'\x1a')
         self.timeouts = m.COMMTIMEOUTS(10, 20, 30, 40, 50)
         self.saved_state, self.saved_timeouts = bytes(self.state), bytes(self.timeouts)
         self.dtr, self.rts = True, False    # as the open left them
+        self.reached = []
         self.reports_lines = True
+        self.stores_baud = None             # a driver that keeps another rate than the one asked for
         self.reads = []                     # bytes (b'' = a timeout), an exception, or a callable returning bytes
         self.fail = {}                      # wrapper name -> [exception or None per call]
+
+    def opened_at(self, dtr, rts):
+        self.dtr, self.rts = dtr, rts
 
     def patch(self):
         for name in ('nt_port_exists', 'nt_open', 'nt_get_state', 'nt_set_state', 'nt_get_timeouts',
@@ -256,6 +266,15 @@ class FakePort:
     def names(self):
         return [c[0] for c in self.log]
 
+    def lines(self):
+        return self.dtr, self.rts
+
+    def _move(self, dtr, rts):
+        if dtr != self.dtr and rts != self.rts:
+            self.reached += [(dtr, self.rts), (self.dtr, rts)]
+        self.dtr, self.rts = dtr, rts
+        self.reached.append((dtr, rts))
+
     def nt_port_exists(self, name):
         return name in self.exists
 
@@ -263,6 +282,7 @@ class FakePort:
         self._call('nt_open', device)
         if self.open_error:
             raise self.open_error
+        self.reached.append(self.lines())
         return self.handle
 
     def _h(self, h):
@@ -275,13 +295,14 @@ class FakePort:
 
     def nt_set_state(self, h, d):
         self._h(h)
-        self._call('nt_set_state', bytes(d))
+        before = self.lines()
+        self._call('nt_set_state', bytes(d), before)
         self.state = self.m.DCB.from_buffer_copy(d)
-        # SetCommState drives DTR/RTS per the control modes (handshake and toggle left alone here)
-        if d.fDtrControl in (0, 1):
-            self.dtr = bool(d.fDtrControl)
-        if d.fRtsControl in (0, 1):
-            self.rts = bool(d.fRtsControl)
+        if self.stores_baud:
+            self.state.BaudRate = self.stores_baud
+        # SetCommState drives the lines per the control modes; handshake idles high, toggle low
+        self._move(d.fDtrControl != self.m.DTR_CONTROL_DISABLE,
+                   d.fRtsControl in (self.m.RTS_CONTROL_ENABLE, self.m.RTS_CONTROL_HANDSHAKE))
 
     def nt_get_timeouts(self, h):
         self._h(h)
@@ -297,9 +318,9 @@ class FakePort:
         self._h(h)
         self._call('nt_escape', func)
         if func == self.m.CLRDTR:
-            self.dtr = False
+            self._move(False, self.rts)
         elif func == self.m.CLRRTS:
-            self.rts = False
+            self._move(self.dtr, False)
 
     def nt_lines(self, h):
         self._h(h)
@@ -326,7 +347,27 @@ class FakePort:
 
     def nt_close(self, h):
         self._h(h)
-        self._call('nt_close')
+        self._call('nt_close', self.lines())
+
+
+class SignalArrivesAtTheEnd:
+    """The module's `signal`, delivering SIGINT twice just as the capture starts ignoring it."""
+
+    def __init__(self):
+        self.fired = False
+
+    def __getattr__(self, name):
+        return getattr(signal, name)
+
+    def signal(self, sig, handler):
+        if handler is signal.SIG_IGN and sig == signal.SIGINT and not self.fired:
+            self.fired = True
+            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signal.SIGINT)
+        return signal.signal(sig, handler)
+
+
+RESET = (False, True)    # DTR low, RTS high: an Espressif auto-reset circuit holds EN low
 
 
 @unittest.skipUnless(os.name == 'nt', 'the Win32 backend; the POSIX one has the pty cases')
@@ -359,18 +400,31 @@ class WindowsBackendTest(unittest.TestCase):
     def calls(self, name):
         return [c for c in self.port.log if c[0] == name]
 
+    def configured(self):
+        return self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[0][1])
+
     def assert_restored_and_closed(self, out):
+        """The saved DCB and timeouts are back, but for DTR/RTS control, which holds the lines: no line moves."""
         self.assertTrue(out['terminalRestored'])
-        self.assertEqual(self.port.names()[-3:], ['nt_set_state', 'nt_set_timeouts', 'nt_close'])
-        self.assertEqual(self.calls('nt_set_state')[-1][1], self.port.saved_state)
+        self.assertEqual(self.port.names()[-4:], ['nt_lines', 'nt_set_state', 'nt_set_timeouts', 'nt_close'])
+        _, restored, before = self.calls('nt_set_state')[-1]
+        want = self.m.DCB.from_buffer_copy(self.port.saved_state)
+        want.fDtrControl, want.fRtsControl = int(before[0]), int(before[1])    # ENABLE 1 / DISABLE 0
+        self.assertEqual(restored, bytes(want))
+        self.assertEqual(self.calls('nt_close')[-1][1], before)
         self.assertEqual(self.calls('nt_set_timeouts')[-1][1], self.port.saved_timeouts)
 
+    def assert_no_reset(self):
+        self.assertNotIn(RESET, self.port.reached)
+
     def test_raw_8n1_at_the_baud_then_the_saved_settings_back(self):
+        self.port.state.XonChar = self.port.state.XoffChar = b'\x00'    # equal: SetCommState would refuse them
+        self.port.saved_state = bytes(self.port.state)
         rc, out, err = self.run_main(baud='921600', seconds='0.2')
         self.assertEqual(rc, 0, err)
         self.assertEqual(out['device'], '\\\\.\\COM7')
         self.assertEqual(self.port.log[0], ('nt_open', '\\\\.\\COM7'))
-        configured = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[0][1])
+        configured = self.configured()
         self.assertEqual((configured.BaudRate, configured.ByteSize, configured.Parity, configured.StopBits),
                          (921600, 8, 0, 0))
         self.assertEqual(configured.fBinary, 1)
@@ -379,34 +433,56 @@ class WindowsBackendTest(unittest.TestCase):
             self.assertEqual(getattr(configured, flag), 0, flag)
         # leave: the levels the open left, as plain enable/disable (no handshake, no toggle)
         self.assertEqual((configured.fDtrControl, configured.fRtsControl), (1, 0))
-        self.assertEqual((configured.XonChar, configured.EofChar), (b'\x11', b'\x1a'))
+        self.assertEqual((configured.XonChar, configured.XoffChar), (b'\x11', b'\x13'))
+        self.assertEqual((configured.XonLim, configured.XoffLim, configured.EofChar), (2048, 512, b'\x1a'))
         self.assertEqual(out['lines'], {'policy': 'leave', 'afterSetup': {'dtr': True, 'rts': False}})
         self.assertNotIn('nt_escape', self.port.names())
+        self.assertNotIn('effectiveBaud', out)
         self.assertEqual(out['ended'], 'time')
         self.assertTrue(out['baseline'].startswith('none'))
         self.assertNotIn('otherOpeners', out)
+        self.assertEqual(set(self.port.reached), {(True, False)})    # no line ever moved
         self.assert_restored_and_closed(out)
 
     def test_leave_without_a_line_report_follows_the_saved_control_modes(self):
         self.port.reports_lines = False
         rc, out, err = self.run_main(seconds='0.1')
         self.assertEqual(rc, 0, err)
-        configured = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[0][1])
         # DTR handshake idles high, RTS toggle idles low
-        self.assertEqual((configured.fDtrControl, configured.fRtsControl), (1, 0))
+        self.assertEqual((self.configured().fDtrControl, self.configured().fRtsControl), (1, 0))
         self.assertIsNone(out['lines']['afterSetup'])
+        restored = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[-1][1])
+        self.assertEqual((restored.fDtrControl, restored.fRtsControl), (1, 0))    # the levels it set, held
 
-    def test_lines_low_clears_both_after_the_configuration(self):
-        self.port.rts = True
+    def test_lines_low_clears_rts_then_dtr_after_the_configuration(self):
+        self.port.opened_at(True, True)
         rc, out, err = self.run_main(lines='low', seconds='0.1')
         self.assertEqual(rc, 0, err)
-        names = self.port.names()
-        self.assertEqual(names[:7], ['nt_open', 'nt_get_state', 'nt_get_timeouts', 'nt_lines', 'nt_set_state',
-                                     'nt_escape', 'nt_escape'])
-        self.assertEqual(self.calls('nt_escape'), [('nt_escape', self.m.CLRDTR), ('nt_escape', self.m.CLRRTS)])
-        self.assertEqual(names[7:9], ['nt_lines', 'nt_set_timeouts'])
+        self.assertEqual(self.port.names()[:10], ['nt_open', 'nt_get_state', 'nt_get_timeouts', 'nt_lines',
+                                                  'nt_set_state', 'nt_get_state', 'nt_escape', 'nt_escape',
+                                                  'nt_lines', 'nt_set_timeouts'])
+        self.assertEqual((self.configured().fDtrControl, self.configured().fRtsControl), (1, 1))    # held
+        self.assertEqual(self.calls('nt_escape'), [('nt_escape', self.m.CLRRTS), ('nt_escape', self.m.CLRDTR)])
+        self.assertEqual(self.port.reached, [(True, True), (True, True), (True, False), (False, False),
+                                             (False, False)])
         self.assertEqual(out['lines'], {'policy': 'low', 'afterSetup': {'dtr': False, 'rts': False}})
+        self.assert_no_reset()
         self.assert_restored_and_closed(out)
+        self.assertEqual(self.port.lines(), (False, False))    # the restore did not raise them again
+
+    def test_lines_low_with_unknown_levels_never_passes_the_reset_state(self):
+        for opened in ((True, True), (False, False), (True, False)):
+            with self.subTest(opened=opened):
+                self.setUp()
+                self.port.reports_lines = False
+                self.port.opened_at(*opened)
+                rc, out, err = self.run_main(lines='low', seconds='0.05')
+                self.assertEqual(rc, 0, err)
+                self.assertEqual((self.configured().fDtrControl, self.configured().fRtsControl), (1, 0))
+                self.assert_no_reset()
+                self.assertEqual(self.port.lines(), (False, False))
+                restored = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[-1][1])
+                self.assertEqual((restored.fDtrControl, restored.fRtsControl), (0, 0))
 
     def test_lines_low_refused_when_the_driver_cannot_clear_them(self):
         self.port.fail['nt_escape'] = [ctypes.WinError(1)]
@@ -414,8 +490,26 @@ class WindowsBackendTest(unittest.TestCase):
         self.assertEqual(rc, 3, err)
         self.assertIn('--lines low refused', out['error'])
         self.assertNotIn('nt_read', self.port.names())
-        self.assertEqual(self.port.names()[-2:], ['nt_set_timeouts', 'nt_close'])
-        self.assertTrue(out['terminalRestored'])
+        self.assert_restored_and_closed(out)
+
+    def test_an_early_error_restores_without_moving_a_line(self):
+        self.port.opened_at(False, False)    # the saved modes (handshake/toggle) would raise DTR
+        self.port.fail['nt_set_state'] = [ctypes.WinError(87)]    # the driver refuses the rate
+        rc, out, err = self.run_main(baud='12345678')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('COM7: ', out['error'])
+        self.assertNotIn('nt_read', self.port.names())
+        self.assert_restored_and_closed(out)
+        self.assertEqual(set(self.port.reached), {(False, False)})
+
+    def test_a_rate_the_driver_stores_differently_is_refused(self):
+        self.port.stores_baud = 230400
+        rc, out, err = self.run_main(baud='250000')
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(out['effectiveBaud'], 230400)
+        self.assertIn('the driver set 230400 baud, not 250000', out['error'])
+        self.assertNotIn('nt_read', self.port.names())
+        self.assert_restored_and_closed(out)
 
     def test_chunks_times_and_marks(self):
         self.port.reads = [b'', b'ESP-ROM:esp32p4\r\nrst:0x17 (CHIP_USB_UART_RESET)\r\n', b'', b'\x00\xff binary\n']
@@ -454,11 +548,21 @@ class WindowsBackendTest(unittest.TestCase):
             with self.subTest(sig=sig):
                 self.setUp()
                 self.port.reads = [b'boot\n', lambda: (signal.raise_signal(sig), b'')[1]]
+                t0 = time.monotonic()
                 rc, out, err = self.run_main(seconds='10')
+                self.assertLess(time.monotonic() - t0, 2)
                 self.assertEqual(rc, 0, err)
                 self.assertEqual(out['ended'], f'signal {int(sig)}')
                 self.assertEqual(self.out.read_bytes(), b'boot\n')
                 self.assert_restored_and_closed(out)
+
+    def test_a_signal_as_the_capture_ends_still_restores_and_reports(self):
+        self.m.signal = SignalArrivesAtTheEnd()
+        rc, out, err = self.run_main(seconds='0.1')
+        self.assertTrue(self.m.signal.fired)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['ended'], 'time')
+        self.assert_restored_and_closed(out)
 
     def test_a_busy_port_is_refused_without_its_holder(self):
         for code in (5, 32):    # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
@@ -467,7 +571,7 @@ class WindowsBackendTest(unittest.TestCase):
                 self.port.open_error = ctypes.WinError(code)
                 rc, out, err = self.run_main()
                 self.assertEqual(rc, 3, err)
-                self.assertIn('COM7: busy', out['error'])
+                self.assertIn('COM7: busy or being removed: ' + ctypes.WinError(code).strerror, out['error'])
                 self.assertNotIn('otherOpeners', out)
                 self.assertNotIn('terminalRestored', out)
                 self.assertEqual(self.port.names(), ['nt_open'])
@@ -479,14 +583,6 @@ class WindowsBackendTest(unittest.TestCase):
         self.assertEqual(rc, 3, err)
         self.assertNotIn('busy', out['error'])
 
-    def test_a_rejected_configuration_still_restores(self):
-        self.port.fail['nt_set_state'] = [ctypes.WinError(87)]    # the driver refuses the rate
-        rc, out, err = self.run_main(baud='12345678')
-        self.assertEqual(rc, 3, err)
-        self.assertIn('COM7: ', out['error'])
-        self.assertNotIn('nt_read', self.port.names())
-        self.assert_restored_and_closed(out)
-
     def test_a_read_error_fails_and_restores(self):
         self.port.reads = [b'boot\n', ctypes.WinError(87)]
         rc, out, err = self.run_main(seconds='5')
@@ -496,16 +592,36 @@ class WindowsBackendTest(unittest.TestCase):
         self.assert_restored_and_closed(out)
 
     def test_the_device_going_away_ends_the_capture(self):
-        self.port.reads = [b'boot\n', ctypes.WinError(1167)]    # ERROR_DEVICE_NOT_CONNECTED
-        self.port.fail['nt_set_state'] = [None, ctypes.WinError(1167)]
-        self.port.fail['nt_set_timeouts'] = [None, ctypes.WinError(1167)]
+        for code in (1167, 995):    # ERROR_DEVICE_NOT_CONNECTED, ERROR_OPERATION_ABORTED
+            with self.subTest(code=code):
+                self.setUp()
+                self.port.reads = [b'boot\n', ctypes.WinError(code)]
+                self.port.fail['nt_set_state'] = [None, ctypes.WinError(code)]
+                self.port.fail['nt_set_timeouts'] = [None, ctypes.WinError(code)]
+                rc, out, err = self.run_main(seconds='5')
+                self.assertEqual(rc, 3, err)
+                self.assertEqual(out['ended'], 'device gone')
+                self.assertFalse(out['terminalRestored'])
+                self.assertIn('restoring the port settings', out['error'])
+                self.assertEqual(self.port.names()[-3:], ['nt_set_state', 'nt_set_timeouts', 'nt_close'])
+                self.assertEqual(self.out.read_bytes(), b'boot\n')
+
+    def test_reads_that_keep_ending_empty_at_once_are_a_gone_device(self):
+        self.port.reads = [b'boot\n'] + [lambda: b''] * 3
+        t0 = time.monotonic()
         rc, out, err = self.run_main(seconds='5')
-        self.assertEqual(rc, 3, err)
+        self.assertLess(time.monotonic() - t0, 1)
+        self.assertEqual(rc, 0, err)
         self.assertEqual(out['ended'], 'device gone')
-        self.assertFalse(out['terminalRestored'])
-        self.assertIn('restoring the port settings', out['error'])
-        self.assertEqual(self.port.names()[-3:], ['nt_set_state', 'nt_set_timeouts', 'nt_close'])    # both tried
-        self.assertEqual(self.out.read_bytes(), b'boot\n')
+        self.assertEqual(out['bytes'], 5)
+
+    def test_a_few_early_empty_reads_do_not_end_the_capture(self):
+        quick = lambda: b''    # noqa: E731
+        self.port.reads = [quick, quick, b'', quick, quick, b'', b'boot\n', quick, quick]
+        rc, out, err = self.run_main(seconds='0.4')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['ended'], 'time')
+        self.assertEqual(out['bytes'], 5)
 
     def test_port_names_and_refusals(self):
         for port, device in (('COM7', 'COM7'), ('com7', 'COM7'), ('\\\\.\\COM7', 'COM7'), ('\\\\.\\com12', 'COM12')):
