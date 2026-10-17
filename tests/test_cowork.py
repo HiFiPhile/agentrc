@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 import os
@@ -6,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -182,7 +184,9 @@ class CoworkTest(unittest.TestCase):
             'HOME': str(base / 'home'), 'USERPROFILE': str(base / 'home'),
             'XDG_CONFIG_HOME': str(base / 'config'), 'CODEX_HOME': str(base / 'codex'),
             'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
-            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}, clear=True)
+            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
+            # Git for Windows enables fsmonitor system-wide: its daemon would outlive each repo, holding the dir
+            'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.fsmonitor', 'GIT_CONFIG_VALUE_0': 'false'}, clear=True)
         self.env.start()
         self.cwd = os.getcwd()
         os.chdir(self.root)
@@ -279,11 +283,20 @@ class CoworkTest(unittest.TestCase):
         until(lambda: not cowork.held(self.box() / f'{request}.lock'))
 
     def read_wait(self, request):
-        proc = subprocess.Popen([sys.executable, str(SCRIPT), 'read', '--wait', request], cwd=self.root,
+        argv = [str(SCRIPT)]
+        if os.name == 'nt':  # it polls without holding the lock open: a sentinel marks that it waits
+            polling = Path(self.tmp.name) / f'polling-{len(self.background)}'
+            argv = ['-c', f'import pathlib, sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import cowork\n'
+                          f'held = cowork.held\n'
+                          f'def waiting(lock, wait=False):\n'
+                          f'    wait and pathlib.Path({str(polling)!r}).touch()\n'
+                          f'    return held(lock, wait)\n'
+                          f'cowork.held = waiting\nsys.exit(cowork.main(sys.argv[1:]))']
+        proc = subprocess.Popen([sys.executable, *argv, 'read', '--wait', request], cwd=self.root,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.background.append(proc)
-        if os.name == 'nt':  # it polls without holding the lock open: give it time to start
-            time.sleep(1)
+        if os.name == 'nt':
+            until(lambda: proc.poll() is not None or polling.exists())
         else:
             until(lambda: proc.poll() is not None or cowork.holds(proc.pid, self.box() / f'{request}.lock'))
         self.assertIsNone(proc.poll())
@@ -841,7 +854,169 @@ class CoworkTest(unittest.TestCase):
         code, _, reply, _ = self.send('--task', 'x', PATH=f'{self.bin}{os.pathsep}{os.path.dirname(shutil.which("git"))}')
         self.assertEqual(code, 1)
         self.assertIn('failed', reply)
-        self.assertIn('cannot find the file' if os.name == 'nt' else 'No such file', reply)
+        self.assertIn('codex is not on PATH as codex.exe, codex.cmd, codex.bat' if os.name == 'nt' else 'No such file',
+                      reply)
+
+    @unittest.skipIf(os.name != 'nt', 'CreateProcess and shutil.which search the current directory on Windows only')
+    def test_the_cli_is_found_on_path_alone_never_in_the_checkout(self):
+        (self.root / 'codex.cmd').write_text('@echo hijacked> hijacked\r\n')  # a contributor's checkout
+        env = {k: v for k, v in os.environ.items() if k.lower() != 'nodefaultcurrentdirectoryinexepath'}
+        with mock.patch.dict('os.environ', env, clear=True):
+            code, _, reply, _ = self.send('--task', 'x')
+        self.assertEqual((code, reply), (0, 'codex reply\nFiles touched: none\n'))
+        self.assertFalse((self.root / 'hijacked').exists())
+        self.assertEqual(len(self.calls()), 1)
+        first, second = Path(self.tmp.name) / 'first', Path(self.tmp.name) / 'second'
+        for where, names in ((first, ('codex.cmd',)), (second, ('codex.exe', 'codex.cmd'))):
+            where.mkdir()
+            for name in names:
+                (where / name).touch()
+        for path, found in (((first, second), first / 'codex.cmd'), ((second, first), second / 'codex.exe')):
+            with self.subTest(path=path), mock.patch.dict('os.environ', {'PATH': os.pathsep.join(map(str, path))}):
+                self.assertEqual(cowork.nt_cli(['codex', 'exec']), [str(found), 'exec'], 'PATH order, then .exe first')
+
+    @unittest.skipIf(os.name != 'nt', 'cmd.exe runs batch files on Windows only')
+    def test_a_batch_file_cli_runs_but_never_with_an_argument_cmd_would_reparse(self):
+        (self.bin / 'claude.exe').unlink()  # an npm install: claude.cmd only
+        (self.bin / 'claude.cmd').write_text(f'@"{sys.executable}" "{self.stubs / "claude"}" %*\r\n')
+        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q')
+        self.assertEqual((code, reply), (0, 'claude reply\nFiles touched: a.c\n'))
+        code, _, reply, _ = self.send('--to', 'claude', '--model', 'x&echo.>injected', '--task', 'q')
+        self.assertEqual(code, 1)
+        self.assertIn('is a batch file, and cmd.exe would reinterpret', reply)
+        self.assertFalse((self.root / 'injected').exists())
+        self.assertEqual(len(self.calls()), 1, 'refused before it ran')
+
+    @unittest.skipIf(os.name != 'nt', 'job objects are Windows')
+    def test_a_refused_breakaway_is_noted_in_the_requests_err(self):
+        err = Path(self.tmp.name) / 'x.err'
+        with mock.patch.object(cowork, 'nt_popen', side_effect=[PermissionError(5, 'Access is denied'), 'runner']), \
+                err.open('ab') as stream:
+            self.assertEqual(cowork.nt_detach(['x'], '.', 0, stream), 'runner')
+        self.assertIn(b'refused breakaway', err.read_bytes())
+
+    @unittest.skipIf(os.name != 'nt', 'job objects are Windows')
+    def test_a_tool_may_ask_to_break_away_from_the_clis_job(self):
+        # the CLI itself, not a launcher: the fakes' launcher lets them break away from its own job
+        gate = Path(self.tmp.name) / 'joined'
+        away = (f"import os, subprocess, sys, time\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.02)\n"
+                "try:\n    subprocess.run([sys.executable, '-c', ''], creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB, "
+                "check=True); print('left')\nexcept OSError as e:\n    print(repr(e))")
+        cli = subprocess.Popen([sys.executable, '-c', away], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            job = cowork.nt_job(cli)
+        gate.touch()
+        out, _ = cli.communicate(timeout=10)
+        cowork.kernel32.CloseHandle(job)
+        self.assertEqual((out.strip(), err.getvalue()), ('left', ''))
+
+    @unittest.skipIf(os.name != 'nt', 'the job object is the Windows backend')
+    def test_kill_takes_a_daemon_whose_parent_already_exited(self):
+        daemon = ("import subprocess, sys; open('daemon.pid', 'w').write(str(subprocess.Popen("
+                  f"{SLEEP!r}, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP).pid))")
+        self.codex_does(f'import subprocess; subprocess.run([sys.executable, "-c", {daemon!r}])')
+        proc, request = self.send_gated('--task', 'x')
+        until(lambda: (self.root / 'daemon.pid').exists() and (self.root / 'daemon.pid').read_text())
+        pid = int((self.root / 'daemon.pid').read_text())
+        try:
+            self.run_cli('kill', request)
+            proc.wait(timeout=10)
+            until(lambda: gone(pid), timeout=5)  # taskkill finds no parent link to it: only the job holds it
+        finally:
+            subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True)
+
+    @unittest.skipIf(os.name != 'nt', 'msvcrt locks are Windows')
+    def test_admission_retries_only_a_lock_held_by_another(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        for failure, raised in ((OSError(errno.EACCES, 'held'), False), (OSError(errno.EBADF, 'bad'), True)):
+            with self.subTest(failure=failure), mock.patch.object(cowork.msvcrt, 'locking',
+                                                                  side_effect=[failure, None, None]):
+                with contextlib.ExitStack() as stack:
+                    if raised:
+                        stack.enter_context(self.assertRaises(OSError))
+                    stack.enter_context(cowork.admission(box))
+
+    @unittest.skipIf(os.name != 'nt', 'an open file blocks its removal on Windows only')
+    def test_a_request_file_still_open_elsewhere_neither_loses_the_reply_nor_raises(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        for let_go in (0.3, None):
+            with self.subTest(let_go=let_go):
+                for ext, body in (('exit', b'0\n'), ('reply', b'done\nFiles touched: none\n'), ('lock', b''),
+                                  ('err', b''), ('jsonl', b'')):
+                    (box / f'codex-x.{ext}').write_bytes(body)
+                holder = (box / 'codex-x.jsonl').open()  # what a grandchild inherited as its stdout
+                timer = let_go and threading.Timer(let_go, holder.close)
+                try:
+                    if timer:
+                        timer.start()
+                    code, out, err = self.run_cli('read', 'codex-x')
+                    left = self.leftovers('codex-x')
+                finally:
+                    if timer:
+                        timer.join()
+                    holder.close()
+                self.assertEqual((code, out), (0, 'done\nFiles touched: none\n'))
+                self.assertNotIn('Traceback', err)
+                if timer:
+                    self.assertEqual((left, err), ([], receipt('codex-x')))
+                else:
+                    self.assertEqual(left, ['.jsonl'], 'all else is gone, the lock with it')
+                    self.assertIn('delivered, but', err)
+                    (box / 'codex-x.jsonl').unlink()
+
+    @unittest.skipIf(os.name != 'nt', 'os.replace onto an open file fails on Windows only')
+    def test_setting_the_default_waits_out_a_reader_of_the_preference_file(self):
+        self.assertEqual(self.run_cli('default', 'astra')[0], 0)
+        holder = cowork.preset_file().open()
+        timer = threading.Timer(0.3, holder.close)
+        timer.start()
+        try:
+            code, _, err = self.run_cli('default', 'sol')
+        finally:
+            timer.join()
+            holder.close()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(cowork.preset_file().read_bytes(), b'sol\n')
+
+    @unittest.skipIf(os.name != 'nt', 'stdin is read as UTF-8 on Windows; elsewhere in the locale encoding')
+    def test_a_task_on_stdin_that_is_not_utf8_is_a_usage_error(self):
+        done = subprocess.run([sys.executable, str(SCRIPT), 'send', '--task', '-'], cwd=self.root,
+                              input=b'caf\xe9\n', capture_output=True, timeout=30)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stderr.decode().strip(), '--task - must be UTF-8')
+        self.assertEqual(self.calls(), [])
+
+    def test_a_cygwin_or_msys_python_is_refused(self):
+        for platform in ('cygwin', 'msys'):
+            with self.subTest(platform), mock.patch.object(sys, 'platform', platform):
+                code, out, err = self.run_cli('default')
+                self.assertEqual((code, out), (1, ''))
+                self.assertIn('native Windows CPython', err)
+
+    def test_the_windows_middle_process_is_no_command_elsewhere(self):
+        with mock.patch.object(cowork, 'fcntl', object()), mock.patch.object(cowork, 'nt_detach') as detach:
+            code, _, err = self.run_cli('_detach', 'codex', 'main', 'codex-x', '0', '5')
+        self.assertEqual(code, 2, err)
+        detach.assert_not_called()
+
+    def test_git_output_is_utf8_on_windows_and_the_locale_encoding_elsewhere(self):
+        real, seen = subprocess.run, []
+
+        def recording(*args, **kwargs):
+            if args[0][0] == 'git':
+                seen.append(kwargs)
+            return real(*args, **kwargs)
+        with mock.patch.object(cowork.subprocess, 'run', recording):
+            cowork.git_dir()
+            cowork.git(self.root, 'status')
+            cowork.tree_state(self.root)
+        self.assertGreater(len(seen), 3)
+        for kwargs in seen:  # as text=True alone decodes outside Windows: strictly, in the locale's encoding
+            self.assertTrue(kwargs.get('text'))
+            self.assertEqual(kwargs.get('encoding'), 'utf-8' if os.name == 'nt' else None)
+            self.assertIn(kwargs.get('errors'), (None, 'replace') if os.name == 'nt' else (None,))
 
     def test_publish_is_all_or_nothing_and_the_first_verdict_wins(self):
         target = self.root / 'x.exit'
@@ -929,7 +1104,7 @@ class CoworkTest(unittest.TestCase):
                 else 'start_new_session=True')
         self.codex_does(f"import subprocess; open('tool.pid', 'w').write(str(subprocess.Popen({SLEEP!r}, {away}).pid))")
         proc, request = self.send_gated('--task', 'x')
-        until(lambda: (self.root / 'tool.pid').exists())
+        until(lambda: (self.root / 'tool.pid').exists() and (self.root / 'tool.pid').read_text())
         self.run_cli('kill', request)
         proc.wait(timeout=10)
         tool = int((self.root / 'tool.pid').read_text())
@@ -992,6 +1167,24 @@ class CoworkTest(unittest.TestCase):
             if orphan.poll() is None:
                 orphan.kill()
                 orphan.wait()
+
+    @unittest.skipIf(os.name != 'nt', 'the Windows backend dates the pid; /proc shows the open lock')
+    def test_a_pid_reused_after_the_runner_wrote_it_is_not_ours(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        lock = box / 'codex-x.lock'
+        with holding(lock) as held:
+            stranger = subprocess.Popen(SLEEP)
+            try:
+                held.write(f'{stranger.pid}\n')
+                held.flush()
+                self.assertTrue(cowork.holds(stranger.pid, lock), 'born between the lock and the pid write')
+                born = cowork.nt_born(stranger.pid)
+                os.utime(lock, ns=(born - 1, born - 1))  # the pid was written before it was born
+                self.assertFalse(cowork.holds(stranger.pid, lock))
+            finally:
+                stranger.kill()
+                stranger.wait()
 
     def test_kill_on_a_finished_request_signals_nothing(self):
         request = self.reaped('--task', 'done')
@@ -1210,7 +1403,8 @@ class CoworkTest(unittest.TestCase):
         out, err = reader.communicate(timeout=10)
         self.assertEqual((reader.returncode, out, err),
                          (0, '', f'cowork result {request} codex/main: replied, exit 0; written to {out_file}\n'))
-        self.assertEqual(out_file.read_text(), 'codex reply\nFiles touched: none\n' + receipt(request))
+        self.assertEqual(out_file.read_bytes().decode(), 'codex reply\nFiles touched: none\n' + receipt(request),
+                         'the same bytes on every OS')
         self.assertEqual(self.leftovers(request), [])
         self.assertEqual(sorted(p.name for p in out_file.parent.glob('reply.txt*')), ['reply.txt'], 'no temp file left')
 
