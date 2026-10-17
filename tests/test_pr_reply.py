@@ -20,6 +20,7 @@ spec.loader.exec_module(reply)
 REPO, PR, ME = 'o/r', 7, 'hathach'
 # A gh stand-in that echoes stdin and appends UTF-8 text: a real process, so the pipe decoding is the script's own.
 ECHO = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read() + ' ✓ 修复'.encode())"
+STRAY = "import sys; sys.stdout.buffer.write(b'ok \\xff'); sys.stderr.buffer.write(b'err \\xfe'); sys.exit(1)"
 GH = reply.gh  # the real one: ReplyCase patches it
 
 
@@ -795,9 +796,18 @@ class EncodingTest(ReplyCase):
         with mock.patch.object(reply.subprocess, 'run', lambda argv, **kw: real([sys.executable, '-c', ECHO], **kw)):
             self.assertEqual(GH(['api'], '{"body": "é"}'), (0, '{"body": "é"} ✓ 修复', ''))
 
+    def test_a_byte_gh_prints_that_is_not_utf8_is_replaced_not_raised(self):
+        real = subprocess.run
+        with mock.patch.object(reply.subprocess, 'run', lambda argv, **kw: real([sys.executable, '-c', STRAY], **kw)):
+            self.assertEqual(GH(['api']), (1, 'ok �', 'err �'))
+
     def test_a_refusal_prints_utf8_whatever_the_console(self):
         path = self.json_file({'replies': [{'commentId': 1, 'body': '修复 🙂'}]})
-        done = subprocess.run([sys.executable, str(SCRIPT), '--pr', str(PR), '--repo', REPO, '--manifest', path], capture_output=True)
+        # PATH an empty dir: no gh to reach; and none of Python's own UTF-8 switches, so the script's is what is tested
+        bare = os.path.join(self.tmp, 'bin')
+        os.mkdir(bare)
+        env = {**{k: v for k, v in os.environ.items() if k.upper() not in ('PATH', 'PYTHONUTF8', 'PYTHONIOENCODING')}, 'PATH': bare}
+        done = subprocess.run([sys.executable, str(SCRIPT), '--pr', str(PR), '--repo', REPO, '--manifest', path], capture_output=True, env=env)
         self.assertEqual(done.returncode, 2)
         self.assertIn('修复 🙂', done.stderr.decode('utf-8'))
 

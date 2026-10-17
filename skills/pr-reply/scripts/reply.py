@@ -124,7 +124,8 @@ def sealed(facts):
 
 
 def gh(args, stdin=None):
-    r = subprocess.run(['gh', *args], input=stdin, capture_output=True, encoding='utf-8')
+    # replace: a stray byte must reach the error and read-back paths, not raise past them
+    r = subprocess.run(['gh', *args], input=stdin, capture_output=True, encoding='utf-8', errors='replace')
     return r.returncode, r.stdout, r.stderr
 
 
@@ -576,7 +577,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    # what it prints carries remote text, which a Windows console code page cannot always encode
-    sys.stdout.reconfigure(encoding='utf-8')
-    sys.stderr.reconfigure(encoding='utf-8')
+    if os.name == 'nt':  # what it prints carries remote text, which a Windows console code page cannot always encode
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())
