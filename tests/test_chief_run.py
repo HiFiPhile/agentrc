@@ -103,7 +103,10 @@ class ChiefRun(unittest.TestCase):
         self.bin.mkdir()
         if os.name == 'nt':
             # Windows cannot exec a shebang file: a real claude.exe launcher runs the fake, found before any real claude
-            from pip._vendor.distlib.scripts import ScriptMaker
+            try:
+                from pip._vendor.distlib.scripts import ScriptMaker
+            except ImportError:
+                self.skipTest("needs pip's vendored distlib to build a fake claude.exe")
             (self.fake / 'claude').write_text(FAKE)
             maker = ScriptMaker(str(self.fake), str(self.bin))
             maker.executable = sys.executable

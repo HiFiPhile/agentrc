@@ -117,7 +117,10 @@ class ShadowGuard(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'CreateProcess tries the working directory before PATH')
     def test_a_git_in_the_project_is_not_the_one_run(self):
         # Claude Code runs the hook in the project, a contributor's checkout: its git.exe must not run
-        from pip._vendor.distlib.scripts import ScriptMaker
+        try:
+            from pip._vendor.distlib.scripts import ScriptMaker
+        except ImportError:
+            self.skipTest('no distlib to build a git.exe stub')
         fake = self.root / 'fake'
         fake.mkdir()
         (fake / 'git').write_text(f'#!/usr/bin/env python3\nimport pathlib, sys\npathlib.Path({str(self.root / "ran")!r}).touch()\nsys.exit(1)\n')
