@@ -585,6 +585,26 @@ class WindowsBackendTest(unittest.TestCase):
         self.assertEqual(self.port.names()[-2:], ['nt_set_timeouts', 'nt_close'])
         self.assertEqual(self.port.reached, [RESET])
 
+    def test_lines_low_with_unknown_levels_and_a_refused_dcb_keeps_rts_low(self):
+        for opened in ((True, True), (False, False), DOWNLOAD, RESET):
+            with self.subTest(opened=opened):
+                self.setUp()
+                self.port.state.fRtsControl = self.m.RTS_CONTROL_ENABLE    # writing the saved modes raises RTS
+                self.port.saved_state = bytes(self.port.state)
+                self.port.reports_lines = False
+                self.port.opened_at(*opened)
+                self.port.fail['nt_set_state'] = [ctypes.WinError(87)]    # the driver refuses our DCB
+                rc, out, err = self.run_main(lines='low')
+                self.assertEqual(rc, 3, err)
+                self.assertNotIn('nt_read', self.port.names())
+                restored = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[-1][1])
+                self.assertEqual((restored.fDtrControl, restored.fRtsControl), (0, 0))
+                self.assertEqual(self.port.wire, (False, False))
+                left = self.port.reached.index((opened[0], False))    # the CLRRTS before the DCB
+                self.assertNotIn(RESET, self.port.reached[left:])
+                if opened == RESET:
+                    self.assertNotIn(DOWNLOAD, self.port.reached[left:])
+
     def test_an_early_error_restores_without_moving_a_line(self):
         self.port.opened_at(False, False)    # the saved modes (handshake/toggle) would raise DTR
         self.port.fail['nt_set_state'] = [ctypes.WinError(87)]    # the driver refuses the rate
