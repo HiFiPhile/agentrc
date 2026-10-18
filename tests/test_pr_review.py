@@ -504,11 +504,25 @@ class Ledger(Case):
 
     def test_an_absolute_or_backslashed_comment_path_is_refused(self):
         r = self.result_for(self.p)
-        for path in ('/abs/src/core/a.c', 'C:/abs/src/core/a.c', 'C:\\abs\\src\\core\\a.c', '\\\\srv\\share\\src\\core\\a.c',
+        r['draft']['comments'][0]['path'] = '/abs/src/core/a.c'
+        with self.assertRaisesRegex(facts.Unusable, 'absolute path or a backslash'):
+            self.save(r)
+        led = {'pr': PR, 'reviews': []}
+        for path in ('C:/abs/src/core/a.c', 'C:\\abs\\src\\core\\a.c', '\\\\srv\\share\\src\\core\\a.c',
                      '\\src\\core\\a.c', 'C:src/core/a.c', 'src\\core\\a.c'):
             r['draft']['comments'][0]['path'] = path
-            with self.assertRaisesRegex(facts.Unusable, 'absolute path or a backslash', msg=path):
-                self.save(r)
+            with mock.patch.object(ledger.os, 'name', 'nt'), \
+                    self.assertRaisesRegex(facts.Unusable, 'absolute path or a backslash', msg=path):
+                ledger.save(led, r, None)
+
+    def test_a_colon_or_backslash_is_part_of_a_posix_path(self):
+        if os.name == 'nt':
+            self.skipTest('Windows reads them as a drive and a separator')
+        r = self.result_for(self.p)
+        for path in ('a:b.c', 'src\\core\\a.c'):
+            r['draft']['comments'][0]['path'] = path
+            self.assertTrue(self.save(r)['saved'], path)
+            Path(self.p['ledger']).unlink()
 
     def test_carried_findings_keep_their_id(self):
         self.save(self.result_for(self.p))

@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -26,6 +27,10 @@ STATE = tempfile.TemporaryDirectory()
 os.environ['XDG_STATE_HOME'] = STATE.name
 import search  # noqa: E402
 import locate  # noqa: E402
+
+# Git for Windows puts an xpdf pdftotext on PATH but no pdfinfo; extraction runs both.
+needs_poppler = unittest.skipUnless(shutil.which('pdfinfo') and shutil.which('pdftotext'),
+                                    'poppler (pdfinfo and pdftotext) is not on PATH')
 
 SCHEMA = """
 CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, path TEXT);
@@ -317,6 +322,7 @@ class Extract(unittest.TestCase):
         self.src = self.lib / 'doc.pdf'
         self.src.write_bytes(FIXTURE.read_bytes())
 
+    @needs_poppler
     def test_extraction_records_the_source_and_the_physical_page_count(self):
         meta = locate.extract(4, str(self.src))
         self.assertEqual(meta['pages'], 3, 'the fixture has 3 pages, the middle one blank')
@@ -325,6 +331,7 @@ class Extract(unittest.TestCase):
         self.assertEqual((meta['size'], meta['mtime_ns']), locate.stat_of(self.src))
         self.assertEqual(os.listdir(locate.INDEX), ['4.txt'], 'one file per book, no stray temporaries')
 
+    @needs_poppler
     def test_the_extracted_pages_are_the_pages_a_reader_would_open(self):
         locate.extract(4, str(self.src))
         _, pages = locate.read_index(4)
@@ -336,6 +343,7 @@ class Extract(unittest.TestCase):
         self.assertEqual(total, 2, "page 3's two adjacent mentions are one excerpt")
         self.assertTrue(blocks[0].startswith('p1'), blocks[0])
 
+    @needs_poppler
     def test_a_replaced_revision_is_re_extracted_and_an_unchanged_one_is_not(self):
         locate.extract(4, str(self.src))
         self.assertTrue(locate.is_current(locate.read_header(4), 4, str(self.src)))
@@ -345,6 +353,7 @@ class Extract(unittest.TestCase):
         self.assertEqual(fresh['mtime_ns'], locate.stat_of(self.src)[1])
         self.assertTrue(locate.is_current(locate.read_header(4), 4, str(self.src)), 're-extraction heals it')
 
+    @needs_poppler
     def test_a_pdf_with_no_text_layer_is_unavailable_not_an_empty_document(self):
         """A scan extracts to blank pages; calling that "indexed" would turn
         every later lookup into a false claim that the term is absent."""
@@ -356,6 +365,7 @@ class Extract(unittest.TestCase):
         self.assertIn('text layer', str(e.exception))
         self.assertEqual(os.listdir(locate.INDEX), [], 'nothing cached for an unusable book')
 
+    @needs_poppler
     def test_a_pdftotext_failure_is_unavailable_and_leaves_nothing_behind(self):
         self.addCleanup(setattr, locate, 'EXTRACTOR', locate.EXTRACTOR)
         locate.EXTRACTOR = [sys.executable, '-c', 'raise SystemExit(1)']  # pdfinfo still succeeds
@@ -364,6 +374,7 @@ class Extract(unittest.TestCase):
         self.assertIn('pdftotext exit 1', str(e.exception))
         self.assertEqual(os.listdir(locate.INDEX), [])
 
+    @needs_poppler
     def test_a_source_replaced_mid_extraction_is_refused_rather_than_indexed(self):
         real = locate.page_count
 
@@ -377,6 +388,7 @@ class Extract(unittest.TestCase):
             locate.extract(4, str(self.src))
         self.assertIn('changed while', str(e.exception))
 
+    @needs_poppler
     def test_a_page_count_disagreement_refuses_and_leaves_no_index_behind(self):
         self.addCleanup(setattr, locate, 'page_count', locate.page_count)
         locate.page_count = lambda src: 99
@@ -385,6 +397,7 @@ class Extract(unittest.TestCase):
         self.assertIn('pdfinfo says 99', str(e.exception))
         self.assertEqual(os.listdir(locate.INDEX), [], 'the temporary file is cleaned up')
 
+    @needs_poppler
     def test_the_manifest_path_is_slash_separated_and_a_backslash_one_stays_current(self):
         # The index syncs with the library; Windows once wrote backslashes, and
         # every other OS must not re-extract the whole library over them.
@@ -400,6 +413,7 @@ class Extract(unittest.TestCase):
         self.assertTrue(locate.is_current(locate.read_header(4), 4, str(src)))
         self.assertEqual(locate.read_index(4)[0]['path'], 'Vendor/doc.pdf', 'and reads back as one')
 
+    @needs_poppler
     def test_pdfinfo_output_that_is_not_in_the_locale_encoding_still_counts_pages(self):
         # pdfinfo prints the title in UTF-8; decoded as GBK it once came back as None.
         # Ł and ‘ are UTF-8 bytes 0x81 and 0x98, which cp1252 and cp1251 leave undefined.
@@ -407,6 +421,7 @@ class Extract(unittest.TestCase):
         pdf.write_bytes(minimal_pdf('USB — RM® Ł ‘x’'))
         self.assertEqual(locate.page_count(str(pdf)), 1)
 
+    @needs_poppler
     def test_pdftotext_is_asked_for_utf8_and_the_manifest_keeps_its_identity(self):
         # xpdf's pdftotext (Git for Windows ships one) writes Latin-1 unless asked: an
         # index of U+FFFD that is_current() would then accept on every machine.
@@ -422,6 +437,7 @@ class Extract(unittest.TestCase):
         self.assertEqual(meta['extractor'], ['pdftotext', '-layout'])
         self.assertTrue(locate.is_current(locate.read_header(4), 4, str(self.src)))
 
+    @needs_poppler
     def test_an_index_a_reader_holds_open_is_still_replaced(self):
         # Windows refuses to replace a file another handle has open, as a `find` may.
         locate.extract(4, str(self.src))
@@ -473,6 +489,7 @@ class Extract(unittest.TestCase):
         self.assertEqual(Path(cmd[0]).parent, poppler)
         self.assertEqual(cmd[1:], [*locate.EXTRACTOR[1:], '-enc', 'UTF-8'])
 
+    @needs_poppler
     def test_a_file_pdfinfo_cannot_read_is_unavailable_not_silently_unverified(self):
         bad = self.lib / 'bad.pdf'
         bad.write_bytes(b'not a pdf')
@@ -573,6 +590,7 @@ class BuildEndToEnd(unittest.TestCase):
         self.summary = out.getvalue()
         return code
 
+    @needs_poppler
     def test_build_all_indexes_the_library_then_reports_the_rest_unchanged(self):
         self.assertEqual(self.build('--all'), 0)
         self.assertEqual(os.listdir(locate.INDEX), ['1.txt'], 'the photography book is skipped')
@@ -584,6 +602,7 @@ class BuildEndToEnd(unittest.TestCase):
         self.assertNotIn('indexed', self.summary)
         self.assertIn('2 book(s)', self.summary, 'the headline counts the skipped book too')
 
+    @needs_poppler
     def test_find_indexes_a_skipped_book_because_skipping_is_only_a_build_cost(self):
         self.build('--all')
         self.assertEqual(locate.main(['find', '--book', '2', '--term', 'SIE_CTRL']), 0)
@@ -593,6 +612,7 @@ class BuildEndToEnd(unittest.TestCase):
         os.remove(self.lib / 'Vendor/RM0001 (1)/RM0001.pdf')
         self.assertEqual(self.build('--all'), 3)
 
+    @needs_poppler
     def test_the_build_prunes_the_index_of_a_book_that_lost_its_pdf(self):
         self.build('--all')
         db = sqlite3.connect(locate.DB)
@@ -932,6 +952,7 @@ class History(unittest.TestCase):
         self.assertEqual((gone['exit'], gone['result']), (3, None))
         self.assertIn('unavailable', gone['error'])
 
+    @needs_poppler
     def test_a_find_records_the_pages_returned_and_the_source_it_searched(self):
         code, out, _ = self.call(locate.main, 'find', '--book', '1', '--term', 'SIE_CTRL', '--limit', '2',
                                  '--context', '0')
@@ -1035,6 +1056,7 @@ class History(unittest.TestCase):
         self.assertEqual(len(self.records()), 240)
 
 
+@needs_poppler
 class PageCommand(unittest.TestCase):
     """`page` over the three-page fixture, whose page 2 has no text layer."""
     setUp, call, records = History.setUp, History.call, History.records

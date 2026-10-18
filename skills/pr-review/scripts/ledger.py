@@ -519,8 +519,10 @@ def save(led, result, reason):
     same = [r for r in led['reviews'] if r['head'] == result['head'] and r['status'] == 'posted']
     if same and not reason:
         raise Unusable(f"{result['head']} was already reviewed and posted; a second review needs --reason")
-    # A backslash is a separator on Windows, where `\x`, `\\srv\x` and `C:x` are absolute too: refused on every OS.
-    if any(re.match(r'/|[A-Za-z]:', p) or '\\' in p for p in (str(c.get('path', '')) for c in result['draft']['comments'])):
+    # On Windows a backslash is a separator and `\x`, `\\srv\x` and `C:x` are absolute too; elsewhere they are names.
+    windows = os.name == 'nt'
+    if any(p.startswith('/') or windows and (re.match(r'[A-Za-z]:', p) or '\\' in p)
+           for p in (str(c.get('path', '')) for c in result['draft']['comments'])):
         raise Unusable('a draft comment has an absolute path or a backslash; GitHub needs repository-relative paths with /')
     findings = number(led, result)
     try:

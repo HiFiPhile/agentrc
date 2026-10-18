@@ -149,14 +149,14 @@ def codex_exe():
 
 
 def run_tree(cmd, input, timeout, **kwargs):
-    """subprocess.run; on Windows a timeout kills the whole tree: npm's
-    codex.cmd runs cmd.exe, then node, which could still write the -o file."""
+    """subprocess.run; on Windows a timeout or any other failure kills the whole
+    tree: npm's codex.cmd runs cmd.exe, then node, which could still write the -o file."""
     if os.name != 'nt':
         return subprocess.run(cmd, input=input, timeout=timeout, **kwargs)
     with subprocess.Popen(cmd, stdin=subprocess.PIPE, **kwargs) as process:
         try:
             process.communicate(input, timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except BaseException:
             taskkill = os.path.join(os.environ.get('SystemRoot', 'C:/Windows'), 'System32', 'taskkill.exe')
             subprocess.run([taskkill, '/T', '/F', '/PID', str(process.pid)], capture_output=True)
             process.wait()
@@ -258,12 +258,20 @@ def worktrees(root):
     return trees
 
 
+def symlinks(tree):
+    """core.symlinks as git reads it, true unless set."""
+    try:
+        return git(tree, 'config', '--type=bool', 'core.symlinks').strip() != b'false'
+    except subprocess.CalledProcessError:
+        return True
+
+
 def snapshot_tree(tree, blobs):
     """{path: [mode, blob id]} for every tracked, dirty or untracked file of one
     worktree. Blob ids match git's, so staging or committing a file is not a
     change. Submodules keep their index entry untouched: their content is out
     of scope."""
-    files = {}
+    files, links = {}, None    # links: core.symlinks, read at the first link checked out as a plain file
     for record in git(tree, 'ls-files', '--stage', '-z').split(b'\0'):
         if record:
             meta, name = record.split(b'\t', 1)
@@ -292,7 +300,10 @@ def snapshot_tree(tree, blobs):
             if os.name == 'nt':
                 # No exec bit to read (core.fileMode false), and a link checked out as a plain
                 # file (core.symlinks false): git keeps the index mode, and still filters the bytes.
-                mode = files[name][0] if files.get(name, [''])[0] in ('100644', '100755', '120000') else '100644'
+                index = files.get(name, [''])[0]
+                if index == '120000' and links is None:
+                    links = symlinks(tree)
+                mode = index if index in ('100644', '100755') or (index == '120000' and not links) else '100644'
             else:
                 mode = '100755' if path.stat().st_mode & 0o111 else '100644'
         else:
@@ -420,7 +431,7 @@ def read_marker(marker):
     """The repository's overrides: `model=`/`effort=` lines in the marker file.
     Anything else is refused so a typo cannot silently fall back to a default."""
     overrides = {}
-    for number, line in enumerate(marker.read_text().splitlines(), 1):
+    for number, line in enumerate(marker.read_text(encoding='utf-8').splitlines(), 1):
         line = line.strip()
         if not line or line.startswith('#'):
             continue
@@ -600,7 +611,7 @@ class Locked:
         self.lock = (self.directory / 'lock').open('w')
         lock_exclusive(self.lock)
         path = self.directory / 'state.json'
-        loaded = json.loads(path.read_text()) if path.exists() else {}
+        loaded = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
         if loaded and set(loaded) != set(new_state()):
             # State written by an older version of this hook has no usable
             # shape; start over and say so at the next Stop rather than crash.
@@ -685,7 +696,7 @@ def settled(state):
 def load_state(directory):
     """The session's state, or None when it is missing, unreadable or of another shape."""
     try:
-        state = json.loads((directory / 'state.json').read_text())
+        state = json.loads((directory / 'state.json').read_text(encoding='utf-8'))
         if isinstance(state, dict) and set(state) == set(new_state()):
             referenced(state)
             return state

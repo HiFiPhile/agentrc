@@ -135,7 +135,7 @@ def locked(d):
 def load(d):
     """The stored reading {at, used, until, retry_at}, or None when missing or malformed."""
     try:
-        rec = json.loads((d / 'usage.json').read_text())
+        rec = json.loads((d / 'usage.json').read_text(encoding='utf-8'))
         for key in ('at', 'until', 'retry_at'):
             percent(rec[key])
         if not rec['used']:

@@ -89,6 +89,11 @@ Claude Code sets `NoDefaultCurrentDirectoryInExePath`; set it too when running
 the scripts from another shell, or Windows runs a `git.exe` or `gh.exe` from the
 current directory, a PR checkout for many of them.
 
+`pr-babysit`'s build check puts a temp directory into the build command
+unquoted, so it refuses a temp dir with a blank or shell syntax in it, as a
+profile path such as `C:\Users\First Last` gives; point `TMP` and `TEMP` at a
+plain path such as `C:\tmp` there.
+
 `install.py` creates symlinks, which needs Developer Mode or an elevated shell.
 Linux only: `--herdr-plugin` (herdr runs on Linux and macOS), `lsusbt`,
 `usb-kernel-debug`, `hil`'s rig-host scripts, and the capture scripts of

@@ -107,16 +107,17 @@ const fileDigest = (p) => existsSync(p) ? sha256(readFileSync(realpathSync(p))) 
 const treeDigest = (root) => {
   if (!existsSync(root)) return null
   const h = createHash('sha256')
+  const top = realpathSync(root)
   const walk = (dir) => {
     for (const name of readdirSync(dir).sort()) {
       if (name === '__pycache__' || name === '.git') continue
       const p = join(dir, name)
       const st = statSync(p)
       if (st.isDirectory()) walk(p)
-      else h.update(`${relative(root, p).split(sep).join('/')}\0${st.size}\0${st.size < 1 << 20 ? sha256(readFileSync(p)) : ''}\n`)
+      else h.update(`${relative(top, p).split(sep).join('/')}\0${st.size}\0${st.size < 1 << 20 ? sha256(readFileSync(p)) : ''}\n`)
     }
   }
-  walk(realpathSync(root))
+  walk(top)
   return h.digest('hex')
 }
 const env = () => ({

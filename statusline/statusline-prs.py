@@ -82,7 +82,7 @@ def scan(transcript, session_id):
 
 def load(path):
     try:
-        cache = json.loads(Path(path).read_text())
+        cache = json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return {}
     return cache if isinstance(cache, dict) else {}

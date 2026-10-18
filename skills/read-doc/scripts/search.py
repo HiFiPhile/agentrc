@@ -205,7 +205,7 @@ def resolve(bid, path, fmt, name):
     return None
 
 
-# Windows locks are mandatory: lock a byte far past the records, so readers are never refused.
+# Windows locks are mandatory: lock a byte far past the records, so readers are refused only past 1 GiB of them.
 LOCK_BYTE = 1 << 30
 
 

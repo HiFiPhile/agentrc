@@ -465,9 +465,10 @@ class Library:
                         # Never put the password in argv: /proc/<pid>/cmdline is world
                         # readable, so `ps` would show it for the life of every call —
                         # which would defeat keeping it in a gitignored file at all.
-                        # calibredb takes `<f:PATH>` and rstrip()s the contents, so hand
-                        # it a 0600 file on tmpfs (never touches disk) and delete it
-                        # immediately. Its other option, `<stdin>`, routes through
+                        # calibredb takes `<f:PATH>`, decodes it as UTF-8 and rstrip()s it,
+                        # so hand it a private file (0600 in $XDG_RUNTIME_DIR or /tmp; the
+                        # user's temp dir on Windows) and delete it immediately. Its
+                        # other option, `<stdin>`, routes through
                         # getpass() and needs a TTY we do not have here.
                         rt = Path(os.environ.get("XDG_RUNTIME_DIR",
                                                  tempfile.gettempdir() if os.name == "nt" else "/tmp"))
@@ -475,7 +476,7 @@ class Library:
                         try:
                             if hasattr(os, "fchmod"):  # mkstemp already made it 0600; Windows has no modes
                                 os.fchmod(fd, 0o600)
-                            with os.fdopen(fd, "w") as fh:
+                            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                                 fh.write(pw)
                             p2 = subprocess.run(
                                 ["calibredb", "--with-library", url, "--username", user,

@@ -268,8 +268,9 @@ class Guard:
             raise Denied(f'`{cmd}` writes or maps paths this guard cannot follow on Windows; dispatch the step to a unit')
         sources = []
         if cmd in ('ln', 'link') or (cmd == 'cp' and links(args)):
-            targets = [] if cmd == 'link' else written(cmd, args)   # link, unlisted as a writer, names its target too
-            sources = [a for a in args if not a.startswith('-') and a not in targets]
+            operands, directories = getopt(args)
+            # link, unlisted as a writer, names its target too; ln's lone operand is linked into the cwd
+            sources = operands if cmd == 'link' or directories or len(operands) < 2 else operands[:-1]
         elif cmd == 'rsync':
             sources = [a.split('=', 1)[1] if '=' in a else args[k + 1] for k, a in enumerate(args)
                        if re.fullmatch(r'--(link|copy|compare)-dest(=.*)?', a) and ('=' in a or k + 1 < len(args))]
@@ -320,6 +321,35 @@ def links(args):
         if re.match(r'--(l|sy)|-[^-St]*[ls]', a):
             return True
     return False
+
+
+def getopt(args):
+    """cp's, ln's or install's operands and the directories -t names, as GNU getopt reads them: options anywhere
+    before `--`, clustered or abbreviated, -S/--suffix and -t/--target-directory taking the next word or their rest."""
+    operands, directories, k = [], [], 0
+    while k < len(args):
+        a = args[k]
+        if a == '--':
+            operands += args[k + 1:]
+            break
+        value = option = None
+        if a.startswith('--'):
+            name, eq, value = a.partition('=')
+            # the shortest prefix each stays unique at among cp's, ln's and install's options
+            option = next((o for o, n in (('--suffix', 4), ('--target-directory', 3)) if len(name) >= n and o.startswith(name)), None)
+            value = value if eq else None
+        elif a.startswith('-') and a != '-':
+            if m := re.match(r'-[^St]*([St])(.*)', a):
+                option, value = m.group(1), m.group(2) or None
+        else:
+            operands.append(a)
+        if option and value is None and k + 1 < len(args):
+            k += 1
+            value = args[k]
+        if option in ('t', '--target-directory'):
+            directories.append(value)
+        k += 1
+    return operands, directories
 
 
 TOO_LONG = 'checking this call took too long; split the command, or name its paths as drive paths (C:/...)'
@@ -482,12 +512,10 @@ def written(cmd, args):
     """The paths a file-writing command names as its targets."""
     names = [a for a in args if not a.startswith('-')]
     if cmd in WRITERS_LAST:
-        # -t/--target-directory names the destination where the command has it (rsync's -t keeps times)
-        target = [] if cmd == 'rsync' else \
-            [args[k + 1] for k, a in enumerate(args[:-1]) if a in ('-t', '--target-directory')] + \
-            [a.split('=', 1)[1] for a in args if a.startswith('--target-directory=')] + \
-            [a[2:] for a in args if a.startswith('-t') and len(a) > 2 and not a.startswith('--')]
-        return target or names[-1:]
+        if cmd == 'rsync':    # its -t keeps times
+            return names[-1:]
+        operands, directories = getopt(args)
+        return directories or operands[-1:]
     if cmd in WRITERS_AFTER_FIRST:
         # --reference takes the place of the mode or owner: every operand is a target
         return names if any(a.startswith('--reference') for a in args) else names[1:]

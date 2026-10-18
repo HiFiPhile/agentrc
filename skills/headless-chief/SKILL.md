@@ -30,10 +30,13 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    skill's hook denies `Workflow` and `Agent` calls in such a worktree for
    interactive sessions too. The `launcher: exit` line in `progress.log` is
    the end of the run;
-   `kill <launcher pid>` stops it early. On Windows, `taskkill /T /F /PID <pid>` on the `launcher: started pid`
-   line's pid does (exit line `claude exited 1`), never on the launcher pid, which loses the exit line; there only
-   a chief chief_run started in a git repository counts as running, and a launcher that loses its run lock to
-   another reports its exit 2 only on the `progress.log` exit line, after the launch returned 0.
+   `kill <launcher pid>` stops it early. On Windows,
+   `taskkill /T /F /PID <pid>` on the `launcher: started pid` line's pid
+   does (exit line `claude exited 1`), never on the launcher pid, which
+   loses the exit line; there only a chief chief_run started in a git
+   repository counts as running, and a launcher that loses its run lock to
+   another reports its exit 2 only on the `progress.log` exit line, after
+   the launch returned 0.
 3. **Watch** with Monitor on `tail -n +1 -F <dir>/progress.log`, its
    description, on every arm, the target, such as `chief hathach/tinyusb#3988
    babysit`. Each line is
@@ -66,14 +69,15 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    |---|---|
    | 0 | chief ended with a report |
    | 1 | no final result, an error result, or one without text |
-   | 2 | bad arguments, `--out` already exists, a chief already runs in the worktree, or its `.claude` shadows agentrc's installed copies or cannot be read |
+   | 2 | bad arguments, `--out` already exists, a chief already runs in the worktree, its run lock cannot be taken (Windows), or its `.claude` shadows agentrc's installed copies or cannot be read |
    | 127 | `claude` could not start |
    | other | claude's own status; 128 + N when killed by signal N (not on Windows); 1 for a Windows NTSTATUS, named in hex on the exit line |
 
 Leave the worktree to chief until it exits; remaining in-scope work goes into
 its task. A signal to the launcher is passed
-on to chief (not on Windows, step 2); the launcher still writes the exit line. A relaunch needs a new
-`--out`; its grant follows the README's headless recipe.
+on to chief (not on Windows, step 2); the launcher still writes the exit
+line. A relaunch needs a new `--out`; its grant follows the README's
+headless recipe.
 
 The rest of the directory is for autopsy: `stream.jsonl` (every event,
 raw), `stderr.log`, and `session`, whose id names the transcript:

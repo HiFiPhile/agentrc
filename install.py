@@ -242,7 +242,7 @@ def plan_settings(names, install, statusline):
             strip(hooks, name)
             if install:
                 linked = Path.home() / '.claude' / 'hooks' / name
-                for event, groups in json.loads((REPO / 'hooks' / name / 'hooks.json').read_text()).items():
+                for event, groups in json.loads((REPO / 'hooks' / name / 'hooks.json').read_text(encoding='utf-8')).items():
                     for group in groups:
                         entries = [{**h, 'command': quote_command(linked / h['command'])} for h in group['hooks']]
                         hooks.setdefault(event, []).append({**group, 'hooks': entries})

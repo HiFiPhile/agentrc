@@ -5,6 +5,7 @@ the subagent's reply reaches the stream only inside a top-level user tool_result
 worker assistant event was streamed, so worker exclusion is shown on the event types
 that do appear."""
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -514,6 +515,38 @@ class ChiefRun(unittest.TestCase):
             self.assertIn('cannot take the run lock', r.stderr)
             self.assertNotIn('Traceback', r.stderr)
             self.assertFalse(self.out.exists())
+
+    def test_a_refusal_after_the_run_lock_releases_it(self):
+        # Windows frees a closed handle's lock only after a delay: a refusal must not leave it to that
+        spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
+        chief_run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chief_run)
+        released = []
+        with mock.patch.object(chief_run, 'lock_held', lambda worktree, keep: chief_run.HELD.append('lock')), \
+                mock.patch.object(chief_run, 'release', lambda: released.append(chief_run.HELD.pop())), \
+                mock.patch.object(chief_run, 'refusal', lambda worktree, fix: 'stale roles'), \
+                mock.patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
+            chief_run.main(self.argv()[2:])
+        self.assertEqual(released, ['lock'])
+        self.assertFalse(self.out.exists())
+
+    def test_a_detached_launchers_own_output_is_appended_after_claudes(self):
+        # the Windows launcher inherits stderr.log as a handle with no append mode, at offset 0
+        self.out.mkdir()
+        launcher = (f'import sys, argparse, pathlib; sys.path.insert(0, {str(SCRIPT.parent)!r}); import chief_run\n'
+                    'out = pathlib.Path(sys.argv[1])\n'
+                    'def launch(a, task):\n'
+                    '    with (out / "stderr.log").open("ab") as err: err.write(b"claude stderr\\n")\n'
+                    '    raise RuntimeError("boom")\n'
+                    'chief_run.launch, chief_run.refusal, chief_run.lock_held = launch, lambda *a: None, lambda *a, **k: None\n'
+                    'a = argparse.Namespace(out=out, worktree=pathlib.Path(sys.argv[2]))\n'
+                    'chief_run.detached(a, lambda: chief_run.detached_launch(a))')
+        with (self.out / 'stderr.log').open('wb') as log:
+            subprocess.run([sys.executable, '-c', launcher, str(self.out), str(self.worktree)], input=b'task', stdout=log,
+                           stderr=log, env=self.env, timeout=30)
+        logged = (self.out / 'stderr.log').read_bytes()
+        self.assertTrue(logged.startswith(b'claude stderr\n'), logged)
+        self.assertIn(b'RuntimeError: boom', logged)
 
     def test_a_launcher_that_fails_detached_still_writes_its_exit_line(self):
         failing = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import chief_run\n'

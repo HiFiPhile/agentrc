@@ -143,6 +143,8 @@ class ChiefGuard(unittest.TestCase):
         for c in ('echo x > src/a.c', 'cd /tmp && printf done > chief-report.md', 'out=/tmp/r.md; printf done > "$out"',
                   'printf done > "$(git rev-parse --show-toplevel)/r.md"', 'mkdir -p "$(git rev-parse --git-path chief)"',
                   'touch new.c', 'git diff --output=chief-report.patch', 'cp -t . /tmp/brief.md', 'rsync -t /tmp/brief.md .',
+                  'cp -rt . /tmp/brief.md', 'cp --target-dir . /tmp/brief.md', 'cp -t. /tmp/brief.md',
+                  'cp --t . /tmp/brief.md', 'cp --t=. /tmp/brief.md',
                   'chmod 600 src/a.c', 'echo x > ~/chief-note.md', 'echo x > "$HOME/chief-note.md"'):
             self.assert_denied(c, 'literal absolute path')
 
@@ -258,6 +260,23 @@ class ChiefGuard(unittest.TestCase):
                 self.assertIn('chief guard: the check failed', r.stderr)
                 self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
 
+    def test_a_link_suffix_or_target_directory_is_no_link_source(self):
+        # the Windows link check, run here on POSIX paths: a value -S or -t takes is not a source
+        guard, wt = self.module(), self.wt
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            check = guard.Guard(self.event()).windows
+            for cmd, args in (('ln', ['-S', '.bak', '/tmp/a', '/tmp/b']), ('ln', ['-sfS', '~', '/tmp/a', '/tmp/b']),
+                              ('ln', ['--suffix', '.bak', '-s', '/tmp/a', '/tmp/b']), ('cp', ['-sS', '.bak', '/tmp/a', '/tmp/b']),
+                              ('ln', ['-s', '-t', '/tmp', '/tmp/a']), ('ln', ['-t', '/tmp', '-S', '.bak', '/tmp/a']),
+                              ('cp', ['-s', '-t', '/tmp', '-S', '.bak', '/tmp/a'])):
+                check(cmd, cmd, args)
+            for cmd, args in (('ln', ['-S', '.bak', f'{wt}/src', '/tmp/b']), ('ln', ['-S', '-s', f'{wt}/src', '/tmp/b']),
+                              ('ln', ['-s', '--', '-S', f'{wt}/src', '/tmp/b']), ('cp', ['-sS', '.bak', f'{wt}/src', '/tmp/b']),
+                              ('ln', ['-t', '/tmp', '-S', '.bak', f'{wt}/src']), ('ln', ['-st', '/tmp', f'{wt}/src']),
+                              ('ln', ['-s', '--target-dir', '/tmp', f'{wt}/src']), ('ln', ['-st/tmp', f'{wt}/src'])):
+                with self.subTest(args=args), self.assertRaisesRegex(guard.Denied, 'cannot follow'):
+                    check(cmd, cmd, args)
+
     def test_a_cygwin_or_msys_python_denies_every_call(self):
         # os.name is 'posix' there, so every Windows check would be skipped
         guard = self.module()
@@ -268,7 +287,7 @@ class ChiefGuard(unittest.TestCase):
             self.assertIn(f'needs a native Windows Python; this is {platform}', err)
         self.assertEqual(self.main(guard, 'git status')[0], 0)
 
-    @unittest.skipIf(os.name == 'nt' or sys.platform == 'darwin', 'NTFS and APFS names are Unicode')
+    @unittest.skipIf(os.name == 'nt', 'NTFS names are Unicode')
     def test_a_non_utf8_worktree_is_still_the_worktree(self):
         # git prints the path's bytes: decoded strictly as UTF-8 the guard crashed instead of placing it
         self.project = Path(os.fsdecode(os.fsencode(str(self.root)) + b'/wt-\xff'))

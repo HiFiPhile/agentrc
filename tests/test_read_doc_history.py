@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "read-doc" / "scripts"
 HISTORY = Path("read-doc") / "lookups.jsonl"
 sys.path.insert(0, str(ROOT / "tests"))
-from test_read_doc import FIXTURE, fake_library  # noqa: E402
+from test_read_doc import FIXTURE, fake_library, needs_poppler  # noqa: E402
 
 
 SEARCH = {
@@ -145,6 +145,7 @@ class History(unittest.TestCase):
                 self.assertEqual(words[1:], expected)
                 self.assertTrue(Path(words[2]).is_absolute())
 
+    @needs_poppler
     @unittest.skipIf(shutil.which("sh") is None, "the replay is a sh command")
     def test_show_command_repeats_a_real_logged_find(self):
         library = Path(self.tmp.name) / "library"
@@ -175,6 +176,7 @@ class History(unittest.TestCase):
                 self.assertEqual(replay.returncode, code, replay.stderr)
                 self.assertEqual(replay.stdout, original.stdout)
 
+    @needs_poppler
     @unittest.skipIf(shutil.which("sh") is None, "the replay is a sh command")
     def test_a_logged_page_lists_and_replays(self):
         library = Path(self.tmp.name) / "library"

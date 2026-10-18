@@ -73,7 +73,7 @@ def run(*args):
 
 class Tmp(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # as pcb.py reports it: Windows' long TEMP name
         self.addCleanup(rmtree, self.tmp)
 
     def write(self, name, data):

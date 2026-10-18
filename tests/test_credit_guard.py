@@ -183,7 +183,8 @@ class Guard(unittest.TestCase):
     def test_a_lock_failure_other_than_contention_is_not_waited_out(self):
         self.state.mkdir()
         failure = OSError(errno.EBADF, 'bad file descriptor')
-        with mock.patch.object(cg.msvcrt, 'locking', side_effect=failure), self.assertRaises(OSError) as raised,                 cg.locked(self.state):
+        with mock.patch.object(cg.msvcrt, 'locking', side_effect=failure), self.assertRaises(OSError) as raised, \
+                cg.locked(self.state):
             pass
         self.assertEqual(raised.exception.errno, errno.EBADF, 'not a TimeoutError after LOCK_WAIT')
 

@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -87,9 +88,10 @@ class Session:
 class GateTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        base = Path(self.tmp.name)
-        self.root = make_repo(base / 'repo')
-        self.s = Session(self.root, base / 'state')
+        # as git reports it (Windows' long TEMP name): snapshot() keeps worktrees under root
+        self.base = Path(self.tmp.name).resolve()
+        self.root = make_repo(self.base / 'repo')
+        self.s = Session(self.root, self.base / 'state')
         self.s.prompt('first')
 
     def tearDown(self):
@@ -208,6 +210,21 @@ class GateTest(unittest.TestCase):
         self.assertEqual(sh(self.root, 'git', 'ls-files', '-s', 'link').split()[0], '120000')
         self.assertEqual(self.s.stop(), {}, 'staging changes neither mode nor blob')
 
+    def test_a_file_standing_in_for_a_link_takes_the_mode_git_gives_it(self):
+        # the Windows rule, run here: a plain file keeps the link's 120000 only while core.symlinks is false
+        sha = subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=self.root, input=b'c.txt', check=True,
+                             capture_output=True).stdout.decode().strip()
+        (self.root / 'link').write_bytes(b'a.txt')
+        blobs = self.base / 'cache' / 'blobs'
+        blobs.mkdir(parents=True)
+        for symlinks, want in (('true', '100644'), ('false', '120000')):
+            sh(self.root, 'git', 'config', 'core.symlinks', symlinks)
+            sh(self.root, 'git', 'update-index', '--add', '--cacheinfo', f'120000,{sha},link')
+            with mock.patch.object(gate.os, 'name', 'nt'):
+                got = gate.snapshot_tree(self.root, blobs)['link'][0]
+            sh(self.root, 'git', 'add', 'link')
+            self.assertEqual((got, sh(self.root, 'git', 'ls-files', '-s', 'link').split()[0]), (want, want), symlinks)
+
     def test_non_ascii_text_reaches_codex_and_comes_back(self):
         text = 'caf\u00e9 \u2714 \u0151'  # outside the Windows ANSI code pages
         (self.root / 'a.txt').write_bytes(f'{text}\n'.encode())
@@ -272,12 +289,12 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.s.stop(), {}, 'removing the worktree is not a deletion of its files')
 
     def test_a_worktree_of_a_bare_repository_is_tracked(self):
-        bare = Path(self.tmp.name) / 'bare.git'
+        bare = self.base / 'bare.git'
         sh(self.root, 'git', 'clone', '-q', '--bare', str(self.root), str(bare))
-        root = Path(self.tmp.name) / 'linked'
+        root = self.base / 'linked'
         sh(bare, 'git', 'worktree', 'add', '-q', str(root), 'main')
         (bare / 'simplify-gate').touch()
-        s = Session(root, Path(self.tmp.name) / 'linked-state')
+        s = Session(root, self.base / 'linked-state')
         s.prompt()
         (root / 'a.txt').write_text('a2\n')
         s.results = [json.dumps({'findings': []})]
@@ -609,6 +626,19 @@ class GateTest(unittest.TestCase):
         time.sleep(2.5)
         self.assertFalse(late.exists(), 'a grandchild, as node under codex.cmd, outlived the timeout')
 
+    def test_an_interrupted_codex_is_killed_with_its_children(self):
+        # the Windows path, run here with taskkill stood in for: any failure, not only a timeout, kills the tree
+        killed = []
+
+        def taskkill(args, **kw):
+            killed.append(args[1:3])
+            os.kill(int(args[-1]), signal.SIGTERM)
+        with mock.patch.object(gate.os, 'name', 'nt'), mock.patch.object(subprocess, 'run', taskkill), \
+                mock.patch.object(subprocess.Popen, 'communicate', side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            gate.run_tree([sys.executable, '-c', 'import time; time.sleep(30)'], input=b'', timeout=30)
+        self.assertEqual(killed, [['/T', '/F']])
+
     @unittest.skipUnless(os.name == 'nt', 'msvcrt locks are Windows only')
     def test_a_lock_failure_other_than_contention_is_not_waited_out(self):
         failure = OSError(errno.EBADF, 'bad file descriptor')
@@ -748,7 +778,7 @@ DAY = 86400
 class PruneTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()  # as git reports it
         self.cache = self.base / 'cache'
         self.store = self.cache / gate.STORE
 
@@ -1120,7 +1150,7 @@ class ActivationTest(unittest.TestCase):
 class SkillTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()  # as git reports it
         self.root = make_repo(self.base / 'repo')
         self.marker = self.root / '.git' / 'simplify-gate'
         self.marker.unlink()

@@ -216,18 +216,18 @@ def main(argv=None):
         fail(f'a chief already runs in {a.worktree} (pid {", ".join(map(str, pids))})')
     if why := lock_held(a.worktree, keep=a.foreground):
         fail(why)
-    if why := refusal(a.worktree, 'relaunch with a new --out'):
-        fail(why)
     try:
-        task = a.task_file.open('rb')
-    except OSError as e:
-        fail(f'{a.task_file} cannot be read: {e}')
-    a.out.mkdir(parents=True)
-    if a.foreground:
+        if why := refusal(a.worktree, 'relaunch with a new --out'):
+            fail(why)
         try:
+            task = a.task_file.open('rb')
+        except OSError as e:
+            fail(f'{a.task_file} cannot be read: {e}')
+        a.out.mkdir(parents=True)
+        if a.foreground:
             return launch(a, task)
-        finally:
-            release()
+    finally:
+        release()
     if os.name == 'nt':
         # no fork: this process's own command line runs again as the launcher, without a console or the caller's
         # group; the task goes on its stdin, as a forked launcher keeps the file open whatever the caller does with it
@@ -280,6 +280,11 @@ def detached_launch(a):
         print(f'chief_run: --_detached is the launcher chief_run starts, in the new --out it made; {a.out} is not one',
               file=sys.stderr)
         return 2
+    # the inherited log handle has no append mode: it would write over claude's stderr
+    opened = os.open(a.out / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(opened, 1)
+    os.close(opened)
+    os.dup2(1, 2)
     why = None if a.worktree.is_dir() else f'{a.worktree} is not a directory'
     if why := why or refusal(a.worktree, 'relaunch with a new --out') or lock_held(a.worktree, keep=True, wait=5):
         Progress(a.out / 'progress.log').line(f'launcher: exit 2 ({why}) · report none')
