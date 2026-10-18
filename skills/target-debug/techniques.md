@@ -33,6 +33,7 @@ session; a core found halted ran at the next session; with the setting, a runnin
 board (CMSIS-DAP) is sampled through `probe_state.py`'s OpenOCD session, which also reports the other cores' DHCSR.
 `--halt-samples N` runs `probe_state.py`'s halting fallback (below) N times for a core with no usable PCSR, its PCs
 reported apart as halt reads (`--help`). ST-Link entries carry no OpenOCD configuration and are not covered.
+On Windows: the same, with `JLink.exe`/`openocd.exe` from PATH, never the current directory (unverified on hardware).
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
 
@@ -125,6 +126,11 @@ A UART console (the board's debug serial, if wired) goes through `console_captur
 python3 <skill dir>/scripts/console_capture.py --port /dev/serial/by-id/<port> --baud 115200 --seconds 20 \
   --lines low --out <new file> [--mark '<reset banner regex>']
 ```
+
+On Windows the port is `--port COM<n>` (a COM number stays with its device; `Get-PnpDevice -Class Ports` lists
+them); Windows opens a port exclusively, so one another program holds is refused as busy without naming the holder.
+Stop it early with Ctrl-C/Ctrl-Break, or from another process with CTRL_BREAK_EVENT to a child started with
+CREATE_NEW_PROCESS_GROUP; a kill skips the restore and the summary. That backend is unverified on hardware.
 
 Opening a port raises DTR and RTS, which can reset an Espressif chip (`espressif.md`, "Console"): `--mark` reports
 where a reset banner shows up, so a reset at the open is measured rather than assumed. Clients share the port's

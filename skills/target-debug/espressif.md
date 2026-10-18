@@ -175,7 +175,9 @@ In this order, since an esptool reset before the first step started the boot loo
    established.
 2. Verify the build image through a non-writing route before reprogramming: `esp_verify.py --manifest
    <build>/flasher_args.json --chip <c> --port /dev/serial/by-id/<port> --before <reset> --after <reset>` (`--help`),
-   never an objcopy of the ELF. A failure before esptool's command runs (the connect, a wrong `--chip`, the stub upload)
+   never an objcopy of the ELF. On Windows the port is `COM<n>` and `ESP_VERIFY_ESPTOOL` takes Windows quoting (e.g. the
+   IDF venv's `<venv>\Scripts\python.exe -m esptool`); that route is unverified on hardware. A failure before
+   esptool's command runs (the connect, a wrong `--chip`, the stub upload)
    can leave the chip in the ROM loader, since esptool skips `--after` then (the report's `chipState`; the P4 came back
    on a reset from the USJ's lines, 2026-10-16). Without such a port, use a forced download boot where the board has one
    (the Metro S3: "ESP32-S3"), else report verification pending, or restore and verify the pinned image under

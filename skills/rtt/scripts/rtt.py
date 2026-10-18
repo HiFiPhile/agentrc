@@ -29,6 +29,7 @@ strip_banner. One self-contained file, stdlib only: it is copied to rigs as is.
 """
 import argparse
 import contextlib
+import errno
 import json
 import math
 import os
@@ -45,11 +46,34 @@ import time
 
 
 IS_WINDOWS = os.name == 'nt'
+if IS_WINDOWS:
+    import ctypes   # here, not at teardown: close() may run during interpreter shutdown
 
 
 def _tool_exe(env_name: str, posix_name: str, windows_name: str = None) -> str:
     """Return an overridable executable name without invoking a shell."""
     return os.environ.get(env_name, windows_name if IS_WINDOWS and windows_name else posix_name)
+
+
+def _resolve_exe(name: str) -> str:
+    """The program to start for `name`. Windows: a bare name is looked up on PATH only,
+    as `.exe` like CreateProcess (a .cmd would run under cmd.exe, which answers the console
+    break with a prompt) -- CreateProcess would search python's dir and the cwd, where a
+    checkout's JLink.exe or openocd.exe would run instead. POSIX: execvp's lookup."""
+    if not IS_WINDOWS or os.path.dirname(name):
+        return name
+    base, ext = os.path.splitext(name)
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        if not (os.path.isabs(d) and os.path.splitdrive(d)[0]):
+            continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
+        if os.path.isfile(os.path.join(d, base + (ext or '.exe'))):
+            return os.path.join(d, base + (ext or '.exe'))
+    raise FileNotFoundError(errno.ENOENT, f'{name} not on PATH', name)
+
+
+def _taskkill() -> str:
+    # by full path: a bare name would find a taskkill.exe in python's dir or the cwd first
+    return os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
 
 
 def _popen_group_options() -> dict:
@@ -70,18 +94,44 @@ def _termination_signals() -> tuple:
     return tuple(getattr(signal, name) for name in names if hasattr(signal, name))
 
 
+def _console_break(proc) -> bool:
+    """Windows' SIGTERM: CTRL_BREAK_EVENT to the server's own process group (_spawn
+    makes it one). The event travels only through a console the caller shares, and
+    the server inherits ours, so send it only where it is attached to our console:
+    with none (a detached caller) it got its own or none. False = not delivered, and
+    on any failure: the caller's ladder must always reach the tree kill."""
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        pids = (ctypes.c_uint32 * 256)()
+        n = kernel32.GetConsoleProcessList(pids, len(pids))
+        if n > len(pids):   # the list outgrew the buffer: n is the size it needs
+            pids = (ctypes.c_uint32 * n)()
+            n = kernel32.GetConsoleProcessList(pids, len(pids))
+        if not 0 < n <= len(pids) or proc.pid not in pids[:n]:
+            return False
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+    except Exception:   # noqa: BLE001 - e.g. teardown from __del__ at interpreter exit
+        return False
+    return True
+
+
 def _terminate_process_group(proc, force: bool) -> None:
     """Stop the server and anything it spawned, on POSIX or Windows."""
     if IS_WINDOWS:
         if proc.poll() is not None:
+            return
+        # force=False is SIGTERM's counterpart: a break the server may handle or die of
+        # in an orderly way; the caller's wait observes which, then escalates. Where no
+        # break reaches the server, only the tree kill below is left.
+        if not force and _console_break(proc):
             return
         # Enumerate and stop the tree while the parent still exists. TerminateProcess
         # (Popen.terminate/kill) reaches only the direct child, and taskkill cannot find
         # the descendants by their former parent after that process has exited.
         # /F is required for console children: without it taskkill can retire the
         # parent first and leave its child alive, after which /PID can no longer find
-        # the tree. POSIX retains its graceful-then-force ladder below.
-        cmd = ['taskkill', '/PID', str(proc.pid), '/T', '/F']
+        # the tree.
+        cmd = [_taskkill(), '/PID', str(proc.pid), '/T', '/F']
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=10, check=False)
@@ -182,13 +232,16 @@ def nm_rtt_addr(elf: str, nm: str = None, stop=None) -> int:
     out when nm cannot read the file (another architecture, no toolchain)."""
     nm = nm or os.environ.get('RTT_NM', 'arm-none-eabi-nm')
     try:
-        cmd = [nm, elf]
+        cmd = [_resolve_exe(nm), elf]
         if stop is None:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # errors='replace': an undecodable byte must not crash the check (on Windows
+            # its reader thread died and left stdout/stderr None)
+            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=30)
         else:
             if stop():
                 raise _StopCapture
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    errors='replace')
             try:
                 deadline = time.monotonic() + 30
                 while True:
@@ -284,8 +337,9 @@ class _SocketRtt:
         self._log = tempfile.NamedTemporaryFile(prefix='rtt-server-', suffix='.log',
                                                 delete=not IS_WINDOWS)
         try:
-            self._proc = subprocess.Popen(cmd, stdin=stdin, stdout=self._log,
-                                          stderr=subprocess.STDOUT, **_popen_group_options())
+            self._proc = subprocess.Popen([_resolve_exe(cmd[0]), *cmd[1:]], stdin=stdin,
+                                          stdout=self._log, stderr=subprocess.STDOUT,
+                                          **_popen_group_options())
         except FileNotFoundError as e:
             self.close()
             raise RttError(f'RTT console: {e.filename or cmd[0]} not on PATH') from e
@@ -438,8 +492,10 @@ class _SocketRtt:
                 raise RttError(f'RTT console write failed after {sent}/{len(data)} bytes: {e}') from e
         return sent
 
-    def _gentle_stop(self, proc) -> None:
-        """Subclass hook: ask the server to exit before the group takedown."""
+    def _gentle_stop(self, proc) -> bool:
+        """Subclass hook: ask the server to exit before the group takedown. False = no
+        such channel: close() goes straight to the group's stop signal."""
+        return False
 
     def close(self) -> None:
         self._eof = True   # latch: post-close eof reads True, like a hung-up server
@@ -451,16 +507,15 @@ class _SocketRtt:
         proc = getattr(self, '_proc', None)
         if proc:
             if proc.poll() is None:
-                if IS_WINDOWS:
-                    # taskkill must see the live parent to enumerate its descendants.
-                    _terminate_process_group(proc, force=False)
-                else:
-                    self._gentle_stop(proc)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=5)
+                # the same ladder on every OS: the server's own exit first (it owns the
+                # probe, and killed mid-session it can leave the target halted)
+                if self._gentle_stop(proc):
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=5)
         if proc and proc.poll() is None:
             # The server owns a separate POSIX session or Windows process group.
-            # Retire it before returning so it cannot hold the probe for the next run.
+            # Retire it before returning so it cannot hold the probe for the next run;
+            # SIGTERM or, on Windows, CTRL_BREAK first, then the kill.
             _terminate_process_group(proc, force=False)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
@@ -539,7 +594,7 @@ class JlinkRtt(_SocketRtt):
         self._spawn(cmd, stdin=subprocess.PIPE)
         self._connect(port, stop=stop)
 
-    def _gentle_stop(self, proc) -> None:
+    def _gentle_stop(self, proc) -> bool:
         with contextlib.suppress(OSError, ValueError):
             proc.stdin.write(b'exit\n')
             proc.stdin.flush()
@@ -547,6 +602,7 @@ class JlinkRtt(_SocketRtt):
         # not skip it (the base close also closes it for the server-already-dead path)
         with contextlib.suppress(OSError, ValueError):
             proc.stdin.close()
+        return True
 
 
 class OpenocdRtt(_SocketRtt):
@@ -604,14 +660,9 @@ class OpenocdRtt(_SocketRtt):
         cmd += ['-c', f'rtt setup 0x{addr:x} 0x800 "SEGGER RTT"',
                 '-c', 'rtt polling_interval 1', '-c', 'rtt start',
                 '-c', f'rtt server start {port} {channel}']
+        # no _gentle_stop: openocd has no stdin to ask it to exit, and keeps listening after the client goes
         self._spawn(cmd)
         self._connect(port, stop=stop)
-
-    def _gentle_stop(self, proc) -> None:
-        # no stdin channel to ask openocd to exit, and it keeps its listener up after
-        # the client disconnects: go straight to the group takedown instead of blocking
-        # the base class's 5 s wait on a process that has no reason to leave
-        _terminate_process_group(proc, force=False)
 
 
 def _mem32_words(stdout: str) -> dict:
@@ -648,7 +699,8 @@ def dump_ring(probe: str, device: str, addr: int, out_path: str, channel: int = 
         # same clean-exit contract as nm_rtt_addr/_spawn: a missing binary or a wedged
         # probe must not reach the CLI as a traceback
         try:
-            r = subprocess.run(jlink, input=script, capture_output=True, text=True, timeout=60)
+            r = subprocess.run([_resolve_exe(jlink[0]), *jlink[1:]], input=script, capture_output=True,
+                               text=True, timeout=60)
         except FileNotFoundError:
             raise SystemExit(f'{jlink[0]} not on PATH — the --dump route needs J-Link Commander')
         except subprocess.TimeoutExpired:
@@ -721,7 +773,7 @@ def hil_flasher(path, board):
     flasher.name must be there, what else is missing is the caller's to supply. Raises
     ValueError. Kept identical in rtt.py and pc_sample.py, which are copied around alone."""
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8-sig') as f:
             config = json.load(f)
     except (OSError, ValueError) as e:
         raise ValueError(f'--hil-config {path}: {e}')
@@ -1036,10 +1088,12 @@ def main() -> int:
                 break
     except KeyboardInterrupt:
         pass
-    except BrokenPipeError:
+    except OSError as e:
         # downstream consumer (head/grep -m) closed the pipe: a normal way to end a
         # capture, not an error. Point stdout at devnull so interpreter shutdown does
-        # not raise on the final implicit flush.
+        # not raise on the final implicit flush. Windows reports that write as EINVAL.
+        if not (isinstance(e, BrokenPipeError) or IS_WINDOWS and e.errno == errno.EINVAL):
+            raise
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     finally:
         # from here on the cleanup is committed: a late TERM, or a second Ctrl-C, landing
@@ -1055,4 +1109,12 @@ def main() -> int:
 
 
 if __name__ == '__main__':
+    if IS_WINDOWS:
+        # messages, help and server log tails in UTF-8, not the ANSI code page (target
+        # bytes go to stdout.buffer untouched)
+        # None under pythonw or a DETACHED_PROCESS parent
+        if sys.stdout:
+            sys.stdout.reconfigure(encoding='utf-8')
+        if sys.stderr:
+            sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())

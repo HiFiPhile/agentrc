@@ -18,7 +18,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 import unittest.mock
 from unittest import mock
@@ -47,34 +49,66 @@ for a in sys.argv:
         out += [func, loc]
 if mode == 'short':
     out = out[:-1]
-print('\\n'.join(out))
+sys.stdout.buffer.write((os.linesep.join(out) + os.linesep).encode())
 '''
 
 
 LINK = ('--interface', 'swd', '--speed', '4000')
+# the J-Link Commander name probe_state.py looks up on PATH
+JLINK = 'JLink.exe' if os.name == 'nt' else 'JLinkExe'
 
 
-@unittest.skipIf(os.name == 'nt', 'J-Link and addr2line stubs require POSIX executable semantics')
+def make_tool(d, name, body):
+    """A fake tool in d that starts by name, its path: a POSIX script, or on Windows, which cannot start a
+    shebang script, a launcher .exe for the same Python source (JLinkExe is JLink.exe there)."""
+    if os.name != 'nt':
+        f = Path(d) / name
+        f.write_text(body)
+        f.chmod(f.stat().st_mode | stat.S_IEXEC)
+        return f
+    try:
+        from pip._vendor.distlib.scripts import ScriptMaker
+    except ImportError:
+        raise unittest.SkipTest('Windows fakes need pip (its vendored distlib launcher)')
+    name = 'JLink' if name == 'JLinkExe' else name
+    src = Path(d) / 'stub-src'
+    src.mkdir(exist_ok=True)
+    (src / name).write_text('#!/usr/bin/env python3\n' + body.split('\n', 1)[1], encoding='utf-8')
+    maker = ScriptMaker(str(src), str(d))
+    maker.executable, maker.variants = sys.executable, {''}
+    maker.make(name)
+    return Path(d) / f'{name}.exe'
+
+
+def fake_tools(case, d, tools):
+    """Build the fakes first on a PATH in an environment without the tool overrides, and check that each name
+    resolves to its fake: a missing fake fails here, it never lets a test start a real probe tool."""
+    env = {k: v for k, v in os.environ.items() if k not in ('PROBE_STATE_JLINK_EXE', 'PROBE_STATE_OPENOCD')}
+    env['PATH'] = f'{d}{os.pathsep}{os.environ["PATH"]}'
+    for name, body in tools:
+        stub = make_tool(d, name, body)
+        with mock.patch.dict(os.environ, {'PATH': env['PATH']}):
+            found = pc_sample.which(JLINK if name == 'JLinkExe' else name)
+        case.assertEqual(found and Path(found).resolve(), stub.resolve(), name)
+    return env
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         d = Path(self._dir.name)
-        for name, body in (('JLinkExe', FAKE_JLINK_STATE), ('fake-addr2line', FAKE_ADDR2LINE)):
-            f = d / name
-            f.write_text(body)
-            f.chmod(f.stat().st_mode | stat.S_IEXEC)
+        env = fake_tools(self, d, (('JLinkExe', FAKE_JLINK_STATE), ('fake-addr2line', FAKE_ADDR2LINE)))
         self.elf = d / 'fw.elf'
         self.elf.write_bytes(b'\x7fELF')
         self.log = d / 'log.json'
-        self.env = {**os.environ, 'PATH': f'{d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log),
-                    'FAKE_PCSR': '20000100'}
+        self.env = {**env, 'FAKE_LOG': str(self.log), 'FAKE_PCSR': '20000100'}
 
     def run_cli(self, *args, **env):
         e = {**self.env, **env}
         return subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'FAKE', *LINK,
                                '--elf', str(self.elf), '--addr2line', 'fake-addr2line', *args],
-                              capture_output=True, text=True, timeout=30, env=e, cwd='/')
+                              capture_output=True, encoding='utf-8', timeout=30, env=e, cwd='/')
 
     def test_histogram_symbols_and_counts(self):
         r = self.run_cli('--samples', '6', '--raw', str(self.elf.parent / 'raw.txt'),
@@ -91,8 +125,8 @@ class CliTest(unittest.TestCase):
         self.assertIn('unresolved symbols: 1', r.stdout)
         self.assertIn('DHCSR before: 0x00010001 (running)', r.stdout)
         self.assertIn('DHCSR after: 0x00010001 (running)', r.stdout)
-        self.assertEqual((self.elf.parent / 'raw.txt').read_text().splitlines(),
-                         ['08001000', '08001000', '08002000', 'ffffffff', '00000000', '08003000'])
+        self.assertEqual((self.elf.parent / 'raw.txt').read_bytes().decode().split('\n'),
+                         ['08001000', '08001000', '08002000', 'ffffffff', '00000000', '08003000', ''])
         # the top entry is the spin function and comes first, with its share and site
         lines = r.stdout.splitlines()
         self.assertTrue(lines[1].startswith('     2  50.0%  spin_here'), lines[1])
@@ -100,6 +134,16 @@ class CliTest(unittest.TestCase):
         script = json.loads(self.log.read_text())['script'].splitlines()
         self.assertEqual(script[:3] + script[-2:], ['mem32 E000ED00, 1', 'mem32 E000EDF0, 1', 'mem32 E000EDFC, 1',
                                                     'mem32 E000EDF0, 1', 'qc'])
+
+    def test_symbols_and_paths_beyond_the_console_code_page(self):
+        # addr2line prints the ELF's UTF-8 names; a Windows console code page holds neither of these
+        # only Windows' pc_sample.py forces UTF-8 on stdout; POSIX prints in the locale's encoding
+        utf8 = {} if os.name == 'nt' else {'PYTHONIOENCODING': 'utf-8'}
+        r = self.run_cli('--samples', '2', FAKE_PCSR='08001000', FAKE_SYMS='0x08001000=spin_\u2714@m\u00e9n\u00fc.c:42',
+                         **utf8)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('spin_\u2714', r.stdout)
+        self.assertIn('0x08001000  m\u00e9n\u00fc.c:42', r.stdout)
 
     def test_histogram_aggregates_pcs_by_function(self):
         # four sites in busy() outrank two samples at one idle() site
@@ -158,7 +202,7 @@ class CliTest(unittest.TestCase):
     def test_a_commander_that_fails_after_answering_is_no_capture(self):
         r = self.run_cli('--samples', '3', FAKE_MODE='fail', FAKE_SYMS='0x20000100=loop@main.c:1')
         self.assertEqual(r.returncode, 1)
-        self.assertIn('JLinkExe exited 1', r.stderr)
+        self.assertIn(f'{JLINK} exited 1', r.stderr)
         self.assertNotIn('usable of', r.stdout)
 
     def test_another_probe_or_core_is_refused(self):
@@ -172,7 +216,7 @@ class CliTest(unittest.TestCase):
     def test_blank_selectors_never_reach_the_commander(self):
         for flag in ('--probe', '--device'):
             r = subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'FAKE', *LINK,
-                                '--elf', str(self.elf), f'{flag}=  '], capture_output=True, text=True,
+                                '--elf', str(self.elf), f'{flag}=  '], capture_output=True, encoding='utf-8',
                                timeout=30, env={**self.env, 'FAKE_JLINK_SLEEP': '60'})
             self.assertEqual(r.returncode, 2, flag)
             self.assertIn('must not be empty', r.stderr)
@@ -180,10 +224,12 @@ class CliTest(unittest.TestCase):
     def test_missing_or_hanging_jlink(self):
         r = self.run_cli(PATH='/nonexistent')
         self.assertEqual(r.returncode, 2)
-        self.assertIn('JLinkExe not found - install it or set PROBE_STATE_JLINK_EXE', r.stderr)
+        self.assertIn(f'{JLINK} not found - install it or set PROBE_STATE_JLINK_EXE', r.stderr)
+        start = time.monotonic()
         r = self.run_cli('--samples', '1', '--timeout', '1', FAKE_JLINK_SLEEP='60')
         self.assertEqual(r.returncode, 1)
-        self.assertIn('JLinkExe did not finish within 1 s', r.stderr)
+        self.assertIn(f'{JLINK} did not finish within 1 s', r.stderr)
+        self.assertLess(time.monotonic() - start, 20)    # killed at the timeout, not waited for
 
     def test_symbolizer_failures_are_bounded_and_explicit(self):
         for mode, want in (('fail', 'fake-addr2line failed: fake addr2line: bad ELF'),
@@ -199,29 +245,60 @@ class CliTest(unittest.TestCase):
     def test_the_link_and_the_commander_come_from_the_caller(self):
         base = [sys.executable, str(SCRIPT), '--probe', '000', '--device', 'X', '--elf', str(self.elf)]
         for given in ((), ('--interface', 'swd'), ('--speed', '4000')):
-            r = subprocess.run([*base, *given], capture_output=True, text=True, timeout=30, env=self.env)
+            r = subprocess.run([*base, *given], capture_output=True, encoding='utf-8', timeout=30, env=self.env)
             self.assertEqual(r.returncode, 2, given)
         for bad in ('0', 'fast', '4000kHz'):
-            r = subprocess.run([*base, '--interface', 'swd', f'--speed={bad}'], capture_output=True, text=True,
-                               timeout=30, env=self.env)
+            r = subprocess.run([*base, '--interface', 'swd', f'--speed={bad}'], capture_output=True,
+                               encoding='utf-8', timeout=30, env=self.env)
             self.assertEqual(r.returncode, 2, bad)
             self.assertIn('--speed must be kHz', r.stderr)
         d = Path(self._dir.name)
         argv = d / 'argv'
-        other = d / 'commander'
-        other.write_text(f'#!{sys.executable}\nimport sys\nopen({str(argv)!r}, "w").write(" ".join(sys.argv[1:]))\n')
-        other.chmod(0o755)
+        other = make_tool(d, 'commander',
+                          f'#!{sys.executable}\nimport sys\nopen({str(argv)!r}, "w").write(" ".join(sys.argv[1:]))\n')
         r = subprocess.run([*base, '--interface', 'jtag', '--speed', 'adaptive', '--samples', '1'],
-                           capture_output=True, text=True, timeout=30,
+                           capture_output=True, encoding='utf-8', timeout=30,
                            env={**self.env, 'PROBE_STATE_JLINK_EXE': str(other)})
         self.assertIn('incomplete capture: 0/5 reads', r.stderr)      # the override ran, and said nothing
         self.assertIn('-if jtag -speed adaptive', argv.read_text())
         argv.unlink()
-        r = subprocess.run([*base, *LINK], capture_output=True, text=True, timeout=30,
+        r = subprocess.run([*base, *LINK], capture_output=True, encoding='utf-8', timeout=30,
                            env={**self.env, 'PC_SAMPLE_JLINK_EXE': str(other)})
         self.assertEqual(r.returncode, 2)
         self.assertIn('PC_SAMPLE_JLINK_EXE is no longer read', r.stderr)
         self.assertFalse(argv.exists())
+
+    def test_a_tool_in_the_current_directory_is_not_taken(self):
+        # shutil.which and CreateProcess look in the current directory first on Windows: a checkout's own tool
+        cwd = Path(self._dir.name) / 'checkout'
+        cwd.mkdir()
+        make_tool(cwd, 'fake-addr2line', FAKE_ADDR2LINE)
+        make_tool(cwd, 'JLinkExe', FAKE_JLINK_STATE)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
+        with mock.patch.dict(os.environ, {'PATH': str(self.elf.parent / 'empty')}):
+            os.environ.pop('NoDefaultCurrentDirectoryInExePath', None)    # the Windows default; restored on exit
+            self.assertIsNone(pc_sample.which('fake-addr2line'))
+            with self.assertRaisesRegex(probe_state.ToolError, f'{JLINK} not found'):
+                probe_state.tool('PROBE_STATE_JLINK_EXE_UNSET', 'JLinkExe', 'JLink.exe')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows PATH lookup')
+    def test_a_path_entry_without_drive_and_root_is_not_searched(self):
+        # '.', 'bin' and '\bin' name directories of the cwd or its drive: a checkout's tools
+        cwd = Path(self._dir.name) / 'checkout'
+        for d in (cwd, cwd / 'bin'):
+            d.mkdir(parents=True)
+            (d / 'fake-addr2line.exe').write_bytes(b'')
+            (d / JLINK).write_bytes(b'')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
+        for entry in ('.', 'bin', os.path.splitdrive(str(cwd))[1]):
+            with self.subTest(entry=entry), mock.patch.dict(os.environ, {'PATH': entry}):
+                self.assertIsNone(pc_sample.which('fake-addr2line'))
+                with self.assertRaisesRegex(probe_state.ToolError, f'{JLINK} not found'):
+                    probe_state.tool('PROBE_STATE_JLINK_EXE_UNSET', 'JLinkExe', 'JLink.exe')
+        with mock.patch.dict(os.environ, {'PATH': str(cwd / 'bin')}):
+            self.assertEqual(pc_sample.which('fake-addr2line'), os.path.join(cwd / 'bin', 'fake-addr2line.exe'))
 
     def test_raw_never_overwrites(self):
         raw = Path(self._dir.name) / 'pcs.txt'
@@ -237,10 +314,12 @@ class CliTest(unittest.TestCase):
             r = self.run_cli(*args)
             self.assertEqual(r.returncode, 2, args)
         r = subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'X', *LINK,
-                            '--elf', '/nonexistent.elf'], capture_output=True, text=True, timeout=30)
+                            '--elf', '/nonexistent.elf'], capture_output=True, encoding='utf-8', timeout=30,
+                           env=self.env)
         self.assertEqual(r.returncode, 2)
         self.assertIn('ELF not found', r.stderr)
-        r = subprocess.run([sys.executable, str(SCRIPT), '--help'], capture_output=True, text=True, timeout=30, cwd='/')
+        r = subprocess.run([sys.executable, str(SCRIPT), '--help'], capture_output=True, encoding='utf-8', timeout=30,
+                           cwd='/')
         self.assertEqual(r.returncode, 0)
         self.assertIn('--interval-ms', r.stdout)
 
@@ -265,9 +344,9 @@ import json, os, sys
 regs = {k: os.environ.get('FAKE_' + k, d).split(',') for k, d in
         (('CPUID', '410fc241'), ('DHCSR', '01010001'), ('DEMCR', '01000000'), ('PCSR', '08001000'),
          ('FPCTRL', '00000260'), ('DWTCTRL', '40000000'))}
-def log(script):
+def log(script, **extra):
     with open(os.environ['FAKE_LOG'], 'a') as f:
-        f.write(json.dumps({'argv': sys.argv[1:], 'script': script}) + '\\n')
+        f.write(json.dumps({'argv': sys.argv[1:], 'script': script, **extra}) + '\\n')
 seen = {}
 mode = os.environ.get('FAKE_MODE', '')
 def value(reg):
@@ -335,8 +414,12 @@ if gdb_port:
     while os.environ.get('FAKE_SERVER_STAY'):
         time.sleep(0.05)
     sys.exit(0)
-script = sys.argv[-1]
-log(script)
+assert sys.argv[-2] == '-f', sys.argv    # a session's Tcl comes as a file, its last argument
+path = sys.argv[-1]
+script = open(path).read()
+time.sleep(float(os.environ.get('FAKE_OPENOCD_SLEEP', '0')))
+sys.argv[-1] = script    # logged in place of the file, which is gone once the session ends
+log(script, file=path)
 print('Info : CMSIS-DAP: Serial# = E6614C311B597D32', file=sys.stderr)
 if 'not touched:' in script:    # OpenOCD.recover
     print(f'R DHCSR 0x{value("DHCSR"):08x}', file=sys.stderr)
@@ -557,6 +640,35 @@ SYMS = [('g_count', 0x2000_0010, 4, OBJ, BSS), ('g_flag', 0x2000_0014, 1, OBJ, B
 
 
 class ProbeStateUnitTest(unittest.TestCase):
+    def test_a_stdin_feeder_that_never_started_does_not_hang_the_cleanup(self):
+        # Windows feeds stdin from a thread; joining one that never started raised, and the cleanup retried forever
+        class Unstartable:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+            def join(self, timeout=None):
+                raise RuntimeError('cannot join thread before it is started')
+
+        errors = []
+
+        def call():
+            try:
+                probe_state.run([sys.executable, '-c', 'import time; time.sleep(30)'], 30, stdin='x')
+            except RuntimeError as e:
+                errors.append(e)
+
+        windows = types.SimpleNamespace(name='nt', path=os.path, environ=os.environ)    # kill(): taskkill, then kill
+        with mock.patch.object(probe_state, 'os', windows), \
+                mock.patch.object(probe_state, 'threading', types.SimpleNamespace(Thread=Unstartable)):
+            caller = threading.Thread(target=call, daemon=True)
+            caller.start()
+            caller.join(20)
+        self.assertFalse(caller.is_alive(), 'run() never returned')
+        self.assertEqual([str(e) for e in errors], ["can't start new thread"])
+
     def test_dhcsr_bits(self):
         self.assertEqual(probe_state.dhcsr_state(0x03030003),
                          {'raw': '0x03030003', 'halted': True, 'sleeping': False, 'lockup': False,
@@ -754,20 +866,18 @@ class FakeToolsCase(unittest.TestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         self.d = Path(self._dir.name)
-        for name, body in self.tools:
-            f = self.d / name
-            f.write_text(body)
-            f.chmod(f.stat().st_mode | stat.S_IEXEC)
+        env = fake_tools(self, self.d, self.tools)
         self.config = self.d / 'hil.json'
         self.config.write_text(json.dumps({'boards': STATE_BOARDS}))
         self.log = self.d / 'log.json'
-        self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log)}
+        self.env = {**env, 'FAKE_LOG': str(self.log)}
 
     def sessions(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
-    def signal_when(self, argv, until, env, signals=(signal.SIGTERM,)):
-        """Start argv, wait until until() holds, send each signal in turn; (returncode, stdout, stderr)."""
+    def signal_when(self, argv, until, env, signals=(signal.SIGTERM,), gap=0.05):
+        """Start argv, wait until until() holds, send each signal in turn, gap seconds apart;
+        (returncode, stdout, stderr)."""
         proc = subprocess.Popen([sys.executable, *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 cwd='/', env={**self.env, **env})
         deadline = time.monotonic() + 20
@@ -776,12 +886,11 @@ class FakeToolsCase(unittest.TestCase):
         time.sleep(0.3)
         for sig in signals:
             proc.send_signal(sig)
-            time.sleep(0.05)
+            time.sleep(gap)
         stdout, stderr = proc.communicate(timeout=60)
         return proc.returncode, stdout, stderr
 
 
-@unittest.skipIf(os.name == 'nt', 'openocd and addr2line stubs require POSIX executable semantics')
 class PcSampleOpenOCDTest(FakeToolsCase):
     tools = (('openocd', FAKE_OPENOCD_STATE), ('JLinkExe', FAKE_JLINK_STATE), ('fake-addr2line', FAKE_ADDR2LINE))
 
@@ -793,7 +902,7 @@ class PcSampleOpenOCDTest(FakeToolsCase):
     def run_cli(self, board, *args, **env):
         return subprocess.run([sys.executable, str(SCRIPT), '--hil-config', str(self.config), '--board', board,
                                '--elf', str(self.elf), '--addr2line', 'fake-addr2line', *args],
-                              capture_output=True, text=True, timeout=30, env={**self.env, **env}, cwd='/')
+                              capture_output=True, encoding='utf-8', timeout=60, env={**self.env, **env}, cwd='/')
 
     def scripts(self):
         return [s['script'] for s in self.sessions()]
@@ -808,6 +917,68 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertEqual(len(self.scripts()), 1)    # usable samples: no halting fallback
         self.assertEqual(self.scripts()[0].count('rd PCSR'), 3)
 
+    def test_a_long_capture_reaches_openocd_as_a_script_file(self):
+        # 8000 reads as one -c argument: past Windows' 32767-character command line and Linux's 128 KiB argument
+        tmp = self.d / 'tmp'
+        tmp.mkdir()
+        r = self.run_cli('max32', '--samples', '8000', FAKE_PCSR='08001000', FAKE_SYMS='0x08001000=spin@main.c:4',
+                         TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('8000 usable of 8000 samples', r.stdout)
+        session = self.sessions()[0]
+        self.assertEqual(session['argv'][-2], '-f')
+        self.assertEqual(session['script'].count('rd PCSR'), 8000)
+        self.assertTrue(session['file'].endswith('.tcl'))
+        self.assertNotIn('\\', session['file'])    # OpenOCD takes a Windows path with forward slashes
+        self.assertEqual(list(tmp.iterdir()), [])    # removed after the session
+
+    @unittest.skipUnless(os.name == 'nt', 'the ANSI code page of a program\'s arguments is a Windows matter')
+    def test_a_temp_path_outside_the_ansi_code_page(self):
+        # openocd.exe takes argv and opens files in the ANSI code page: a character outside it would arrive as '?'
+        odd = self.d / 'tmp_✔'
+        odd.mkdir()
+        self.assertTrue(os.path.samefile(probe_state.short_path(str(odd)), odd))    # the real helper: same dir
+        links = []
+
+        def short(path):    # an ASCII name for the same file stands in for its 8.3 form
+            links.append(self.d / f'short{len(links)}.tcl')
+            os.link(path, links[-1])
+            return str(links[-1])
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(tempfile, 'tempdir', str(odd)), \
+                mock.patch.object(probe_state, 'ansi_codec', return_value='cp1252'):
+            ocd = probe_state.OpenOCD('E6614C311B597D32', '-f target/x.cfg', None)
+            with mock.patch.object(probe_state, 'short_path', side_effect=short):
+                _, reads = ocd.batch(f'rd DHCSR 0x{probe_state.DHCSR:08x}', 30)
+            self.assertEqual(reads, [('DHCSR', 0x01010001)])
+            self.assertEqual(self.sessions()[-1]['file'], links[0].as_posix())
+            with mock.patch.object(probe_state, 'short_path', side_effect=lambda path: path):    # no 8.3 names
+                with self.assertRaisesRegex(probe_state.ToolError,
+                                            r'outside the ANSI code page \(cp1252\).*set TMPDIR'):
+                    ocd.batch(f'rd DHCSR 0x{probe_state.DHCSR:08x}', 30)
+        self.assertEqual(len(self.sessions()), 1)    # refused before openocd ran
+        self.assertEqual(list(odd.iterdir()), [])    # and the script file removed either way
+
+    def test_a_temp_path_with_a_brace_is_refused(self):
+        braced = self.d / 'tmp{x}'
+        braced.mkdir()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(tempfile, 'tempdir', str(braced)):
+            ocd = probe_state.OpenOCD('E6614C311B597D32', '-f target/x.cfg', None)
+            with self.assertRaisesRegex(probe_state.ToolError, 'has a brace, which OpenOCD -f cannot quote: '
+                                                               'set TMPDIR'):
+                ocd.batch(f'rd DHCSR 0x{probe_state.DHCSR:08x}', 30)
+        self.assertFalse(self.log.exists())    # refused before openocd ran
+        self.assertEqual(list(braced.iterdir()), [])    # and the script file removed
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX kill() runs no taskkill')
+    def test_a_hung_taskkill_still_kills_the_tool(self):
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(proc.wait)
+        with mock.patch.object(probe_state.subprocess, 'run',
+                               side_effect=subprocess.TimeoutExpired('taskkill', 10)) as taskkill:
+            probe_state.kill(proc)
+        self.assertEqual(taskkill.call_args.kwargs['timeout'], 10)
+        self.assertIsNotNone(proc.wait(10))
+
     def test_the_halting_fallback_is_labelled_apart(self):
         r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF',
                          FAKE_HALT_PCS='08003000,08003000,08004000')
@@ -821,8 +992,12 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertIn('halting fallback: openocd: resume 0 failed', r.stderr)
 
     def test_a_stalled_fallback_is_killed_then_recovered(self):
+        tmp = self.d / 'tmp'
+        tmp.mkdir()
         r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', '--timeout', '2', FAKE_PCSR='FFFFFFFF',
-                         FAKE_HALT_STALL='1', FAKE_STATE=str(self.d / 'state'))
+                         FAKE_HALT_STALL='1', FAKE_STATE=str(self.d / 'state'), TMPDIR=str(tmp), TEMP=str(tmp),
+                         TMP=str(tmp))
+        self.assertEqual(list(tmp.iterdir()), [])    # the killed session's script file is removed too
         self.assertEqual(r.returncode, 1)
         self.assertIn('did not finish within 2 s', r.stderr)
         self.assertIn('the core was left halted, resumed: now running (DHCSR 0x01010001)', r.stderr)
@@ -834,6 +1009,7 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertIn('stopped before its guards passed, so it halted nothing', r.stderr)
         self.assertEqual(len(self.scripts()), 2)    # no recovery session
 
+    @unittest.skipIf(os.name == 'nt', 'Windows cannot send SIGINT to one child process')
     def test_an_interrupted_fallback_is_recovered_only_past_its_guards(self):
         # stall '1': interrupted mid-loop with the core halted by it; 'early': before its guards printed, with a
         # core that halted by itself meanwhile, which no recovery may resume
@@ -868,7 +1044,7 @@ class PcSampleOpenOCDTest(FakeToolsCase):
     def halt_with_signal(self, raises):
         """halt_reads over a session that takes SIGTERM; raises: the failure it then ends with."""
         def batch(body, timeout):
-            os.kill(os.getpid(), signal.SIGTERM)
+            signal.raise_signal(signal.SIGTERM)    # os.kill would terminate the process on Windows
             if raises:
                 raise raises
             return 'R DHCSR 0x01010001\nGUARDED\nH 0x08001000\nR DHCSR 0x01010001\n', \
@@ -925,7 +1101,7 @@ class PcSampleOpenOCDTest(FakeToolsCase):
 
         def kill(proc):
             procs.append(proc)
-            os.kill(os.getpid(), signal.SIGTERM)    # lands during the timeout's cleanup, before the kill
+            signal.raise_signal(signal.SIGTERM)    # lands during the timeout's cleanup, before the kill
             real_kill(proc)
         with mock.patch.object(subprocess.Popen, 'kill', kill):
             with self.assertRaises(Stop) as cm:
@@ -933,6 +1109,32 @@ class PcSampleOpenOCDTest(FakeToolsCase):
                                 1)
         self.assertIn('GUARDED', cm.exception.text)
         self.assertIsNotNone(procs[-1].poll())
+
+    def test_run_returns_lf_text(self):
+        # a tool's Windows output is CRLF; the session parsers anchor on $, which matches before \n only
+        tool = 'import os, sys; sys.stdout.buffer.write(b"R DHCSR 0x01010001" + os.linesep.encode())'
+        text = probe_state.run([sys.executable, '-c', tool], 30)
+        self.assertEqual(text, 'R DHCSR 0x01010001\n')
+        self.assertEqual(probe_state._OCD_READ_RE.findall(text), [('DHCSR', '0x01010001')])
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX run() kills the tool alone, as before')
+    def test_a_hung_tool_is_killed_with_its_children(self):
+        import ctypes
+        pidfile = self.d / 'grandchild'
+        tool = (f'import subprocess, sys, time; p = subprocess.Popen([sys.executable, "-c", "import time; '
+                f'time.sleep(60)"]); open({str(pidfile)!r}, "w").write(str(p.pid)); time.sleep(60)')
+        with self.assertRaisesRegex(probe_state.ToolError, 'did not finish within'):
+            probe_state.run([sys.executable, '-c', tool], 3)
+        pid = int(pidfile.read_text())
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x1000, False, pid)    # PROCESS_QUERY_LIMITED_INFORMATION
+        code = ctypes.c_ulong()
+        if handle:
+            k32.GetExitCodeProcess(handle, ctypes.byref(code))
+            k32.CloseHandle(handle)
+        if handle and code.value == 259:    # STILL_ACTIVE
+            subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True)
+            self.fail('the grandchild outlived the timeout')
 
     def test_a_multi_core_or_newly_halted_target_is_refused(self):
         r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF',
@@ -1429,10 +1631,11 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertEqual(out['exprs'][1], {'expr': 'x', 'output': '3'})
         self.assertEqual(out['gdbStderr'], ['Division by zero'])
 
-    def interrupt(self, board, until, *args, signals=(signal.SIGTERM,), **env):
+    def interrupt(self, board, until, *args, signals=(signal.SIGTERM,), gap=0.05, **env):
         rc, stdout, stderr = self.signal_when(
             [str(AUTOPSY), '--hil-config', str(self.config), '--board', board, '--elf', str(self.elf),
-             '--out', str(self.d / 'out'), *args], lambda: self.log.exists() and until(self.sessions()), env, signals)
+             '--out', str(self.d / 'out'), *args], lambda: self.log.exists() and until(self.sessions()), env, signals,
+            gap)
         return rc, json.loads(stdout), stderr
 
     def test_a_signal_after_the_anchor_still_reaches_the_end_anchor(self):
@@ -1486,8 +1689,11 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertEqual((self.d / 'state').read_text(), '01010001')
 
     def test_signals_still_run_cleanup_and_the_end_anchor(self):
+        # each session takes 0.5 s, so the second signal lands in the cleanup, after the first one's handler ran:
+        # two deliveries before Python runs the handler count once
         rc, out, stderr = self.interrupt('max32', lambda ss: any(s['script'] == 'gdb' for s in ss),
-                                         signals=(signal.SIGTERM, signal.SIGTERM), FAKE_GDB_HANG_ATTACHED='1')
+                                         signals=(signal.SIGTERM, signal.SIGTERM), gap=0.3,
+                                         FAKE_GDB_HANG_ATTACHED='1', FAKE_OPENOCD_SLEEP='0.5')
         self.assertEqual(rc, 3, stderr)
         self.assertIn('interrupted by signal 15, 15', out['error'])
         self.assertTrue(out['restored'])

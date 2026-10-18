@@ -84,17 +84,17 @@ import math
 import os
 import re
 import shlex
-import shutil
 import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HALT_WAIT_MS, HIL_PROBE_ROUTES, SENTINEL,  # noqa: E402
-                       SPEED_RE, ToolError, hil_flasher, hil_jlink_device)
+                       SPEED_RE, ToolError, hil_flasher, hil_jlink_device, which)
 
 CPUID = 0xE000ED00
 # FP_CTRL (ARMv7-M C1-906, Armv8-M D1.2.109) and BP_CTRL (ARMv6-M C1-352) share the address
@@ -339,7 +339,7 @@ class HaltRefused(ToolError):
 
 def tool(env, posix, windows=None):
     name = os.environ.get(env) or (windows if os.name == 'nt' and windows else posix)
-    exe = shutil.which(name)
+    exe = which(name)
     if not exe:
         raise ToolError(f'{name} not found - install it or set {env}')
     return exe
@@ -348,13 +348,61 @@ def tool(env, posix, windows=None):
 _running = []    # the tool run() waits on, for a signal handler that stops it rather than raising
 
 
+def kill(proc):
+    """Kill the tool; on Windows its whole process tree, which TerminateProcess alone would leave running."""
+    if os.name == 'nt':
+        try:
+            subprocess.run([os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe'),
+                            '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass    # proc.kill() below still stops the tool itself
+    proc.kill()
+
+
+def ansi_codec():
+    import ctypes    # Windows only, like the callers
+    return f'cp{ctypes.windll.kernel32.GetACP()}'
+
+
+def short_path(path):
+    """The 8.3 form of an existing path on Windows, or path itself when the volume has none."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    n = k32.GetShortPathNameW(path, None, 0)
+    buf = ctypes.create_unicode_buffer(n or 1)
+    return buf.value if n and k32.GetShortPathNameW(path, buf, n) else path
+
+
+def ansi_path(path):
+    """path as openocd.exe, a program of the ANSI code page, receives and opens it: as it is, else its 8.3 form;
+    a character outside that code page would reach it as '?'."""
+    codec = ansi_codec()
+    for form in (path, short_path(path)):
+        try:
+            form.encode(codec)
+            return form
+        except UnicodeEncodeError:
+            pass
+    raise ToolError(f'temporary file {path!r} is outside the ANSI code page ({codec}) openocd.exe takes its '
+                    f'arguments in, and has no 8.3 short name: set TMPDIR to a directory that is not')
+
+
 def stop_running():
-    """Kill the tool run() is waiting on; run() then fails with its output (safe in a signal handler)."""
+    """Kill the tool run() is waiting on; run() then fails with its output. Called from a signal handler: on
+    Windows its taskkill may block that handler up to 10 s."""
     for proc in list(_running):
         try:
-            proc.kill()
+            kill(proc)
         except OSError:
             pass
+
+
+def feed(pipe, data):
+    try:
+        pipe.write(data)
+        pipe.close()
+    except (OSError, ValueError):
+        pass    # the tool exited, or was killed, before it read everything
 
 
 def run(cmd, timeout, stdin=None):
@@ -365,9 +413,16 @@ def run(cmd, timeout, stdin=None):
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
                                 stdout=out, stderr=subprocess.STDOUT)
         _running.append(proc)
-        caught = None
+        caught, feeder = None, None
         try:
-            proc.communicate(None if stdin is None else stdin.encode(), timeout=timeout)
+            if os.name == 'nt' and stdin is not None:
+                # communicate() on Windows writes stdin in this thread, outside its timeout
+                thread = threading.Thread(target=feed, args=(proc.stdin, stdin.encode()), daemon=True)
+                thread.start()
+                feeder = thread    # only once started: the cleanup below joins it
+                proc.wait(timeout=timeout)
+            else:
+                proc.communicate(None if stdin is None else stdin.encode(), timeout=timeout)
         except BaseException as e:
             caught = e
         while True:
@@ -375,12 +430,16 @@ def run(cmd, timeout, stdin=None):
             # is never left running and its output never lost
             try:
                 if proc.poll() is None:
-                    proc.kill()
+                    kill(proc)
                 proc.wait()
-                if proc.stdin:
+                if feeder:
+                    feeder.join(5)
+                if proc.stdin and not (feeder and feeder.is_alive()):
                     proc.stdin.close()
                 out.seek(0)
                 text = out.read().decode(errors='replace')
+                if os.name == 'nt':
+                    text = text.replace('\r\n', '\n')    # the tools' text-mode output; the parsers match on \n
                 break
             except BaseException as e:
                 caught = e
@@ -545,7 +604,22 @@ class OpenOCD:
                 f'if {{[catch {{\n{body}\n}} err]}} {{echo "ERROR [string map {{"\\n" " | "}} $err]"}}\nshutdown')
 
     def batch(self, body, timeout):
-        text = run(self.cmd + ['-c', self.script(body)], timeout)
+        # The script goes in a file: as one -c argument a long capture overflows the command line (32767
+        # characters on Windows, 128 KiB per argument on Linux). OpenOCD runs `-f F` as `script {F}`, which
+        # sources it at global level as -c would run it; a brace in the path would break that quoting.
+        fd, path = tempfile.mkstemp(prefix='probe_state.', suffix='.tcl')
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(self.script(body).encode())
+            name = ansi_path(path).replace('\\', '/') if os.name == 'nt' else path
+            if '{' in name or '}' in name:
+                raise ToolError(f'temporary file {name!r} has a brace, which OpenOCD -f cannot quote: set TMPDIR')
+            text = run(self.cmd + ['-f', name], timeout)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         err = re.search(r'^ERROR (.*)$', text, re.M)
         if err:
             failure = ToolError(f'openocd: {err.group(1)}')

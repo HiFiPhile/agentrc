@@ -47,6 +47,22 @@ class ToolError(RuntimeError):
     pass
 
 
+def which(name):
+    """shutil.which, except that on Windows a bare name is looked up on PATH only: shutil.which and
+    CreateProcess both try the current directory first, which may be a checkout under test."""
+    if os.name != 'nt' or os.path.dirname(name):
+        return shutil.which(name)
+    exts = [''] if os.path.splitext(name)[1].lower() in ('.exe', '.cmd', '.bat') else ['.exe', '.cmd', '.bat']
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        if not (os.path.isabs(d) and os.path.splitdrive(d)[0]):
+            continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
+        for e in exts:
+            path = os.path.join(d, name + e)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
 def probe_state_module():
     # run as a script, this module is __main__: register it so probe_state's import shares ToolError
     sys.modules.setdefault('pc_sample', sys.modules[__name__])
@@ -74,12 +90,12 @@ def symbolize(addr2line, elf, pcs, timeout):
     """{pc: (func, 'file:line')} for the given PCs; a PC addr2line cannot place is ('??', '')."""
     if not pcs:
         return {}
-    exe = shutil.which(addr2line)
+    exe = which(addr2line)
     if not exe:
         raise ToolError(f'{addr2line} not on PATH')
     cmd = [exe, '-e', elf, '-f', '-C'] + [f'0x{pc:08x}' for pc in pcs]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='replace', timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise ToolError(f'{addr2line} did not finish within {timeout:.0f} s') from e
     if r.returncode != 0:
@@ -131,7 +147,7 @@ def hil_flasher(path, board):
     flasher.name must be there, what else is missing is the caller's to supply. Raises
     ValueError. Kept identical in rtt.py and pc_sample.py, which are copied around alone."""
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8-sig') as f:
             config = json.load(f)
     except (OSError, ValueError) as e:
         raise ValueError(f'--hil-config {path}: {e}')
@@ -255,7 +271,7 @@ def main(argv=None):
     try:
         pcs, dhcsr, others = sample(backend, a.samples, a.interval_ms, timeout)
         if a.raw:
-            with open(a.raw, 'w') as f:
+            with open(a.raw, 'w', newline='\n') as f:
                 f.writelines(f'{pc:08x}\n' for pc in pcs)
         found_running = not (dhcsr[0] | dhcsr[1]) & (1 << 17)
         if a.halt_samples and found_running and not any(pc not in (0, SENTINEL) for pc in pcs):
@@ -285,4 +301,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':    # symbols and paths from the ELF are UTF-8; the console code page may not hold them
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())

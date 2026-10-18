@@ -4,10 +4,18 @@
   esp_verify.py --manifest <build>/flasher_args.json --chip esp32p4 \
       --port /dev/serial/by-id/<port> --before default-reset --after hard-reset [--timeout S]
 
-ESP_VERIFY_ESPTOOL is a command line (e.g. '/path/to/python -m esptool'); otherwise
-use esptool on PATH. The command/output contract is esptool 5.5.0 from ESP-IDF 6.1.
+ESP_VERIFY_ESPTOOL is a command line (e.g. '/path/to/python -m esptool'), split with POSIX
+shell rules, or on Windows with the native ones (CommandLineToArgvW, so a path keeps its
+backslashes); otherwise use esptool on PATH (on Windows esptool.exe, .cmd or .bat on PATH, never
+the cwd's). A .cmd or .bat runs under cmd.exe, which alters a %, ^, & or ! in the arguments, and a
+standalone esptool.exe echoes the snapshot paths in the ANSI code page: a temp directory outside it
+fails the run (exit 3), so set TMPDIR to one inside it.
+The command/output contract is esptool 5.5.0 from ESP-IDF 6.1.
 Reset policies are required, never taken from the manifest. No retry is made. esptool is
 killed after --timeout seconds (default 300), a tool failure that leaves the chip state unknown.
+--port is /dev/serial/by-id or by-path on POSIX, since ttyACM/ttyUSB numbers drift with
+enumeration order; on Windows COM<n> or \\\\.\\COM<n>, a number Windows keeps per device instance, passed
+to esptool as COM<n>: it finds a USB-Serial-JTAG port, and its reset sequence, only by that name.
 Port ownership is the caller's board lock, not checked here: esptool's pyserial
 exclusive=True uses advisory flock on POSIX and cannot exclude other readers
 (esptool/loader.py:453-465; serial/serialposix.py:382-389). Stop console readers.
@@ -52,12 +60,15 @@ FLASH_VALUES = {
 BEFORE = ('default-reset', 'usb-reset', 'no-reset', 'no-reset-no-sync')
 AFTER = ('hard-reset', 'soft-reset', 'no-reset', 'no-reset-stub', 'watchdog-reset')
 PORT = re.compile(r'/dev/serial/(by-id|by-path)/[^/\x00-\x20]+')
+# Windows keeps a COM number per device instance (its serial number or hub port), unlike Linux tty numbers
+COM_PORT = re.compile(r'(?:\\\\\.\\)?COM([1-9][0-9]*)', re.IGNORECASE)
 OFFSET = re.compile(r'(0[xX][0-9a-fA-F]+|[0-9]+)')
 HEADER = re.compile(r"Verifying (0x[0-9a-f]+) \(([0-9]+)\) bytes at "
                     r"(0x[0-9a-f]+) in flash against '(.+)'\.\.\.")
 VERDICTS = {'Verification successful (digest matched).': 'match',
             'Verification failed (digest mismatch).': 'mismatch'}
 MISMATCH_ERROR = 'ERROR: A fatal error occurred: Verification failed.'
+KILLED_DRAIN_S = 5    # Windows: how long a killed esptool's output may take to reach EOF
 
 
 class JsonParser(argparse.ArgumentParser):
@@ -74,8 +85,96 @@ def unique_object(pairs):
     return obj
 
 
+def split_command(line):
+    if os.name != 'nt':
+        return shlex.split(line)
+    # the native rules: POSIX shlex would eat the backslashes of a Windows path
+    import ctypes
+    from ctypes import wintypes
+    line = line.lstrip()
+    if not line:    # CommandLineToArgvW('') returns this process's own path
+        return []
+    shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int))
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel32.LocalFree.argtypes = (wintypes.HLOCAL,)
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    argc = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW(line, ctypes.byref(argc))
+    if not argv:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        kernel32.LocalFree(ctypes.cast(argv, ctypes.c_void_p))
+
+
+def find_tool(name):
+    if os.name != 'nt':
+        return name if shutil.which(name) else None
+    # Windows: the file with its extension, since CreateProcess adds only .exe; a bare name on PATH only,
+    # since shutil.which and CreateProcess search the cwd (perhaps a checkout) first
+    exts = ('',) if name.lower().endswith(('.exe', '.cmd', '.bat')) else ('.exe', '.cmd', '.bat')
+    # '.', 'bin', '\bin' or an empty entry would name a directory of the cwd or its drive
+    dirs = [''] if os.path.dirname(name) else [d for d in os.environ.get('PATH', '').split(os.pathsep)
+                                               if os.path.isabs(d) and os.path.splitdrive(d)[0]]
+    for directory in dirs:
+        for ext in exts:
+            if os.path.isfile(os.path.join(directory, name + ext)):
+                return os.path.join(directory, name + ext)
+    return None
+
+
+def decode_nt(output):
+    """Tool output as text, line by line: UTF-8 (PYTHONIOENCODING), else the ANSI code page, which a
+    standalone (PyInstaller) esptool.exe writes whatever PYTHONIOENCODING says; newlines as text mode reads."""
+    if output is None:
+        return None
+    lines = []
+    for line in output.splitlines(keepends=True):
+        try:
+            lines.append(line.decode('utf-8'))
+        except UnicodeDecodeError:
+            lines.append(line.decode('mbcs', errors='replace'))
+    return ''.join(lines).replace('\r\n', '\n').replace('\r', '\n')
+
+
+def run_tool(command, env, timeout):
+    if os.name != 'nt':
+        return subprocess.run(command, capture_output=True, text=True, errors='replace', env=env, timeout=timeout)
+    # Windows: a timeout kills the tree: a venv python.exe is a launcher whose child interpreter holds the
+    # pipes, so killing the launcher alone leaves communicate() waiting.
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          env={**env, 'PYTHONIOENCODING': 'utf-8'}) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            taskkill = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
+            try:
+                subprocess.run([taskkill, '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass    # still kill the tool itself, or Popen's exit waits on it
+            proc.kill()
+            try:
+                exc.stdout, exc.stderr = proc.communicate(timeout=KILLED_DRAIN_S)
+            except subprocess.TimeoutExpired:
+                # a descendant taskkill missed holds the pipes: their reader threads return the output only at
+                # EOF, and closing a pipe one of them reads blocks as well, so Popen's exit must not close them
+                proc.stdout = proc.stderr = None
+                exc.survivor = True
+            exc.stdout, exc.stderr = decode_nt(exc.stdout), decode_nt(exc.stderr)
+            raise
+    return subprocess.CompletedProcess(command, proc.returncode, decode_nt(stdout), decode_nt(stderr))
+
+
+def as_text(output):
+    # a POSIX timeout gives the raw bytes, text=True notwithstanding; Windows' run_tool gives str
+    return output.decode(errors='replace') if isinstance(output, bytes) else output or ''
+
+
 def load_manifest(path, chip):
-    manifest = json.loads(path.read_text(), object_pairs_hook=unique_object)
+    manifest = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=unique_object)
     if not isinstance(manifest, dict):
         raise ValueError('manifest must be an object')
     extra = manifest.get('extra_esptool_args')
@@ -179,12 +278,22 @@ def main(argv=None):
             raise ValueError('--timeout must be a finite positive number of seconds')
         if not re.fullmatch(r'esp(?:32[a-z0-9]*|8266)', args.chip):
             raise ValueError('--chip must name an explicit ESP chip, not auto')
-        if not PORT.fullmatch(args.port) or args.port.rsplit('/', 1)[-1] in ('.', '..'):
+        if os.name == 'nt':
+            com = COM_PORT.fullmatch(args.port)
+            if not com:
+                raise ValueError(r'--port must be COM<n> or \\.\COM<n>; Windows keeps that number per device '
+                                 'instance, unlike drifting Linux tty numbers')
+            # esptool finds a USB-Serial-JTAG device by an exact match with pyserial's COM<n> (esp_pylib
+            # get_port_vid_pid) and resets any other name with a UART bridge's sequence
+            args.port = 'COM' + com.group(1)
+        elif not PORT.fullmatch(args.port) or args.port.rsplit('/', 1)[-1] in ('.', '..'):
             raise ValueError('--port must use /dev/serial/by-id or by-path; ttyACM/ttyUSB numbers drift')
         images, payloads, settings, stub = load_manifest(args.manifest.resolve(), args.chip)
-        command = shlex.split(os.environ.get('ESP_VERIFY_ESPTOOL', 'esptool'))
-        if not command or not shutil.which(command[0]):
+        command = split_command(os.environ.get('ESP_VERIFY_ESPTOOL', 'esptool'))
+        tool = find_tool(command[0]) if command else None
+        if not tool:
             raise ValueError('esptool not found: set ESP_VERIFY_ESPTOOL or put esptool on PATH')
+        command[0] = tool
         result.update(manifest=str(args.manifest.resolve()), chip=args.chip, port=args.port,
                       before=args.before, after=args.after, stub=stub, flash_settings=settings, ranges=images)
     except (ValueError, OSError) as exc:
@@ -213,12 +322,12 @@ def main(argv=None):
             result['command'] = command
             env = {**os.environ, 'ESPTOOL_OPEN_PORT_ATTEMPTS': '1', 'NO_COLOR': '1'}
             try:
-                proc = subprocess.run(command, capture_output=True, text=True, errors='replace', env=env,
-                                      timeout=args.timeout)
+                proc = run_tool(command, env, args.timeout)
             except subprocess.TimeoutExpired as exc:
-                # on POSIX a timeout's output is the raw bytes, text=True notwithstanding
-                result.update(tool_exit=None, stdout=(exc.stdout or b'').decode(errors='replace'),
-                              stderr=(exc.stderr or b'').decode(errors='replace'))
+                result.update(tool_exit=None, stdout=as_text(exc.stdout), stderr=as_text(exc.stderr))
+                if getattr(exc, 'survivor', False):
+                    raise ValueError(f'esptool did not finish within {args.timeout:g} s; it was killed, but a '
+                                     f'process it started survived and may still hold {args.port}') from exc
                 raise ValueError(f'esptool did not finish within {args.timeout:g} s and was killed') from exc
             result.update(tool_exit=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
             output = proc.stdout + '\n' + proc.stderr
