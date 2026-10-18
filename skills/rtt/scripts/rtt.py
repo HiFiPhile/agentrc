@@ -56,8 +56,9 @@ def _tool_exe(env_name: str, posix_name: str, windows_name: str = None) -> str:
 
 
 def _resolve_exe(name: str) -> str:
-    """The program to start for `name`. Windows: a bare name is looked up on PATH only
-    (.exe first) -- CreateProcess would search python's dir and the cwd, where a
+    """The program to start for `name`. Windows: a bare name is looked up on PATH only,
+    as `.exe` like CreateProcess (a .cmd would run under cmd.exe, which answers the console
+    break with a prompt) -- CreateProcess would search python's dir and the cwd, where a
     checkout's JLink.exe or openocd.exe would run instead. POSIX: execvp's lookup."""
     if not IS_WINDOWS or os.path.dirname(name):
         return name
@@ -65,9 +66,8 @@ def _resolve_exe(name: str) -> str:
     for d in os.environ.get('PATH', '').split(os.pathsep):
         if not (os.path.isabs(d) and os.path.splitdrive(d)[0]):
             continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
-        for e in (ext,) if ext else ('.exe', '.cmd', '.bat'):
-            if os.path.isfile(os.path.join(d, base + e)):
-                return os.path.join(d, base + e)
+        if os.path.isfile(os.path.join(d, base + (ext or '.exe'))):
+            return os.path.join(d, base + (ext or '.exe'))
     raise FileNotFoundError(errno.ENOENT, f'{name} not on PATH', name)
 
 
@@ -232,7 +232,7 @@ def nm_rtt_addr(elf: str, nm: str = None, stop=None) -> int:
     out when nm cannot read the file (another architecture, no toolchain)."""
     nm = nm or os.environ.get('RTT_NM', 'arm-none-eabi-nm')
     try:
-        cmd = [nm, elf]
+        cmd = [_resolve_exe(nm), elf]
         if stop is None:
             # errors='replace': an undecodable byte must not crash the check (on Windows
             # its reader thread died and left stdout/stderr None)
@@ -492,8 +492,10 @@ class _SocketRtt:
                 raise RttError(f'RTT console write failed after {sent}/{len(data)} bytes: {e}') from e
         return sent
 
-    def _gentle_stop(self, proc) -> None:
-        """Subclass hook: ask the server to exit before the group takedown."""
+    def _gentle_stop(self, proc) -> bool:
+        """Subclass hook: ask the server to exit before the group takedown. False = no
+        such channel: close() goes straight to the group's stop signal."""
+        return False
 
     def close(self) -> None:
         self._eof = True   # latch: post-close eof reads True, like a hung-up server
@@ -507,9 +509,9 @@ class _SocketRtt:
             if proc.poll() is None:
                 # the same ladder on every OS: the server's own exit first (it owns the
                 # probe, and killed mid-session it can leave the target halted)
-                self._gentle_stop(proc)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=5)
+                if self._gentle_stop(proc):
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=5)
         if proc and proc.poll() is None:
             # The server owns a separate POSIX session or Windows process group.
             # Retire it before returning so it cannot hold the probe for the next run;
@@ -592,7 +594,7 @@ class JlinkRtt(_SocketRtt):
         self._spawn(cmd, stdin=subprocess.PIPE)
         self._connect(port, stop=stop)
 
-    def _gentle_stop(self, proc) -> None:
+    def _gentle_stop(self, proc) -> bool:
         with contextlib.suppress(OSError, ValueError):
             proc.stdin.write(b'exit\n')
             proc.stdin.flush()
@@ -600,6 +602,7 @@ class JlinkRtt(_SocketRtt):
         # not skip it (the base close also closes it for the server-already-dead path)
         with contextlib.suppress(OSError, ValueError):
             proc.stdin.close()
+        return True
 
 
 class OpenocdRtt(_SocketRtt):
@@ -657,15 +660,9 @@ class OpenocdRtt(_SocketRtt):
         cmd += ['-c', f'rtt setup 0x{addr:x} 0x800 "SEGGER RTT"',
                 '-c', 'rtt polling_interval 1', '-c', 'rtt start',
                 '-c', f'rtt server start {port} {channel}']
+        # no _gentle_stop: openocd has no stdin to ask it to exit, and keeps listening after the client goes
         self._spawn(cmd)
         self._connect(port, stop=stop)
-
-    def _gentle_stop(self, proc) -> None:
-        # no stdin channel to ask openocd to exit, and it keeps its listener up after
-        # the client disconnects: go straight to the group takedown (SIGTERM, or
-        # CTRL_BREAK on Windows) instead of blocking the base class's 5 s wait on a
-        # process that has no reason to leave
-        _terminate_process_group(proc, force=False)
 
 
 def _mem32_words(stdout: str) -> dict:
@@ -1115,6 +1112,9 @@ if __name__ == '__main__':
     if IS_WINDOWS:
         # messages, help and server log tails in UTF-8, not the ANSI code page (target
         # bytes go to stdout.buffer untouched)
-        sys.stdout.reconfigure(encoding='utf-8')
-        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
+        # None under pythonw or a DETACHED_PROCESS parent
+        if sys.stdout:
+            sys.stdout.reconfigure(encoding='utf-8')
+        if sys.stderr:
+            sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())

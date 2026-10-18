@@ -1,6 +1,7 @@
 """Tests for the rtt skill's rtt.py: the JlinkRtt and OpenocdRtt console
 classes and the CLI, against a fake JLinkExe or openocd named by RTT_JLINK_EXE /
-RTT_OPENOCD_EXE -- real subprocesses and sockets, no hardware, stdlib only."""
+RTT_OPENOCD_EXE -- real subprocesses and sockets, no hardware, stdlib only (on
+Windows the stubs need pip's vendored distlib; without it their tests skip)."""
 import contextlib
 import importlib.util
 import io
@@ -26,15 +27,17 @@ rtt = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = rtt
 _spec.loader.exec_module(rtt)
 
-_no_tools = tempfile.TemporaryDirectory()
-_no_tools_env = mock.patch.dict(os.environ, {
-    'RTT_JLINK_EXE': os.path.join(_no_tools.name, 'no-JLinkExe'),
-    'RTT_OPENOCD_EXE': os.path.join(_no_tools.name, 'no-openocd')})
+_no_tools = _no_tools_env = None
 
 
 def setUpModule():
     # every server a test does not stub resolves to an absent path: a run that should
     # have been refused fails to start, never reaching a real probe tool on PATH
+    global _no_tools, _no_tools_env
+    _no_tools = tempfile.TemporaryDirectory()
+    _no_tools_env = mock.patch.dict(os.environ, {
+        'RTT_JLINK_EXE': os.path.join(_no_tools.name, 'no-JLinkExe'),
+        'RTT_OPENOCD_EXE': os.path.join(_no_tools.name, 'no-openocd')})
     _no_tools_env.start()
 
 
@@ -52,7 +55,10 @@ def make_stub(bin_dir, name, source):
         script.write_text(f'#!{sys.executable}\n{source}', encoding='utf-8')
         script.chmod(0o755)
         return script
-    from pip._vendor.distlib.scripts import ScriptMaker
+    try:
+        from pip._vendor.distlib.scripts import ScriptMaker
+    except ImportError:
+        raise unittest.SkipTest('Windows stubs need pip (its vendored distlib launcher)')
     source_dir = bin_dir / f'{name}-source'
     source_dir.mkdir()
     (source_dir / name).write_text(f'#!python\n{source}', encoding='utf-8')
@@ -85,6 +91,14 @@ def pid_alive(pid):
         ctypes.windll.kernel32.CloseHandle(handle)
 
 
+def skip_without_a_shared_console(test):
+    # Windows' stop signal is a console break, which reaches a server only through a console we share
+    if os.name == 'nt':
+        import ctypes
+        if ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint32 * 1)(), 1) == 0:
+            test.skipTest('this runner has no console for the server to share')
+
+
 # what close() sends a server after its gentle stop: on Windows a console break
 STOP_SIGNAL = 'SIGBREAK' if os.name == 'nt' else 'SIGTERM'
 
@@ -99,8 +113,11 @@ port = int(sys.argv[sys.argv.index('-RTTTelnetPort') + 1])
 if os.environ.get('FAKE_JLINK_PIDFILE'):
     open(os.environ['FAKE_JLINK_PIDFILE'], 'w').write(str(os.getpid()))
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(('127.0.0.1', port)); srv.listen(1)
 mode = os.environ.get('FAKE_JLINK_MODE', '')
+if mode == 'deaf':
+    # a small, fixed receive window: the client's writes stall once its send buffer is full
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+srv.bind(('127.0.0.1', port)); srv.listen(1)
 if mode == 'ignore_exit':
     signal.signal(getattr(signal, 'SIGBREAK', signal.SIGTERM), lambda *_: os._exit(0))
 def serve():
@@ -115,6 +132,8 @@ def serve():
             if not conn.recv(4096): os._exit(0)
     if mode == 'deaf':
         conn.sendall(b'hello from target\\r\\n')
+        if os.environ.get('FAKE_JLINK_CONNECTED'):
+            open(os.environ['FAKE_JLINK_CONNECTED'], 'w').close()
         time.sleep(600)   # never reads: the client's writes back up
     if mode == 'rst':
         import struct
@@ -150,7 +169,14 @@ def serve():
         d = conn.recv(4096)
         if not d: return
         conn.sendall(d.upper())
-threading.Thread(target=serve, daemon=True).start()
+def serve_quietly():
+    # a client that closes with the greeting unread resets the connection, and a traceback
+    # still printing when 'exit' ends the interpreter can abort it (_enter_buffered_busy)
+    try:
+        serve()
+    except OSError:
+        pass
+threading.Thread(target=serve_quietly, daemon=True).start()
 for line in sys.stdin:
     if line.strip() == 'exit' and mode != 'ignore_exit': break
 while mode == 'ignore_exit':
@@ -287,6 +313,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)   # it left on 'exit', nothing killed it
 
     def test_close_signals_a_commander_that_misses_exit_before_killing_it(self):
+        skip_without_a_shared_console(self)
         con = self._console(mode='ignore_exit')
         self._read_until(con, b'hello from target')
         proc = con._proc
@@ -496,30 +523,36 @@ class JlinkRttFakeProbe(unittest.TestCase):
         self.assertIn(b'hello from target', r.stdout)
 
     def test_cli_a_write_under_way_when_the_capture_ends_still_decides_the_result(self):
-        # the capture window closes long before the stalled write gives up
-        env = dict(os.environ, **self._env, FAKE_JLINK_MODE='deaf', HIL_SERIAL_WRITE_TIMEOUT='2')
+        # the capture window closes long before the stalled write gives up, which it must do within
+        # a second: Windows then grows the stalled socket's send buffer and lets the write through
+        env = dict(os.environ, **self._env, FAKE_JLINK_MODE='deaf', HIL_SERIAL_WRITE_TIMEOUT='0.6')
         with tempfile.TemporaryFile() as flood:
             flood.write(b'x' * (32 << 20))
             flood.seek(0)
             r = subprocess.run([sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
-                                '--device', 'FAKE', *LINK, '--seconds', '0.3', '-i'],
+                                '--device', 'FAKE', *LINK, '--seconds', '0.1', '-i'],
                                stdin=flood, capture_output=True, timeout=60, env=env)
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn(b'rtt: -i input did not reach the target: RTT console write stalled', r.stderr)
 
     def test_cli_a_term_while_waiting_out_a_write_still_closes_the_server(self):
+        skip_without_a_shared_console(self)
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryFile() as flood:
-            pidfile = Path(d) / 'server.pid'
-            env = dict(os.environ, **self._env, FAKE_JLINK_MODE='deaf', HIL_SERIAL_WRITE_TIMEOUT='3',
-                       FAKE_JLINK_PIDFILE=str(pidfile))
+            pidfile, connected = Path(d) / 'server.pid', Path(d) / 'connected'
+            # the write gives up before Windows grows its send buffer (see above)
+            env = dict(os.environ, **self._env, FAKE_JLINK_MODE='deaf', HIL_SERIAL_WRITE_TIMEOUT='0.6',
+                       FAKE_JLINK_PIDFILE=str(pidfile), FAKE_JLINK_CONNECTED=str(connected))
             flood.write(b'x' * (32 << 20))
             flood.seek(0)
             # Windows' TERM is a console break, which reaches only a process group of its own
             p = subprocess.Popen([sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
-                                  '--device', 'FAKE', *LINK, '--seconds', '0.3', '-i'],
+                                  '--device', 'FAKE', *LINK, '--seconds', '0.1', '-i'],
                                  stdin=flood, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
                                  **rtt._popen_group_options() if os.name == 'nt' else {})
-            time.sleep(1.5)                 # the window is over, the stalled write is not
+            deadline = time.monotonic() + 30
+            while not connected.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.3)                 # the window is over, the stalled write is not
             p.send_signal(signal.CTRL_BREAK_EVENT if os.name == 'nt' else signal.SIGTERM)
             _, err = p.communicate(timeout=60)
             server = int(pidfile.read_text())
@@ -906,6 +939,7 @@ class OpenocdRttFakeProbe(unittest.TestCase):
             con.write(b'x')                    # same post-close contract as JlinkRtt
 
     def test_close_signals_a_server_that_outlives_its_client_before_killing_it(self):
+        skip_without_a_shared_console(self)
         self._fake_tool()
         with mock.patch.dict(os.environ, FAKE_OPENOCD_MODE='linger'):
             con = rtt.OpenocdRtt('-f fake.cfg', 0x20000000, 0, serial_no='000')
@@ -1012,26 +1046,34 @@ class RttPlatformLifecycle(unittest.TestCase):
 
             def _gentle_stop(self, proc):
                 self.calls.append('gentle')
+                return True
 
-        for windows in (True, False):
-            calls = []
-            con = FakeConsole(FakeProc(), calls)
-            with mock.patch.object(rtt, 'IS_WINDOWS', windows), \
-                 mock.patch.object(rtt, '_terminate_process_group',
-                                   side_effect=lambda _p, force: calls.append(('group', force))):
-                con.close()
-            self.assertEqual(calls, ['gentle', ('group', False), ('group', True)], windows)
+        def openocd(proc, _calls):
+            con = rtt.OpenocdRtt.__new__(rtt.OpenocdRtt)
+            rtt._SocketRtt.__init__(con)
+            con._proc = proc
+            return con
+
+        # openocd has no exit channel: its ladder starts at the stop signal, sent once
+        for make, want in ((FakeConsole, ['gentle', ('group', False), ('group', True)]),
+                           (openocd, [('group', False), ('group', True)])):
+            for windows in (True, False):
+                calls = []
+                con = make(FakeProc(), calls)
+                with mock.patch.object(rtt, 'IS_WINDOWS', windows), \
+                     mock.patch.object(rtt, '_terminate_process_group',
+                                       side_effect=lambda _p, force: calls.append(('group', force))):
+                    con.close()
+                con._proc = None   # the fake never dies: __del__ must not run a real kill ladder on its pid
+                self.assertEqual(calls, want, (make, windows))
 
     @unittest.skipUnless(os.name == 'nt', 'Windows console semantics')
     def test_a_break_goes_only_to_a_server_on_our_console(self):
         code = ('import signal, sys, time; signal.signal(signal.SIGBREAK, lambda *_: sys.exit(7)); '
                 'print("ready", flush=True)\nwhile True: time.sleep(0.05)')
-        import ctypes
-        pids = (ctypes.c_uint32 * 1)()
-        own_console = ctypes.windll.kernel32.GetConsoleProcessList(pids, 1) > 0
         for flags, reaches in ((subprocess.CREATE_NO_WINDOW, False), (0, True)):   # its own console; ours
-            if reaches and not own_console:
-                self.skipTest('this runner has no console for the server to share')
+            if reaches:
+                skip_without_a_shared_console(self)
             proc = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE,
                                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | flags)
             try:
@@ -1071,8 +1113,13 @@ class RttPlatformLifecycle(unittest.TestCase):
             def kill(self):
                 self.killed = True
 
+        def no_ctypes(*_args):
+            # a fresh exception per call: a reused one's traceback would keep this frame, and
+            # `con`, alive until a GC pass inside another test
+            raise ImportError('sys.meta_path is None, Python is likely shutting down')
+
         broken = mock.Mock()
-        broken.WinDLL.side_effect = ImportError('sys.meta_path is None, Python is likely shutting down')
+        broken.WinDLL.side_effect = no_ctypes
         proc = AliveProc()
         with mock.patch.dict(sys.modules, ctypes=broken), \
              mock.patch.object(rtt, 'ctypes', broken, create=True):
@@ -1084,8 +1131,17 @@ class RttPlatformLifecycle(unittest.TestCase):
              mock.patch.object(rtt, 'ctypes', broken, create=True), \
              mock.patch.object(rtt.subprocess, 'run') as taskkill:
             con.close()
+        con._proc = None   # the fake never dies: __del__ must not run a real kill ladder on its pid
         self.assertEqual(taskkill.call_count, 2)   # both rungs fell through to the tree kill
         self.assertTrue(proc.killed)
+
+    def test_nm_is_looked_up_like_the_servers(self):
+        # Windows: on PATH only, never python's dir or the cwd that CreateProcess would search
+        with mock.patch.object(rtt, 'IS_WINDOWS', True), mock.patch.dict(os.environ, {'PATH': ''}), \
+             mock.patch.object(rtt.subprocess, 'run') as run, \
+             self.assertRaisesRegex(SystemExit, 'fake-nm not on PATH'):
+            rtt.nm_rtt_addr('x.elf', nm='fake-nm')
+        run.assert_not_called()
 
     @unittest.skipUnless(os.name == 'nt', 'Windows PATH lookup')
     def test_a_path_entry_without_drive_and_root_is_not_searched(self):
@@ -1104,6 +1160,10 @@ class RttPlatformLifecycle(unittest.TestCase):
                             rtt._resolve_exe('JLink')
                 with mock.patch.dict(os.environ, {'PATH': str(cwd / 'bin')}):
                     self.assertEqual(rtt._resolve_exe('JLink'), os.path.join(cwd / 'bin', 'JLink.exe'))
+                    # a bare name is an .exe, as CreateProcess has it: a .cmd runs under cmd.exe
+                    (cwd / 'bin' / 'openocd.cmd').write_bytes(b'')
+                    with self.assertRaisesRegex(FileNotFoundError, 'not on PATH'):
+                        rtt._resolve_exe('openocd')
             finally:
                 os.chdir(prev)
 
@@ -1270,6 +1330,7 @@ class RttPlatformLifecycle(unittest.TestCase):
 
         proc = InterruptedNm()
         with mock.patch.object(rtt.subprocess, 'Popen', return_value=proc), \
+             mock.patch.object(rtt, '_resolve_exe', lambda name: name), \
              self.assertRaises(KeyboardInterrupt):
             rtt.nm_rtt_addr('fake.elf', nm='fake-nm', stop=lambda: False)
         self.assertTrue(proc.terminated)

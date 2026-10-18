@@ -147,6 +147,53 @@ sys.exit(m.main(sys.argv[1:]))
         self.assertIn('No space left', out['error'])
         self.assertTrue(out['terminalRestored'])
 
+    def test_a_signal_before_the_capture_leaves_no_files(self):
+        # the capture never starts its own handlers here: the signal lands in the window after the files exist
+        run = f'''
+import importlib.util, os, signal, sys
+spec = importlib.util.spec_from_file_location('console_capture', {str(SCRIPT)!r})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.capture_posix = lambda *args: os.kill(os.getpid(), signal.SIGTERM)
+if sys.argv[1] == 'create':    # the signal lands as the first file is made, before main lists it
+    real = open
+    def opening(path, mode='r', *args, **kw):
+        f = real(path, mode, *args, **kw)
+        if mode == 'xb':
+            os.kill(os.getpid(), signal.SIGTERM)
+        return f
+    m.open = opening
+sys.exit(m.main(sys.argv[2:]))
+'''
+        for when in ('create', 'capture'):
+            with self.subTest(when=when):
+                r = subprocess.run([sys.executable, '-c', run, when, '--port', self.port, '--baud', '115200',
+                                    '--out', str(self.out), '--seconds', '0.3', '--lines', 'leave'],
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn('before the capture began', r.stderr)
+                self.assertEqual(list(self.d.iterdir()), [])
+
+    def test_a_signal_as_the_capture_takes_over_ends_it_with_a_summary(self):
+        run = f'''
+import importlib.util, os, signal, sys
+spec = importlib.util.spec_from_file_location('console_capture', {str(SCRIPT)!r})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+real = signal.signal
+def install(sig, handler):
+    old = real(sig, handler)
+    if getattr(handler, '__name__', '') == 'on_signal' and sig == signal.SIGTERM:
+        os.kill(os.getpid(), signal.SIGTERM)    # the moment the capture's own handler is in place
+    return old
+signal.signal = install
+sys.exit(m.main(sys.argv[1:]))
+'''
+        r = subprocess.run([sys.executable, '-c', run, '--port', self.port, '--baud', '115200', '--out', str(self.out),
+                            '--seconds', '5', '--lines', 'leave'], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)['ended'], 'signal 15')
+
     def test_a_port_that_is_not_a_terminal_fails_with_json(self):
         plain = self.d / 'plain'
         plain.write_bytes(b'')
@@ -226,6 +273,8 @@ class FakePort:
     The DTR/RTS levels are modelled: every state the lines may pass through is kept in `reached`, and
     a SetCommState that moves both lines may pass through either intermediate state (kernel32 picks
     the order), so (DTR low, RTS high), which resets an Espressif chip, shows up if any step allows it.
+    `dtr`/`rts` are the levels the driver holds and reports, `wire` what the device sees: like Windows'
+    CDC-ACM driver (ESP32-S3 TRM 33.4.2), a DTR change alone reaches the device only with an RTS write.
     """
 
     def __init__(self, m):
@@ -241,6 +290,7 @@ class FakePort:
         self.timeouts = m.COMMTIMEOUTS(10, 20, 30, 40, 50)
         self.saved_state, self.saved_timeouts = bytes(self.state), bytes(self.timeouts)
         self.dtr, self.rts = True, False    # as the open left them
+        self.wire = self.lines()
         self.reached = []
         self.reports_lines = True
         self.stores_baud = None             # a driver that keeps another rate than the one asked for
@@ -249,6 +299,7 @@ class FakePort:
 
     def opened_at(self, dtr, rts):
         self.dtr, self.rts = dtr, rts
+        self.wire = self.lines()
 
     def patch(self):
         for name in ('nt_port_exists', 'nt_open', 'nt_get_state', 'nt_set_state', 'nt_get_timeouts',
@@ -269,11 +320,14 @@ class FakePort:
     def lines(self):
         return self.dtr, self.rts
 
-    def _move(self, dtr, rts):
-        if dtr != self.dtr and rts != self.rts:
-            self.reached += [(dtr, self.rts), (self.dtr, rts)]
+    def _move(self, dtr, rts, rts_written=True):
         self.dtr, self.rts = dtr, rts
-        self.reached.append((dtr, rts))
+        if not rts_written:
+            return
+        if dtr != self.wire[0] and rts != self.wire[1]:
+            self.reached += [(dtr, self.wire[1]), (self.wire[0], rts)]
+        self.wire = self.lines()
+        self.reached.append(self.wire)
 
     def nt_port_exists(self, name):
         return name in self.exists
@@ -282,7 +336,7 @@ class FakePort:
         self._call('nt_open', device)
         if self.open_error:
             raise self.open_error
-        self.reached.append(self.lines())
+        self.reached.append(self.wire)
         return self.handle
 
     def _h(self, h):
@@ -320,7 +374,7 @@ class FakePort:
         self._h(h)
         self._call('nt_escape', func)
         if func == self.m.CLRDTR:
-            self._move(False, self.rts)
+            self._move(False, self.rts, rts_written=False)
         elif func == self.m.CLRRTS:
             self._move(self.dtr, False)
 
@@ -370,6 +424,7 @@ class SignalArrivesAtTheEnd:
 
 
 RESET = (False, True)    # DTR low, RTS high: an Espressif auto-reset circuit holds EN low
+DOWNLOAD = (True, False)    # DTR high, RTS low: IO0 low, or a USB-Serial-JTAG download flag set
 
 
 @unittest.skipUnless(os.name == 'nt', 'the Win32 backend; the POSIX one has the pty cases')
@@ -474,27 +529,37 @@ class WindowsBackendTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.port.names()[:10], ['nt_open', 'nt_get_state', 'nt_get_timeouts', 'nt_lines',
                                                   'nt_set_state', 'nt_get_state', 'nt_escape', 'nt_escape',
-                                                  'nt_lines', 'nt_set_timeouts'])
+                                                  'nt_escape', 'nt_lines'])
         self.assertEqual((self.configured().fDtrControl, self.configured().fRtsControl), (1, 1))    # held
-        self.assertEqual(self.calls('nt_escape'), [('nt_escape', self.m.CLRRTS), ('nt_escape', self.m.CLRDTR)])
-        self.assertEqual(self.port.reached, [(True, True), (True, True), (True, False), (False, False),
+        # the second CLRRTS carries DTR low to the device
+        self.assertEqual(self.calls('nt_escape'), [('nt_escape', self.m.CLRRTS), ('nt_escape', self.m.CLRDTR),
+                                                   ('nt_escape', self.m.CLRRTS)])
+        self.assertEqual(self.port.reached, [(True, True), (True, True), DOWNLOAD, (False, False),
                                              (False, False)])
         self.assertEqual(out['lines'], {'policy': 'low', 'afterSetup': {'dtr': False, 'rts': False}})
         self.assert_no_reset()
         self.assert_restored_and_closed(out)
         self.assertEqual(self.port.lines(), (False, False))    # the restore did not raise them again
+        self.assertEqual(self.port.wire, (False, False))
 
     def test_lines_low_with_unknown_levels_never_passes_the_reset_state(self):
-        for opened in ((True, True), (False, False), (True, False)):
+        for opened in ((True, True), (False, False), DOWNLOAD, RESET):
             with self.subTest(opened=opened):
                 self.setUp()
                 self.port.reports_lines = False
                 self.port.opened_at(*opened)
                 rc, out, err = self.run_main(lines='low', seconds='0.05')
                 self.assertEqual(rc, 0, err)
-                self.assertEqual((self.configured().fDtrControl, self.configured().fRtsControl), (1, 0))
-                self.assert_no_reset()
+                self.assertEqual((self.configured().fDtrControl, self.configured().fRtsControl), (0, 0))
+                if opened == RESET:
+                    # out of reset with IO0 high (RTS cleared alone), and IO0 never low after it
+                    self.assertEqual(self.port.reached[:2], [RESET, (False, False)])
+                    self.assertNotIn(RESET, self.port.reached[1:])
+                    self.assertNotIn(DOWNLOAD, self.port.reached[1:])
+                else:
+                    self.assert_no_reset()
                 self.assertEqual(self.port.lines(), (False, False))
+                self.assertEqual(self.port.wire, (False, False))
                 restored = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[-1][1])
                 self.assertEqual((restored.fDtrControl, restored.fRtsControl), (0, 0))
 
@@ -505,6 +570,20 @@ class WindowsBackendTest(unittest.TestCase):
         self.assertIn('--lines low refused', out['error'])
         self.assertNotIn('nt_read', self.port.names())
         self.assert_restored_and_closed(out)
+
+    def test_lines_low_with_unknown_levels_refused_when_rts_cannot_be_cleared_first(self):
+        self.port.reports_lines = False
+        self.port.opened_at(*RESET)
+        self.port.fail['nt_escape'] = [ctypes.WinError(1)]
+        rc, out, err = self.run_main(lines='low')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('--lines low refused', out['error'])
+        # refused before any DCB, which could leave the reset with IO0 low
+        self.assertEqual([c[0] for c in self.port.log if c[0] in ('nt_escape', 'nt_set_state')], ['nt_escape'])
+        # nothing of ours was set: the saved modes are not written back, which could move the lines
+        self.assertTrue(out['terminalRestored'])
+        self.assertEqual(self.port.names()[-2:], ['nt_set_timeouts', 'nt_close'])
+        self.assertEqual(self.port.reached, [RESET])
 
     def test_an_early_error_restores_without_moving_a_line(self):
         self.port.opened_at(False, False)    # the saved modes (handshake/toggle) would raise DTR

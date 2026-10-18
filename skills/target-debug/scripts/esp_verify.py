@@ -6,12 +6,16 @@
 
 ESP_VERIFY_ESPTOOL is a command line (e.g. '/path/to/python -m esptool'), split with POSIX
 shell rules, or on Windows with the native ones (CommandLineToArgvW, so a path keeps its
-backslashes); otherwise use esptool on PATH (on Windows esptool.exe on PATH, never the cwd's).
+backslashes); otherwise use esptool on PATH (on Windows esptool.exe, .cmd or .bat on PATH, never
+the cwd's). A .cmd or .bat runs under cmd.exe, which alters a %, ^, & or ! in the arguments, and a
+standalone esptool.exe echoes the snapshot paths in the ANSI code page: a temp directory outside it
+fails the run (exit 3), so set TMPDIR to one inside it.
 The command/output contract is esptool 5.5.0 from ESP-IDF 6.1.
 Reset policies are required, never taken from the manifest. No retry is made. esptool is
 killed after --timeout seconds (default 300), a tool failure that leaves the chip state unknown.
 --port is /dev/serial/by-id or by-path on POSIX, since ttyACM/ttyUSB numbers drift with
-enumeration order; on Windows COM<n> or \\\\.\\COM<n>, a number Windows keeps per device instance.
+enumeration order; on Windows COM<n> or \\\\.\\COM<n>, a number Windows keeps per device instance, passed
+to esptool as COM<n>: it finds a USB-Serial-JTAG port, and its reset sequence, only by that name.
 Port ownership is the caller's board lock, not checked here: esptool's pyserial
 exclusive=True uses advisory flock on POSIX and cannot exclude other readers
 (esptool/loader.py:453-465; serial/serialposix.py:382-389). Stop console readers.
@@ -57,7 +61,7 @@ BEFORE = ('default-reset', 'usb-reset', 'no-reset', 'no-reset-no-sync')
 AFTER = ('hard-reset', 'soft-reset', 'no-reset', 'no-reset-stub', 'watchdog-reset')
 PORT = re.compile(r'/dev/serial/(by-id|by-path)/[^/\x00-\x20]+')
 # Windows keeps a COM number per device instance (its serial number or hub port), unlike Linux tty numbers
-COM_PORT = re.compile(r'(?:\\\\\.\\)?COM[1-9][0-9]*', re.IGNORECASE)
+COM_PORT = re.compile(r'(?:\\\\\.\\)?COM([1-9][0-9]*)', re.IGNORECASE)
 OFFSET = re.compile(r'(0[xX][0-9a-fA-F]+|[0-9]+)')
 HEADER = re.compile(r"Verifying (0x[0-9a-f]+) \(([0-9]+)\) bytes at "
                     r"(0x[0-9a-f]+) in flash against '(.+)'\.\.\.")
@@ -107,13 +111,15 @@ def split_command(line):
 
 
 def find_tool(name):
-    if os.name != 'nt' or os.path.dirname(name):
+    if os.name != 'nt':
         return name if shutil.which(name) else None
-    # Windows: PATH only; shutil.which and CreateProcess search the cwd (perhaps a checkout) first
+    # Windows: the file with its extension, since CreateProcess adds only .exe; a bare name on PATH only,
+    # since shutil.which and CreateProcess search the cwd (perhaps a checkout) first
     exts = ('',) if name.lower().endswith(('.exe', '.cmd', '.bat')) else ('.exe', '.cmd', '.bat')
-    for directory in os.environ.get('PATH', '').split(os.pathsep):
-        if not (os.path.isabs(directory) and os.path.splitdrive(directory)[0]):
-            continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
+    # '.', 'bin', '\bin' or an empty entry would name a directory of the cwd or its drive
+    dirs = [''] if os.path.dirname(name) else [d for d in os.environ.get('PATH', '').split(os.pathsep)
+                                               if os.path.isabs(d) and os.path.splitdrive(d)[0]]
+    for directory in dirs:
         for ext in exts:
             if os.path.isfile(os.path.join(directory, name + ext)):
                 return os.path.join(directory, name + ext)
@@ -156,6 +162,7 @@ def run_tool(command, env, timeout):
                 # a descendant taskkill missed holds the pipes: their reader threads return the output only at
                 # EOF, and closing a pipe one of them reads blocks as well, so Popen's exit must not close them
                 proc.stdout = proc.stderr = None
+                exc.survivor = True
             exc.stdout, exc.stderr = decode_nt(exc.stdout), decode_nt(exc.stderr)
             raise
     return subprocess.CompletedProcess(command, proc.returncode, decode_nt(stdout), decode_nt(stderr))
@@ -272,9 +279,13 @@ def main(argv=None):
         if not re.fullmatch(r'esp(?:32[a-z0-9]*|8266)', args.chip):
             raise ValueError('--chip must name an explicit ESP chip, not auto')
         if os.name == 'nt':
-            if not COM_PORT.fullmatch(args.port):
+            com = COM_PORT.fullmatch(args.port)
+            if not com:
                 raise ValueError(r'--port must be COM<n> or \\.\COM<n>; Windows keeps that number per device '
                                  'instance, unlike drifting Linux tty numbers')
+            # esptool finds a USB-Serial-JTAG device by an exact match with pyserial's COM<n> (esp_pylib
+            # get_port_vid_pid) and resets any other name with a UART bridge's sequence
+            args.port = 'COM' + com.group(1)
         elif not PORT.fullmatch(args.port) or args.port.rsplit('/', 1)[-1] in ('.', '..'):
             raise ValueError('--port must use /dev/serial/by-id or by-path; ttyACM/ttyUSB numbers drift')
         images, payloads, settings, stub = load_manifest(args.manifest.resolve(), args.chip)
@@ -314,6 +325,9 @@ def main(argv=None):
                 proc = run_tool(command, env, args.timeout)
             except subprocess.TimeoutExpired as exc:
                 result.update(tool_exit=None, stdout=as_text(exc.stdout), stderr=as_text(exc.stderr))
+                if getattr(exc, 'survivor', False):
+                    raise ValueError(f'esptool did not finish within {args.timeout:g} s; it was killed, but a '
+                                     f'process it started survived and may still hold {args.port}') from exc
                 raise ValueError(f'esptool did not finish within {args.timeout:g} s and was killed') from exc
             result.update(tool_exit=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
             output = proc.stdout + '\n' + proc.stderr

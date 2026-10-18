@@ -38,10 +38,12 @@ python3 <skill dir>/scripts/rtt.py --backend jlink --probe <serial> --device <JL
 #   alone never proves target output
 ```
 
-Windows is supported by the script (`JLink.exe` default; teardown sends Commander
-`exit`, then CTRL_BREAK to the server's process group when it shares the console,
-then `taskkill`s the tree) but unverified on hardware. `RTT_JLINK_EXE` and `RTT_OPENOCD_EXE`
-override the server executables on any platform, as `RTT_NM` does for nm.
+Windows is supported by the script (`JLink.exe` default) but unverified on hardware. Teardown sends Commander `exit`
+(openocd has none), then CTRL_BREAK to the server's process group when it shares the console, then `taskkill`s the
+tree if the server is still alive, each rung after up to 5 s. A bare tool name is looked up as `<name>.exe` in the
+PATH entries with a drive and root (`C:\...`) only, never the cwd or python's directory. `RTT_JLINK_EXE`,
+`RTT_OPENOCD_EXE` and `RTT_NM` override the server and nm executables on any platform; give a full path for a tool
+that is not on PATH.
 
 `--device` is the J-Link device name of the MCU. Always pass the probe
 serial — rigs and benches run several probes, and an unpinned flash grabs

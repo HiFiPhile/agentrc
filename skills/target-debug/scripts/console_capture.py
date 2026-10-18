@@ -37,20 +37,23 @@ each enumeration. Windows opens a comm port exclusively, so a port another progr
 refused, without the holder: Windows does not say which program has it (no otherOpeners), and its
 "access denied" also means a port being removed, so the refusal carries Windows' own text.
 The DCB and COMMTIMEOUTS are saved and the port set to raw 8N1 at --baud without flow control,
-parity, error-character or NUL handling; a rate the driver refuses, or stores as another rate
-(read back), fails the run. SetCommState drives DTR and RTS as the DCB's control modes say, so
-every DCB this script writes holds them at their current levels (IOCTL_SERIAL_GET_DTRRTS): `leave`
-keeps the levels the open left, guessed from the saved control modes when the driver cannot report
-them; `low` then clears RTS before DTR (EscapeCommFunction), since DTR low with RTS high holds an
-Espressif chip in reset (esptool's reset is DTR off, RTS on). At the end the saved DCB and
-COMMTIMEOUTS go back, except the DTR/RTS control, which keeps the levels the lines have then, so
-the restore moves no line, like tcsetattr (equal XON/XOFF characters, which SetCommState refuses,
-go back as 0x11/0x13); whether the open or the close moves them is the
-driver's choice, as HUPCL is on Linux. A read waits at most 50 ms, which bounds the end at
---seconds and at Ctrl-C or Ctrl-Break. Another process cannot signal the script (TerminateProcess
-skips the restore and the summary): to stop it early, start it with CREATE_NEW_PROCESS_GROUP and
-send it CTRL_BREAK_EVENT. Reads that keep ending empty long before their timeout end the capture as
-'device gone'. This backend is unverified on hardware.
+parity, error-character or NUL handling; a rate the driver refuses, or stores as another rate (read
+back), fails the run, with that rate as `effectiveBaud` in the summary. SetCommState drives DTR and
+RTS as the DCB's control modes say, so every DCB this script writes holds them at their current
+levels (IOCTL_SERIAL_GET_DTRRTS): `leave` keeps the levels the open left, guessed from the saved
+control modes when the driver cannot report them; `low` then clears RTS before DTR
+(EscapeCommFunction), since DTR low with RTS high holds an Espressif chip in reset (esptool's reset
+is DTR off, RTS on), and clears RTS once more, since Windows' CDC-ACM driver sends a DTR change only
+with an RTS write (ESP32-S3 TRM 33.4.2). With levels the driver cannot report, `low` clears RTS
+alone before any DCB, which then lowers DTR only, and is refused if RTS cannot be cleared. At the end
+the saved DCB and COMMTIMEOUTS go back, except
+the DTR/RTS control, which keeps the levels the lines have then, so the restore moves no line, like
+tcsetattr (equal XON/XOFF characters, which SetCommState refuses, go back as 0x11/0x13); whether the
+open or the close moves them is the driver's choice, as HUPCL is on Linux. A read waits at most 50
+ms, which bounds the end at --seconds and at Ctrl-C or Ctrl-Break. Another process cannot signal the
+script (TerminateProcess skips the restore and the summary): to stop it early, start it with
+CREATE_NEW_PROCESS_GROUP and send it CTRL_BREAK_EVENT. Reads that keep ending empty long before
+their timeout end the capture as 'device gone'. This backend is unverified on hardware.
 
 Exit: 0 captured (an empty capture included); 2 bad usage; 3 the port could not be opened or
 configured, a read failed, its settings could not be restored, or an output file failed to close.
@@ -96,6 +99,7 @@ ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_INSUFFICIENT_BUFFER = 5, 32,
 ERRORS_GONE = {ERROR_ACCESS_DENIED, 22, 31, 433, 995, 1167, 1617}    # BAD_COMMAND, GEN_FAILURE, NO_SUCH_DEVICE,
                                                                      # DEVICE_NOT_CONNECTED, DEVICE_REMOVED
 QUICK_EMPTY_READS = 3    # in a row, each back in under a quarter of READ_POLL_MS: the device is gone
+nt_clock = time.perf_counter    # time.monotonic ticks every 15.6 ms on Windows before Python 3.13
 
 if termios is None:
     import ctypes
@@ -284,11 +288,11 @@ def capture_posix(a, speed, out, times, result):
     def on_signal(signum, _frame):
         raise Stop(f'signal {signum}')
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, on_signal)
     fd, saved, errors = None, None, []
     chunks, size, ended = [], 0, 'time'
     try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, on_signal)
         fd = os.open(a.port, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
         t_open = time.monotonic()
         result['openedAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds')
@@ -362,6 +366,7 @@ def capture_nt(a, speed, out, times, result):
     for sig in sigs:
         signal.signal(sig, on_signal)
     h, saved, levels, errors = None, None, None, []    # levels: DTR/RTS as last read or set
+    configured = False    # a DCB of ours was tried: before that the port has nothing to restore
     chunks, size, ended = [], 0, 'time'
     try:
         try:
@@ -370,14 +375,20 @@ def capture_nt(a, speed, out, times, result):
             if e.winerror not in (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION):
                 raise
             raise OSError(e.errno, f'busy or being removed: {e.strerror} (Windows does not say which program has it)')
-        t_open = time.monotonic()
+        t_open = nt_clock()
         result['openedAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds')
         saved = nt_get_state(h), nt_get_timeouts(h)
         levels = want = nt_lines(h)
         if a.lines == 'low' and levels is None:
-            # unknown levels: DTR high, RTS low is reached from any other state without DTR low, RTS high
-            want = {'dtr': True, 'rts': False}
+            # unknown levels: RTS low alone first, so the DCB only lowers DTR: it never enters a reset (DTR low,
+            # RTS high) nor leaves one with DTR high, IO0 low within the strapping hold, the ROM loader
+            try:
+                nt_escape(h, CLRRTS)
+            except OSError as e:
+                raise OSError(e.errno, f'cannot clear RTS on this port ({e.strerror}); --lines low refused')
+            want = {'dtr': False, 'rts': False}
         dcb = nt_raw(saved[0], speed, want)
+        configured = True
         nt_set_state(h, dcb)
         levels = {'dtr': dcb.fDtrControl == DTR_CONTROL_ENABLE, 'rts': dcb.fRtsControl == RTS_CONTROL_ENABLE}
         effective = nt_get_state(h).BaudRate
@@ -386,17 +397,19 @@ def capture_nt(a, speed, out, times, result):
             raise OSError(errno.EINVAL, f'the driver set {effective} baud, not {speed}; pass --baud {effective} '
                                         'to capture at that rate')
         if a.lines == 'low':
-            # RTS first: DTR low with RTS high holds an Espressif chip in reset
+            # RTS first: DTR low with RTS high holds an Espressif chip in reset; RTS again: Windows' CDC-ACM
+            # driver sends DTR only with an RTS write, and DTR high, RTS low sets a USB-Serial-JTAG download flag
             try:
                 nt_escape(h, CLRRTS)
                 levels['rts'] = False
                 nt_escape(h, CLRDTR)
                 levels['dtr'] = False
+                nt_escape(h, CLRRTS)
             except OSError as e:
                 raise OSError(e.errno, f'cannot clear DTR/RTS on this port ({e.strerror}); --lines low refused')
         result['lines'] = {'policy': a.lines, 'afterSetup': nt_lines(h)}
         deadline, poll, quick = t_open + a.seconds, None, 0
-        while not stop and (left := deadline - time.monotonic()) > 0:
+        while not stop and (left := deadline - nt_clock()) > 0:
             ms = max(1, min(READ_POLL_MS, math.ceil(left * 1000)))
             if ms != poll:
                 # MAXDWORD/MAXDWORD/ms: ReadFile returns once bytes are there, or empty after ms
@@ -404,7 +417,7 @@ def capture_nt(a, speed, out, times, result):
                 t.ReadIntervalTimeout, t.ReadTotalTimeoutMultiplier, t.ReadTotalTimeoutConstant = MAXDWORD, MAXDWORD, ms
                 nt_set_timeouts(h, t)
                 poll = ms
-            t_read = time.monotonic()
+            t_read = nt_clock()
             try:
                 chunk = nt_read(h, 4096)
             except OSError as e:
@@ -414,14 +427,14 @@ def capture_nt(a, speed, out, times, result):
                 break
             if not chunk:
                 # empty long before its timeout, again and again: a driver completing reads on a removed device
-                early = ms == READ_POLL_MS and time.monotonic() - t_read < READ_POLL_MS / 4000
+                early = ms == READ_POLL_MS and nt_clock() - t_read < READ_POLL_MS / 4000
                 quick = quick + 1 if early else 0
                 if quick >= QUICK_EMPTY_READS:
                     ended = 'device gone'
                     break
                 continue
             quick = 0
-            rec = {'t': round(time.monotonic() - t_open, 4), 'offset': size, 'len': len(chunk)}
+            rec = {'t': round(nt_clock() - t_open, 4), 'offset': size, 'len': len(chunk)}
             out.write(chunk)
             out.flush()
             times.write((json.dumps(rec) + '\n').encode())
@@ -440,7 +453,7 @@ def capture_nt(a, speed, out, times, result):
                 result['terminalRestored'] = True
                 # SetCommState drives DTR/RTS per the DCB: hold them where they are now
                 held = nt_hold(saved[0], nt_lines(h) or levels)
-                for put, value in ((nt_set_state, held), (nt_set_timeouts, saved[1])):
+                for put, value in ((nt_set_state, held),) * configured + ((nt_set_timeouts, saved[1]),):
                     try:
                         put(h, value)
                     except OSError as e:
@@ -488,21 +501,36 @@ def main(argv=None):
         patterns = [re.compile(m) for m in a.mark]
     except re.error as e:
         p.error(f'--mark: {e}')
+    if termios is not None:
+        device = os.path.realpath(a.port)
+    openers = other_openers(device) if termios else []
     times_path = a.out + '.times'
-    files = []
+    files, early = [], []
+
+    def discard():
+        for f in files:
+            f.close()
+            os.unlink(f.name)
+
+    def abandon(signum, _frame):    # until the capture's own handlers: no capture, so no files to block a rerun
+        discard()
+        sys.exit(f'console_capture: interrupted by signal {signum} before the capture began')
+
+    sigs = [s for s in (signal.SIGINT, signal.SIGTERM, getattr(signal, 'SIGBREAK', None)) if s]
+    for sig in sigs:    # held while a file exists that `files` does not list yet
+        signal.signal(sig, lambda signum, _frame: early.append(signum))
     for path in (a.out, times_path):
         try:
             files.append(open(path, 'xb'))
         except OSError as e:
-            for f in files:
-                f.close()
-                os.unlink(f.name)
+            discard()
             p.error(f'{path}: exists; a capture never overwrites' if isinstance(e, FileExistsError) else f'{path}: {e}')
+    for sig in sigs:
+        signal.signal(sig, abandon)
+    if early:
+        abandon(early[0], None)
     out, times = files
-    if termios is not None:
-        device = os.path.realpath(a.port)
     result = {'port': a.port, 'device': device, 'baud': a.baud, 'seconds': a.seconds, 'out': a.out, 'times': times_path}
-    openers = other_openers(device) if termios else []
     if openers:
         result['otherOpeners'] = openers
     chunks, size, ended, errors = (capture_posix if termios else capture_nt)(a, speed, out, times, result)

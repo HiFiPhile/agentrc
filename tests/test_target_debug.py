@@ -18,7 +18,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 import unittest.mock
 from unittest import mock
@@ -64,7 +66,10 @@ def make_tool(d, name, body):
         f.write_text(body)
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
         return f
-    from pip._vendor.distlib.scripts import ScriptMaker
+    try:
+        from pip._vendor.distlib.scripts import ScriptMaker
+    except ImportError:
+        raise unittest.SkipTest('Windows fakes need pip (its vendored distlib launcher)')
     name = 'JLink' if name == 'JLinkExe' else name
     src = Path(d) / 'stub-src'
     src.mkdir(exist_ok=True)
@@ -132,7 +137,10 @@ class CliTest(unittest.TestCase):
 
     def test_symbols_and_paths_beyond_the_console_code_page(self):
         # addr2line prints the ELF's UTF-8 names; a Windows console code page holds neither of these
-        r = self.run_cli('--samples', '2', FAKE_PCSR='08001000', FAKE_SYMS='0x08001000=spin_\u2714@m\u00e9n\u00fc.c:42')
+        # only Windows' pc_sample.py forces UTF-8 on stdout; POSIX prints in the locale's encoding
+        utf8 = {} if os.name == 'nt' else {'PYTHONIOENCODING': 'utf-8'}
+        r = self.run_cli('--samples', '2', FAKE_PCSR='08001000', FAKE_SYMS='0x08001000=spin_\u2714@m\u00e9n\u00fc.c:42',
+                         **utf8)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('spin_\u2714', r.stdout)
         self.assertIn('0x08001000  m\u00e9n\u00fc.c:42', r.stdout)
@@ -409,6 +417,7 @@ if gdb_port:
 assert sys.argv[-2] == '-f', sys.argv    # a session's Tcl comes as a file, its last argument
 path = sys.argv[-1]
 script = open(path).read()
+time.sleep(float(os.environ.get('FAKE_OPENOCD_SLEEP', '0')))
 sys.argv[-1] = script    # logged in place of the file, which is gone once the session ends
 log(script, file=path)
 print('Info : CMSIS-DAP: Serial# = E6614C311B597D32', file=sys.stderr)
@@ -631,6 +640,35 @@ SYMS = [('g_count', 0x2000_0010, 4, OBJ, BSS), ('g_flag', 0x2000_0014, 1, OBJ, B
 
 
 class ProbeStateUnitTest(unittest.TestCase):
+    def test_a_stdin_feeder_that_never_started_does_not_hang_the_cleanup(self):
+        # Windows feeds stdin from a thread; joining one that never started raised, and the cleanup retried forever
+        class Unstartable:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+            def join(self, timeout=None):
+                raise RuntimeError('cannot join thread before it is started')
+
+        errors = []
+
+        def call():
+            try:
+                probe_state.run([sys.executable, '-c', 'import time; time.sleep(30)'], 30, stdin='x')
+            except RuntimeError as e:
+                errors.append(e)
+
+        windows = types.SimpleNamespace(name='nt', path=os.path, environ=os.environ)    # kill(): taskkill, then kill
+        with mock.patch.object(probe_state, 'os', windows), \
+                mock.patch.object(probe_state, 'threading', types.SimpleNamespace(Thread=Unstartable)):
+            caller = threading.Thread(target=call, daemon=True)
+            caller.start()
+            caller.join(20)
+        self.assertFalse(caller.is_alive(), 'run() never returned')
+        self.assertEqual([str(e) for e in errors], ["can't start new thread"])
+
     def test_dhcsr_bits(self):
         self.assertEqual(probe_state.dhcsr_state(0x03030003),
                          {'raw': '0x03030003', 'halted': True, 'sleeping': False, 'lockup': False,
@@ -837,8 +875,9 @@ class FakeToolsCase(unittest.TestCase):
     def sessions(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
-    def signal_when(self, argv, until, env, signals=(signal.SIGTERM,)):
-        """Start argv, wait until until() holds, send each signal in turn; (returncode, stdout, stderr)."""
+    def signal_when(self, argv, until, env, signals=(signal.SIGTERM,), gap=0.05):
+        """Start argv, wait until until() holds, send each signal in turn, gap seconds apart;
+        (returncode, stdout, stderr)."""
         proc = subprocess.Popen([sys.executable, *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 cwd='/', env={**self.env, **env})
         deadline = time.monotonic() + 20
@@ -847,7 +886,7 @@ class FakeToolsCase(unittest.TestCase):
         time.sleep(0.3)
         for sig in signals:
             proc.send_signal(sig)
-            time.sleep(0.05)
+            time.sleep(gap)
         stdout, stderr = proc.communicate(timeout=60)
         return proc.returncode, stdout, stderr
 
@@ -914,10 +953,21 @@ class PcSampleOpenOCDTest(FakeToolsCase):
             self.assertEqual(self.sessions()[-1]['file'], links[0].as_posix())
             with mock.patch.object(probe_state, 'short_path', side_effect=lambda path: path):    # no 8.3 names
                 with self.assertRaisesRegex(probe_state.ToolError,
-                                            r'outside the ANSI code page \(cp1252\).*TEMP and TMP'):
+                                            r'outside the ANSI code page \(cp1252\).*set TMPDIR'):
                     ocd.batch(f'rd DHCSR 0x{probe_state.DHCSR:08x}', 30)
         self.assertEqual(len(self.sessions()), 1)    # refused before openocd ran
         self.assertEqual(list(odd.iterdir()), [])    # and the script file removed either way
+
+    def test_a_temp_path_with_a_brace_is_refused(self):
+        braced = self.d / 'tmp{x}'
+        braced.mkdir()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(tempfile, 'tempdir', str(braced)):
+            ocd = probe_state.OpenOCD('E6614C311B597D32', '-f target/x.cfg', None)
+            with self.assertRaisesRegex(probe_state.ToolError, 'has a brace, which OpenOCD -f cannot quote: '
+                                                               'set TMPDIR'):
+                ocd.batch(f'rd DHCSR 0x{probe_state.DHCSR:08x}', 30)
+        self.assertFalse(self.log.exists())    # refused before openocd ran
+        self.assertEqual(list(braced.iterdir()), [])    # and the script file removed
 
     @unittest.skipUnless(os.name == 'nt', 'POSIX kill() runs no taskkill')
     def test_a_hung_taskkill_still_kills_the_tool(self):
@@ -1581,10 +1631,11 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertEqual(out['exprs'][1], {'expr': 'x', 'output': '3'})
         self.assertEqual(out['gdbStderr'], ['Division by zero'])
 
-    def interrupt(self, board, until, *args, signals=(signal.SIGTERM,), **env):
+    def interrupt(self, board, until, *args, signals=(signal.SIGTERM,), gap=0.05, **env):
         rc, stdout, stderr = self.signal_when(
             [str(AUTOPSY), '--hil-config', str(self.config), '--board', board, '--elf', str(self.elf),
-             '--out', str(self.d / 'out'), *args], lambda: self.log.exists() and until(self.sessions()), env, signals)
+             '--out', str(self.d / 'out'), *args], lambda: self.log.exists() and until(self.sessions()), env, signals,
+            gap)
         return rc, json.loads(stdout), stderr
 
     def test_a_signal_after_the_anchor_still_reaches_the_end_anchor(self):
@@ -1638,8 +1689,11 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertEqual((self.d / 'state').read_text(), '01010001')
 
     def test_signals_still_run_cleanup_and_the_end_anchor(self):
+        # each session takes 0.5 s, so the second signal lands in the cleanup, after the first one's handler ran:
+        # two deliveries before Python runs the handler count once
         rc, out, stderr = self.interrupt('max32', lambda ss: any(s['script'] == 'gdb' for s in ss),
-                                         signals=(signal.SIGTERM, signal.SIGTERM), FAKE_GDB_HANG_ATTACHED='1')
+                                         signals=(signal.SIGTERM, signal.SIGTERM), gap=0.3,
+                                         FAKE_GDB_HANG_ATTACHED='1', FAKE_OPENOCD_SLEEP='0.5')
         self.assertEqual(rc, 3, stderr)
         self.assertIn('interrupted by signal 15, 15', out['error'])
         self.assertTrue(out['restored'])

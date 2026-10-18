@@ -90,6 +90,8 @@ class Resolver(Config):
         self.config.write_text(json.dumps({'boards': [{**BOARDS[0], 'note': 'aꀀŁ'}]}, ensure_ascii=False),
                                encoding='utf-8')
         env = {k: v for k, v in os.environ.items() if k not in ('PYTHONUTF8', 'PYTHONIOENCODING')}
+        if os.name != 'nt':
+            env['LC_ALL'] = 'C'    # ASCII; Windows reads the ANSI code page whatever the locale variables say
         for name, script in SCRIPTS.items():
             with self.subTest(script=name):
                 code = ('import importlib.util, sys; s = importlib.util.spec_from_file_location("m", sys.argv[1]); '

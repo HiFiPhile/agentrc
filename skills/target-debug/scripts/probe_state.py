@@ -384,11 +384,12 @@ def ansi_path(path):
         except UnicodeEncodeError:
             pass
     raise ToolError(f'temporary file {path!r} is outside the ANSI code page ({codec}) openocd.exe takes its '
-                    f'arguments in, and has no 8.3 short name: set TEMP and TMP to a directory that is not')
+                    f'arguments in, and has no 8.3 short name: set TMPDIR to a directory that is not')
 
 
 def stop_running():
-    """Kill the tool run() is waiting on; run() then fails with its output (safe in a signal handler)."""
+    """Kill the tool run() is waiting on; run() then fails with its output. Called from a signal handler: on
+    Windows its taskkill may block that handler up to 10 s."""
     for proc in list(_running):
         try:
             kill(proc)
@@ -416,8 +417,9 @@ def run(cmd, timeout, stdin=None):
         try:
             if os.name == 'nt' and stdin is not None:
                 # communicate() on Windows writes stdin in this thread, outside its timeout
-                feeder = threading.Thread(target=feed, args=(proc.stdin, stdin.encode()), daemon=True)
-                feeder.start()
+                thread = threading.Thread(target=feed, args=(proc.stdin, stdin.encode()), daemon=True)
+                thread.start()
+                feeder = thread    # only once started: the cleanup below joins it
                 proc.wait(timeout=timeout)
             else:
                 proc.communicate(None if stdin is None else stdin.encode(), timeout=timeout)

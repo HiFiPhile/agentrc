@@ -65,8 +65,10 @@ if mode == 'wrong_chip':
     sys.exit(2)
 if mode == 'hang':
     import subprocess, time
-    # a child holding the pipes, as a Windows venv python.exe launcher's interpreter does
-    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+    # a child holding the pipes, as a Windows venv python.exe launcher's interpreter does (passed explicitly:
+    # Windows' Popen hands a child no handle it is not given)
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
+                             stdout=sys.stdout, stderr=sys.stderr)
     pathlib.Path(os.environ['FAKE_CALL'] + '.child').write_text(str(child.pid))
     print('Connected to ESP32-P4 on /dev/serial/by-id/fake:', flush=True)
     time.sleep(30)
@@ -121,7 +123,7 @@ class VerifyTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.root = Path(self.directory.name)
+        self.root = Path(self.directory.name).resolve()  # esp_verify reports resolved image paths
         self.manifest = self.root / 'flasher_args.json'
         self.call = self.root / 'call.json'
         self.tool = self.root / 'fake esptool'
@@ -256,6 +258,7 @@ class VerifyTest(unittest.TestCase):
         self.assertIn('did not finish within 1 s', result['error'])
         self.assertIsNone(result['tool_exit'])
         self.assertTrue(alive(int(child.read_text())))    # what taskkill would have ended
+        self.assertIn('a process it started survived and may still hold', result['error'])
 
     @staticmethod
     def reap(pid):
@@ -277,7 +280,14 @@ class VerifyTest(unittest.TestCase):
         # a snapshot path in the ANSI code page, echoed in it: e9 in cp1252, a8 a6 in cp936, neither UTF-8
         temp = self.root / 'tmp \u00e9'
         temp.mkdir()
-        self.assertRaises(UnicodeDecodeError, str(temp).encode('mbcs').decode, 'utf-8')
+        try:
+            str(temp).encode('mbcs').decode('utf-8')
+        except UnicodeEncodeError:
+            self.skipTest('this ANSI code page has no \u00e9')
+        except UnicodeDecodeError:
+            pass
+        else:
+            self.skipTest('the ANSI code page is UTF-8')
         code, result = self.run_cli(FAKE_MODE='ansi', TMPDIR=str(temp), TEMP=str(temp), TMP=str(temp))
         self.assertEqual(code, 0, result)
         self.assertEqual(result['status'], 'match')
@@ -340,7 +350,8 @@ class VerifyTest(unittest.TestCase):
             with self.subTest(port=port):
                 code, result = self.run_cli('--port', port)
                 self.assertEqual(code, 0, result)
-                self.assertEqual(json.loads(self.call.read_text())['args'][2:4], ['--port', port])
+                # the name esptool matches against pyserial's to find a USB-Serial-JTAG port
+                self.assertEqual(json.loads(self.call.read_text())['args'][2:4], ['--port', 'COM250'])
 
     @unittest.skipIf(NT, 'POSIX /dev/serial path')
     def test_by_path_port_is_accepted(self):
@@ -351,7 +362,9 @@ class VerifyTest(unittest.TestCase):
         # an unquoted path keeps its backslashes on Windows, as in the IDF venv's 'C:\...\python.exe -m esptool'
         plain = native(str(self.root / 'esptool_stub.py'))
         shutil.copy(self.tool, plain)
-        code, result = self.run_cli(ESP_VERIFY_ESPTOOL=cmdline([native(sys.executable)]) + ' ' + plain)
+        # unquoted where the temp directory allows it: no rule keeps whitespace in an unquoted argument
+        arg = cmdline([plain]) if any(c.isspace() for c in plain) else plain
+        code, result = self.run_cli(ESP_VERIFY_ESPTOOL=cmdline([native(sys.executable)]) + ' ' + arg)
         self.assertEqual(code, 0, result)
         self.assertEqual(result['command'][1], plain)
         if not NT:
@@ -374,7 +387,10 @@ class VerifyTest(unittest.TestCase):
 
     @unittest.skipUnless(NT, 'Windows launcher')
     def test_path_fallback_is_path_only_on_windows(self):
-        from pip._vendor.distlib.scripts import ScriptMaker
+        try:
+            from pip._vendor.distlib.scripts import ScriptMaker
+        except ImportError:
+            self.skipTest('the launcher comes from pip (its vendored distlib)')
         shutil.copy(self.tool, self.root / 'esptool.py')
         for target in ('bin', 'cwd'):
             maker = ScriptMaker(str(self.root), str(self.root / target))
@@ -396,7 +412,7 @@ class VerifyTest(unittest.TestCase):
             (d / 'esptool.exe').write_bytes(b'')
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(cwd)
-        for entry in ('.', 'bin', os.path.splitdrive(str(cwd))[1]):
+        for entry in ('.', 'bin', os.path.splitdrive(str(cwd))[1], '', os.pathsep):    # '': an empty entry
             with self.subTest(entry=entry), mock.patch.dict(os.environ, {'PATH': entry}):
                 self.assertIsNone(esp_verify.find_tool('esptool'))
         with mock.patch.dict(os.environ, {'PATH': str(cwd / 'bin')}):
@@ -410,8 +426,9 @@ class VerifyTest(unittest.TestCase):
             (bin_dir / name).write_text(f'@"{native(sys.executable)}" "{native(str(self.tool))}" %*\n',
                                         encoding='ascii')
         self.env.pop('ESP_VERIFY_ESPTOOL')
+        # a directory and no extension: the file found, since CreateProcess would add only .exe
         for command, found in ((None, 'esptool.cmd'), ('esptool.cmd', 'esptool.cmd'), ('other', 'other.bat'),
-                               ('other.bat', 'other.bat')):
+                               ('other.bat', 'other.bat'), (cmdline([str(bin_dir / 'other')]), 'other.bat')):
             with self.subTest(command=command):
                 env = {'PATH': str(bin_dir), **({'ESP_VERIFY_ESPTOOL': command} if command else {})}
                 code, result = self.run_cli(**env)
