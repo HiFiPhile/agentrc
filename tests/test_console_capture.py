@@ -597,10 +597,14 @@ class WindowsBackendTest(unittest.TestCase):
                 rc, out, err = self.run_main(lines='low')
                 self.assertEqual(rc, 3, err)
                 self.assertNotIn('nt_read', self.port.names())
-                restored = self.m.DCB.from_buffer_copy(self.calls('nt_set_state')[-1][1])
+                self.assertTrue(out['terminalRestored'])
+                self.assertEqual(self.port.names()[-6:], ['nt_escape', 'nt_set_state', 'nt_lines', 'nt_set_state',
+                                                          'nt_set_timeouts', 'nt_close'])
+                refused, restored = (self.m.DCB.from_buffer_copy(c[1]) for c in self.calls('nt_set_state'))
+                self.assertEqual((refused.fDtrControl, refused.fRtsControl), (0, 0))
                 self.assertEqual((restored.fDtrControl, restored.fRtsControl), (0, 0))
                 self.assertEqual(self.port.wire, (False, False))
-                left = self.port.reached.index((opened[0], False))    # the CLRRTS before the DCB
+                left = self.port.reached.index((opened[0], False))    # the CLRRTS, or the open if RTS was already low
                 self.assertNotIn(RESET, self.port.reached[left:])
                 if opened == RESET:
                     self.assertNotIn(DOWNLOAD, self.port.reached[left:])

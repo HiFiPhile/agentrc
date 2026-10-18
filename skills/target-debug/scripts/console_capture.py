@@ -45,8 +45,8 @@ control modes when the driver cannot report them; `low` then clears RTS before D
 (EscapeCommFunction), since DTR low with RTS high holds an Espressif chip in reset (esptool's reset
 is DTR off, RTS on), and clears RTS once more, since Windows' CDC-ACM driver sends a DTR change only
 with an RTS write (ESP32-S3 TRM 33.4.2). With levels the driver cannot report, `low` clears RTS
-alone before any DCB, which then lowers DTR only, as does the restore if the driver refuses that DCB,
-and is refused if RTS cannot be cleared. At the end the saved DCB and COMMTIMEOUTS go back, except
+alone before any DCB, and is refused if RTS cannot be cleared; that DCB then lowers DTR only, as does
+the restore if the driver refuses it. At the end the saved DCB and COMMTIMEOUTS go back, except
 the DTR/RTS control, which keeps the levels the lines have then, so the restore moves no line, like
 tcsetattr (equal XON/XOFF characters, which SetCommState refuses, go back as 0x11/0x13); whether the
 open or the close moves them is the driver's choice, as HUPCL is on Linux. A read waits at most 50
