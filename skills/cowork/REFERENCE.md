@@ -18,8 +18,13 @@ reply, or a failed turn's diagnostic, on stdout; then on stderr any other
 diagnostic and last the receipt, `cowork result <id> <side>/<lane>:
 <outcome>, exit <N>[; paths reported: <paths>]; <usage>`; then removes the
 request's files, so a reader killed or cut off before that lets a later one
-print it all again. Outcomes: `replied` (0); `no-footer`, `empty-reply`,
-`tree-changed`, `unverified` (4); `failed`, `killed`, `died` (1). A refusal
+print it all again. On Windows a file still open in another process cannot
+be removed: the delivery says so and repeats the receipt, which stays the
+last line. A lock left open keeps the whole request, which a later `read`
+delivers again; any other file left goes with the lane's next send or its
+`reset`, which is refused (exit 3) while a request's file stays open.
+Outcomes: `replied` (0); `no-footer`, `empty-reply`, `tree-changed`,
+`unverified` (4); `failed`, `killed`, `died` (1). A refusal
 (exit 3) prints no receipt. A Codex turn's usage comes from its rollout
 under `$CODEX_HOME/sessions` (`~/.codex/sessions` when unset), the turn
 matched by its request header, else from the stream's session totals,
@@ -54,6 +59,16 @@ one to a read-only lane, owes the line only when it changed a file. Paths
 a successful reply's line names, other than none, reach the receipt as `paths
 reported:`, what the coworker says it touched; they leave the verdict
 alone.
+
+## Windows
+
+Run it with a native Windows CPython. The CLI and `git` run only as PATH
+alone finds them, never from the working directory, the checkout, or a
+relative PATH entry: `git.exe`, and the CLI's `.exe` before its `.cmd` or
+`.bat`. A batch-file CLI runs through `cmd.exe`, which would reparse its
+arguments, so a turn whose arguments or checkout path hold one of
+`%^&|<>!"` fails (exit 1) before the CLI runs: install the native `.exe` or
+move the checkout.
 
 ## `--no-edit`
 
