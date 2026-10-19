@@ -109,6 +109,96 @@ helper and any cleanup state.
   its usbfs node) loads this skill's `scripts/usb_observe.py` the way it loads
   the lock helper, one module instance per process; it observes only.
 
+## Flashers
+
+A runner that flashes or resets through this skill's `scripts/hil_flash.py`
+gets the backend's command and its execution only; board, image, retries and
+recovery stay the contract's. Linux only.
+
+- A flasher is a dict: `name` (`jlink`, `stlink`, `openocd`, `lm4flash`,
+  `esptool`, `pyocd`), `uid` (the probe's serial), `args` (passed to the tool
+  verbatim), and optionally `vid_pid` (openocd's complete `0xVVVV 0xPPPP`
+  pairs; pyocd requires exactly one) and `verify`. A malformed `vid_pid` raises
+  `ValueError` before the tool runs. Every call takes an explicit `timeout`;
+  `run=` injects the caller's runner, by default `scripts/hil_process.py`'s
+  `run_cmd`.
+- A flash or reset returns an `Operation`: the last run's `CompletedProcess`
+  fields plus `attempts`, each run's command, command file, output and rc on
+  its own, never concatenated; `retried` is every attempt but the last. An
+  exception from the runner carries the operation so far as `.operation`. Only
+  a J-Link crash is rerun, and only when the caller passes `crash_retries`.
+- Each attempt has a `kind`: `exited`, `timed_out` (rc 124, or a raised
+  `TimeoutExpired` whose partial output it keeps), `interrupted` (a
+  `BaseException` that is not an `Exception`, or an exception with a true
+  `interrupted` attribute) or `error` (any other exception, such as a launch
+  failure), the exception itself as `error`, a `cleanup` status and a
+  `receipt`. A runner reports the last two as `cleanup` (`done`, `pending`,
+  `unknown`) and `receipt` attributes on its result or exception. Only an
+  explicit `done` counts: a missing attribute or any other value is
+  `unknown`, the default runner's included, since `run_cmd` abandons a
+  survivor of its bounded reap and a tool's exit does not prove its
+  descendants exited. The operation's `cleanup` is its worst attempt's
+  (`pending`, then `unknown`, then `done`) and `receipts` lists every
+  receipt. A J-Link crash is not rerun after an attempt reported `pending`
+  or a receipt.
+- `flash_jlink` and `reset_jlink` write their command file in `workdir`, the
+  current directory by default.
+- `run_jlink_commands` and `run_stlink_commands` run one probe session of the
+  caller's commands with the caller's connection profile, from a unique
+  command file in `workdir`; `sysresetreq_jlink` and `sysresetreq_stlink` write
+  AIRCR SYSRESETREQ through such a session, a reset distinct from the probe's
+  (`reset_jlink`, `reset_stlink`). Their results are raw: judging the
+  transcript, retrying and recovering stay the caller's.
+- `openocd_esp` is `scripts/hil_openocd_esp.py`'s (`flash_openocd_esp`,
+  `reset_openocd_esp`): an Espressif chip's built-in USB-Serial/JTAG through
+  openocd-esp32 v0.12.0-esp32-20260703 only, found by `HIL_OPENOCD_ESP`, else
+  `openocd` on PATH. `uid` is the USJ serial; `args`
+  is `-f board/<chip>-builtin.cfg` or `-f interface/esp_usb_jtag.cfg -f
+  target/<chip>.cfg` and nothing else. The USJ's bus-port is resolved by
+  serial, exactly one match, and pinned before init; it is never convoy-safe.
+  The caller hard-resets the chip out of its ROM loader first: one left there
+  (esptool `--after no-reset`) faults the flash stub after `reset init`. A
+  command whose log shows a failed target event hook (`Execution of event
+  <name> failed:`), or cannot be read, fails although openocd answers success:
+  a flash writes nothing after three such `reset init`s, and such a `reset run`
+  leaves the session pending.
+  A flash takes the caller's ordered segments (sector-aligned offset, raw
+  binary file, size), programs each with verify, stops at the first failure
+  and reads every segment back byte for byte. It also requires `security`, the
+  caller's evidence read from the chip before programming (for tinyuf2, with
+  esptool over the same USJ's serial port):
+  `{"flashEncryption": "off", "secureBoot": "off", "source": <where it was
+  read>}`. Without it, or with either feature not `off`, the flash is refused
+  before anything starts; the provider never infers or defaults the chip's
+  security state, and records the evidence in the operation. Each operation is
+  one session that is never killed: after a command that returned, `reset run`
+  and a confirmed shutdown end it; an init failure, a command outstanding at
+  the timeout or interrupt, or a failed reset or shutdown leaves cleanup
+  `pending` with the session's receipt, for the caller's cleanup holder, and no
+  retry, restore or test may overlap it. Under a CI job (`RUNNER_TRACKING_ID`
+  or `GITHUB_ACTIONS` set) flash and reset are refused, and a consumer calls
+  `ci_refusal()` before its own preparatory sessions; `end` stays available.
+- `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
+  a pending session with `reset run` and a confirmed shutdown, within one
+  deadline and never signalling it. It refuses on any doubt: the session (or
+  another `end`) still holds the receipt's lock, the process is not the
+  receipt's, no pidfd is available, init failed or is unproven (that board
+  needs a separately reviewed recovery), or the last command sent is not known
+  to have run. Exit 0 closes the receipt with the results and keeps it, and a
+  rerun on it exits 0 again; anything else (refusal, failure, timeout,
+  interrupt) exits 1 with the receipt open and the board held (2: bad usage or
+  an unreadable receipt). Releasing the board's cleanup holder (`hil_lock.py
+  release --token TOKEN`) after exit 0 stays the caller's step.
+- rc 0 means the tool reported success, not that the target runs the image;
+  the project's own checks decide that. rc 124 from the default runner means
+  it killed the tool's process group on the timeout and reaped it for a
+  bounded grace: a survivor is abandoned, so 124 proves neither that every
+  descendant died nor that the board is in a known state. An `openocd_esp`
+  timeout also returns 124; its `cleanup` says whether the session still
+  ended (`done`) or a command was outstanding and the server was left running
+  on purpose (`pending`). A J-Link crash rerun is no proof the target was
+  untouched either.
+
 ## Reporting
 
 Interactively, show the run's result in its native form (its table verbatim, or

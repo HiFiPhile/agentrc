@@ -559,9 +559,11 @@ class DetachedHolder(LockDir):
 
         def gone():
             deadline = time.monotonic() + 10
-            while not holder.exists() and time.monotonic() < deadline:
+            text = ''
+            while not text and time.monotonic() < deadline:     # rewritten, so briefly empty, per board
+                text = holder.read_text() if holder.exists() else ''
                 _sleep(0.01)
-            pid = int(holder.read_text())
+            pid = int(text)
             self.addCleanup(self.kill_quietly, pid, signal.SIGKILL)     # a takeover holder ignores SIGTERM
             while time.monotonic() < deadline:
                 try:
@@ -872,6 +874,36 @@ class RecoveryBlockers(LockDir):
                 break
             kill_before += 1
 
+    def test_an_ordinary_taker_killed_after_the_sentinel_blocks_until_a_takeover(self):
+        """Pins today's fail-closed outcome (agentrc#154): the reader cannot tell this from an
+        interrupted protected rewrite, so the free board needs a recovery takeover."""
+        pid = os.fork()
+        if pid == 0:
+            try:
+                fh = hil_lock.flock_nb(BOARD)
+                real, calls = os.pwrite, []
+
+                def pwrite(*a):
+                    calls.append(1)
+                    if len(calls) == 2:
+                        os._exit(9)
+                    return real(*a)
+                os.pwrite = pwrite
+                hil_lock.write_record(fh, 'selftest')
+                os._exit(0)
+            finally:
+                os._exit(1)
+        self.assertEqual(os.waitpid(pid, 0)[1] >> 8, 9)
+        self.assertEqual(self.lock_bytes()[:1], b'#')
+        with self.assertRaisesRegex(hil_lock.RecoveryBlocked, hil_lock.RECOVERY_BLOCKER):
+            self.acquire()
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_hold([], 'selftest recovery', take_over_board=BOARD), 0)
+        token = out.getvalue().split('token ')[1].split(')')[0]
+        self.addCleanup(DetachedHolder.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        self.assertEqual(hil_lock.cmd_release_token(token), 0)
+        self.assertIsNotNone(self.acquire())
+
     def test_a_protected_taker_ends_with_release_board_lock(self):
         fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True)
         self.assertIs(hil_lock.read_record(BOARD)['protected'], True)
@@ -1077,7 +1109,51 @@ class UnreadableRecords(LockDir):
     def test_a_record_left_unreadable_is_not_a_completed_release(self):
         self.patch(hil_lock.time, 'sleep', lambda s: None)
         Path(hil_lock.lock_path(BOARD)).write_bytes(b'\xff')
-        self.assertEqual(hil_lock._wait_cleared([BOARD], time.monotonic()), [BOARD])
+        self.assertEqual(hil_lock._wait_cleared([BOARD], 999999999, None, time.monotonic()), [BOARD])
+
+    def test_a_holder_still_on_its_flock_is_not_a_completed_release(self):
+        self.patch(hil_lock.time, 'sleep', lambda s: None)
+        fh = hil_lock.flock_nb(BOARD)               # records cleared, flock not yet dropped
+        me = (os.getpid(), hil_lock.proc_start(os.getpid()))
+        self.assertEqual(hil_lock._wait_cleared([BOARD], *me, time.monotonic()), [BOARD])
+        fh.close()
+        self.assertEqual(hil_lock._wait_cleared([BOARD], *me, time.monotonic()), [])
+
+    def test_an_exited_holder_not_yet_reaped_has_dropped_its_flock(self):
+        self.patch(hil_lock.time, 'sleep', lambda s: None)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                fh = hil_lock.flock_nb(BOARD)      # kept open: only the kernel's exit drops it
+                os._exit(0 if fh else 1)
+            finally:
+                os._exit(1)
+        self.addCleanup(os.waitpid, pid, 0)
+        start = hil_lock.proc_start(pid)
+        deadline = time.monotonic() + 5
+        while not hil_lock._exited(pid, start) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(hil_lock._wait_cleared([BOARD], pid, start, time.monotonic()), [])
+
+    def test_a_thread_set_that_changes_during_the_scan_is_not_an_exit(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        self.addCleanup(os.waitpid, pid, 0)
+        start = hil_lock.proc_start(pid)
+        deadline = time.monotonic() + 5
+        while not hil_lock._exited(pid, start) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        real, scans = os.listdir, []
+
+        def listdir(path):                      # a worker appears between the two scans
+            got = real(path)
+            if path == f'/proc/{pid}/task':
+                scans.append(1)
+                return got + ['999999999'] if len(scans) > 1 else got
+            return got
+        self.patch(hil_lock.os, 'listdir', listdir)
+        self.assertFalse(hil_lock._exited(pid, start))
 
 
 class HolderFields(LockDir):
