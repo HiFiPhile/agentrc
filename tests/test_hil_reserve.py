@@ -15,6 +15,7 @@ import fcntl
 import importlib.util
 import io
 import json
+import shutil
 import signal
 import sys
 import tempfile
@@ -46,6 +47,8 @@ case "$ACTION" in
   survivor) setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   survivor-same-group) sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   hang) sleep 30; exit 0 ;;
+  refuse) exit 3 ;;
+  refuse-drop) mv "$SYS_DEVICES/3-1.4.1" "$SYS_DEVICES/.gone"; exit 3 ;;
   probe-locks) python3 - "$LOCK_DIR" > "$ARGV_OUT.locks" <<'PY'
 import fcntl, os, sys
 for fn in sorted(os.listdir(sys.argv[1])):
@@ -209,6 +212,12 @@ class Fixture(unittest.TestCase):
 
     def held(self):
         return {k for k, v in self.records().items() if v}
+
+    def recovered(self):
+        """A killed reservation leaves protected records: recovery blockers until a takeover
+        ends them. Stands in for that recovery between two runs."""
+        for fn in os.listdir(self.locks):
+            (self.locks / fn).write_text('')
 
     def flock_free(self, lock):
         with open(self.locks / f'{lock}.lock', 'r+') as f:
@@ -425,7 +434,8 @@ class Check(Fixture):
     def test_usage_errors(self):
         for argv in (('check', '../x', *self.rosters()), ('check', '3-1', '--roster', 'a', 'b', 'c'),
                      ('run', 'pci-rebind', '3-1', *self.rosters(), '--reason', 'r'),
-                     ('run', 'root-cycle', '3-1', *self.rosters(), '--reason', 'r', '--script', 'x')):
+                     ('run', 'root-cycle', '3-1', *self.rosters(), '--reason', 'r', '--script', 'x'),
+                     ('check', '3-1', '--scope', 'port', *self.rosters())):
             with self.assertRaises(SystemExit):
                 main(*argv)
 
@@ -473,6 +483,22 @@ class Run(Fixture):
         out = p.output()
         self.assertEqual((p.returncode, 'board lock unavailable: holder record: disk full' in out), (1, True), out)
         self.assertFalse(self.argv_out.exists())
+        self.assertEqual(self.held(), set())
+        self.assertTrue(all(self.flock_free(l) for l in self.records()))
+
+    def test_unreadable_holder_fields_refuse_before_any_lock(self):
+        def patch(m):
+            m.hil_lock.proc_start = lambda pid: None
+        p = self.run_run(patch=patch)
+        out = p.output()
+        self.assertEqual((p.returncode, 'refused: holder record fields: ' in out), (1, True), out)
+        self.assertFalse(self.argv_out.exists())
+        self.assertEqual(self.records(), {})
+
+    def test_a_root_cycle_refusal_before_its_mutation_releases_when_the_subtree_is_unchanged(self):
+        p = self.run_run(action='refuse')
+        out = p.output()
+        self.assertEqual((p.returncode, 'root-cycle refused before writing anything' in out), (1, True), out)
         self.assertEqual(self.held(), set())
         self.assertTrue(all(self.flock_free(l) for l in self.records()))
 
@@ -538,8 +564,12 @@ class Run(Fixture):
         line = p.blocker()
         self.assertIn('SIGHUP ignored during command', line)
         self.assertIn('SIGTERM forwarded', line)
-        p.kill()                                        # frees the locks for the second run
+        p.kill()                                        # frees the flocks, leaves recovery blockers
         self.argv_out.unlink()
+        refused = self.run_run()
+        self.assertIn('recovery blocker', refused.output())
+        self.assertNotEqual(refused.returncode, 0)
+        self.recovered()
 
         def before(m):
             real, calls = m.check, []
@@ -613,10 +643,10 @@ class Run(Fixture):
         def patch(m):
             real = m.walk
 
-            def walk(busport, identities, deadline, cached=True):
+            def walk(busport, identities, deadline, cached=True, **kw):
                 if not cached:
                     time.sleep(1.2)                  # the reads of the look outlast the 1 s budget
-                return real(busport, identities, deadline, cached)
+                return real(busport, identities, deadline, cached, **kw)
             m.walk = walk
         p = self.run_run(patch=patch, budget='1')
         line = p.blocker()
@@ -634,6 +664,7 @@ class Run(Fixture):
         self.assertEqual(self.argv_out.read_text().split(), ['root-cycle', '3-1.1', 'E6633861A3978538'])
         self.assertIn('3-1.1 (serial E6633861A3978538 (udev)) not back: serial unreadable', line)
         p.kill()
+        self.recovered()
         q = self.run_run(action='cure')                      # re-enumerated: sysfs answers again
         out = q.output()
         self.assertEqual(q.returncode, 0, out)
@@ -672,7 +703,8 @@ class Run(Fixture):
     def test_an_unreadable_class_or_a_new_node_after_the_command_is_a_blocker(self):
         p = self.run_run(action='unreadable-class')
         self.assertIn('3-1: class unreadable', p.blocker())
-        p.kill()                                        # frees the locks for the second run
+        p.kill()
+        self.recovered()
         self.dev('3-1', cls='09')
         q = self.run_run(action='new-node', busport='3-1.2')
         self.assertIn('3-1.9: new node (serial new)', q.blocker())
@@ -683,13 +715,14 @@ class Run(Fixture):
                 p = self.run_run(action=action)
                 line = p.blocker()
                 orphan = int(Path(str(self.argv_out) + '.pid').read_text())
-                self.addCleanup(lambda o=orphan: os.kill(o, signal.SIGKILL) if hr.proc_start(o) else None)
+                self.addCleanup(lambda o=orphan: os.kill(o, signal.SIGKILL) if hr.hil_lock.proc_start(o) else None)
                 self.assertIn(f'surviving pids [{orphan}]', line)
                 os.kill(orphan, signal.SIGKILL)
                 time.sleep(0.3)
                 self.assertIsNone(p.poll())      # still a cleanup holder: the survivor leaving frees nothing
                 self.assertEqual(self.records()['raspberry_pi_pico2']['role'], 'cleanup-holder')
                 p.kill()
+                self.recovered()
 
     def test_sigterm_during_the_command_is_forwarded_and_ends_as_a_blocker(self):
         p = self.run_run(action='hang')
@@ -824,7 +857,7 @@ class Run(Fixture):
         hr.signal.pidfd_send_signal = send
         self.addCleanup(setattr, hr.signal, 'pidfd_send_signal', real)
         rc, out = main('release', '--token', tok)
-        self.assertEqual((rc, f'holder pid {p.pid} could not be signalled' in out), (1, True), out)
+        self.assertEqual((rc, f'delivery failed: holder pid {p.pid}' in out), (1, True), out)
 
     def test_release_refuses_without_pidfd_support(self):
         p = self.run_run(action='fail')
@@ -844,7 +877,57 @@ class Run(Fixture):
         tok = p.token()
         p.kill()
         rc, out = main('release', '--token', tok)      # the kernel dropped the flocks; the records are stale
-        self.assertEqual((rc, f'holder pid {p.pid} cannot be opened' in out), (1, True), out)
+        self.assertEqual((rc, f'holder pid {p.pid} of token {tok} is gone' in out), (1, True), out)
+        self.assertIn('recovery takeover', out)
+
+
+class HubScope(Fixture):
+    """hub-cycle's coverage walk spans the target's parent hub, not its root port; the lock
+    set stays every roster board, and a refusal before the script's first write releases."""
+
+    def setUp(self):
+        super().setUp()
+        self.dev('3-1.4', cls='09', serial='hub-sn')
+        self.dev('3-1.4.1', serial='stlink-f303')         # tinyuf2 stm32f303disco probe
+        self.dev('3-1.5', serial='stranger')              # a sibling of the hub, outside its scope
+
+    def run_hub(self, action='ok', busport='3-1.4.1'):
+        return self.fork_main('run', 'hub-cycle', busport, *self.rosters(), '--reason', 'test',
+                              '--budget', '1', action=action)
+
+    def test_the_hub_scope_walks_only_the_parent_hub(self):
+        rc, out = main('check', '3-1.4.1', *self.rosters())
+        self.assertEqual((rc, 'uncovered under root port 3-1' in out, '3-1.5' in out), (1, True, True), out)
+        rc, out = main('check', '3-1.4.1', '--scope', 'hub', *self.rosters())
+        self.assertEqual(rc, 0, out)
+        self.assertIn('3-1.4.1: serial stlink-f303 -> stm32f303disco', out)
+        self.assertNotIn('3-1.5', out)
+        rc, out = main('check', '3-1', '--scope', 'hub', *self.rosters())
+        self.assertEqual((rc, 'on a root port' in out), (1, True), out)
+
+    def test_hub_cycle_holds_every_roster_lock_and_releases(self):
+        p = self.run_hub()
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.argv_out.read_text().split(), ['hub-cycle', '3-1.4.1', 'stlink-f303'])
+        self.assertIn('holding mimxrt1064_evk raspberry_pi_pico2 stm32f303disco stm32h743eval', out)
+        self.assertIn('released 4 lock(s); 2 node(s) back under hub 3-1.4', out)
+        self.assertEqual(self.held(), set())
+
+    def test_hub_cycle_refuses_a_hub_target(self):
+        shutil.rmtree(self.sys / '3-1.5')
+        rc, out = main('run', 'hub-cycle', '3-1.4', *self.rosters(), '--reason', 'test')
+        self.assertEqual((rc, 'is a hub: hub-cycle cycles a leaf only' in out), (1, True), out)
+        self.assertFalse(self.argv_out.exists())
+
+    def test_a_refusal_before_writing_releases_only_when_the_subtree_is_unchanged(self):
+        p = self.run_hub(action='refuse')
+        out = p.output()
+        self.assertEqual((p.returncode, 'refused before writing anything' in out), (1, True), out)
+        self.assertEqual(self.held(), set())
+        p = self.run_hub(action='refuse-drop')
+        self.assertIn('command exited 3', p.blocker())
+        self.assertEqual(len(self.held()), 4)
 
 
 if __name__ == '__main__':

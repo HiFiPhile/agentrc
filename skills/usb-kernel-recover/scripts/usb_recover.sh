@@ -9,7 +9,14 @@
 #                          # it; [serial] is verified against the device and refused on mismatch,
 #                          # skipping the leaf hubs (which fake ganged switching and do not
 #                          # actually cut power). Bounces every sibling under that root port.
-#                          # The D-state escape: no device lock, so it cannot convoy.
+#                          # Its power-off takes no device lock, but uhubctl's status pass
+#                          # opens the port's children first (agentrc#149).
+#                          # Exit 3: refused before uhubctl ran.
+#   hub-cycle <busport> [serial]  # e.g. 5-3.2 -> ask the kernel to power the hub port feeding that
+#                          # LEAF off and on (its `disable` file: 1, 2 s, 0) under the hub's lock.
+#                          # Whether VBUS drops is the hub's: success proves re-enumeration, not a
+#                          # power cycle. Its serial must answer: a wedged leaf would block the
+#                          # write. Exit 3: refused before anything was written.
 #   pci-rebind <pciaddr>   # e.g. 0000:05:00.0 -> unbind+bind the whole xHCI
 #                          # controller. For a DEAD CONTROLLER, not a wedged
 #                          # device: it renumbers every bus it owns.
@@ -35,10 +42,12 @@ SHIELD_ATTRS='bNumInterfaces bmAttributes bMaxPower configuration bConfiguration
 SYSFS=/sys
 SHIELD_STATE=/run/tinyusb-hil/shield
 FAIL_CHMOD=''          # a path whose chmod the tests make fail, to reach the rollback-failure branch
+PORT_WRITE_TIMEOUT=''
 if [ "$(id -u)" -ne 0 ]; then
   SYSFS=${USB_RECOVER_SYSFS:-/sys}
   SHIELD_STATE=${USB_RECOVER_STATE:-/run/tinyusb-hil/shield}
   FAIL_CHMOD=${USB_RECOVER_TEST_FAIL_CHMOD:-}
+  PORT_WRITE_TIMEOUT=${USB_RECOVER_PORT_WRITE_TIMEOUT:-}
 fi
 
 USBPATH_RE='^[0-9]+-[0-9]+(\.[0-9]+)*$'
@@ -46,6 +55,7 @@ PCI_RE='^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9]$'
 DRIVER_RE='^[A-Za-z0-9_-]+$'
 
 die() { echo "usb_recover: $*" >&2; exit 1; }
+refuse() { echo "usb_recover: $*" >&2; exit 3; }   # nothing was written
 
 lock_read() {
   # Read an attribute served under the device lock (serial, product) with a 2s bound.
@@ -105,6 +115,40 @@ require_usb_controller() {
 }
 
 sysfs_gen() { stat -c %i "$SYSFS/bus/usb/devices/$1/" 2>/dev/null || echo none; }
+
+await_reenum() {  # await_reenum TARGET GEN: print its new generation; non-zero after ten 1 s looks without one
+  local now
+  for _ in $(seq 1 10); do
+    sleep 1
+    now=$(sysfs_gen "$1")
+    if [ "$now" != none ] && [ "$now" != "$2" ]; then echo "$now"; return 0; fi
+  done
+  return 1
+}
+
+# s for one `disable` write and its read-back; a positive integer, never evaluated as an expression
+[[ $PORT_WRITE_TIMEOUT =~ ^[1-9][0-9]*$ ]] || PORT_WRITE_TIMEOUT=15
+PORT_OFF_SECS=2
+port_write() {
+  # port_write FILE VALUE: write it and read it back in a child bounded by PORT_WRITE_TIMEOUT:
+  # both take the hub's lock. 0 done, 1 failed, 2 the child outlived SIGKILL (D state) and was
+  # left running -- it may still write, so no other write may follow it. The read-back is the
+  # shell's own `read`, so the timeout's SIGKILL reaches every process doing the work.
+  local child n=0
+  sh -c 'echo "$2" > "$1" && read -r v < "$1" && [ "$v" = "$2" ]' sh "$1" "$2" &
+  child=$!
+  while kill -0 "$child" 2>/dev/null; do
+    if [ $n -ge $((PORT_WRITE_TIMEOUT * 5)) ]; then
+      kill -9 "$child" 2>/dev/null
+      sleep 1
+      kill -0 "$child" 2>/dev/null && { survivor=$child; return 2; }
+      wait "$child" 2>/dev/null
+      return 1
+    fi
+    sleep 0.2; n=$((n + 1))
+  done
+  wait "$child" || return 1
+}
 usage() { sed -n '/^# Usage/,/^set -euo pipefail/p' "$0" | grep -E '^#   (sudo|[a-z])' >&2; exit 2; }
 
 # ---- shield -----------------------------------------------------------------------------
@@ -118,42 +162,135 @@ usage() { sed -n '/^# Usage/,/^set -euo pipefail/p' "$0" | grep -E '^#   (sudo|[
 # copied from a sibling (siblings differ, and may carry another shield). Every check and
 # mutation runs under one flock, so two shields cannot both pass the overlap check.
 
-attr_op() {
-  # attr_op stat PATH            -> "<inode> <mode>"      rc 0
-  # attr_op chmod PATH INODE MODE -> "ok"                 rc 0, applied to THAT inode
-  # rc 2 "gone": the path is absent or names a different inode (re-enumerated, replaced)
-  # rc 1: could not inspect or change it -- never mistaken for gone
-  # O_PATH|O_NOFOLLOW pins the object without opening it for reading (no ->show() on a
-  # wedged attribute, no read permission needed), fstat gives the inode of exactly that
-  # object, and chmod through /proc/self/fd changes it and nothing that replaced it.
-  FAIL_CHMOD="$FAIL_CHMOD" python3 - "$@" <<'PY'
-import os, stat, sys
-op, path = sys.argv[1], sys.argv[2]
-if op == 'chmod' and path == os.environ.get('FAIL_CHMOD') and sys.argv[4] != '000':
-    print('chmod failed: injected'); sys.exit(1)     # a RESTORE that fails, the rollback branch
-try:
-    fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
-except FileNotFoundError:
-    print('gone'); sys.exit(2)
-except OSError as e:
-    print(f'inspect failed: {e.strerror}'); sys.exit(1)
-try:
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode):
-        print('not a regular file'); sys.exit(1)
-    if op == 'stat':
-        print(f'{st.st_ino} {st.st_mode & 0o777:o}'); sys.exit(0)
-    if str(st.st_ino) != sys.argv[3]:
-        print('gone'); sys.exit(2)
-    if st.st_mode & 0o777 == int(sys.argv[4], 8):
-        print('ok'); sys.exit(0)        # already there: nothing to change, nothing to fail
+attr_tx() {
+  # One python3 per verb: attr_tx shield|restore|status ... Per attribute, O_PATH|O_NOFOLLOW
+  # pins the object without opening it for reading (no ->show() on a wedged attribute, no read
+  # permission needed), fstat gives the inode of exactly that object, and chmod through
+  # /proc/self/fd changes it and nothing that replaced it. An attribute is done, gone (absent,
+  # or a different inode: re-enumerated, replaced) or could not be inspected or changed --
+  # never mistaken for gone.
+  SYSFS="$SYSFS" FAIL_CHMOD="$FAIL_CHMOD" SHIELD_ATTRS="$SHIELD_ATTRS" python3 - "$@" <<'PY'
+import os, stat, sys, tempfile
+DEV = os.path.join(os.environ['SYSFS'], 'bus/usb/devices')
+FAIL = os.environ.get('FAIL_CHMOD')
+DONE, FAILED, GONE = 0, 1, 2
+
+
+def die(msg):
+    print(f'usb_recover: {msg}', file=sys.stderr)
+    sys.exit(1)
+
+
+def attr(path, ino=None, mode=None):
+    """(outcome, text): with ino/mode a chmod of THAT inode, else '<inode> <mode>'."""
+    if mode is not None and path == FAIL and mode != '000':
+        return FAILED, 'chmod failed: injected'      # a RESTORE that fails, the rollback branch
     try:
-        os.chmod(f'/proc/self/fd/{fd}', int(sys.argv[4], 8))
+        fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return GONE, 'gone'
     except OSError as e:
-        print(f'chmod failed: {e.strerror}'); sys.exit(1)
-    print('ok')
-finally:
-    os.close(fd)
+        return FAILED, f'inspect failed: {e.strerror}'
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return FAILED, 'not a regular file'
+        if mode is None:
+            return DONE, f'{st.st_ino} {st.st_mode & 0o777:o}'
+        if str(st.st_ino) != ino:
+            return GONE, 'gone'
+        if st.st_mode & 0o777 != int(mode, 8):     # already there: nothing to change, nothing to fail
+            try:
+                os.chmod(f'/proc/self/fd/{fd}', int(mode, 8))
+            except OSError as e:
+                return FAILED, f'chmod failed: {e.strerror}'
+        return DONE, 'ok'
+    finally:
+        os.close(fd)
+
+
+def restore(lines):
+    """chmod each attr line back to its recorded mode: (restored, gone, failures)."""
+    restored = gone = 0
+    failed = []
+    for name, ino, mode in lines:
+        rc, out = attr(f'{DEV}/{name}', ino, mode)
+        if rc == DONE:
+            restored += 1
+        elif rc == GONE:
+            gone += 1
+        else:
+            failed.append(f'{name} ({out})')
+    return restored, gone, failed
+
+
+def recorded(rec):
+    with open(rec) as f:
+        return [line.split()[1:4] for line in f if line.startswith('attr ')]
+
+
+op, args = sys.argv[1], sys.argv[2:]
+if op == 'shield':
+    # snapshot every attribute before anything is published or changed; an attribute that
+    # cannot be inspected stops the shield here, with nothing done
+    rec, owner, bp, pid, objs = args[0], args[1], args[2], args[3], args[4:]
+    lines, attrs = [owner], []
+    for obj in objs:
+        d = f'{DEV}/{obj}'
+        try:
+            lines.append(f'obj {obj} {os.stat(d + "/").st_ino}')
+        except OSError as e:
+            die(f'shield: cannot inspect {obj} ({e.strerror}); nothing changed')
+        for f in os.environ['SHIELD_ATTRS'].split():
+            rc, out = attr(f'{d}/{f}')
+            if rc == DONE:
+                lines.append(f'attr {obj}/{f} {out}')
+                attrs.append([f'{obj}/{f}', *out.split()])
+            elif rc == GONE:
+                lines.append(f'absent {obj}/{f}')
+            else:
+                die(f'shield: cannot inspect {obj}/{f} ({out}); nothing changed')
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(rec), prefix=f'.{bp}.')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        os.replace(tmp, rec)
+    except OSError as e:
+        os.unlink(tmp)
+        die(f'shield: cannot write {rec} ({e.strerror}); nothing changed')
+    # mutate only the inodes just recorded, and roll back on the first failure so a
+    # half-shield never survives; a rollback that itself fails keeps the record
+    changed = []
+    for name, ino, mode in attrs:
+        rc, out = attr(f'{DEV}/{name}', ino, '000')
+        if rc != DONE:
+            restored, _, failed = restore(changed)
+            if failed:
+                die(f'shield: chmod 000 {name} failed ({out}); rollback incomplete: {" ".join(failed)}; '
+                    f'record {rec} KEPT for unshield')
+            os.unlink(rec)
+            die(f'shield: chmod 000 {name} failed ({out}); rolled back {restored} attribute(s), no record kept')
+        changed.append([name, ino, mode])
+    print(f'shielded {bp}: {len(changed)} attribute(s) on {",".join(objs)} set 000; record {rec} (owner pid {pid})')
+elif op == 'restore':
+    rec, bp = args
+    restored, gone, failed = restore(recorded(rec))
+    if failed:
+        die(f'unshield: could not restore {" ".join(failed)}; record {rec} kept (restored {restored}, gone {gone})')
+    os.unlink(rec)
+    print(f'unshielded {bp}: restored {restored} attribute(s), {gone} gone (re-enumerated or unplugged); record removed')
+else:   # status REC...: "<still> <open> <gone> <unknown>" per record, in order
+    for rec in args:
+        n = [0, 0, 0, 0]
+        for name, ino, _ in recorded(rec):
+            rc, out = attr(f'{DEV}/{name}')
+            if rc == DONE and out.split()[0] == ino:
+                n[0 if out.split()[1] == '0' else 1] += 1
+            elif rc == FAILED:
+                n[3] += 1
+            else:
+                n[2] += 1
+        print(*n)
 PY
 }
 
@@ -191,24 +328,8 @@ shield_lock() {
   flock -w 30 9 || die "another shield/unshield has held $SHIELD_STATE/.lock for 30 s"
 }
 
-# restore_from LINES... : chmod each "attr <obj/f> <ino> <mode>" line back to <mode>.
-# Sets restored/gone and appends failures to failed[].
-restore_from() {
-  local line out rc
-  for line in "$@"; do
-    set -- $line
-    rc=0; out=$(attr_op chmod "$SYSFS/bus/usb/devices/$2" "$3" "$4") || rc=$?   # never a bare assignment under set -e
-    case $rc in
-      0) restored=$((restored + 1)) ;;
-      2) gone=$((gone + 1)) ;;
-      *) failed+=("$2 ($out)") ;;
-    esac
-  done
-}
-
 shield() {
-  local bp=$1 pid=$2 start objs obj rec tmp d f path out rc changed=() line
-  local restored=0 gone=0 failed=()
+  local bp=$1 pid=$2 start objs obj rec
   [[ "$bp" =~ $USBPATH_RE ]] || die "bad usb path: $bp"
   [[ "$pid" =~ ^[0-9]+$ ]] || die "shield: owner pid '$pid' is not a pid"
   start=$(proc_start "$pid")
@@ -227,48 +348,11 @@ shield() {
       fi
     done
   done
-  rec="$SHIELD_STATE/$bp"
-  # snapshot every attribute before anything is published or changed; an attribute that
-  # cannot be inspected stops the shield here, with nothing done
-  tmp=$(mktemp "$SHIELD_STATE/.$bp.XXXXXX")
-  {
-    echo "owner $pid $start $(cat /proc/sys/kernel/random/boot_id)"
-    for obj in $objs; do
-      d="$SYSFS/bus/usb/devices/$obj"
-      echo "obj $obj $(stat -c %i "$d/")"
-      for f in $SHIELD_ATTRS; do
-        rc=0; out=$(attr_op stat "$d/$f") || rc=$?
-        case $rc in
-          0) echo "attr $obj/$f $out" ;;
-          2) echo "absent $obj/$f" ;;
-          *) rm -f "$tmp"; die "shield: cannot inspect $obj/$f ($out); nothing changed" ;;
-        esac
-      done
-    done
-  } > "$tmp" || { rm -f "$tmp"; exit 1; }
-  mv "$tmp" "$rec"
-  # mutate only the inodes just recorded, and roll back on the first failure so a
-  # half-shield never survives; a rollback that itself fails keeps the record
-  while read -r line; do
-    set -- $line
-    [ "$1" = attr ] || continue
-    rc=0; out=$(attr_op chmod "$SYSFS/bus/usb/devices/$2" "$3" 000) || rc=$?
-    if [ $rc -ne 0 ]; then
-      restore_from "${changed[@]}"
-      if [ ${#failed[@]} -gt 0 ]; then
-        die "shield: chmod 000 $2 failed ($out); rollback incomplete: ${failed[*]}; record $rec KEPT for unshield"
-      fi
-      rm -f "$rec"
-      die "shield: chmod 000 $2 failed ($out); rolled back $restored attribute(s), no record kept"
-    fi
-    changed+=("$line")
-  done < "$rec"
-  echo "shielded $bp: ${#changed[@]} attribute(s) on $(echo $objs | tr ' ' ,) set 000; record $rec (owner pid $pid)"
+  attr_tx shield "$SHIELD_STATE/$bp" "owner $pid $start $(cat /proc/sys/kernel/random/boot_id)" "$bp" "$pid" $objs
 }
 
 unshield() {
-  local bp=$1 pid=${2:-} rec owner line lines=()
-  local restored=0 gone=0 failed=()
+  local bp=$1 pid=${2:-} rec owner
   [[ "$bp" =~ $USBPATH_RE ]] || die "bad usb path: $bp"
   shield_lock
   rec="$SHIELD_STATE/$bp"
@@ -278,19 +362,11 @@ unshield() {
   if [ "$4" = alive ] && [ "$pid" != "$1" ]; then
     die "unshield: $bp is shielded by live pid $1; pass that pid, or wait for it"
   fi
-  while read -r line; do
-    [[ "$line" == attr\ * ]] && lines+=("$line")
-  done < "$rec"
-  restore_from "${lines[@]}"
-  if [ ${#failed[@]} -gt 0 ]; then
-    die "unshield: could not restore ${failed[*]}; record $rec kept (restored $restored, gone $gone)"
-  fi
-  rm -f "$rec"
-  echo "unshielded $bp: restored $restored attribute(s), $gone gone (re-enumerated or unplugged); record removed"
+  attr_tx restore "$rec" "$bp"
 }
 
 shield_status() {
-  local only=${1:-} rec bp line n=0 still open gone unknown out rc err
+  local only=${1:-} rec bp still open gone unknown counts err recs=()
   # the state dir is root-owned 0700: anything but a listable dir or a missing one is "cannot
   # inspect", never "no shields"; the same for a record this caller cannot read
   err=$(LC_ALL=C ls -A -- "$SHIELD_STATE" 2>&1 >/dev/null) || {
@@ -306,20 +382,15 @@ shield_status() {
     [ -r "$rec" ] || die "shield-status: cannot inspect $rec (run with sudo)"
     bp=$(basename "$rec")
     [ -z "$only" ] || [ "$bp" = "$only" ] || continue
-    n=$((n + 1)); still=0; open=0; gone=0; unknown=0
-    while read -r line; do
-      set -- $line
-      [ "$1" = attr ] || continue
-      rc=0; out=$(attr_op stat "$SYSFS/bus/usb/devices/$2") || rc=$?
-      if [ $rc -eq 0 ] && [ "${out%% *}" = "$3" ]; then
-        if [ "${out##* }" = 0 ]; then still=$((still + 1)); else open=$((open + 1)); fi
-      elif [ $rc -eq 1 ]; then unknown=$((unknown + 1))
-      else gone=$((gone + 1)); fi
-    done < "$rec"
-    set -- $(record_owner "$rec")
-    echo "$bp: owner pid $1 $4; $still attribute(s) still shielded, $open recorded but not shielded, $gone gone, $unknown uninspectable; objects: $(grep '^obj ' "$rec" | cut -d' ' -f2 | tr '\n' ' ')"
+    recs+=("$rec")
   done
-  [ $n -gt 0 ] || echo "no shields recorded under $SHIELD_STATE"
+  [ ${#recs[@]} -gt 0 ] || { echo "no shields recorded under $SHIELD_STATE"; return 0; }
+  counts=$(attr_tx status "${recs[@]}") || die "shield-status: cannot inspect the records"
+  for rec in "${recs[@]}"; do
+    read -r still open gone unknown
+    set -- $(record_owner "$rec")
+    echo "$(basename "$rec"): owner pid $1 $4; $still attribute(s) still shielded, $open recorded but not shielded, $gone gone, $unknown uninspectable; objects: $(grep '^obj ' "$rec" | cut -d' ' -f2 | tr '\n' ' ')"
+  done <<< "$counts"
 }
 
 # Resolve a /dev node (ttyACMx, ttyUSBx, sgN, ...) up to its USB device busport.
@@ -401,15 +472,15 @@ case "$action" in
     # writes the wedged device's sysfs or takes its lock, so it cannot join a D-state convoy.
     # uhubctl exits 0 even when it does nothing ("No compatible devices detected" still returns
     # 0), so its status proves nothing -- the sysfs_gen check below is the only real verdict.
-    [[ "$target" =~ $USBPATH_RE ]] || die "bad usb path: $target"
+    [[ "$target" =~ $USBPATH_RE ]] || refuse "bad usb path: $target"
     UHUBCTL=$(command -v uhubctl || echo /sbin/uhubctl)
-    [ -x "$UHUBCTL" ] || die "uhubctl not installed"
+    [ -x "$UHUBCTL" ] || refuse "uhubctl not installed"
     # Existence alone only proves *something* occupies that path -- bus numbers renumber every
     # boot, so a stale busport can name a different device entirely and we would cut power to its
     # whole subtree (every fixture under that root port). Callers that know what they expect pass the
     # serial as a third argument and we refuse on mismatch; otherwise print the identity so a
     # wrong target is at least visible.
-    [ -e "$SYSFS/bus/usb/devices/$target" ] || die "no such usb device: $target"
+    [ -e "$SYSFS/bus/usb/devices/$target" ] || refuse "no such usb device: $target"
     idf="$SYSFS/bus/usb/devices/$target"
     serial=$(lock_read "$idf/serial")
     expect=${3:-}
@@ -421,7 +492,7 @@ case "$action" in
       echo "root-cycle: WARNING $target's serial did not answer (it is wedged), so '$expect'" \
            "could NOT be confirmed; proceeding, but verify the busport if siblings drop" >&2
     elif [ -n "$expect" ] && [ "$expect" != "$serial" ]; then
-      die "root-cycle: $target has serial '$serial', expected '$expect' — stale busport, refusing"
+      refuse "root-cycle: $target has serial '$serial', expected '$expect' — stale busport, refusing"
     fi
     # idVendor/idProduct are usb_descriptor_attr_le16: served WITHOUT the device lock, so
     # a plain cat is safe on a wedged device. serial/product are usb_string_attr and are not.
@@ -440,15 +511,66 @@ case "$action" in
     # power-off control transfer straight to the root hub with no child-disconnect in front.
     "$UHUBCTL" -S -l "$bus" -p "$rootport" -a cycle -d 5 \
       || die "uhubctl failed to cycle bus $bus port $rootport"
-    for _ in $(seq 1 10); do
-      sleep 1
-      now=$(sysfs_gen "$target")
-      if [ "$now" != none ] && [ "$now" != "$gen" ]; then
-        echo "root-cycled $bus port $rootport: $target re-enumerated"\
-             "(devnum $(cat "$SYSFS/bus/usb/devices/$target/devnum" 2>/dev/null || echo ?), gen $gen -> $now)"; exit 0
-      fi
-    done
+    if now=$(await_reenum "$target" "$gen"); then
+      echo "root-cycled $bus port $rootport: $target re-enumerated"\
+           "(devnum $(cat "$SYSFS/bus/usb/devices/$target/devnum" 2>/dev/null || echo ?), gen $gen -> $now)"; exit 0
+    fi
     die "root-cycle: $target did not re-enumerate after cycling bus $bus port $rootport (sysfs generation still $gen: no disconnect happened)"
+    ;;
+  hub-cycle)
+    # A targeted kernel port power-off/on request (`disable` 1, 2 s, 0) under the hub's lock.
+    # Whether VBUS physically drops is the hub's: a ganged hub cuts the gang only when this was
+    # the last port in it needing power, and restoring one port powers the gang (USB 2.0 11.11);
+    # a hub without switches drops the port only logically; a USB 3 hub's companion port may keep
+    # VBUS up (USB 3.2 Table 10-2). So success proves re-enumeration, not a power cycle or a
+    # firmware restart; physical power guarantees belong to the rig contract's Limits.
+    # `disable` rather than a raw hub request: disable_store runs under the hub's lock, after any
+    # enumeration in progress, where a raw hub request that met an enumeration killed an AMD
+    # 500-series xHCI (tinyuf2 bench history, 2026-10-14); that choice is made against that
+    # incident, not verified under it. The price is root-cycle's hazard: disable_store
+    # disconnects the child under the hub's lock first, so a wedged target would block it --
+    # hence the serial that must answer, and a wedged leaf is left to root-cycle, whose libusb
+    # request has no child-disconnect in front.
+    [[ "$target" =~ $USBPATH_RE ]] || refuse "bad usb path: $target"
+    [[ "$target" == *.* ]] || refuse "hub-cycle: $target is on a root port; that is root-cycle's"
+    hub=${target%.*}; port=${target##*.}
+    idf="$SYSFS/bus/usb/devices/$target"; hubd="$SYSFS/bus/usb/devices/$hub"
+    [ -e "$idf" ] || refuse "no such usb device: $target"
+    # bDeviceClass is a lock-free descriptor attribute, safe on a wedged device
+    cls=$(cat "$hubd/bDeviceClass" 2>/dev/null) || refuse "hub-cycle: cannot read $hub's class"
+    [ "$cls" = 09 ] || refuse "hub-cycle: $hub is not a hub"
+    cls=$(cat "$idf/bDeviceClass" 2>/dev/null) || refuse "hub-cycle: cannot read $target's class"
+    [ "$cls" != 09 ] || refuse "hub-cycle: $target is a hub; only a leaf is cycled"
+    disable="$hubd/$hub:1.0/$hub-port$port/disable"
+    [ -f "$disable" ] || refuse "hub-cycle: no port control file $disable"
+    serial=$(lock_read "$idf/serial")
+    [ "$serial" != '?' ] || refuse "hub-cycle: $target's serial did not answer (wedged): the port write would block on its lock; use root-cycle"
+    [ -n "$serial" ] || refuse "hub-cycle: $target has no readable serial to prove it answers"
+    expect=${3:-}
+    [ -z "$expect" ] || [ "$expect" = "$serial" ] || refuse "hub-cycle: $target has serial '$serial', expected '$expect' — stale busport, refusing"
+    gen=$(sysfs_gen "$target")
+    echo "hub-cycle: target $target serial=$serial; writing 1, then 0 after ${PORT_OFF_SECS} s, to $disable"
+    # from the first off write on, any failure or interruption still tries to power the port
+    # back on, unless a writer survived (it could still write after the restore)
+    interrupted='' survivor='' off=0 on=0
+    trap 'interrupted=yes' INT TERM HUP
+    port_write "$disable" 1 || off=$?
+    # `|| :`: a signal to the process group kills the sleep too, and set -e must not skip the restore
+    if [ $off -eq 0 ] && [ -z "$interrupted" ]; then sleep "$PORT_OFF_SECS" || :; fi
+    if [ -n "$survivor" ]; then
+      restored="not attempted: writer pid $survivor survived"
+    else
+      port_write "$disable" 0 || on=$?
+      [ $on -eq 0 ] && restored=restored || restored="NOT restored (write ${on})"
+    fi
+    trap - INT TERM HUP
+    if [ $off -ne 0 ] || [ $on -ne 0 ] || [ -n "$interrupted" ]; then
+      die "hub-cycle: cycle of $hub port $port failed (off ${off}, on ${on}${interrupted:+, interrupted}); power-on ${restored}"
+    fi
+    if now=$(await_reenum "$target" "$gen"); then
+      echo "hub-cycled $hub port $port: $target re-enumerated (gen $gen -> $now)"; exit 0
+    fi
+    die "hub-cycle: $target did not re-enumerate after cycling $hub port $port (sysfs generation still $gen)"
     ;;
   *)
     usage
