@@ -105,9 +105,12 @@ plain path such as `C:\tmp` there.
 Not on Windows yet; [#148](https://github.com/hathach/agentrc/issues/148) has
 the skipped tests and notes for a port:
 
-- `hil`'s rig-host scripts (`hil_lock.py`, `hil_reserve.py`, `usb_observe.py`)
-  and `usb-kernel-recover`'s `usb_recover.sh`: POSIX `flock` and `fork`,
-  `/proc` and sysfs.
+- `hil`'s rig-host scripts (`hil_lock.py`, `hil_reserve.py`, `usb_observe.py`,
+  `hil_process.py`, `hil_farm_check.py`, `hil_tt.py`, `hil_usbtest.py`) and
+  `usb-kernel-recover`'s `usb_recover.sh`: POSIX `flock` and `fork`, `/proc`
+  and sysfs.
+- `hil`'s `hil_report_core.py` locks its writer with `msvcrt` on Windows, but
+  its tests use `fcntl` and skip there.
 - `lsusbt`: sysfs.
 - `usb-kernel-debug`: kernel dynamic debug and usbmon, which have no Windows
   counterpart to port to.
@@ -160,6 +163,7 @@ through its `Build contract:` and `HIL contract:` lines:
 | Skill | Use it to | Start with |
 |---|---|---|
 | [`hil`](skills/hil/SKILL.md) | run a project's HIL tests and judge their results: contract sections, board locks, verdicts, retries | the project's `HIL contract:` page |
+| [`farm-check`](skills/farm-check/SKILL.md) | check a HIL farm's health: probe on the bus, a light image flashes, the board comes back and is restored; never a test verdict | the project's farm-check launcher, from its `HIL contract:` page |
 | [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO; Espressif chips over USB-Serial-JTAG or pad JTAG with openocd-esp32 (read its `espressif.md` first) | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
 | [`rtt`](skills/rtt/SKILL.md) | console or log over a debug probe (SEGGER RTT), live or post-mortem | `rtt.py --backend jlink --probe <serial> --device <dev> --interface swd --speed auto --seconds 20` |
 | [`etm-trace`](skills/etm-trace/SKILL.md) | instruction-level trace through a J-Trace and Ozone: hot functions, coverage, history before a fault | `etm_capture.py --jdebug <ref.jdebug> --elf <elf> --probe jtrace --duration-ms 10000 --out <dir>`, then `etm_profile.py <dir> --elf <elf>` |
