@@ -29,6 +29,20 @@ S3 = 'espressif_esp32s3_devkitc_1'
 
 
 
+class RateLimitParity(unittest.TestCase):
+    def test_collect_reads_a_rate_limit_as_facts_does(self):
+        cases = [('HTTP 403: API rate limit exceeded for user ID 1.', {'core': {'remaining': 0, 'reset': 1790000060}}),
+                 ('HTTP 403: You have exceeded a secondary rate limit.', {'core': {'remaining': 4000, 'reset': 1790000060}}),
+                 ('HTTP 429: Too Many Requests', {'graphql': {'remaining': 0, 'reset': 1790000000}}),
+                 ('HTTP 403: API rate limit exceeded', None), ('HTTP 502: Bad Gateway', {})]
+        for stderr, resources in cases:
+            with self.subTest(stderr):
+                out = b'not json' if resources is None else json.dumps({'resources': resources}).encode()
+                answer = lambda argv, **kw: mock.Mock(returncode=0, stdout=out)
+                with mock.patch('subprocess.run', answer), mock.patch('time.time', return_value=1789990000):
+                    self.assertEqual(collect.rate_limit(stderr), FACTS.rate_limit(stderr))
+
+
 def unsealed(text):
     """The printed line without its seal, which must be facts.py's over the rest; an error line has none."""
     line = json.loads(text)
@@ -47,6 +61,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = []   # `gh pr checks` answers in order: a list of checks, or (rc, stderr)
         self.calls = []
         self.clock = [0]
+        self.resources = {}   # `gh api rate_limit`'s resources
 
         def run(argv, **kw):
             self.calls.append(argv[1:3])
@@ -56,6 +71,8 @@ class InventoryTest(unittest.TestCase):
                 state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
                 return mock.Mock(returncode=0, stdout=json.dumps(
                     {'headRefOid': head, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': mergeable, 'state': state}).encode())
+            if argv[1:3] == ['api', 'rate_limit']:
+                return mock.Mock(returncode=0, stdout=json.dumps({'resources': self.resources}).encode())
             if argv[1] == 'api':   # a failing Actions job's record: a first attempt, its own execution
                 job = int(argv[2].split('/jobs/')[1])
                 return mock.Mock(returncode=0, stdout=json.dumps({'id': job, 'run_id': 7, 'run_attempt': 1, 'head_sha': HEAD}).encode())
@@ -102,10 +119,11 @@ class InventoryTest(unittest.TestCase):
                           self.check('lint', 'cancel', 'https://example.com/x')]]
         rc, r = self.main()
         self.assertEqual((rc, r['status'], r['pending']), (0, 'red', 0))
-        self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'pending', 'registered', 'status', 'waiting'], 'only what the workflow reads, and no null error')
+        self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'status', 'waiting'], 'only what the workflow reads, and no null error')
         self.assertEqual([(c['name'], c['bucket'], c['link']) for c in r['checks']],
                          [('hil', 'fail', JOB.format(3)), ('docs', 'fail', RTD.format(9)), ('lint', 'cancel', 'https://example.com/x')])
         self.assertEqual([c['aliases'] for c in r['checks']], [[], [], []], 'printed empty, so a relay has nothing to add (#50)')
+        self.assertRegex(r['observedAt'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
 
     def test_registered_counts_every_check_and_waiting_fingerprints_the_pending_ones(self):
         self.heads = [HEAD]
@@ -189,12 +207,35 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []), 'pending checks are counted, not listed')
         self.assertEqual((self.calls.count(['pr', 'checks']), self.calls.count(['pr', 'view'])), (3, 4), 'the PR is read before, on every poll and after')
 
+    def test_a_stop_file_ends_the_wait_before_the_next_poll(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('hil', 'pending', JOB.format(3))]]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stop = Path(tmp.name) / 'stop'
+        polls = []
+
+        def sleep(s):
+            self.clock[0] += s
+            polls.append(s)
+            if len(polls) == 2:
+                stop.touch()
+        with mock.patch.object(collect.time, 'sleep', sleep):
+            rc, r = self.main('--wait-seconds', '600', '--stop-file', str(stop))
+        self.assertEqual(rc, 1)
+        self.assertIn(f'stopped before the next GitHub call: {stop} exists', r['error'])
+        self.assertEqual((self.calls.count(['pr', 'checks']), self.calls.count(['pr', 'view'])), (2, 2),
+                         'no GitHub call once the file exists')
+        rc, r = self.main('--wait-seconds', '0', '--stop-file', str(stop))
+        self.assertEqual(rc, 1, 'nor a first one')
+        self.assertEqual(self.calls.count(['pr', 'view']), 2)
+
     def test_brief_lists_no_checks_only_while_running(self):
         self.heads = [HEAD]
         self.listings = [[self.check('hil', 'pending', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []))
-        self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'pending', 'registered', 'status', 'waiting'], 'the same members as a whole line')
+        self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'status', 'waiting'], 'the same members as a whole line')
         self.listings = [[self.check('hil', 'pass', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((r['status'], [c['link'] for c in r['checks']]), ('red', [JOB.format(4)]), 'settled: the whole inventory')
@@ -287,6 +328,19 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn('HTTP 502', r['error'])
         self.assertNotIn('status', r)
+        self.assertNotIn('rateLimit', r)
+
+    def test_a_rate_limit_is_reported_with_its_reset(self):
+        self.heads = [HEAD]
+        self.listings = [(1, 'GraphQL: API rate limit exceeded for user ID 249515.')]
+        self.resources = {'core': {'remaining': 4000, 'reset': 1790009999}, 'graphql': {'remaining': 0, 'reset': 1790000060}}
+        rc, r = self.main()
+        self.assertEqual((rc, r['rateLimit']['resetAt'], r['rateLimit']['secondary']), (1, '2026-09-21T14:14:20Z', False))
+        self.assertIn('API rate limit exceeded', r['error'])
+        self.resources = {'core': {'remaining': 4000, 'reset': 1790009999}}
+        self.listings = [(1, 'HTTP 403: You have exceeded a secondary rate limit.')]
+        rc, r = self.main()
+        self.assertEqual((r['rateLimit']['resetAt'], r['rateLimit']['secondary']), (None, True))
 
     def test_a_head_other_than_expected_is_refused_before_listing(self):
         self.heads = [OTHER]
@@ -428,7 +482,12 @@ class FailuresTest(unittest.TestCase):
                 n = int(argv[4].split('/attempts/')[1].split('/')[0])
                 jobs = self.attempts.get(n, [])
                 return ok(self.paged.get(n) or [{'total_count': len(jobs), 'jobs': jobs}])
+            limited = mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 403: API rate limit exceeded for user ID 1.')
+            if argv[1:3] == ['api', 'rate_limit']:
+                return ok({'resources': {'core': {'remaining': 0, 'reset': 1790000060}}})
             if argv[1:3] == ['api', '--paginate']:
+                if self.changed == 'limited':
+                    return limited
                 if self.changed is None:
                     return mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 500')
                 return ok([[{'filename': f, 'patch': '@@'} for f in self.changed]])
@@ -440,6 +499,8 @@ class FailuresTest(unittest.TestCase):
                 return ok({'jobs': self.run_jobs[argv[3]]})
             path = argv[2]
             job = path.split('/jobs/')[1].split('/')[0]
+            if path.endswith('/logs') and self.logs[job] == 'limited':
+                return limited
             return ok(self.logs[job]) if path.endswith('/logs') else ok(self.jobs[job])
         for obj, name, fake in ((collect.subprocess, 'run', run), (collect.tempfile, 'gettempdir', lambda: self.tmp.name),
                                 (collect.rtd, 'token', lambda: 'k'),
@@ -776,6 +837,15 @@ class FailuresTest(unittest.TestCase):
                     '[{"cleanup": {"survivors": [1]}}]'):
             self.assertEqual(collect.uf2_reports([fail, f'{{"pass": true, "caveat": "", "results": {bad}}}']),
                              [(1, json.loads(fail))], bad)
+
+    def test_a_rate_limit_reading_a_check_or_the_changed_paths_fails_the_whole_call(self):
+        for name, setup in (('a job log', lambda: self.logs.__setitem__('3', 'limited')), ('the changed paths', lambda: setattr(self, 'changed', 'limited'))):
+            with self.subTest(name):
+                self.setUp()
+                setup()
+                rc, r = self.main(JOB.format(3))
+                self.assertEqual((rc, r['rateLimit']['resetAt'], r['rateLimit']['secondary']), (1, '2026-09-21T14:14:20Z', False))
+                self.assertIn('API rate limit exceeded', r['error'])
 
     def test_changed_paths_are_read_for_any_readable_check_and_their_failure_is_named(self):
         rc, r = self.main('https://greptile.com/')

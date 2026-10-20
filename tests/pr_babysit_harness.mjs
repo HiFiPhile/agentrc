@@ -94,7 +94,7 @@ const STATE_PIN = {
   remote: PIN.remote, pushUrls: PIN.pushUrls,
 }
 const chainAudit = (commits = [ADOPT], paths = ['src/adopted.c'], over = {}) => ({
-  from: HEAD, to: commits[commits.length - 1], commits, paths, unpublished: paths, refusal: '', ...over,
+  from: HEAD, to: commits[commits.length - 1], commits, paths, unpublished: paths, mergeOnly: [], refusal: '', ...over,
 })
 const adoptionState = ({
   maxCycles = 4, cyclesUsed = 1, reviewers = ['coderabbit'], autoRun = reviewers,
@@ -136,12 +136,12 @@ const conforms = (schema, value, at) => {
 
 // state_transfer.py's envelope for a saved output holding `state`, all chunks or `chunks` ("1,3").
 const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
-const transferOf = (state, chunks) => {
+const transferOf = (state, chunks, pad) => {
   const dir = mkdtempSync(join(tmpdir(), 'pr-babysit-state-'))
   try {
     const file = join(dir, 'w.output')
     writeFileSync(file, JSON.stringify({ result: { state } }))
-    const done = spawnSync('python3', [STATE_TRANSFER, file, ...(chunks ? ['--chunks', chunks] : [])], { encoding: 'utf8' })
+    const done = spawnSync('python3', [STATE_TRANSFER, file, ...(chunks ? ['--chunks', chunks] : []), ...(pad ? ['--pad'] : [])], { encoding: 'utf8' })
     return JSON.parse(done.stdout.trim().split('\n').at(-1))
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
@@ -215,7 +215,8 @@ async function run(opts = {}) {
       // The real state_transfer.py on a saved output holding opts.load, then
       // opts.copy(envelope, label) for what the loader agent hands back.
       if (opts.load instanceof Error) throw opts.load
-      const envelope = transferOf(opts.load, (String(prompt).match(/ --chunks ([\d,]+)\n/) || [])[1])
+      const asked = String(prompt).match(/ --chunks ([\d,]+)( --pad)?\n/) || []
+      const envelope = transferOf(opts.load, asked[1], !!asked[2])
       const answer = opts.copy ? await opts.copy(envelope, label) : envelope
       return answer === null ? null : conforms(options.schema, answer, label)
     }
@@ -242,6 +243,7 @@ async function run(opts = {}) {
       if (push.pushed) prHead = to
       return push
     }
+    if (label === 'stop:ci') return conforms(options.schema, { stopped: true }, label)
     if (label.startsWith('prstate#')) {
       // preflight.py --state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
       const state = typeof opts.prState === 'function' ? opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
@@ -286,6 +288,8 @@ async function run(opts = {}) {
       } else if (/collect\.py bases /.test(text)) {
         answer = { head, bases: links.map(link => ({ link, base: baseOf(link) })) }
       } else if (/ inventory /.test(text)) {
+        // opts.inventoryWait(calls, label): hold an inventory read, as a wait still polling.
+        if (opts.inventoryWait) await opts.inventoryWait(calls, label)
         answer = {
           head: ci.headSha ?? head, status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
           pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
@@ -293,6 +297,8 @@ async function run(opts = {}) {
           registered: ci.registered ?? Math.max(1, failed.length), waiting: ci.status === 'running' ? ci.waiting ?? label : '',
           ignored: / --ignore-check /.test(text) ? ci.ignored ?? [] : [],
           ...(/ --brief /.test(text) && ci.status === 'running' ? { checks: [] } : {}),
+          // opts.clock: collect.py's observedAt per call, by default one fixed time.
+          observedAt: typeof opts.clock === 'function' ? opts.clock(label) : at(0),
         }
       } else {
         if (opts.evidence) await opts.evidence(calls)
@@ -319,9 +325,11 @@ async function run(opts = {}) {
     }
     if (label.startsWith('reviews#')) {
       if (reviews instanceof Error) throw reviews
-      const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle() : reviews)
-      // A finding that relates to no earlier verdict, unless a case says it does.
-      if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, ...f }))
+      // opts.reviewsWait(calls): hold the validator's answer, as afterReviewLane holds the CI evidence.
+      if (opts.reviewsWait) await opts.reviewsWait(calls)
+      const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews)
+      // A finding that relates to no earlier verdict and names no repair of ours, unless a case says it does.
+      if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
       // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
       // state; explicit records are filled the same way, one field at a time.
       // The auto-running bots are the ones the workflow's prompt names.
@@ -378,6 +386,9 @@ async function run(opts = {}) {
       // none of the PR's id spaces (noTarget), it names a review body
       // (reviewBody) or the receipts are reshaped (receipts).
       const entries = JSON.parse(String(prompt).match(/Manifest: (\{.*\})$/)[1]).replies
+      // reply.py's error line before anything is posted (replyError), as the relay is told to return it.
+      const scriptError = opts.replyError && opts.replyError(label)
+      if (scriptError) return conforms(options.schema, { error: scriptError, receipts: [] }, label)
       const failed = opts.dropDoneIds && opts.dropDoneIds(label)
       const receipt = ({ commentId, digest }) => failed
         ? { commentId, kind: 'review', replyId: null, digest, sent: false, posted: false, verified: false, resolved: null, error: 'posting failed' }
@@ -386,7 +397,8 @@ async function run(opts = {}) {
         : opts.reviewBody && opts.reviewBody(commentId)
           ? { commentId, kind: 'review-body', replyId: 500 + commentId, digest, sent: true, posted: true, verified: true, resolved: null, error: null }
         : opts.lost && opts.lost(commentId)
-          ? { commentId, kind: 'review', replyId: null, digest, sent: true, posted: false, verified: false, resolved: null, error: 'connection reset' }
+          // lost: true, or the error text the posting failed with
+          ? { commentId, kind: 'review', replyId: null, digest, sent: true, posted: false, verified: false, resolved: null, error: typeof opts.lost(commentId) === 'string' ? opts.lost(commentId) : 'connection reset' }
           : opts.wrongBody && opts.wrongBody(commentId)
             ? { commentId, kind: 'review', replyId: 500 + commentId, digest, sent: true, posted: true, verified: false, resolved: null, error: 'read-back mismatch on body' }
           : opts.alreadyThere && opts.alreadyThere(commentId)
@@ -471,6 +483,8 @@ async function run(opts = {}) {
     }
     if (label.startsWith('reuse#')) {
       if (opts.reuse === null) return null
+      const scriptError = opts.replyError && opts.replyError(label)
+      if (scriptError) return conforms(options.schema, { error: scriptError, receipts: [] }, label)
       const { reuses } = payloadOf(prompt, 'Reuses')
       return conforms(options.schema, { receipts: printed(reuses.map(u => ({
         commentId: u.commentId, kind: 'review', replyId: u.replyId, digest: u.bodyDigest,
@@ -1449,7 +1463,7 @@ test('the fixer is told to stage nothing, and how to verify', async () => {
 test('the CI lane waits out its budget in slices, 30 minutes by default', async () => {
   const sliceCalls = (calls) => calls.filter(c => /^ci:collect#1\.\d+$/.test(c.label))
   const slices = (calls) => sliceCalls(calls)
-    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+)(?: --brief)?(?: --ignore-check '[^']*')* --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
+    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+)(?: --brief)?(?: --ignore-check '[^']*')* --stop-file '[^']*' --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
   const { calls } = await run({ ci: RUNNING, args: { maxCycles: 1 } })
   assert.equal(slices(calls).reduce((a, b) => a + b), 30 * 60)
   const briefs = sliceCalls(calls).map(c => / --brief /.test(c.prompt))
@@ -1816,6 +1830,8 @@ const WAITING = { findings: [], replies: [], bots: 'pending' }
 const YIELD = { autoPush: true, maxCycles: 3, yieldAfterCycle: true }
 const ciLabels = (labels) => labels.filter(l => l.startsWith('ci:'))
 const job = (n) => `https://github.com/o/r/actions/runs/1/job/${n}`
+// A judge that re-ran every check it was given: an empty failure list is a re-run by the contract.
+const rerunAll = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
 
 test('a same-head relaunch recalls the judged verdicts from the store: no judge', async () => {
   const store = new Map()
@@ -2015,18 +2031,183 @@ test('a check keeps one re-run record per head, and a known re-run replaces a po
   const lost = await run({ throwOn: 'ci:judge#', args: { autoPush: true, maxCycles: 3 }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.equal(lost.labels.filter(l => l.startsWith('ci:judge#')).length, 3)
   assert.deepEqual(lost.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', false]])
-  const rerun = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
-  const known = await run({ throwOn: 'ci:judge#1', judge: rerun, args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
+  const known = await run({ throwOn: 'ci:judge#1', judge: rerunAll, args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(known.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', true]])
 })
 
 test('a re-run carries across a launch: its old run is still settling', async () => {
-  const rerun = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
-  const first = await run({ args: YIELD, reviews: WAITING, ci: { status: 'red', infraRerun: ['7'], realFailures: [RIG] }, judge: rerun })
+  const first = await run({ args: YIELD, reviews: WAITING, ci: { status: 'red', infraRerun: ['7'], realFailures: [RIG] }, judge: rerunAll })
   assert.deepEqual(first.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', true]])
   const again = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1'])
   assert.equal(again.result.history.at(-1).ci.status, 'running')
+})
+
+// #123: a red whose re-run has not registered came back at once, and the re-arm spent a cycle every few seconds.
+const minuteOf = (minutes) => (label) => at(minutes[Number(label.match(/^ci:collect#(\d+)/)[1]) - 1])
+
+test('a re-run not yet registered waits before the next cycle, and is judged once it registers (#123)', async () => {
+  const ci = (label) => redWith({ ...RIG, link: job(/^ci:(collect|judge)#[3-9]/.test(label) ? 4 : 1) }).ci
+  let judged = 0
+  const { labels, logs, napMs, result } = await run({ ci, reviews: WAITING, judge: j => judged++ ? j : rerunAll(j), args: { maxCycles: 3 } })
+  assert.deepEqual(ciLabels(labels).filter(l => l.startsWith('ci:judge')), ['ci:judge#1', 'ci:judge#3'])
+  assert.ok(logs.some(l => /cycle 1: CI still settling .* re-arming after a wait/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /cycle 2: CI still settling .* re-arming after a wait/.test(l)))
+  assert.ok(napMs.includes(60000) && napMs.includes(120000), JSON.stringify(napMs))
+  assert.notEqual(result.reason, 'ci-stuck')
+})
+
+test('a re-run that never registers stops ci-stuck after ciWait minutes, naming its check (#123)', async () => {
+  const opts = { ci: redWith(RIG).ci, reviews: WAITING, judge: rerunAll }
+  const { result, logs } = await run({ ...opts, clock: minuteOf([0, 10, 30]), args: { maxCycles: 5 } })
+  assert.equal(result.reason, 'ci-stuck')
+  assert.deepEqual(result.unregistered, ['ci / hil / pico'])
+  assert.equal(result.cycles, 3)
+  assert.ok(logs.some(l => /the re-run of ci \/ hil \/ pico has not registered within 30 minutes/.test(l)))
+  const early = await run({ ...opts, clock: minuteOf([0, 10, 29]), args: { maxCycles: 3 } })
+  assert.notEqual(early.result.reason, 'ci-stuck', 'within ciWait it is still settling')
+})
+
+test('a re-run\'s deadline starts after the judge returns, not at the inventory read before it (#123)', async () => {
+  // The evidence and the judging take ten minutes: the read after the judge sees minute 10.
+  const minutes = minuteOf([0, 15, 35, 40, 45])
+  const stamped = /^ci:collect#1\.t\b/
+  const opts = { ci: redWith(RIG).ci, reviews: WAITING, judge: rerunAll, args: { maxCycles: 5 } }
+  const { result, labels } = await run({ ...opts, clock: (label) => stamped.test(label) ? at(10) : minutes(label) })
+  assert.ok(labels.includes('ci:collect#1.t'), labels.join(' '))
+  assert.equal(result.reason, 'ci-stuck')
+  assert.equal(result.cycles, 4, '35 minutes after the inventory read but 25 after the judge is still settling')
+  const lost = await run({ ...opts, clock: minutes, garble: (label, line) => stamped.test(label) ? null : line })
+  assert.equal(lost.result.reason, 'ci-stuck')
+  assert.equal(lost.result.cycles, 5, 'an unread time is taken from the next read, at minute 15')
+})
+
+test('a PR the read after a re-run finds merged or closed ends both lanes, its re-run kept (#123)', async () => {
+  for (const status of ['merged', 'closed']) {
+    const ci = (label) => label === 'ci:collect#1.t' ? { ...GREEN, status, mergeable: 'UNKNOWN' } : redWith(RIG).ci
+    const { result, labels, logs } = await run({ ci, reviews: WAITING, judge: rerunAll, args: { maxCycles: 3 } })
+    assert.equal(result.reason, `pr-${status}`, logs.join('\n'))
+    assert.equal(result.cycles, 1)
+    assert.equal(ciLabels(labels).at(-1), 'ci:collect#1.t', 'no further wait, read or judge')
+    assert.equal(result.state.ciCache.reruns.length, 1, 'the re-run is recorded')
+  }
+})
+
+test('a re-run\'s deadline carries across launches; one from a state without its time starts at the resume (#123)', async () => {
+  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll })
+  const { state } = first.result
+  assert.deepEqual(state.ciCache.reruns.map(r => r.at), [at(0)])
+  const resumed = (st, minutes) => run({ args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, clock: () => at(minutes) })
+  assert.notEqual((await resumed(state, 29)).result.reason, 'ci-stuck')
+  assert.equal((await resumed(state, 30)).result.reason, 'ci-stuck', 'the resume does not restart the deadline')
+  const old = seal({ ...state, ciCache: { ...state.ciCache, reruns: state.ciCache.reruns.map(({ at: _, ...r }) => r) } })
+  const timed = await resumed(old, 100)
+  assert.notEqual(timed.result.reason, 'ci-stuck')
+  assert.deepEqual(timed.result.state.ciCache.reruns.map(r => r.at), [at(100)], 'timed from the first read after the resume, once')
+  assert.equal((await resumed(timed.result.state, 130)).result.reason, 'ci-stuck')
+})
+
+// #90: every harvest of a launch hit a secondary limit, and each failed cycle was charged.
+const LIMIT = { observedAt: at(5), resetAt: null, secondary: true }
+const LIMITED_REVIEWS = { headSha: '', headEventEvidence: 'rate limited', bots: [], botsWhole: true, findings: [], replies: [],
+  rateLimit: { error: 'gh api: HTTP 403: You have exceeded a secondary rate limit.', ...LIMIT } }
+const limitedInventory = (label, line) => label.startsWith('ci:collect#') && line && 'status' in line
+  ? { ...line, error: 'gh pr checks: GraphQL: API rate limit exceeded', rateLimit: { ...LIMIT, resetAt: at(60), secondary: false }, seal: '' } : line
+
+test('a harvest GitHub refused for a rate limit stops the launch at once, the cycle not charged (#90)', async () => {
+  for (const args of [{ maxCycles: 4 }, { ...YIELD }, { autoPush: true, maxCycles: 4, yieldOnChange: true }]) {
+    const { result, labels, logs } = await run({ reviews: LIMITED_REVIEWS, args })
+    assert.equal(result.reason, 'github-rate-limited', JSON.stringify(args))
+    assert.deepEqual(result.rateLimit, LIMITED_REVIEWS.rateLimit)
+    assert.equal(result.state.cyclesUsed, 0, 'nothing observed: the cycle is not charged')
+    assert.equal(labels.filter(l => l.startsWith('reviews#')).length, 1)
+    assert.ok(logs.some(l => /GitHub refused a call for a secondary rate limit .* relaunch once it clears/.test(l)))
+  }
+})
+
+test('a CI read GitHub refused for a rate limit stops the cycle too, with its reset (#90)', async () => {
+  const { result, logs } = await run({ reviews: WAITING, garble: limitedInventory, args: { maxCycles: 4 } })
+  assert.equal(result.reason, 'github-rate-limited')
+  assert.deepEqual(result.rateLimit, { error: 'gh pr checks: GraphQL: API rate limit exceeded', ...LIMIT, resetAt: at(60), secondary: false })
+  assert.equal(result.state.cyclesUsed, 0)
+  assert.ok(logs.some(l => l.includes(`relaunch after ${at(60)}`)))
+})
+
+test('a repair committed in a rate-limited cycle is held unpushed and charged; the uncharged cycle number runs again (#90)', async () => {
+  const { result, labels } = await run({ reviews: oneValid, garble: limitedInventory, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(result.reason, 'github-rate-limited')
+  assert.deepEqual([result.history[0].reviewPushFailed.committed, result.history[0].reviewPushFailed.detail],
+    [true, 'not pushed: GitHub refused a call for a rate limit this cycle'])
+  assert.equal(labels.some(l => l.startsWith('push#')), false)
+  assert.equal(result.state.pending.stage, 'push-failed', 'the landed commit stays the caller\'s to decide')
+  assert.equal(result.state.cyclesUsed, 1)
+  const first = await run({ reviews: WAITING, args: YIELD })
+  const quiet = await run({ reviews: LIMITED_REVIEWS, args: { ...YIELD, state: first.result.state } })
+  assert.deepEqual([quiet.result.reason, quiet.result.state.cyclesUsed], ['github-rate-limited', 1])
+  const next = await run({ reviews: WAITING, args: { ...YIELD, state: quiet.result.state } })
+  assert.equal(next.result.state.cyclesUsed, 2, 'the uncharged cycle number runs again')
+  assert.ok(next.labels.includes('reviews#2'))
+})
+
+test('reply.py refused for a rate limit stops the launch too; a cycle that re-ran a check is charged (#90)', async () => {
+  const replied = await run({ reviews: oneValid, replyError: (label) => label.startsWith('resolve#') && RATE, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(replied.result.reason, 'github-rate-limited')
+  assert.deepEqual(replied.result.rateLimit, { error: `reply.py: ${RATE}`, observedAt: null, resetAt: null, secondary: false })
+  assert.equal(replied.result.state.cyclesUsed, 1, 'it pushed a repair')
+  const midBatch = await run({ reviews: oneValid, lost: () => RATE, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(midBatch.result.reason, 'github-rate-limited', 'a receipt\'s error names it too')
+  assert.equal(midBatch.result.rateLimit.error, `reply.py: ${RATE}`)
+  const reran = await run({ reviews: LIMITED_REVIEWS, reviewsWait: afterReviewLane('ci:judge#1'), ci: redWith(RIG).ci, judge: rerunAll, args: { maxCycles: 4 } })
+  assert.equal(reran.result.reason, 'github-rate-limited')
+  assert.deepEqual(reran.result.state.ciCache.reruns.map(r => r.sure), [true])
+  assert.equal(reran.result.state.cyclesUsed, 1, 'a re-run without a receipt is still one')
+})
+
+test('CI evidence refused for a rate limit stops the launch even when a review push superseded it (#90)', async () => {
+  const limitedEvidence = (label, line) => label === 'ci:collect#1.f' && line ? { ...line, error: RATE, rateLimit: LIMIT, seal: '' } : line
+  const { result, labels } = await run({
+    reviews: oneValid, args: { autoPush: true, maxCycles: 4 }, garble: limitedEvidence,
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, evidence: afterReviewLane('push#'),
+  })
+  assert.equal(labels.includes('ci:judge#1'), false, 'superseded evidence is still not judged')
+  assert.equal(result.reason, 'github-rate-limited')
+  assert.deepEqual(result.rateLimit, { error: RATE, ...LIMIT })
+})
+
+test('once one lane met a rate limit, the other makes no further GitHub call this cycle (#90)', async () => {
+  const waiting = await run({ reviews: LIMITED_REVIEWS, ci: { status: 'running', infraRerun: [], realFailures: [] }, args: { maxCycles: 4 } })
+  assert.equal(waiting.result.reason, 'github-rate-limited')
+  assert.deepEqual(ciLabels(waiting.labels), ['ci:collect#1.1'], 'no further slice and no full read')
+  for (const status of ['merged', 'closed']) {
+    const ended = await run({ reviews: LIMITED_REVIEWS, ci: { ...GREEN, status, mergeable: 'UNKNOWN' }, args: { maxCycles: 4 } })
+    assert.equal(ended.result.reason, `pr-${status}`, 'an ended PR still outranks the limit')
+  }
+  const refuting = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
+  const posting = await run({ reviews: refuting, reviewsWait: afterReviewLane('ci:collect#1.1'), garble: limitedInventory, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(posting.result.reason, 'github-rate-limited')
+  assert.equal(posting.labels.some(l => /^(prstate|replies)#/.test(l)), false, 'the write gate stops before reading the PR state')
+  assert.equal(posting.result.state.cyclesUsed, 0)
+})
+
+test('a limit the review lane met stops the CI wait in flight before its next poll, not at its end', async () => {
+  const hold = (calls, label) => label === 'ci:collect#1.1' ? afterReviewLane('reviews#1')(calls) : undefined
+  const { result, calls } = await run({ reviews: LIMITED_REVIEWS, ci: { status: 'running', infraRerun: [], realFailures: [] }, inventoryWait: hold, args: { maxCycles: 4 } })
+  assert.equal(result.reason, 'github-rate-limited')
+  const file = `${PIN.receipts}/ci-stop-1`
+  assert.ok(calls.find(c => c.label === 'ci:collect#1.1').prompt.includes(` --stop-file '${file}'`))
+  const stops = calls.filter(c => c.label === 'stop:ci')
+  assert.equal(stops.length, 1)
+  assert.ok(stops[0].prompt.includes(`'${file}'`))
+  const own = await run({ reviews: WAITING, garble: limitedInventory, args: { maxCycles: 4 } })
+  assert.equal(own.result.reason, 'github-rate-limited')
+  assert.equal(own.calls.some(c => c.label === 'stop:ci'), false, 'the collector\'s own limit ended its wait already')
+})
+
+test('another harvest error keeps today\'s path: every reviewer unknown, re-armed (#90)', async () => {
+  const unknown = { findings: [], replies: [], bots: [bot('coderabbit', { state: 'unknown', sha: null, evidence: [], reason: 'gh: HTTP 502' })] }
+  const { result } = await run({ reviews: unknown, args: { maxCycles: 2 } })
+  assert.notEqual(result.reason, 'github-rate-limited')
+  assert.equal(result.state.cyclesUsed, 2)
 })
 
 test('a re-run recorded under a copy\'s link still settles the execution it copied', async () => {
@@ -3600,6 +3781,110 @@ test('a stale reply after a failed fix note is a repair, not a second answer', a
   assert.deepEqual(debtOf(result, 1).repair, { replyId: null, error: 'no reply posted: offered fixNote is stale (now owes a refutation)' })
 })
 
+// The fix note of cycle 1 dies with its batch; from cycle 2 the validator judges each finding stale, fixedBy(sha, prompt) naming the commit.
+const renoteRun = (fixedBy, { first = structuredClone(oneValid), later = (f) => [f] } = {}) => {
+  let cycle = 0
+  const named = []
+  return run({
+    args: { autoPush: true, maxCycles: 4 },
+    dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
+    reviewsPerCycle: (prompt) => {
+      cycle++
+      if (cycle === 1) return first
+      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
+      named.push(sha && JSON.parse(sha))
+      const findings = first.findings.flatMap(f => later(finding({ ...f, verdict: 'stale', fixedBy: fixedBy(sha && JSON.parse(sha)[0].sha) }), cycle))
+      return { findings, replies: [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
+    },
+  }).then(out => ({ ...out, named }))
+}
+
+test('a fix note whose batch died is posted as offered once the validator names our repair as the fix (#115)', async () => {
+  const { result, calls, named } = await renoteRun((sha) => sha)
+  const [offered, again] = manifestOf(calls, 'resolve#1').concat(manifestOf(calls, 'resolve#2'))
+  assert.match(named[0][0].sha, /^[0-9a-f]{40}$/)
+  assert.deepEqual(named[0], [{ commentId: 1, sha: named[0][0].sha }])
+  assert.equal(again.body, offered.body, 'the offered body, byte for byte')
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'no "already fixed" reply')
+  assert.equal(result.state.debt.some(([id]) => id === 1), false)
+  assert.equal(result.handoffs, undefined)
+})
+
+test('a stale verdict naming another fix, or missing a finding the note covered, keeps the note handed off (#115)', async () => {
+  const two = { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' }
+  for (const [name, out] of [
+    ['another commit', await renoteRun(() => 'f'.repeat(40))],
+    ['no commit', await renoteRun(() => null)],
+    ['a sibling judged otherwise', await renoteRun((sha) => sha, { first: two, later: (f) => [f.line === 2 ? { ...f, verdict: 'invalid', fixedBy: null } : f] })],
+  ]) {
+    assert.equal(out.calls.some(c => c.label === 'resolve#2'), false, name)
+    assert.match(debtOf(out.result, 1).repair.error, /offered fixNote is stale/, name)
+  }
+  // A harvest missing a covered finding answers nothing on the comment yet.
+  const partial = await renoteRun((sha) => sha, { first: two, later: (f) => f.line === 2 ? [] : [f] })
+  assert.equal(partial.calls.some(c => /^(resolve|replies)#[234]$/.test(c.label)), false)
+  assert.deepEqual(partial.result.outstanding, [1])
+})
+
+test('a partial harvest before the note qualifies leaves no dismissal behind once it does (#115)', async () => {
+  const two = { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' }
+  const { result, calls } = await renoteRun((sha) => sha, { first: two, later: (f, cycle) => cycle === 2 && f.line === 2 ? [] : [f] })
+  assert.equal(manifestOf(calls, 'resolve#3')[0].body, manifestOf(calls, 'resolve#1')[0].body)
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'no second answer for a dismissal left behind')
+  assert.equal(result.state.debt.some(([id]) => id === 1), false, 'the covered findings owe no dismissal')
+  assert.equal(result.pass, true)
+})
+
+test('a deferred sibling the offered note states does not keep it from being posted (#115)', async () => {
+  let cycle = 0
+  const { result, calls } = await run({
+    args: { autoPush: true, maxCycles: 4, deferrals: [deferral({ findingId: '1#2' })] },
+    dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
+    reviewsPerCycle: (prompt) => {
+      cycle++
+      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
+      const fixed = cycle === 1 ? finding() : finding({ verdict: 'stale', fixedBy: JSON.parse(sha)[0].sha })
+      return { findings: [fixed, finding({ line: 2 })], replies: cycle === 1 ? [] : [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
+    },
+  })
+  const [offered] = manifestOf(calls, 'resolve#1')
+  assert.match(offered.body, new RegExp(`- src/a\\.c:2:\\n  .*${ISSUE}`))
+  assert.equal(manifestOf(calls, 'resolve#2')[0].body, offered.body, 'the offered body, deferred point included')
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
+  assert.equal(result.handoffs, undefined)
+  assert.equal(result.pass, true)
+})
+
+test('a deferred sibling whose point the offered note does not state keeps it handed off (#115)', async () => {
+  // The resumed launch defers the sibling with another reason, so its point is not the one the dead note carried.
+  let cycle = 0
+  const opts = (reason) => ({
+    args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, deferrals: [deferral({ findingId: '1#2', reason })] },
+    dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
+    reviewsPerCycle: (prompt) => {
+      cycle++
+      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
+      const fixed = cycle === 1 ? finding() : finding({ verdict: 'stale', fixedBy: JSON.parse(sha)[0].sha })
+      return { findings: [fixed, finding({ line: 2 })], replies: cycle === 1 ? [] : [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
+    },
+  })
+  const first = await run(opts('broken on master too; own PR'))
+  const { result, calls } = await resumeAt(first.result.state, opts('needs its own PR'))
+  assert.equal(calls.some(c => c.label.startsWith('resolve#')), false, 'the offered note went out without the point now owed')
+  assert.match(debtOf(result, 1).repair.error, /offered fixNote is stale/)
+})
+
+test('a rebase drops a pending fix note\'s repair: the rewritten commit cannot be named again (#115)', async () => {
+  const attempt = { body: `Fixed in ${HEAD}.\n\n- src/a.c:1`, how: 'fixNote', digest: 'd1', repair: { sha: HEAD, findings: ['1#1'] } }
+  const state = adoptionState({ debt: [[1, { dismissals: [], notes: ['1#1'], digest: 'd1', attempt }]] })
+  const { result, calls } = await run({ args: rebaseArgs(state), preflight: { head: FOREIGN, prHead: FOREIGN },
+    reviews: { findings: [finding({ verdict: 'stale', fixedBy: HEAD })], replies: [], bots: 'reviewed' } })
+  assert.equal(calls.find(c => c.label.startsWith('reviews#')).prompt.includes('not yet posted'), false)
+  assert.equal(calls.some(c => c.label.startsWith('resolve#')), false)
+  assert.equal(debtOf(result, 1).attempt.repair, undefined)
+  assert.equal(debtOf(result, 1).attempt.body, attempt.body, 'the offered body stays')
+})
+
 test('an answered comment is not replied to again for a stale re-report', async () => {
   // The fix note already resolved the thread. A drafted "already fixed" reply
   // for the same finding is a second answer to a closed thread.
@@ -3712,6 +3997,39 @@ test('a repair obligation survives a restart and still blocks a repost', async (
   assert.match(debtOf(first.result, 2).repair.error, /^read-back mismatch on body/)
   assert.equal(second.calls.some(c => c.label.startsWith('replies#')), false, 'reposted over a reply that needs repair')
   assert.ok(second.result.handoffs.some(h => h.commentId === 2), 'the restored repair is still handed off')
+})
+
+const RATE = 'gh: API rate limit exceeded for user ID 249515 (HTTP 403)'
+
+test('reply.py\'s error line fails the batch with that error, not a seal mismatch or a retry (#115)', async () => {
+  const { result, labels, logs } = await run({ reviews: oneValid, replyError: (label) => label.startsWith('resolve#') && RATE, args: { autoPush: true, maxCycles: 1 } })
+  assert.equal(labels.some(l => /^resolve#1\.retry/.test(l)), false, 'an error line is an answer: no Sonnet retry')
+  assert.equal(logs.some(l => /does not match its seal/.test(l)), false)
+  assert.ok(logs.some(l => l.includes(`resolve#1 incomplete — reply.py: ${RATE}`)), logs.join('\n'))
+  assert.equal(result.history[0].fixNotePosts.detail, `reply.py: ${RATE}`)
+})
+
+test('reply.py\'s error line refuses a settlement with that error (#115)', async () => {
+  const { edited, at, state, settlement } = await reanswered()
+  const { result } = await run({ reviews: edited, preflight: at, replyError: (label) => label.startsWith('reuse#') && RATE, args: { ...YIELD, maxCycles: 6, state, replySettlements: [settlement] } })
+  assert.deepEqual(result.settlements, [{ commentId: 1, outcome: 'refused', why: `reply.py: ${RATE}` }])
+})
+
+test('receipts beside an error are not trusted: an error line carries no seal to check them by (#115)', async () => {
+  const withError = (label, line) => line && /^(resolve|reuse)#/.test(label) ? { ...line, error: 'HTTP 403', seal: 'bad-seal' } : line
+  const { result } = await run({ reviews: oneValid, garble: withError, args: { autoPush: true, maxCycles: 1 } })
+  assert.equal(result.history[0].fixNotePosts.pass, false)
+  assert.equal(result.state.answeredWith.some(([id]) => id === 1), false)
+  const { edited, at, state, settlement } = await reanswered()
+  const reused = await run({ reviews: edited, preflight: at, garble: withError, args: { ...YIELD, maxCycles: 6, state, replySettlements: [settlement] } })
+  assert.deepEqual(reused.result.settlements, [{ commentId: 1, outcome: 'refused', why: 'reply.py: HTTP 403' }])
+})
+
+test('the hook and commit relays wait out a slow pre-commit, up to the Bash maximum (#140)', async () => {
+  const { calls } = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 1 } })
+  for (const label of ['hooks#1-review', 'commit#1-review']) {
+    assert.match(calls.find(c => c.label === label).prompt, /in the foreground with a Bash timeout of 600000 ms/, label)
+  }
 })
 
 // Comment 2 was answered by a reply (502) whose body reply.py will not post over.
@@ -3894,7 +4212,7 @@ test('a deferred finding is not fixed, is answered with its issue on the caller\
   const { result, calls, labels, logs } = await run({ reviews: oneValid, args: { deferrals: [deferral()] } })
   assert.equal(labels.some(l => /^(fix:|issue#)/.test(l)), false, 'no writer for a deferred finding, and no second read of its issue')
   const [posted] = manifestOf(calls, 'defer#1')
-  assert.equal(posted.body, `- src/a.c:1: Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
+  assert.equal(posted.body, `- src/a.c:1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.deferrals, [{ findingId: '1#1', issueUrl: ISSUE }])
   assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR' }]])
@@ -3906,7 +4224,7 @@ test("a finding the PR owner decided not to fix is deferred with no issue: not f
   const owner = deferral({ issueUrl: undefined, reason: 'the unpinned install is intentional' })
   const { result, calls, labels } = await run({ reviews: oneValid, args: { deferrals: [owner] } })
   assert.equal(labels.some(l => /^(fix:|issue#)/.test(l)), false, 'no writer, and no issue to read')
-  assert.equal(manifestOf(calls, 'defer#1')[0].body, "- src/a.c:1: Left as is, by the PR owner's decision: the unpinned install is intentional.")
+  assert.equal(manifestOf(calls, 'defer#1')[0].body, "- src/a.c:1:\n  Left as is, by the PR owner's decision: the unpinned install is intentional.")
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.deferrals, [{ findingId: '1#1', ownerDecision: 'the unpinned install is intentional' }])
   assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'd1', reason: 'the unpinned install is intentional' }]])
@@ -3916,7 +4234,7 @@ test("a finding the PR owner decided not to fix is deferred with no issue: not f
   // On a mixed comment it rides in the fix note.
   const mixed = { findings: [finding({ findingId: '1#1', claim: 'pin it' }), finding({ findingId: '1#2', line: 2, claim: 'in scope' })], replies: [], bots: 'reviewed' }
   const withFix = await run({ reviews: mixed, args: { deferrals: [owner] } })
-  assert.match(manifestOf(withFix.calls, 'resolve#1')[0].body, /\n\n- src\/a\.c:1: Left as is, by the PR owner's decision: the unpinned install is intentional\.$/)
+  assert.match(manifestOf(withFix.calls, 'resolve#1')[0].body, /\n\n- src\/a\.c:1:\n  Left as is, by the PR owner's decision: the unpinned install is intentional\.$/)
 })
 
 test('a deferral reply that is not verified leaves the comment owed', async () => {
@@ -4060,14 +4378,44 @@ test('a deferral whose reason alone breaks the reply limit is refused before any
   assert.ok(calls.length > 0, 'a reason within the limit runs')
 })
 
-test('a deferral point quotes no claim, and is refused only when its location takes it over the limit', async () => {
+test('a deferral point quotes no claim, and the launch measures the point the cycle posts (#142)', async () => {
   const wordyClaim = { findings: [finding({ claim: 'w '.repeat(80) + 'x'.repeat(300) })], replies: [], bots: 'reviewed' }
   const posted = await run({ reviews: wordyClaim, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
-  assert.equal(manifestOf(posted.calls, 'defer#1')[0].body, `- src/a.c:1: Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
-  const { result, calls } = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(50).trim() })], maxCycles: 2 } })
-  assert.equal(result.reason, 'deferral-refused')
-  assert.match(result.detail, /^1#1: its reply point would exceed 60 words or a line 300 characters; pass a shorter reason$/)
-  assert.equal(calls.some(c => c.label.startsWith('defer#')), false, 'nothing is posted')
+  assert.equal(manifestOf(posted.calls, 'defer#1')[0].body, `- src/a.c:1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
+  // The place is one word on its own line: 7 + 50 + 3 answer words and the place make 61.
+  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(50).trim() })], maxCycles: 2 } }),
+    /deferral reason too long for its reply .*: 1#1$/)
+  const atWords = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(49).trim() })], autoPush: true, maxCycles: 2 } })
+  assert.equal(manifestOf(atWords.calls, 'defer#1').length, 1, '60 words are posted')
+  // The answer line is measured as posted, with its two-space indent.
+  const fill = (n) => 'x'.repeat(n - `  Real, and out of this PR's scope: . Tracked in ${ISSUE}.`.length)
+  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: fill(301) })] } }), /: 1#1$/)
+  const atChars = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: fill(300) })], autoPush: true, maxCycles: 2 } })
+  const line = manifestOf(atChars.calls, 'defer#1')[0].body.split('\n')[1]
+  assert.equal(line.length, 300)
+})
+
+test('a deferral attempt offered in the one-line form is posted as offered, not reformatted (#142)', async () => {
+  const LONG = { deferrals: [deferral()], autoPush: true, maxCycles: 4, yieldAfterCycle: true }
+  const first = await run({ reviews: oneValid, dropDoneIds: (label) => label.startsWith('defer#'), args: LONG })
+  const state = structuredClone(first.result.state)
+  const attempt = debtOf({ state }, 1).attempt
+  assert.match(attempt.body, /^- src\/a\.c:1:\n {2}Real/)
+  const old = `- src/a.c:1: ${attempt.body.split('\n  ')[1]}`
+  attempt.body = old
+  const { digest, ...rest } = state
+  state.digest = fnv1a(canonical(rest))
+  const again = await resumeAt(state, { reviews: oneValid, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(manifestOf(again.calls, 'defer#2')[0].body, old)
+  assert.equal(again.result.state.debt.some(([id]) => id === 1), false, 'the old attempt settles the comment')
+})
+
+test('a deferral place that is not one word, or too long for its line, is named by its finding id (#142)', async () => {
+  for (const file of ['src/my file.c', `src/${'d/'.repeat(150)}a.c`]) {
+    const reviews = { findings: [finding({ file })], replies: [], bots: 'reviewed' }
+    const { calls } = await run({ reviews, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
+    assert.equal(manifestOf(calls, 'defer#1')[0].body, `- 1#1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`, file)
+  }
 })
 
 test('a deferral applied once holds on a resumed launch without being passed again, until the comment is edited', async () => {
@@ -4093,7 +4441,7 @@ test('a deferred point rides in the one reply its mixed comment gets', async () 
   assert.equal(withFix.calls.filter(c => c.label.startsWith('fix:')).length, 1)
   assert.doesNotMatch(withFix.calls.find(c => c.label.startsWith('fix:')).prompt, /deferred point/)
   const [note] = manifestOf(withFix.calls, 'resolve#1')
-  assert.match(note.body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:2\n\n- src\/a\.c:1: Real, and out of this PR's scope/)
+  assert.match(note.body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:2\n\n- src\/a\.c:1:\n  Real, and out of this PR's scope/)
   assert.equal(withFix.labels.some(l => l.startsWith('defer#')), false, 'one reply per comment')
   const refutedPoint = invalidFinding({ findingId: '1#2', line: 2, claim: 'wrong' })
   const withRefutation = await run({
@@ -4101,7 +4449,7 @@ test('a deferred point rides in the one reply its mixed comment gets', async () 
     args: { deferrals: [deferral()] },
   })
   const [reply] = manifestOf(withRefutation.calls, 'replies#1')
-  assert.match(reply.body, /^not so\n\n- src\/a\.c:1: Real, and out of this PR's scope/)
+  assert.match(reply.body, /^not so\n\n- src\/a\.c:1:\n  Real, and out of this PR's scope/)
   assert.equal(withRefutation.labels.some(l => l.startsWith('defer#')), false)
 })
 
@@ -5295,7 +5643,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.equal(JSON.stringify(result.state).includes('adoptHead'), false, 'the launch argument is not persisted')
   const audit = calls.find(c => c.label === 'adopt:audit')
   assert.equal(audit.phase, 'Triage')
-  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'refusal'])
+  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'refusal'])
   assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE} --tip ${TIP}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
@@ -5380,7 +5728,7 @@ test('the audit script\'s refusal, or an audit of another range, is refused', as
 
 test('a merge whose base the checkout lacks stops as adopt-base-missing; other audit errors and refusals do not', async () => {
   const missing = `the PR's base ${TIP} is not in the checkout: fetch it`
-  const errored = error => ({ error, from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], refusal: '' })
+  const errored = error => ({ error, from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], refusal: '' })
   for (const [audit, reason] of [
     [errored(missing), 'adopt-base-missing'],
     [errored('git rev-list: fatal: bad revision'), 'adopt-audit-failed'],
@@ -5398,7 +5746,7 @@ test('a merge whose base the checkout lacks stops as adopt-base-missing; other a
 test('a chain the audit script cannot read back is refused with its error', async () => {
   const { result, labels } = await run({
     args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD },
-    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], refusal: '' },
+    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], refusal: '' },
   })
   assert.equal(result.reason, 'adopt-audit-failed')
   assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
@@ -5589,6 +5937,49 @@ test('a protected path the PR already carries is adopted; one this run would pub
   assert.equal(elsewhere.result.reason, 'adopt-audit-failed', 'a receipt drawn at another publication boundary is no audit')
   assert.match(elsewhere.result.detail, /published at 1{40} on base .*, not .* published at 0f1e2d3c/)
   assert.equal(elsewhere.labels.includes('adopt:push'), false)
+})
+
+test('adoptProtected admits a protected path only a base merge changes, and only the paths it names (#97)', async () => {
+  const roster = ['test/hil/local.json', 'test/hil/other.json']
+  const state = adoptionState({ protected: '^test/hil/' })
+  const audit = (over) => chainAudit([ADOPT], roster, { mergeOnly: roster, ...over })
+  const HINT = '; only a base merge changes them, which adoptProtected may permit'
+  const merged = await run({
+    args: adoptionArgs(state, { autoPush: true, adoptProtected: roster }), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit(),
+  })
+  assert.notEqual(merged.result.reason, 'adopt-audit-failed', merged.result.detail)
+  assert.equal(merged.result.history[1].adoption.publication, 'pushed')
+  assert.ok(merged.logs.some(l => l.includes('protected path(s) test/hil/local.json, test/hil/other.json, named in adoptProtected')))
+  for (const [name, over, args, refused] of [
+    ['an unnamed path', {}, { adoptProtected: ['test/hil/local.json'] }, `test/hil/other.json${HINT}`],
+    ['an ordinary link touching the path too', { mergeOnly: ['test/hil/other.json'] }, { adoptProtected: roster }, 'test/hil/local.json'],
+    ['no adoptProtected', {}, {}, `test/hil/local.json, test/hil/other.json${HINT}`],
+    ['one of two by an ordinary link', { mergeOnly: ['test/hil/other.json'] }, {}, 'test/hil/local.json, test/hil/other.json'],
+  ]) {
+    const { result, labels } = await run({ args: adoptionArgs(state, { autoPush: true, ...args }), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit(over) })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.equal(result.detail, `protected path(s) in the chain: ${refused}`, name)
+    assert.equal(labels.includes('adopt:push'), false, name)
+  }
+})
+
+test('adoptProtected is refused unless it names distinct plain paths beside an adoptHead (#97)', async () => {
+  const state = adoptionState({ protected: '^test/hil/' })
+  for (const [adoptProtected, adoptHead, message] of [
+    ['test/hil/local.json', ADOPT, /must be an array of plain repository-relative paths/],
+    [['./test/hil/local.json'], ADOPT, /must be an array of plain repository-relative paths/],
+    [['../local.json'], ADOPT, /must be an array of plain repository-relative paths/],
+    [[''], ADOPT, /must be an array of plain repository-relative paths/],
+    [['test/hil/local.json', 'test/hil/local.json'], ADOPT, /names a path twice/],
+    [['test/hil/local.json'], undefined, /goes with the adoptHead/],
+  ]) {
+    await assert.rejects(run({ args: adoptionArgs(state, { adoptProtected, adoptHead }), preflight: { head: ADOPT, prHead: HEAD } }), message,
+      JSON.stringify(adoptProtected))
+  }
+  const trace = []
+  await assert.rejects(run({ trace, args: { stateRef: { outputFile: '/tmp/w.output', digest: '0123abcd' }, adoptHead: ADOPT, adoptProtected: ['../x'] } }),
+    /plain repository-relative paths/)
+  assert.deepEqual(trace, [], 'refused before the state loader starts an agent')
 })
 
 test('an uncanonicalizable adopted path fails the audit', async () => {
@@ -6398,7 +6789,7 @@ test('a rate-limited CodeRabbit is asked once after its reset, then waited for',
 })
 
 test('a rate limit is not asked about without the switch, a reset time, or a reset within the hour', async () => {
-  for (const [args, retryAt] of [[{}, at(20)], [{ coderabbitTrigger: true }, null], [{ coderabbitTrigger: true }, at(60)]]) {
+  for (const [args, retryAt] of [[{}, at(20)], [{ coderabbitTrigger: true }, null], [{ coderabbitTrigger: true }, at(61)]]) {
     const { result, labels, logs } = await run({ args: { ...args, maxCycles: 3 }, reviews: quiet([limitedCr(retryAt)]) })
     assert.equal(result.pass, true, result.reason)
     assert.equal(result.cycles, 1)
@@ -6407,6 +6798,18 @@ test('a rate limit is not asked about without the switch, a reset time, or a res
   }
   const last = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, reviews: quiet([limitedCr(at(20))]) })
   assert.equal(last.result.pass, true, 'no cycle left to wait in')
+})
+
+test('a reset estimated an hour out is waited for to the cap, then asked about; one already passed is asked about at once (#138)', async () => {
+  let n = 0
+  const { labels, napMs } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 3 }, minutesPerCycle: 61,
+    reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(60)) : bot('coderabbit')]),
+  })
+  assert.equal(napMs[0], 60 * 60000, 'the minute past the reset stays within the hour')
+  assert.deepEqual(requests(labels), ['crrequest#2'])
+  const passed = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, reviews: quiet([limitedCr(at(-5))]) })
+  assert.deepEqual(requests(passed.labels), ['crrequest#1'])
 })
 
 test('a reset extended before the request is waited for again, and asked about once', async () => {
@@ -6536,7 +6939,10 @@ const saved = async (findings) => {
 const REASON = 'SKILL.md:146 at head (144 at eda9a913) — é ✓ "q" \\ end'
 const savedForLoad = () => saved([invalidFinding({ reason: REASON })])
 const loadWith = (state, stateRef, copy) => run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, copy })
-const asks = (calls) => calls.filter(c => c.label.startsWith('state:load#')).map(c => (c.prompt.match(/ --chunks ([\d,]+)\n/) || [null, 'all'])[1])
+const asks = (calls) => calls.filter(c => c.label.startsWith('state:load#')).map(c => {
+  const m = c.prompt.match(/ --chunks ([\d,]+)( --pad)?\n/)
+  return m ? m[1] + (m[2] ? '+pad' : '') : 'all'
+})
 const flip = (data) => (data[0] === 'A' ? 'B' : 'A') + data.slice(1)
 const once = (change) => (env, label) => label === 'state:load#1' ? change(structuredClone(env)) : env
 // The live loader's "correction" (146 -> 144) made in a chunk together with its
@@ -6598,7 +7004,7 @@ test('a mis-copied, missing or duplicated chunk is asked for again alone', async
   ]
   for (const [change, again] of cases) {
     const got = await loadWith(state, stateRef, once(change))
-    assert.deepEqual(asks(got.calls), ['all', again])
+    assert.deepEqual(asks(got.calls), ['all', `${again}+pad`], 'a re-ask goes padded')
     assert.equal(got.labels[2], 'preflight')
     assert.deepEqual(got.result.state.decisions, state.decisions)
   }
@@ -6606,8 +7012,31 @@ test('a mis-copied, missing or duplicated chunk is asked for again alone', async
   const extra = await loadWith(state, stateRef, (env, label) => label === 'state:load#1'
     ? { ...env, chunks: [...env.chunks.slice(1), { i: 999, data: 'AAAA', sum: fnv1a('AAAA') }] }
     : { ...env, chunks: [...env.chunks, { ...transferOf(state).chunks[last] }] })
-  assert.deepEqual(asks(extra.calls), ['all', '0'])
+  assert.deepEqual(asks(extra.calls), ['all', '0+pad'])
   assert.equal(extra.labels[2], 'preflight')
+})
+
+test('a mis-copied chunk is asked again padded, so its text differs, then plain (#147)', async () => {
+  const { state, stateRef } = await savedForLoad()
+  // The relays keep the source's sum and alter the data, as wf_70c961b3-aea's did, on every unpadded copy of chunk 1.
+  const stubborn = (env) => {
+    if (!env.pad) for (const c of env.chunks) if (c.i === 1) c.data = flip(c.data)
+    return env
+  }
+  const got = await loadWith(state, stateRef, stubborn)
+  assert.deepEqual(asks(got.calls), ['all', '1+pad'])
+  assert.equal(got.labels[2], 'preflight')
+  assert.deepEqual(got.result.state.decisions, state.decisions)
+  // Two rounds without progress end the load; an answer whose pad is not the one asked for is no answer.
+  const both = await loadWith(state, stateRef, (env) => { for (const c of env.chunks) if (c.i === 1) c.data = flip(c.data); return env })
+  assert.deepEqual(asks(both.calls), ['all', '1+pad', '1'])
+  assert.equal(both.result.reason, 'state-transfer-failed')
+  const unpadded = await loadWith(state, stateRef, (env, label) => label === 'state:load#2' ? { ...env, pad: false } : stubborn(env))
+  assert.equal(unpadded.result.reason, 'state-transfer-failed')
+  // Every plain copy failing makes two idle rounds before any padded ask: the load runs on until each chunk had one.
+  const all = await loadWith(state, stateRef, (env) => { if (!env.pad) for (const c of env.chunks) c.data = flip(c.data); return env })
+  assert.equal(asks(all.calls).at(-1).endsWith('+pad'), true, asks(all.calls).join(' '))
+  assert.deepEqual(all.result.state.decisions, state.decisions)
 })
 
 test('changed metadata, or a chunk changed with its sum, asks for the whole state again', async () => {
@@ -6615,7 +7044,7 @@ test('changed metadata, or a chunk changed with its sum, asks for the whole stat
   // A length off by one looks consistent alone: the last chunk seems short, so it is
   // asked for again, and the true length in that reply then drops everything.
   const offByOne = await loadWith(state, stateRef, once(env => ({ ...env, length: env.length + 1 })))
-  assert.deepEqual(asks(offByOne.calls), ['all', String(transferOf(state).chunks.length - 1), 'all'])
+  assert.deepEqual(asks(offByOne.calls), ['all', `${transferOf(state).chunks.length - 1}+pad`, 'all'])
   assert.equal(offByOne.labels[3], 'preflight')
   for (const change of [
     env => ({ ...env, length: 256 * 1024 + 1 }),
@@ -6630,7 +7059,7 @@ test('changed metadata, or a chunk changed with its sum, asks for the whole stat
   // A partial reply whose length differs from the retained chunks' drops them too.
   const partial = await loadWith(state, stateRef, (env, label) =>
     label === 'state:load#1' ? { ...env, chunks: env.chunks.slice(1) } : label === 'state:load#2' ? { ...env, length: env.length - 1 } : env)
-  assert.deepEqual(asks(partial.calls), ['all', '0', 'all'])
+  assert.deepEqual(asks(partial.calls), ['all', '0+pad', 'all'])
   assert.equal(partial.labels[3], 'preflight')
 })
 
@@ -6654,11 +7083,11 @@ test('a large state arrives in two rounds, four chunks per call, and a mangled b
     if (label === 'state:load#2') { delete e.chunks[2].sum; e.chunks[3].data = flip(e.chunks[3].data) }
     return e
   })
-  assert.deepEqual(asks(live.calls), ['all', '3,4,5,6', '7,8', '5,6'], 'every missing chunk is asked for at once, four to a call')
-  assert.equal(live.labels[4], 'preflight')
+  assert.deepEqual(asks(live.calls), ['all', '4,5,6,7', '8', '3+pad', '6,7+pad'], 'every missing chunk is asked for at once, four to a call, re-asks padded')
+  assert.equal(live.labels[5], 'preflight')
   // A reply with mis-copied metadata costs its own chunks, not its siblings'.
   const sibling = await loadWith(state, stateRef, (env, label) => label === 'state:load#2' ? { ...env, digest: '00000000' } : env)
-  assert.deepEqual(asks(sibling.calls), ['all', '4,5,6,7', '8', '4,5,6,7'])
+  assert.deepEqual(asks(sibling.calls), ['all', '4,5,6,7', '8', '4,5,6,7+pad'])
   assert.equal(sibling.labels[4], 'preflight')
   // A short copied length sizes a short budget; the true length, once accepted, grows it.
   const short = await loadWith(state, stateRef, (env, label) => {
@@ -6668,7 +7097,7 @@ test('a large state arrives in two rounds, four chunks per call, and a mangled b
     if (label === 'state:load#5') for (const c of e.chunks) if (c.i !== 8) c.data = flip(c.data)
     return e
   })
-  assert.deepEqual(asks(short.calls), ['all', '3', 'all', '4,5,6,7', '8', '4,5,6'])
+  assert.deepEqual(asks(short.calls), ['all', '3+pad', 'all', '4,5,6,7', '8', '4,5,6+pad'])
   assert.equal(short.labels[6], 'preflight')
   // Progress undone by every other reply stops at the round budget.
   const seesaw = await loadWith(state, stateRef, (env, label) =>
@@ -7153,4 +7582,33 @@ test('a rejudge names answered comments, each once, with a reason', async () => 
   for (const rejudge of [[{ commentId: 1, reason: 'x' }, { commentId: 1, reason: 'y' }], [{ commentId: 1, reason: ' ' }], [{ commentId: '1', reason: 'x' }], { commentId: 1 }]) {
     await assert.rejects(run({ reviews: oneValid, preflight: at, args: { ...YIELD, state: first.result.state, rejudge } }), /rejudge must be/, JSON.stringify(rejudge))
   }
+})
+
+test('a rejudge reaches a comment whose reply of ours is only in a handoff (#114)', async () => {
+  const first = await run(heldForRepair({ args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true } }))
+  assert.deepEqual(debtOf(first.result, 2).repair, HELD)
+  const reason = 'reply 502 cites a commit the rebase dropped'
+  const quiet = { findings: [], replies: [], bots: 'reviewed' }
+  const asked = await resumeAt(first.result.state, { reviews: quiet, args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, rejudge: [{ commentId: 2, reason }] } })
+  const handoff = asked.result.handoffs.find(h => h.commentId === 2)
+  assert.deepEqual([handoff.replyId, handoff.rejudge], [502, { reason }])
+  assert.deepEqual(debtOf(asked.result, 2).repair, HELD, 'the handoff stays; rejudge authorizes no edit or second reply')
+  assert.equal(asked.calls.some(c => c.label.startsWith('replies#')), false)
+  const later = await resumeAt(asked.result.state, { reviews: quiet, args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true } })
+  assert.deepEqual(later.result.handoffs.find(h => h.commentId === 2).rejudge, { reason })
+  const settlement = { commentId: 2, commentDigest: 'd2', replyId: 502, bodyDigest: fnv1a('reworded'), headSha: first.result.state.expectedHead }
+  const settled = await resumeAt(later.result.state, { reviews: quiet, args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, replySettlements: [settlement] } })
+  assert.equal(settled.result.handoffs, undefined)
+  assert.equal(settled.result.state.debt.some(([id]) => id === 2), false)
+})
+
+test('a rejudge still refuses a repair that names no reply of ours', async () => {
+  const first = await run(heldForRepair({ args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true } }))
+  const state = structuredClone(first.result.state)
+  debtOf({ state }, 2).repair = { replyId: null, error: 'no reply posted: over length' }
+  const { digest, ...rest } = state
+  state.digest = fnv1a(canonical(rest))
+  await assert.rejects(resumeAt(state, { reviews: { findings: [], replies: [], bots: 'reviewed' },
+    args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, rejudge: [{ commentId: 2, reason: 'x' }] } }),
+  /rejudge: comment 2 has no answer of ours in the state/)
 })

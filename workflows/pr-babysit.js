@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -86,7 +86,9 @@ const deferralAnswer = (d) => d.issueUrl ? `Real, and out of this PR's scope: ${
 const REPLY_WORDS = 60, REPLY_LINE_CHARS = 300 // words per point; about 3 rendered lines
 const overLength = (body) => body.split(/\n\s*\n|\n(?=[-*+] )/).some(p => p.split(/\s+/).filter(w => w && !/^[-*+]$/.test(w)).length > REPLY_WORDS) ||
   body.split('\n').some(l => l.length > REPLY_LINE_CHARS)
-const longReasons = deferralsArg.filter(d => overLength(deferralAnswer(d))).map(d => d.findingId)
+// The place is one word on its own line, the answer an indented line under it: what a launch measures is what a cycle posts.
+const deferralPoint = (place, d) => `- ${place}:\n  ${deferralAnswer(d)}`
+const longReasons = deferralsArg.filter(d => overLength(deferralPoint('X', d))).map(d => d.findingId)
 if (longReasons.length) throw new Error(`deferral reason too long for its reply (${REPLY_WORDS} words, a line ${REPLY_LINE_CHARS} characters with the issue URL): ${longReasons.join(', ')}`)
 const FULL_SHA = /^[0-9a-f]{40}$/
 // The caller's verified replies on comments this run handed it, each judged to answer the whole comment at headSha.
@@ -145,6 +147,28 @@ const bare = (v) => Array.isArray(v) ? v.map(bare)
 const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 const groupsOf = (list, n) => [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n))
 const withSeal = (schema) => ({ ...schema, required: [...schema.required, 'seal'], properties: { ...schema.properties, seal: { type: 'string' } } })
+// '' for a path that escapes the repo or whose spelling names another file.
+const canon = (p) => {
+  const s = String(p).replace(/\\/g, '/')
+  if (s !== s.trim()) return ''
+  // On any host (the runtime cannot tell which): a drive, C:x included (relative to that drive's cwd), or UNC (\\ is //).
+  if (s.startsWith('/') || /^[A-Za-z]:/.test(s)) return ''
+  const out = []
+  for (const seg of s.split('/')) {
+    if (!seg || seg === '.') continue
+    if (seg === '..') { if (out.pop() === undefined) return '' } else out.push(seg)
+  }
+  return out.join('/')
+}
+
+// The caller's word that a base merge in the adopted chain may change these protected paths (#97).
+const adoptProtected = args.adoptProtected ?? []
+if (!Array.isArray(adoptProtected) || adoptProtected.some(f => typeof f !== 'string' || !f || canon(f) !== f)) {
+  throw new Error('adoptProtected must be an array of plain repository-relative paths')
+}
+if (new Set(adoptProtected).size !== adoptProtected.length) throw new Error('adoptProtected names a path twice')
+if (adoptProtected.length && args.adoptHead == null) throw new Error('adoptProtected goes with the adoptHead it was given for')
+
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
 if (args.stateRef != null) {
@@ -164,7 +188,7 @@ if (args.stateRef != null) {
   const ENVELOPE = {
     type: 'object', additionalProperties: false,
     properties: {
-      v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, error: { type: 'string' },
+      v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, pad: { type: 'boolean' }, error: { type: 'string' },
       chunks: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { i: { type: 'integer' }, data: { type: 'string' }, sum: { type: 'string' } } } },
     },
@@ -174,13 +198,16 @@ if (args.stateRef != null) {
   let got = new Map()
   let idle = 0
   let call = 0
+  // Asks each chunk has failed: a re-ask after an odd count goes padded (#147), so a deterministic mis-copy reads other text.
+  const failed = new Map()
+  const padded = (i) => (failed.get(i) || 0) % 2 === 1
   const reset = (reason) => { why = reason; length = 0; got = new Map() }
   const fresh = (env) => env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
     env.digest === ref.digest && Array.isArray(env.chunks)
-  const take = (env, asked) => {
+  const take = (env, asked, pad) => {
     if (!env) return false
     if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; return false }
-    if (!fresh(env)) { why = 'the envelope metadata is malformed'; return false }
+    if (!fresh(env) || env.pad !== pad) { why = 'the envelope metadata is malformed'; return false }
     if (length && env.length !== length) { reset('the envelope length changed'); return false }
     length = env.length
     const want = new Set(asked || indices().slice(0, PER_CALL))
@@ -189,24 +216,29 @@ if (args.stateRef != null) {
     let added = false
     for (const [i, c] of byIndex) {
       if (!c || !want.has(i) || typeof c.data !== 'string' || c.sum !== fnv1a(c.data)) continue
-      const bytes = fromBase64(c.data)
+      const raw = fromBase64(c.data)
+      const bytes = raw !== null && pad ? (raw[0] === ' ' ? raw.slice(1) : null) : raw
       if (bytes !== null && bytes.length === Math.min(SIZE, length - i * SIZE)) { got.set(i, bytes); added = true }
     }
     return added
   }
   const indices = () => [...Array(Math.ceil(length / SIZE)).keys()]
   const missingOf = () => indices().filter(i => !got.has(i))
-  for (let round = 1; args.state == null && idle < 2 && round <= ROUNDS; round++) {
+  // Idle rounds end the load only once every missing chunk was asked padded too.
+  const untried = () => length > 0 && missingOf().some(i => (failed.get(i) || 0) < 2)
+  for (let round = 1; args.state == null && (idle < 2 || untried()) && round <= ROUNDS; round++) {
     const missing = length ? missingOf() : null
-    const groups = missing ? groupsOf(missing, PER_CALL) : [null]
-    const replies = await parallel(groups.map(asked => () => agent(
-      `Run exactly: python3 ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
+    const groups = missing ? [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
+      : [{ asked: null, pad: false }]
+    const replies = await parallel(groups.map(({ asked, pad }) => () => agent(
+      `Run exactly: python3 ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}${pad ? ' --pad' : ''}` : ''}\n` +
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `state:load#${++call}`, agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
     ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
     let added = false
-    replies.forEach((env, g) => { added = take(env, groups[g]) || added })
+    replies.forEach((env, g) => { added = take(env, groups[g].asked, groups[g].pad) || added })
+    for (const { asked } of groups) for (const i of asked || indices().slice(0, PER_CALL)) if (!got.has(i)) failed.set(i, (failed.get(i) || 0) + 1)
     const left = missingOf()
     idle = added && left.length ? 0 : idle + 1
     if (!length || left.length) { if (length) why = `chunks ${left.join(',')} missing or mis-copied`; continue }
@@ -223,7 +255,8 @@ if (args.stateRef != null) {
 }
 // CI knowledge per head, so a relaunch neither re-reads nor re-judges: re-runs (sure false for a lost judge) and each run link's verdict digest; verdicts live in collect.py's store. placedWith = `<ciNotes digest>:<base job>` an unclassified verdict was judged with.
 const ciCacheShaped = (c) => c && typeof c === 'object' &&
-  Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
+  Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean' &&
+    (r.at === undefined || Number.isFinite(Date.parse(r.at)))) &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket', 'digest'].every(k => typeof e[k] === 'string') &&
     (e.placedWith === undefined || typeof e.placedWith === 'string'))
 const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
@@ -298,12 +331,17 @@ const COLLECT_CHECK = {
     aliases: { type: 'array', items: { type: 'string' } },
   },
 }
+// A gh call GitHub refused for a rate limit (facts.py): resetAt null for a secondary limit, which names no reset.
+const RATE_LIMIT = {
+  type: ['object', 'null'], additionalProperties: false, required: ['observedAt', 'resetAt', 'secondary'],
+  properties: { observedAt: { type: 'string' }, resetAt: { type: ['string', 'null'] }, secondary: { type: 'boolean' } },
+}
 const INVENTORY = withSeal({
-  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks'],
+  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'observedAt'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
     pending: { type: 'integer' }, registered: { type: 'integer' }, ignored: { type: 'array', items: { type: 'string' } }, waiting: { type: 'string' },
-    checks: { type: 'array', items: COLLECT_CHECK },
+    checks: { type: 'array', items: COLLECT_CHECK }, observedAt: { type: 'string' }, rateLimit: RATE_LIMIT,
   },
 })
 const GATE = {
@@ -323,6 +361,7 @@ const GATE = {
 const EVIDENCE = withSeal({
   type: 'object', required: ['head', 'detail', 'gates', 'bases'],
   properties: {
+    rateLimit: RATE_LIMIT,
     error: { type: ['string', 'null'] }, head: { type: 'string' }, detail: { type: 'string' }, gates: { type: 'array', items: GATE },
     bases: {
       type: 'array',
@@ -410,9 +449,9 @@ const REVIEWS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'fixFiles', 'related', 'changeReason'],
+        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'fixFiles', 'related', 'changeReason', 'fixedBy'],
         properties: {
-          related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] },
+          related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] }, fixedBy: { type: ['string', 'null'] },
           source: { type: 'string' }, findingId: { type: 'string' },
           commentDigest: { type: 'string' }, commentAliases: { type: 'array', items: { type: 'string' } }, commentId: { type: 'integer' },
           file: { type: 'string' }, line: { type: 'integer' }, claim: { type: 'string' },
@@ -429,6 +468,8 @@ const REVIEWS = {
         properties: { commentId: { type: 'integer' }, body: { type: 'string' } },
       },
     },
+    // harvest.py's error line when GitHub refused it for a rate limit, with that error.
+    rateLimit: { ...RATE_LIMIT, required: [...RATE_LIMIT.required, 'error'], properties: { ...RATE_LIMIT.properties, error: { type: 'string' } } },
   },
 }
 // code-writer's output contract verbatim: a schema missing a key the role returns rejects a conformant reply.
@@ -512,12 +553,12 @@ const CRTRIGGER = withSeal({
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'refusal'],
+  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'refusal'],
   properties: {
     error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, published: { type: 'string' }, base: { type: 'string' },
     tip: { type: 'string' },
     commits: { type: 'array', items: { type: 'string' } }, paths: { type: 'array', items: { type: 'string' } },
-    unpublished: { type: 'array', items: { type: 'string' } },
+    unpublished: { type: 'array', items: { type: 'string' } }, mergeOnly: { type: 'array', items: { type: 'string' } },
     refusal: { type: 'string' },
   },
 })
@@ -625,6 +666,22 @@ const withNulls = (s, v) => {
   }
   return out
 }
+// The first refusal for a GitHub rate limit this cycle: facts.py's rateLimit plus its error (#90).
+let githubLimit = null
+// While a CI wait runs beside the review lane, the file collect.py checks before each GitHub call: a limit the
+// review lane meets ends that wait at its next poll, not at the slice's end. The collector's own limit ends it already.
+let ciStopFile = null
+let ciStopSent = null
+const STOPPED = { type: 'object', additionalProperties: false, required: ['stopped'], properties: { stopped: { type: 'boolean' }, error: { type: 'string' } } }
+const noteLimit = (limit, from = '') => {
+  if (githubLimit) return
+  githubLimit = limit
+  if (!ciStopFile || from.startsWith('ci:')) return
+  ciStopSent = relayRun(
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`touch -- ${shq(ciStopFile)} && echo '{"stopped": true}'\` ` + relayed(STOPPED),
+    { label: 'stop:ci', phase: 'Triage', model: 'haiku', effort: 'low', schema: STOPPED },
+  )
+}
 // A copy that fails its script's seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
 const relayAgent = async (prompt, { fileTool, ...opts }) => {
@@ -633,6 +690,7 @@ const relayAgent = async (prompt, { fileTool, ...opts }) => {
     log(`${opts.label}: the relayed copy does not match its seal`)
     return null
   }
+  if (v && v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
   return v
 }
 // A dead or unsealed relay gets one fresh Sonnet agent (Haiku mis-copies a long line); only for a script safe to run twice.
@@ -652,9 +710,15 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
   `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
+  'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\'. ' +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
-)
+).then(out => {
+  // reply.py names a rate limit only in error text: the line's, or a sealed receipt's when it struck mid-batch.
+  const said = !out ? undefined : (out.error ? [out.error] : out.receipts.map(r => r.error)).find(e => e && /rate limit|HTTP 429/i.test(e))
+  if (said) noteLimit({ error: `reply.py: ${said}`, observedAt: null, resetAt: null, secondary: /secondary/i.test(said) })
+  return out
+})
 function fromBase64 (text) {
   if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
   const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -675,6 +739,7 @@ const RECEIPTS = withSeal({
   type: 'object', additionalProperties: false,
   required: ['receipts'],
   properties: {
+    error: { type: 'string' },
     receipts: {
       type: 'array',
       items: {
@@ -693,13 +758,17 @@ const RECEIPTS = withSeal({
 
 const COVERS = verdictList('findingId', 'string', 'covers', { type: ['boolean', 'null'] })
 
-const deferralLine = (f) => `- ${f.file}:${f.line}: ${deferralAnswer(f.deferral)}`
+// A place a launch cannot measure as one short word is named by its finding id.
+const deferralLine = (f) => {
+  const place = `${f.file}:${f.line}`
+  return deferralPoint(/\s/.test(place) || `- ${place}:`.length > REPLY_LINE_CHARS ? f.findingId : place, f.deferral)
+}
 
 // Across launches only the last cycle's publication outcome is read (pendingOf).
 const history = restored && restored.last ? [restored.last] : []
 const launchFrom = history.length
 // A check keeps its old link until its re-run registers; one is never re-run twice on a head.
-const ciReruns = restored ? restored.ciCache.reruns : []
+const ciReruns = restored ? restored.ciCache.reruns.map(r => ({ ...r })) : []
 const noteRerun = (r) => {
   const i = ciReruns.findIndex(x => x.head === r.head && x.link === r.link)
   if (i < 0) ciReruns.push(r)
@@ -855,6 +924,8 @@ const handoffWhy = (commentId) => {
     : null
 }
 const handedOff = (commentId) => !!handoffWhy(commentId)
+// [commentId, debt] whose fix note, offered for a repair of ours, no receipt has shown posted.
+const unpostedNotes = () => [...debt].filter(([, d]) => d.attempt && d.attempt.how === 'fixNote' && d.attempt.repair)
 // An edited comment's carried ids may name other points now: none is named to the validator.
 const owedIds = (commentId) => {
   const d = debt.get(commentId)
@@ -963,20 +1034,6 @@ const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
   : rs.bots.map(b => `${b.bot} ${botCell(b, rs.waitedMin)}`).join(' · ')
 
 const nap = (ms) => new Promise(res => setTimeout(res, ms))
-
-// '' for a path that escapes the repo or whose spelling names another file.
-const canon = (p) => {
-  const s = String(p).replace(/\\/g, '/')
-  if (s !== s.trim()) return ''
-  // On any host (the runtime cannot tell which): a drive, C:x included (relative to that drive's cwd), or UNC (\\ is //).
-  if (s.startsWith('/') || /^[A-Za-z]:/.test(s)) return ''
-  const out = []
-  for (const seg of s.split('/')) {
-    if (!seg || seg === '.') continue
-    if (seg === '..') { if (out.pop() === undefined) return '' } else out.push(seg)
-  }
-  return out.join('/')
-}
 
 // A relay that trims a leading blank fails its seal.
 const STATUS_LINE = /^([ MADRCUT?!])([ MADRCUT?!]) (.+)$/
@@ -1345,6 +1402,8 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   const quoted = checked.map(shq).join(' ')
   const hooks = await relayRun(
     `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
+    // A repository's hooks may run its whole test suite: hooks.py stops them before this limit (#140).
+    `in the foreground with a Bash timeout of 600000 ms, the tool's maximum, ` +
     relayed(HOOKS),
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
   )
@@ -1406,7 +1465,8 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
-    `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\`. ` +
+    `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
+    'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
     { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
@@ -1449,6 +1509,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
 
+  if (githubLimit) return { pass: false, committed: true, detail: 'not pushed: GitHub refused a call for a rate limit this cycle', sha }
   beforePush()
   const push = await pushExact(sha, `push#${cycle}-${what}`)
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha, published: 'unknown' }
@@ -1500,12 +1561,13 @@ const readPrState = async (tag) => {
   return r && !r.error ? r.state : null
 }
 // Before each GitHub write but a push (push.py reads it itself), the state is read afresh: only a verified OPEN goes on.
+// A GitHub rate limit seen this cycle, before the read or during it, stops the write too; runCycle reports it (#90).
 const prGate = async (lanes, tag) => {
-  if (!lanes.prState) {
+  if (!lanes.prState && !githubLimit) {
     const state = await readPrState(tag)
     if (state !== 'OPEN') lanes.prState = state === 'MERGED' || state === 'CLOSED' ? state.toLowerCase() : 'unread'
   }
-  return lanes.prState
+  return lanes.prState || (githubLimit ? 'rate-limited' : null)
 }
 
 let napMs = 0
@@ -1540,9 +1602,10 @@ const debtEntry = (commentId, digest) => {
   if (!debt.has(commentId)) debt.set(commentId, { dismissals: new Set(), notes: new Set(), ...(digest !== undefined ? { digest } : {}) })
   return debt.get(commentId)
 }
-// A rejudge stands beside any repair or edit until the caller's reply settles the comment.
+// A rejudge stands beside any repair or edit until the caller's reply settles the comment; a repair naming our reply is an answer of ours too.
 for (const x of rejudgeArg) {
-  if (!answeredWith.has(x.commentId) && !reanswer.has(x.commentId)) throw new Error(`rejudge: comment ${x.commentId} has no answer of ours in the state`)
+  const ours = answeredWith.has(x.commentId) || reanswer.has(x.commentId) || !!debt.get(x.commentId)?.repair?.replyId
+  if (!ours) throw new Error(`rejudge: comment ${x.commentId} has no answer of ours in the state`)
   debtEntry(x.commentId).rejudge = { reason: x.reason.trim() }
 }
 // A refutation or an answer by hand settles the comment; a fix note settles only its notes.
@@ -1571,7 +1634,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   // The first offered body is kept as the attempt until paid: no receipt proves an earlier POST never landed, and reply.py reuses only an identical body.
   const replies = []
   const sonarNotes = new Map()
-  for (const { commentId, body, scanning } of drafts) {
+  for (const { commentId, body, scanning, repair: made } of drafts) {
     const d = debt.get(commentId)
     const a = d && d.attempt
     if (a && (a.how !== how || a.digest !== digestOf.get(commentId))) {
@@ -1584,7 +1647,9 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     }
     if (a && a.body !== body) log(`cycle ${cycle}: comment ${commentId} keeps the body already offered, not this cycle's redraft`)
     const out = a ? a.body : body
-    if (d) d.attempt = { body: out, how, digest: digestOf.get(commentId) }
+    // A fix note's repair stays the one it was first offered for.
+    const madeBy = a ? a.repair : made
+    if (d) d.attempt = { body: out, how, digest: digestOf.get(commentId), ...(madeBy ? { repair: madeBy } : {}) }
     replies.push({ commentId, body: out, digest: fnv1a(out) })
     if (scanning) sonarNotes.set(commentId, out)
   }
@@ -1594,7 +1659,8 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ',
     `Manifest: ${JSON.stringify({ replies })}`)
   const expected = new Map(replies.map(r => [r.commentId, r.digest]))
-  const receipts = out ? out.receipts.filter(r => expected.has(r.commentId)) : []
+  // An error line skips the seal check, so receipts beside it prove nothing.
+  const receipts = out && !out.error ? out.receipts.filter(r => expected.has(r.commentId)) : []
   const settled = new Set()
   const replied = []
   for (const [commentId, digest] of expected) {
@@ -1628,7 +1694,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   const gone = [...expected.keys()].filter(id => retired.has(id))
   const receipt = {
     pass: missing.length === 0,
-    detail: !out ? 'agent died'
+    detail: !out ? 'agent died' : out.error ? `reply.py: ${out.error}`
       : [missing.length ? `unsettled: ${missing.join(', ')}` : gone.length < expected.size ? 'posted and read back' : '',
         gone.length ? `not on the PR, nothing owed: ${gone.join(', ')}` : ''].filter(Boolean).join('; '),
     receipts, replied,
@@ -1703,10 +1769,10 @@ const waitAfter = (cr, askedAt, observedAt) => {
 // A rate limit leaves no box to tick: once its reset passes, one `@coderabbitai review` per head asks again.
 const RETRY_WAIT_MAX_MS = 60 * 60000
 const retryLater = (cr, cycle, ms) => {
-  const wait = ms + 60000
-  if (wait > RETRY_WAIT_MAX_MS || cycle >= maxCycles) return
+  if (ms > RETRY_WAIT_MAX_MS || cycle >= maxCycles) return
   cr.done = false
-  cr.retryWaitMs = wait
+  // A minute past the reset, never past the cap: an estimated reset is exactly an hour out (#138).
+  cr.retryWaitMs = Math.min(ms + 60000, RETRY_WAIT_MAX_MS)
 }
 const requestCodeRabbit = async (cycle, r, cr, ended) => {
   const asked = reviewClock.request
@@ -1755,10 +1821,10 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
     `Reuses: ${JSON.stringify({ reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })}`)
   const settled = []
   for (const s of ready) {
-    const mine = (out ? out.receipts : []).filter(r => r.commentId === s.commentId)
+    const mine = (out && !out.error ? out.receipts : []).filter(r => r.commentId === s.commentId)
     const r = mine.length === 1 ? mine[0] : null
     if (!r || r.replyId !== s.replyId || r.digest !== s.bodyDigest || r.sent || r.posted || !settles(r)) {
-      refuse(s, r ? r.error || 'reuse not verified' : 'no reuse receipt')
+      refuse(s, r ? r.error || 'reuse not verified' : out && out.error ? `reply.py: ${out.error}` : 'no reuse receipt')
       continue
     }
     // A marking our earlier answer still owes keeps that answer (a correction cancelled any it disproved); else the caller's answer owes one when its settlement names how.
@@ -1789,7 +1855,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
       (payload ? `\n${JSON.stringify(payload)}` : '')
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema }
     return relayRun(prompt(command), opts).then(got => {
-      if (got) return got
+      // A retry after a rate limit would only call GitHub again.
+      if (got || githubLimit) return got
       shortened = shortened || /--wait-seconds [1-9]/.test(command)
       return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts)
     })
@@ -1821,15 +1888,20 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   let inv = null
   let last = false
   let left = unregistered ? 0 : ciWait * 60
+  const stop = `${pinned.receipts.trim()}/ci-stop-${cycle}`
   for (let k = 1; ; k++) {
     const slice = Math.min(lanes.reviewDone ? 540 : 180, left)
     // A --brief slice still running prints no checks, so a relay copies nothing it reads again; the budget's last slice is whole.
     last = left - slice < 30
-    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}${ignoring}`, INVENTORY)
+    ciStopFile = lanes.reviewDone ? null : stop
+    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}${ignoring} --stop-file ${shq(stop)}`, INVENTORY)
+    ciStopFile = null
+    if (githubLimit) await ciStopSent
     if (inventoryFailed(inv)) return null
     left -= slice
-    if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended || reviewOnly(inv)) break
+    if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended || reviewOnly(inv) || githubLimit) break
   }
+  if (githubLimit) return ['merged', 'closed'].includes(inv.status) ? endLanes(inv) : null
   // Leaving the wait early on a brief slice still running, the whole inventory is read once, as it stands now;
   // not when the review lane is publishing, which supersedes this CI run anyway.
   if (!last && inv.status === 'running' && !lanes.reviewPublishing && !reviewOnly(inv)) {
@@ -1859,8 +1931,12 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
   if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
   const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
+  // A re-run is timed from when it was asked; one carried from a state without that time, from this launch's first read (#123).
+  for (const r of ciReruns) if (r.at === undefined) r.at = inv.observedAt
   const reruns = ciReruns.filter(r => r.head === inv.head)
-  const settling = failing.filter(c => reruns.some(r => r.sure && [c.link, ...c.aliases].includes(r.link)))
+  const rerunOf = (c) => reruns.find(r => r.sure && [c.link, ...c.aliases].includes(r.link))
+  const settling = failing.filter(rerunOf)
+  const overdue = settling.filter(c => Date.parse(inv.observedAt) - Date.parse(rerunOf(c).at) >= ciWait * 60000)
   // A run's conclusion can change under the same link, so the bucket must match too.
   const reusable = (c) => !settling.includes(c) && !gated.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
     ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket
@@ -1926,6 +2002,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   ciChecks.unchanged += unchanged.length
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
+    // A re-run not yet registered reads as a red the inventory returns at once: the re-arm waits instead (#123).
+    ...(settling.length && inv.status !== 'running' ? { settling: true } : {}),
+    ...(overdue.length ? { unregistered: overdue.map(c => `${c.workflow} / ${c.name}`) } : {}),
     realFailures: cached.flatMap(c => keyed(c, JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures)))),
   }
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
@@ -1940,6 +2019,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const links = judging.map(c => c.link)
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
+  if (githubLimit) return null
   const ev = await collect(`ci:collect#${cycle}.f`, `failures ${[...links.map(l => `--check ${shq(l)}`), ...gated.map(c => `--gate ${shq(c.link)}`)].join(' ')}`, EVIDENCE)
   // A push while the evidence was read restarted CI: judging it could re-run a superseded run.
   if (superseded()) return report
@@ -1976,17 +2056,26 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (!judged || !sameLinks(answered, links)) {
     if (judged) log(`cycle ${cycle}: CI judge answered ${JSON.stringify(answered)} for ${JSON.stringify(links)} — re-arming`)
     // It may have re-run any of them: none is re-run again on this head.
-    for (const c of judging) noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: false })
+    for (const c of judging) noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: false, at: inv.observedAt })
     return null
   }
   const reran = judging.filter(c => judged.checks.find(j => j.link === c.link).failures.length === 0)
+  // The deadline starts no earlier than the judge's return, not at the inventory read before the evidence and judging;
+  // an unread time is left for the next read (#123).
+  const stamp = reran.length && !githubLimit ? await collect(`ci:collect#${cycle}.t`, `inventory --wait-seconds 0 --brief${ignoring}`, INVENTORY) : null
+  const rerunAt = stamp && !stamp.error && Number.isFinite(Date.parse(stamp.observedAt)) ? stamp.observedAt : undefined
   for (const c of reran) {
     if (reruns.some(r => r.workflow === c.workflow && r.check === c.name)) log(`cycle ${cycle}: CI judge re-ran ${c.workflow} / ${c.name} a second time`)
-    noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true })
+    noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true, at: rerunAt })
     ciVerdicts.delete(c.link)
   }
   // An empty answer is a re-run by the contract.
-  if (reran.length) report.status = 'running'
+  if (reran.length) {
+    entry.ciReran = reran.length
+    report.status = 'running'
+    if (inv.status !== 'running') report.settling = true
+  }
+  if (stamp && !stamp.error && ['merged', 'closed'].includes(stamp.status)) return endLanes(stamp)
   if (reran.length && judged.infraRerun.length === 0) log(`cycle ${cycle}: CI judge re-ran ${reran.length} check(s) without a receipt`)
   // A partly judged check is answered by its judgeOnly failures or by all of them; anything else is judged whole next time.
   const failuresOf = new Map(judged.checks.map(j => [j.link, j.failures]))
@@ -2032,7 +2121,14 @@ const runCycle = async (cycle, entry) => {
   const lanes = { reviewDone: !reviewLane, reviewPublishing: false, ended: false, prState: null }
   const verdict = await runLanes(cycle, entry, lanes)
   // The CI lane settles last, so it can read the merge after the review lane stopped for another reason.
-  return lanes.prState === 'merged' || lanes.prState === 'closed' ? prEnded(cycle, lanes.prState) : verdict
+  if (lanes.prState === 'merged' || lanes.prState === 'closed') return prEnded(cycle, lanes.prState)
+  // Another cycle would meet the same refusal: the caller relaunches once it clears (#90).
+  if (githubLimit) {
+    const { error, resetAt, secondary } = githubLimit
+    log(`cycle ${cycle}: GitHub refused a call for a ${secondary ? 'secondary ' : ''}rate limit (${error}) — stopping; relaunch ${resetAt ? `after ${resetAt}` : 'once it clears'}`)
+    return stop(cycle, 'github-rate-limited', { rateLimit: githubLimit })
+  }
+  return verdict
 }
 
 const runLanes = async (cycle, entry, lanes) => {
@@ -2056,7 +2152,10 @@ const runLanes = async (cycle, entry, lanes) => {
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
           `those listed by findingId among them, so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '') +
       (decisions.size > 0
-        ? `Earlier verdicts on this PR (set related and changeReason against them per your procedure): ${JSON.stringify([...decisions].map(([findingId, d]) => ({ findingId, ...d })))}. ` : '')
+        ? `Earlier verdicts on this PR (set related and changeReason against them per your procedure): ${JSON.stringify([...decisions].map(([findingId, d]) => ({ findingId, ...d })))}. ` : '') +
+      (unpostedNotes().length > 0
+        ? 'Our fix notes on these comments are not yet posted; for a stale finding on one, set fixedBy to its sha when that commit\'s change is what fixed the finding: ' +
+          `${JSON.stringify(unpostedNotes().map(([commentId, d]) => ({ commentId, sha: d.attempt.repair.sha })))}. ` : '')
     const nobody = { findings: [], replies: [], bots: [] }
     const r = !reviewLane || reviewers.length === 0
       ? nobody
@@ -2067,6 +2166,10 @@ const runLanes = async (cycle, entry, lanes) => {
     if (!r) {
       entry.error = 'pr-review-validator died'
       return stop(cycle, 'review-validator-died')
+    }
+    if (r.rateLimit) {
+      noteLimit(r.rateLimit)
+      return null
     }
     if (reviewLane && reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
     entry.reviews = reviewLane ? r : null
@@ -2284,9 +2387,19 @@ const runLanes = async (cycle, entry, lanes) => {
     //   deferral: deferred points only; deferred points ride in a mixed comment's reply
     const ledger = new Map()
     const digestOf = new Map()
+    // A fix note whose post died is owed again, as offered, once a fresh judgment names its repair as what made every finding it covered stale (#115);
+    // a deferred sibling may stand beside them only as the offered body already states it.
+    const ownFixed = new Set(unpostedNotes().filter(([id, { attempt: a }]) => {
+      const now = r.findings.filter(f => f.commentId === id)
+      const fixed = now.filter(f => !f.deferral)
+      return fixed.length > 0 && now.every(f => !f.hold && f.commentDigest === a.digest) &&
+        fixed.every(f => f.verdict === 'stale' && f.fixedBy === a.repair.sha && a.repair.findings.includes(f.findingId)) &&
+        now.every(f => !f.deferral || `\n${a.body}\n`.includes(`\n${deferralLine(f)}\n`)) &&
+        a.repair.findings.every(k => fixed.some(f => f.findingId === k))
+    }).map(([id]) => id))
     for (const f of r.findings) {
       const e = ledger.get(f.commentId) || { valid: 0, refuted: 0, deferred: 0 }
-      if (!f.hold) e[f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : 'refuted']++
+      if (!f.hold) e[f.deferral ? 'deferred' : f.verdict === 'valid' || ownFixed.has(f.commentId) ? 'valid' : 'refuted']++
       ledger.set(f.commentId, e)
       digestOf.set(f.commentId, f.commentDigest)
     }
@@ -2312,7 +2425,9 @@ const runLanes = async (cycle, entry, lanes) => {
       const open = () => (d = debtEntry(f.commentId))
       if (d && d.edited) continue
       if (f.verdict !== 'valid') {
-        if (!answered) { const e = open(); e.dismissals.add(dismissalKey(f)); e.digest = f.commentDigest }
+        // A finding our named repair fixed owes no refutation, whatever an earlier partial harvest recorded.
+        if (ownFixed.has(f.commentId)) { if (d) d.dismissals.delete(dismissalKey(f)) }
+        else if (!answered) { const e = open(); e.dismissals.add(dismissalKey(f)); e.digest = f.commentDigest }
         continue
       }
       // Retiring a dismissal is always allowed, even on an answered comment.
@@ -2369,6 +2484,8 @@ const runLanes = async (cycle, entry, lanes) => {
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
 
+    // One fix note per comment: this cycle's pushed repairs, and offered bodies (#115) whose repair a fresh judgment named.
+    const answerable = new Map()
     const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral && !x.hold)
     if (validFindings.length > 0) {
       const work = groupWork(validFindings.map(f => ({
@@ -2417,22 +2534,28 @@ const runLanes = async (cycle, entry, lanes) => {
           return stop(cycle, 'push-failed')
         }
         entry.reviewPush = push
-        // One fix note per comment, built here: the read-back proves only a text the workflow chose.
-        const answerable = new Map()
+        // Built here: the read-back proves only a text the workflow chose.
         const heldNow = heldComments()
         for (const f of validFindings) {
           if (owed(f.commentId) !== 'fixNote' || heldNow.has(f.commentId) || handedOff(f.commentId) || !showsAll(f.commentId, false)) continue
           const line = `- ${f.file}:${f.line}`
           const prev = answerable.get(f.commentId)
-          if (prev) prev.body += `\n${line}`
-          else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}`, scanning: scanning.has(f.commentId) })
+          if (prev) { prev.body += `\n${line}`; prev.repair.findings.push(f.findingId) }
+          else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}`, scanning: scanning.has(f.commentId), repair: { sha: push.sha, findings: [f.findingId] } })
         }
         for (const x of answerable.values()) x.body = withDeferred(x.commentId, x.body)
-        if (answerable.size > 0) {
-          if (await ended('resolve')) return prEnded(cycle, lanes.prState)
-          entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
+      }
+    }
+    if (args.autoPush === true) {
+      for (const id of ownFixed) {
+        if (!answerable.has(id) && owed(id) === 'fixNote' && !handedOff(id) && showsAll(id, false)) {
+          answerable.set(id, { commentId: id, body: debt.get(id).attempt.body, scanning: scanning.has(id) })
         }
       }
+    }
+    if (answerable.size > 0) {
+      if (await ended('resolve')) return prEnded(cycle, lanes.prState)
+      entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
     }
 
     lanes.reviewDone = true
@@ -2508,6 +2631,10 @@ const runLanes = async (cycle, entry, lanes) => {
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} still running with the same ${now.pending} pending check(s) after two whole waits — observe them before relaunching`)
       return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending })
     }
+    if (c.unregistered) {
+      log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: the re-run of ${c.unregistered.join(', ')} has not registered within ${ciWait} minutes — observe it before relaunching`)
+      return stop(cycle, 'ci-stuck', { head: expectedHead, unregistered: c.unregistered })
+    }
     if (!reviewLane) {
       log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
       return null
@@ -2563,7 +2690,8 @@ const runLanes = async (cycle, entry, lanes) => {
       }
     }
     if (c.status === 'running' || c.infraRerun.length > 0) {
-      log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming`)
+      if (c.settling) napMs = backoff(cycle)
+      log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming${c.settling ? ' after a wait' : ''}`)
       return rearm()
     }
     if (!reviewsSettled) {
@@ -2694,15 +2822,23 @@ if (adoptHead !== null) {
   const shas = audit ? audit.commits : []
   const paths = audit ? audit.paths : []
   const badPath = paths.find(f => !canon(f))
-  // A protected path the PR already carries is the caller's history; only what this run would publish is guarded (#49).
-  const guarded = protectedRe && audit ? [...new Set(audit.unpublished.map(canon).filter(f => f && protectedRe.test(f)))] : []
+  // A protected path the PR already carries is the caller's history; only what this run would publish is guarded (#49),
+  // unless only a base merge changes it and the caller named it in adoptProtected (#97).
+  const mergeOnly = audit && !audit.error ? audit.mergeOnly.map(canon) : []
+  const guarded = [], waived = []
+  if (protectedRe && audit && !audit.error) {
+    for (const f of new Set(audit.unpublished.map(canon))) {
+      if (f && protectedRe.test(f)) (mergeOnly.includes(f) && adoptProtected.includes(f) ? waived : guarded).push(f)
+    }
+  }
   const why = !audit ? 'the audit agent died'
     : audit.error ? `the chain could not be read back: ${audit.error}`
     : audit.from !== X || audit.to !== adoptHead || audit.published !== prHead || audit.base !== base || audit.tip !== tip
       ? `the audit read ${audit.from}..${audit.to} published at ${audit.published} on base ${audit.base} tip ${audit.tip}, not ${X}..${adoptHead} published at ${prHead} on base ${base} tip ${tip}`
     : audit.refusal ? audit.refusal
     : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
-    : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}`
+    : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}` +
+      (guarded.every(f => mergeOnly.includes(f)) ? '; only a base merge changes them, which adoptProtected may permit' : '')
     : null
   if (why) {
     log(`preflight: adoption refused — ${why}`)
@@ -2712,6 +2848,7 @@ if (adoptHead !== null) {
     }
     return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: why }))
   }
+  if (waived.length) log(`preflight: adopting a base merge's change to protected path(s) ${waived.join(', ')}, named in adoptProtected`)
   if (prHead !== X && !shas.includes(prHead)) {
     log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor a commit of the chain to ${adoptHead.slice(0, 7)}`)
     return finish(stop(cyclesUsed, 'wrong-head', { head: prHead, expected: [X, adoptHead] }))
@@ -2724,6 +2861,8 @@ if (adoptHead !== null) {
 }
 const rebased = rebasedHead !== null ? { from: restored.expectedHead, to: rebasedHead } : null
 if (rebased) log(`preflight: re-pinned ${rebased.from.slice(0, 7)} -> ${rebased.to.slice(0, 7)}, the PR history the caller rewrote, unaudited; cycles, answers, decisions, holds and deferrals kept`)
+// A rewrite renamed our repair commits: a pending fix note keeps its body but can no longer be posted on a judgment naming one.
+if (rebased) for (const d of debt.values()) if (d.attempt) delete d.attempt.repair
 expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
@@ -2755,6 +2894,8 @@ const adopt = async (entry) => {
   return null
 }
 
+const worked = (e) => Object.entries(actionsOf(e)).some(([k, v]) => k !== 'error' && (Array.isArray(v) ? v.length > 0 : !!v)) ||
+  !!(e.sonar && e.sonar.length) || !!e.ciReran
 const yielded = (cycle) => finish(stop(cycle, 'yielded', { outstanding: outstanding() }), 'paused')
 // yieldOnChange returns after a cycle the caller must see: a push, changed handoffs or corrections, or no usable observation.
 const changeOf = (entry, before) => entry.reviewPush || entry.ciPush ? 'a repair was pushed'
@@ -2766,6 +2907,7 @@ const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
 for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
   waited = false
+  githubLimit = null
   const before = yieldOnChange ? { handoffs: JSON.stringify(handoffList()), corrections: corrections.length } : null
   const entry = { cycle, head: expectedHead, ...(rebased && cycle === firstCycle ? { rebased } : {}) }
   retired.clear()
@@ -2783,6 +2925,8 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
     log(entry.summary)
     cyclesUsed = cycle
   }
+  // A cycle that only met the rate limit observed nothing: it is not charged.
+  if (verdict && verdict.reason === 'github-rate-limited' && !worked(entry)) cyclesUsed = cycle - 1
   if (verdict) return finish(verdict)
   const change = yieldOnChange && cycle < maxCycles ? changeOf(entry, before) : null
   if (change) {

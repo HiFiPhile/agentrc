@@ -153,7 +153,7 @@ class ReplyCase(unittest.TestCase):
 
     def receipts(self, out):
         """The printed receipts, with the nulls the script leaves out put back as pr-babysit does."""
-        if not out:
+        if not out or 'error' in out:
             return None
         for r in out['receipts']:
             self.assertNotIn(None, (r.get('resolved', False), r.get('error', '')), 'a null resolved or error is printed')
@@ -315,6 +315,48 @@ class ReplyTest(ReplyCase):
         self.assertEqual(rc, 1)
         self.assertEqual([r['verified'] for r in receipts], [False, True])
 
+    def refusing(self, refused):
+        """A gh that answers each call refused(args) picks with a rate-limit refusal, logging every call."""
+        real = self.gh.gh
+
+        def gh(args, stdin=None):
+            if refused(args):
+                self.gh.calls.append(args)
+                return 1, '', 'gh: You have exceeded a secondary rate limit. (HTTP 403)'
+            return real(args, stdin)
+        return mock.patch.object(reply, 'gh', gh)
+
+    def test_a_rate_limit_ends_the_batch_with_no_further_call(self):
+        self.gh.review_comment(10)
+        self.gh.review_comment(11)
+        self.gh.issue_comment(20)
+        with self.refusing(lambda args: args[:3] == ['api', '-X', 'POST']):
+            rc, receipts = self.run_script([{'commentId': 10, 'body': 'a'}, {'commentId': 11, 'body': 'b'}, {'commentId': 20, 'body': 'c'}])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.gh.calls[-1][:3], ['api', '-X', 'POST'], 'no call after the refusal')
+        self.assertEqual(sum(a[:3] == ['api', '-X', 'POST'] for a in self.gh.calls), 1)
+        self.assertEqual((receipts[0]['sent'], receipts[0]['posted'], receipts[0]['replyId']), (True, False, None))
+        self.assertIn('rate limit', receipts[0]['error'])
+        for r, cid, body in zip(receipts[1:], (11, 20), 'bc'):
+            self.assertEqual(r, {'commentId': cid, 'kind': None, 'replyId': None, 'digest': reply.fnv1a(body), 'sent': False, 'posted': False,
+                                 'verified': False, 'resolved': None, 'error': 'not tried: GitHub refused an earlier call in this batch for a rate limit'})
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_a_rate_limit_ends_a_reuse_or_edit_batch_too(self):
+        listing = f'repos/{REPO}/pulls/{PR}/comments?per_page=100'
+        items = [{'commentId': 10, 'replyId': 55, 'body': 'x', 'bodyDigest': reply.fnv1a('y'), 'originalDigest': 'z'},
+                 {'commentId': 11, 'replyId': 56, 'body': 'x', 'bodyDigest': reply.fnv1a('y'), 'originalDigest': 'z'}]
+        for settle in (self.reuse, self.edit):
+            with self.subTest(settle=settle.__name__):
+                self.setUp()
+                with self.refusing(lambda args: listing in args):
+                    rc, receipts = settle(*(dict(i) for i in items))
+                self.assertEqual(rc, 1)
+                self.assertIn(listing, self.gh.calls[-1], 'no call after the refusal')
+                self.assertIn('rate limit', receipts[0]['error'])
+                self.assertEqual((receipts[1]['commentId'], receipts[1]['replyId'], receipts[1]['verified']), (11, 56, False))
+                self.assertIn('not tried', receipts[1]['error'])
+
     def test_already_resolved_thread_is_left_alone(self):
         self.gh.review_comment(10)
         self.gh.threads['T10']['resolved'] = True
@@ -331,6 +373,20 @@ class ReplyTest(ReplyCase):
                 rc, receipts = self.run_script(bad)
                 self.assertEqual(rc, 2)
                 self.assertEqual(self.gh.calls, [])
+
+    def test_an_early_failure_ends_stdout_with_an_error_line(self):
+        # A relay copies the last stdout line: with none it improvises (#115).
+        with redirect_stderr(io.StringIO()):
+            rc, out = self.main('--manifest', self.json_file({'replies': []}))
+        self.assertEqual(rc, 2)
+        self.assertEqual(list(out), ['error'])
+        self.gh.down.add('user')
+        with redirect_stderr(io.StringIO()):
+            rc, out = self.main('--manifest', self.json_file({'replies': [{'commentId': 10, 'body': 'ok', 'digest': reply.fnv1a('ok')}]}))
+        self.assertEqual(rc, 2)
+        self.assertEqual(list(out), ['error'])
+        self.assertIn('HTTP 404', out['error'])
+        self.assertEqual(self.gh.mutations, [])
 
     def test_digest_mismatch_posts_nothing(self):
         self.gh.review_comment(10)
@@ -512,7 +568,7 @@ class ReceiptFileTest(ReplyCase):
                              (json.dumps(saved), 'another request'), (json.dumps(tampered), 'seal')]:
             Path(path).write_text(content)
             rc, out, err = self.run_saved(path, body='other words' if why == 'another request' else 'not so')
-            self.assertEqual((rc, out), (2, ''), why)
+            self.assertEqual((rc, list(json.loads(out))), (2, ['error']), why)
             self.assertIn(why, err)
         self.assertEqual(len(self.gh.mutations), 2, 'only the first run posted')
 
@@ -764,9 +820,11 @@ class ReconcileTest(ReplyCase):
         self.assertEqual(self.gh.mutations, [])
 
     def test_bad_pairs_and_reuse_files_are_usage_errors(self):
-        with self.assertRaises(SystemExit) as e:
-            self.main('--inspect', '20-901')
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as e, redirect_stdout(out), redirect_stderr(io.StringIO()):
+            reply.main(['--pr', str(PR), '--repo', REPO, '--inspect', '20-901'])
         self.assertEqual(e.exception.code, 2)
+        self.assertEqual(list(json.loads(out.getvalue().strip().splitlines()[-1])), ['error'], 'a usage error ends stdout with an error line too')
         path = self.json_file({'reuses': [{'commentId': 20, 'replyId': 901, 'bodyDigest': 'x'}]})
         self.assertEqual(self.main('--reuse', path)[0], 2)
         dup = {'commentId': 20, 'replyId': 901, 'bodyDigest': 'x', 'originalDigest': 'y'}

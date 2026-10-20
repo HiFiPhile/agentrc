@@ -17,7 +17,8 @@ never `absent`.
 stdout ends with one JSON line: headSha, observedAt, headEventAt (null when no
 run or timeline event dates the head, or no bot auto-runs), headEventEvidence, bots (one record per
 --reviewers name: bot, state, kind, sha, evidence, reason, retryAt: when a rate-limited
-bot's notice says its next review is available, else null), and comments (every
+bot's notice says its next review is available, an hour after a CodeRabbit notice
+giving no countdown, else null), and comments (every
 inline comment, issue comment and review body by a --reviewers author: kind
 review|issue|review-body, commentId, source, author, body verbatim, digest
 (pr-reply's comment_digest.py: sha256 of the body, 12 hex, without what
@@ -29,7 +30,7 @@ with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
 "coderabbit-walkthrough"; and a Copilot review body saying it could not review,
 "copilot-refusal". Their digest and aliases are still the real body's and identify them,
 and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
-head, or a comment endpoint.
+head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit.
 """
 
 import base64
@@ -41,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, RateLimited, Unusable, report, run  # noqa: E402
 
 # reply.py checks a comment against the same digest, so both skills share one definition.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
@@ -57,6 +58,8 @@ CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbi
 CR_RATE_STATUS = 'review rate limited'
 CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
 COUNTDOWN_TERM = re.compile(r'(\d+) (hour|minute|second)s?')
+# CodeRabbit's included reviews come back within the hour: the reset a notice without a countdown is given.
+ESTIMATED_RESET = timedelta(hours=1)
 COPILOT_QUOTA = 'Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.'
 COPILOT_NO_FILES = "Copilot wasn't able to review any files in this pull request."
 COPILOT_OVERVIEW = ('<!-- ccr-overview', '## Pull request overview')
@@ -108,7 +111,11 @@ def retry_at(notice):
     units = [unit for _, unit in terms]
     if not terms or len(set(units)) != len(units) or COUNTDOWN_TERM.sub('', m.group(1)).replace('and', '').replace(',', '').strip():
         return None
-    wait = timedelta(**{f'{unit}s': int(n) for n, unit in terms})
+    return after(notice, timedelta(**{f'{unit}s': int(n) for n, unit in terms}))
+
+
+def after(notice, wait):
+    """The notice's last edit plus wait, as an ISO 8601 UTC string."""
     return (stamp(notice['updated_at']) + wait).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
@@ -177,7 +184,12 @@ def coderabbit(head, statuses, checks, issue, event_at):
     if pause and (latest_at is None or stamp(pause['updated_at']) > latest_at):
         return record('coderabbit', 'settled', 'reviews paused on this PR', [*ev, f"pause in comment {pause['id']}"], None, 'paused')
     if by_status:
-        notice, why = newest_reading([c for c in rate if stamp(c['updated_at']) >= s_at], 'updated_at', retry_at)
+        # Its notice may be edited a second before the status (#138): one after the head event with no other
+        # CodeRabbit status or run between them is the status's too.
+        before = [stamp(x['updated_at']) for x in statuses if x.get('context') == 'CodeRabbit' and x is not s and stamp(x['updated_at']) < s_at]
+        floor = max([t for t in (event_at and stamp(event_at), run_at, *before) if t], default=None)
+        paired = [c for c in rate if stamp(c['updated_at']) >= s_at or (floor is not None and stamp(c['updated_at']) > floor)]
+        notice, why = newest_reading(paired, 'updated_at', retry_at)
         return limited_record(s.get('description'), notice, why, ev, head)
     # A notice last touched before a status or run on the head is superseded, and an edited
     # one last touched before the head event is about an older push; any other edit hides when it was posted.
@@ -203,9 +215,16 @@ def coderabbit(head, statuses, checks, issue, event_at):
 
 
 def limited_record(reason, notice, why, ev, sha):
-    """CodeRabbit settled as rate-limited, with the notice's reset time; `why` says why the notices give none."""
+    """CodeRabbit settled as rate-limited, with the notice's reset time, or an hour after the notice when it gives no
+    countdown (#138), none when its countdown does not read; `why` says why the notices give none."""
     at = None if why else retry_at(notice)
-    if not at:
+    if not at and notice and not why:
+        if CR_COUNTDOWN.search(notice.get('body') or ''):
+            reason += '; its countdown did not read, no reset time'
+        else:
+            at = after(notice, ESTIMATED_RESET)
+            reason += '; no countdown read, reset estimated an hour after the notice'
+    elif not at:
         reason += f"; no reset time read{f' ({why})' if why else ''}"
     return record('coderabbit', 'settled', reason, [*ev, *([f"comment {notice['id']}"] if notice else [])], sha, 'limited', at)
 
@@ -343,6 +362,8 @@ def pr_types(repo, path, sha):
     try:
         meta = gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
         doc = yaml.safe_load(base64.b64decode(meta['content']).decode())
+    except RateLimited:
+        raise
     except (Unusable, KeyError, ValueError, yaml.YAMLError):
         return None
     on = doc.get('on', doc.get(True)) if isinstance(doc, dict) else None  # YAML 1.1 reads a bare `on` as True
@@ -440,4 +461,4 @@ def collect(argv):
 
 
 if __name__ == '__main__':
-    sys.exit(report(collect, sys.argv[1:]))
+    sys.exit(report(collect, sys.argv[1:], limits=True))

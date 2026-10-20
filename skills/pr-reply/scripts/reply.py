@@ -38,8 +38,13 @@ reply may exist), posted that GitHub answered it, verified is true on a
 matching read-back, false on a mismatch and null when the read-back could not
 be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
 written by hand. Exit 0 when every reply is verified and, for a review
-reply, resolved; 1 otherwise; 2 on a usage or manifest error. A null resolved or
-error is left out of the line: a model relaying it drops a trailing null.
+reply, resolved; 1 otherwise, a failed comment lookup (an inaccessible --repo or a
+rate limit included) being a receipt's error; 2 on a usage or manifest error, or
+when finding the repo (gh repo view) or our login (gh api user) fails, with
+{"error": ...} as the last stdout line. A null resolved or
+error is left out of the line: a model relaying it drops a trailing null. An
+entry whose error names a GitHub rate limit ends the batch: every later entry
+gets a receipt that nothing was tried, with no further GitHub call.
 
 --inspect reads, never writes: for each pair, whether REPLY is ours answering
 COMMENT on this PR (a bare COMMENT names our newest reply to it, an error when
@@ -97,6 +102,10 @@ RESOLVE_MUTATION = 'mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){
 
 class ApiError(Exception):
     pass
+
+
+# What pr-babysit reads as a rate limit in a receipt's error.
+RATE_LIMITED = re.compile(r'rate limit|HTTP 429', re.I)
 
 
 def fnv1a(text):
@@ -449,6 +458,20 @@ def handle(poster, item):
     return rc
 
 
+def settle_all(items, settle, untried):
+    """settle(item) for each item until one meets a GitHub rate limit; every later item gets untried(item), no call made."""
+    receipts, limited = [], False
+    for item in items:
+        if limited:
+            rc = untried(item)
+            rc['error'] = 'not tried: GitHub refused an earlier call in this batch for a rate limit'
+        else:
+            rc = settle(item)
+            limited = bool(RATE_LIMITED.search(rc['error'] or ''))
+        receipts.append(rc)
+    return receipts
+
+
 def load_entries(path, key, what, check):
     """The non-empty `key` list of the JSON file at path, each entry passing check, one per commentId."""
     with open(path, encoding='utf-8') as f:
@@ -512,8 +535,21 @@ def saved_receipt(path, request):
     return line, saved['code']
 
 
+def failed(message):
+    """Exit 2 before anything is posted: a relay copies the last stdout line, and with none it improvises (#115)."""
+    print(f'reply.py: {message}', file=sys.stderr)
+    print(json.dumps({'error': message}))
+    return 2
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        print(json.dumps({'error': f'usage: {message}'}))
+        super().error(message)
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--pr', type=int)
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--manifest')
@@ -539,8 +575,7 @@ def main(argv=None):
                    'entries': replies or reuses or edits}
         saved = saved_receipt(a.receipt, request) if a.receipt else None
     except (OSError, ValueError, json.JSONDecodeError) as e:
-        print(f'reply.py: {e}', file=sys.stderr)
-        return 2
+        return failed(str(e))
     if saved:
         print(json.dumps(saved[0]))
         return saved[1]
@@ -548,20 +583,22 @@ def main(argv=None):
     if not repo:
         rc, out, err = gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'])
         if rc != 0:
-            print(f'reply.py: {err.strip()}', file=sys.stderr)
-            return 2
+            return failed(err.strip())
         repo = out.strip()
     try:
         poster = Poster(repo, a.pr)
     except ApiError as e:
-        print(f'reply.py: {e}', file=sys.stderr)
-        return 2
+        return failed(str(e))
     if a.inspect:
         inspected = [inspect(poster, c, r) for c, r in a.inspect]
         print(json.dumps(sealed({'inspected': inspected})))
         return 0 if all(i['error'] is None for i in inspected) else 1
-    receipts = ([reuse(poster, item) for item in reuses] if reuses else [edit(poster, item) for item in edits] if edits
-                else [handle(poster, item) for item in replies])
+    if reuses:
+        receipts = settle_all(reuses, lambda i: reuse(poster, i), lambda i: receipt(i['commentId'], i['replyId'], i['bodyDigest']))
+    elif edits:
+        receipts = settle_all(edits, lambda i: edit(poster, i), lambda i: receipt(i['commentId'], i['replyId'], fnv1a(i['body'])))
+    else:
+        receipts = settle_all(replies, lambda i: handle(poster, i), lambda i: receipt(i['commentId'], None, fnv1a(i['body'])))
     line = sealed({'receipts': [{k: v for k, v in r.items() if v is not None or k not in ('resolved', 'error')} for r in receipts]})
     code = 0 if all(r['verified'] is True and (r['kind'] != 'review' or r['resolved']) for r in receipts) else 1
     if a.receipt:

@@ -17,7 +17,7 @@ python3 $S/preflight.py --pr N [--needs P]   # the checkout and the PR it must s
 python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
 python3 $S/preflight.py --state N            # before a GitHub write: is the PR still OPEN?
 python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
-python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
+python3 $S/hooks.py [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540)
 python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
 python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
 python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
@@ -26,7 +26,7 @@ python3 $S/sonar.py --pr N --head <sha> --manifest <file> [--receipt <path>]  # 
 python3 $S/coderabbit_trigger.py --pr N --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset
 python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
 python3 $S/scope_check.py --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
-python3 $S/state_transfer.py <saved output> [--chunks I,J]  # a stateRef's state as checksummed base64 chunks
+python3 $S/state_transfer.py <saved output> [--chunks I,J] [--pad]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text
 python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR]  # the caller's reading of a launch
 ```
 

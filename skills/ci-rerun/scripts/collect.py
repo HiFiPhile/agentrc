@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Collect a PR's CI state for a watcher, so no model spends turns waiting or listing.
 
-  collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S] [--brief] [--ignore-check NAME...]
+  collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S] [--brief] [--ignore-check NAME...] [--stop-file PATH]
   collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...]
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while the status is running, then
-prints one JSON object {head, status, mergeable, pending, registered, ignored, waiting, checks}, plus `error` when set
-(a relaying agent can drop a trailing null, so no line carries a null error); every
+prints one JSON object {head, status, mergeable, pending, registered, ignored, waiting, checks, observedAt}, plus `error` when set
+(a relaying agent can drop a trailing null, so no line carries a null error), and
+`rateLimit` {observedAt, resetAt, secondary} beside an error from a gh call GitHub
+refused for a rate limit, as pr-babysit's facts.py reports it; every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
-again). The PR is read again on every poll. A check named exactly an
+again). The PR is read again on every poll; once --stop-file PATH exists (the
+caller met a GitHub rate limit elsewhere) it ends as an error before its next
+GitHub call, the first one included. A check named exactly an
 --ignore-check NAME (a review bot's status the caller tracks elsewhere) is left
 out of everything below, so a listing of only those is one with no check
 registered; `ignored` names those present, sorted, [] when none. `status` is
@@ -23,7 +27,8 @@ pending, no checks registered yet, or mergeable UNKNOWN), else red (a check
 failed or was cancelled) or green; `mergeable` is GitHub's, read last;
 `pending` counts the pending checks, `registered` every check. `waiting`, '' unless
 running, fingerprints the pending checks (name, link, attempt) and mergeable: two
-reads with the same one saw nothing move. A failed or cancelled CircleCI job whose
+reads with the same one saw nothing move. `observedAt` is the UTC time of the
+print, `YYYY-MM-DDTHH:MM:SSZ`, the caller's clock. A failed or cancelled CircleCI job whose
 workflow has not finished (running, failing, on_hold, queued: CircleCI refuses
 to re-run it yet) counts as pending, read from CircleCI's public job and
 workflow API on every poll; a status it cannot read is an error. This also
@@ -166,18 +171,43 @@ COMPARATOR = {'GT': '>', 'LT': '<'}
 CONDITION = ('metricKey', 'actualValue', 'comparator', 'errorThreshold')
 
 
+STOP_FILE = None  # inventory --stop-file
+
+
 class Failed(Exception):
-    pass
+    def __init__(self, message, limit=None):
+        super().__init__(message)
+        self.limit = limit
+
+
+def utc(seconds):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(seconds))
+
+
+def rate_limit(stderr):
+    """rateLimit for a gh failure GitHub refused for a rate limit, else None: a copy of pr-babysit facts.py's, which
+    test_ci_collect holds equal."""
+    if not re.search(r'rate limit|HTTP 429', stderr, re.I):
+        return None
+    try:
+        resources = json.loads(subprocess.run(['gh', 'api', 'rate_limit'], capture_output=True).stdout)['resources']
+        spent = [r['reset'] for r in resources.values() if r.get('remaining') == 0 and isinstance(r.get('reset'), int)]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        spent = []
+    return {'observedAt': utc(time.time()), 'resetAt': utc(max(spent)) if spent else None,
+            'secondary': not spent or 'secondary' in stderr.lower()}
 
 
 def gh(*args, raw=False):
+    if STOP_FILE and os.path.exists(STOP_FILE):
+        raise Failed(f'stopped before the next GitHub call: {STOP_FILE} exists')
     try:
         done = subprocess.run(['gh', *args], capture_output=True)
     except OSError as e:
         raise Failed(f'gh: {e}')
     if done.returncode != 0:
         err = done.stderr.decode(errors='replace').strip()
-        raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}')
+        raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}', rate_limit(err))
     # A job log is whatever the job printed; anything parsed stays strict.
     if raw:
         return done.stdout.decode(errors='replace')
@@ -382,7 +412,8 @@ def printed(inv, brief=False):
     pending = sorted([c['name'], c.get('link') or '', c.get('attempt') or ''] for c in inv['checks'] if c['bucket'] == 'pending')
     return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
             'registered': sum(inv['counts'].values()), 'ignored': inv['ignored'],
-            'waiting': fnv1a(json.dumps([inv['mergeable'], pending])) if inv['status'] == 'running' else '', 'checks': listed}
+            'waiting': fnv1a(json.dumps([inv['mergeable'], pending])) if inv['status'] == 'running' else '', 'checks': listed,
+            'observedAt': utc(time.time())}
 
 
 def evidence_dir(repo, pr, head):
@@ -868,6 +899,8 @@ def changed_paths(repo, pr):
     try:
         names = [f['filename'] for page in gh('api', '--paginate', '--slurp', f'repos/{repo}/pulls/{pr}/files?per_page=100') for f in page]
     except (Failed, KeyError, TypeError) as e:
+        if getattr(e, 'limit', None):
+            raise
         return None, f'the PR files could not be read: {e}'
     if len(names) >= 3000:
         return None, f'GitHub listed {len(names)} files, its cap: the list may be incomplete'
@@ -898,6 +931,8 @@ def failures(repo, pr, head, links, gates=()):
             else:
                 entry['error'] = 'no reader for this check: its link names no run'
         except (Failed, rtd.Failed, circleci.Failed) as e:
+            if getattr(e, 'limit', None):
+                raise
             entry['error'] = str(e)
         checks.append(entry)
     unread = prior_verdicts(repo, pr, head, checks)
@@ -958,6 +993,7 @@ def main(argv=None):
     p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate check, read for the caller')
     p.add_argument('--offset', type=int, help='recall: where the page to print starts, of the lone --check')
     p.add_argument('--ignore-check', action='append', default=[], metavar='NAME', help='inventory: leave out the checks of this exact name')
+    p.add_argument('--stop-file', metavar='PATH', help='inventory: make no further GitHub call once PATH exists')
     a = p.parse_args(argv)
     if a.offset is not None and (a.command != 'recall' or len(a.check) != 1):
         p.error('--offset is for recall with exactly one --check')
@@ -967,6 +1003,8 @@ def main(argv=None):
         p.error('--brief is for inventory')
     if a.ignore_check and a.command != 'inventory':
         p.error('--ignore-check is for inventory')
+    if a.stop_file and a.command != 'inventory':
+        p.error('--stop-file is for inventory')
     if '' in a.ignore_check or len(set(a.ignore_check)) != len(a.ignore_check):
         p.error('an --ignore-check name is empty or given more than once')
     if (a.command in ('failures', 'bases', 'recall')) != bool(a.check or a.gate):
@@ -975,6 +1013,8 @@ def main(argv=None):
         p.error('a link is given more than once')
     if not SHA.fullmatch(a.head):
         p.error('--head must be a full 40-hex SHA')
+    global STOP_FILE
+    STOP_FILE = a.stop_file
     try:
         if a.command == 'inventory':
             out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds), set(a.ignore_check)), a.brief)
@@ -988,7 +1028,7 @@ def main(argv=None):
             out = recall(a.repo, a.pr, a.head, a.check, a.offset)
         out, rc = sealed(out), 0
     except Failed as e:
-        out, rc = {'head': a.head, 'error': str(e)}, 1
+        out, rc = {'head': a.head, 'error': str(e), **({'rateLimit': e.limit} if e.limit else {})}, 1
     print(json.dumps(out))
     return rc
 
