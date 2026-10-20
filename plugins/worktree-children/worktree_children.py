@@ -92,7 +92,9 @@ class Keep(Exception):
 def run(args, cwd=None, input=None):
     """A finished command; one that cannot start reads as exit 127, so its check keeps the child."""
     try:
-        return subprocess.run(args, cwd=cwd, input=input, capture_output=True, text=True, env=ENV)
+        # decoded as os.fsdecode does, so paths round-trip: UTF-8 on Windows (git's), not the locale code page
+        return subprocess.run(args, cwd=cwd, input=input, capture_output=True, encoding=sys.getfilesystemencoding(),
+                              errors='surrogateescape', env=ENV)
     except OSError as e:
         return subprocess.CompletedProcess(args, 127, '', str(e))
 
@@ -214,9 +216,10 @@ def linked_worktree(child):
     return Path(gitdir), Path(common)
 
 
-def herdr_entry(path):
-    """herdr's `worktree list` entry for the checkout at path; Keep when herdr cannot say."""
-    done = run([HERDR, 'worktree', 'list', '--cwd', str(path)])
+def herdr_entry(path, herdr=None):
+    """herdr's `worktree list` entry for the checkout at path, asking `herdr` (default HERDR); Keep when
+    herdr cannot say."""
+    done = run([herdr or HERDR, 'worktree', 'list', '--cwd', str(path)])
     try:
         if done.returncode:
             raise ValueError
@@ -227,6 +230,17 @@ def herdr_entry(path):
     if len(mine) != 1:
         raise Keep('herdr does not list it')
     return mine[0]
+
+
+def linked_workspace(path, herdr=None):
+    """Whether herdr lists the checkout at path as a linked worktree open in a workspace, where a new
+    worktree of the cowork and pr-review skills goes beside it; Keep when herdr cannot say or answers
+    with a malformed entry."""
+    entry = herdr_entry(path, herdr)
+    linked, workspace = entry.get('is_linked_worktree'), entry.get('open_workspace_id')
+    if not isinstance(linked, bool) or not (workspace is None or isinstance(workspace, str) and workspace):
+        raise Keep(f'herdr answered `worktree list` for {path} with a malformed entry: {entry}')
+    return linked and workspace is not None
 
 
 def check_herdr(child):
