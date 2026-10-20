@@ -138,14 +138,23 @@ class ChiefRun(unittest.TestCase):
                 '--task-file', str(self.task), *([] if detached else ['--foreground']), *extra]
 
     def run_it(self, *extra, worktree=None, detached=False, **env):
-        return subprocess.run(self.argv(*extra, worktree=worktree, detached=detached), env={**self.env, **env},
-                              capture_output=True, text=True, timeout=30)
+        r = subprocess.run(self.argv(*extra, worktree=worktree, detached=detached), env={**self.env, **env},
+                           capture_output=True, text=True, timeout=30)
+        return self.detach(r) if detached else r
 
     def start(self, *argv, **kw):
         proc = subprocess.Popen(list(argv) or self.argv(), env=self.env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
         self.addCleanup(lambda: proc.poll() is None and (kill(proc.pid), proc.wait()))   # its tree: Windows keeps claude
         return proc
+
+    def detach(self, r):
+        """A detached launcher writes its exit line before it exits, its logs open until then (Windows will not
+        remove them): its exit is waited for before the test's directory goes."""
+        if 'launcher pid ' in r.stdout:
+            pid = int(r.stdout.split('launcher pid ')[1].split(',')[0])
+            self.addCleanup(self.wait_until, 'the launcher to exit', lambda: not alive(pid))
+        return r
 
     def wait_until(self, what, ok):
         deadline = time.monotonic() + 10
@@ -412,7 +421,7 @@ class ChiefRun(unittest.TestCase):
         else:   # Windows: DETACHED_PROCESS stands for the session, so no console event from the caller reaches it
             control = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], creationflags=subprocess.CREATE_NO_WINDOW)
             self.addCleanup(lambda: (control.kill(), control.wait()))
-            self.assertTrue(has_console(control.pid), 'the probe sees a console where there is one')
+            self.wait_until('the probe to see a console where there is one', lambda: has_console(control.pid))
             self.assertFalse(has_console(pid), 'the launcher has no console')
         (self.fake / 'go').touch()
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 0 (result ok)'))
@@ -482,8 +491,8 @@ class ChiefRun(unittest.TestCase):
                    'line = chief_run.Progress.line\n'
                    'def broken(self, text):\n    if text.startswith("launcher: warning"): raise OSError("disk full")\n    line(self, text)\n'
                    'chief_run.Progress.line = broken\nsys.exit(chief_run.main(sys.argv[1:]))')
-        r = subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True,
-                           text=True, timeout=30)
+        r = self.detach(subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True,
+                                          text=True, timeout=30))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 1 (launcher failed: OSError: disk full)'))
         pid = int((self.fake / 'pid').read_text())
@@ -555,7 +564,7 @@ class ChiefRun(unittest.TestCase):
         failing = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import chief_run\n'
                    'def launch(a, task):\n    chief_run.Progress(a.out / "progress.log").line("launcher: started")\n    raise RuntimeError("boom")\n'
                    'chief_run.launch = launch\nsys.exit(chief_run.main(sys.argv[1:]))')
-        r = subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30)
+        r = self.detach(subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 1'))
         self.assertEqual(self.progress(), [(1, 'launcher: started'), (2, 'launcher: exit 1 (launcher failed: RuntimeError: boom) · report none')])
@@ -567,7 +576,7 @@ class ChiefRun(unittest.TestCase):
                    'line = chief_run.Progress.line\n'
                    'def broken(self, text):\n    if text.startswith("launcher: warning"): raise OSError("disk full")\n    line(self, text)\n'
                    'chief_run.Progress.line = broken\nsys.exit(chief_run.main(sys.argv[1:]))')
-        r = subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30)
+        r = self.detach(subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 1 (launcher failed: OSError: disk full)'))
         self.assertFalse(alive(int((self.fake / 'pid').read_text())), 'chief stopped before the exit line')
