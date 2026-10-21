@@ -22,13 +22,25 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   hour away, naps until the reset and comments `@coderabbitai review` (a limit
   notice has no box), then waits the same way. Needs
   `autoPush` and `coderabbit` in `autoRun`; never restored from a state.
+- `greptileTrigger` (boolean, default false): set in the repository's
+  `CLAUDE.md` when Greptile reviews only on PR open, so a pushed head is
+  reviewed only on request. Greptile is then waited on, as if in `autoRun`.
+  Once per head, when Greptile has stayed absent for 2 minutes, comments
+  exactly `@greptileai` (`greptile_trigger.py`), then waits for the review up
+  to the silent-bot cap counted from the request. A head Greptile already
+  reviewed or is scoring is never asked about. The first launch with the switch
+  latches the run: its state requires Greptile's review of every later head,
+  so a launch without the switch keeps waiting on Greptile, asking nothing. A
+  failed, uncertain or ambiguous request, or no review within the cap, stops
+  `greptile-unreviewed`, never a pass. Needs `autoPush` and `greptile` in
+  `reviewers`; the switch itself is never restored from a state.
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
   paths are ignored; any other pre-existing edit refuses the start.
 - `protected`: regex over repo-relative paths kept out of every fix scope (a
   review fix needing one is withheld, a CI fix's guess at one dropped) and
   never committed or published; an adopted chain may carry one only in commits
-  the PR already has, or in a merge from the base that takes either parent's
-  version of it.
+  the PR already has, in a merge from the base that takes either parent's
+  version of it, or as `adoptProtected` or `adoptReviewedProtected` permits.
 - `generated`: regex over repo-relative paths a fixer's build regenerates; a
   plain modification to one is admitted into the commit on the caller's word
   that the repository hooks validate it.
@@ -92,8 +104,17 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
 - `adoptProtected`: exact repository-relative paths matching `protected` that a
   base merge in the `adoptHead` chain may change, such as a conflict resolved
   in a protected roster; only with `adoptHead`, per launch. A path an
-  unpublished ordinary commit of the chain also touches stays refused, and
+  unpublished ordinary commit of the chain also touches stays refused unless
+  `adoptReviewedProtected` names every unpublished commit changing it, and
   writers and hooks stay bound by `protected`.
+- `adoptReviewedProtected`: `[{ sha, paths }]`, `sha` a full 40-hex commit of
+  the `adoptHead` chain and `paths` the exact protected paths it changes: the
+  caller's word that those changes passed the review the paths require (such
+  as the peer review a repository's `CLAUDE.md` asks for). Each unpublished
+  commit changing a protected path needs its own entry naming that path, a
+  rename both its names, a base merge included; approving one commit approves
+  no other. Only with `adoptHead`, per launch; writers and hooks stay bound by
+  `protected`.
 - `rebasedHead`: full SHA of the PR head after a history rewrite (rebase,
   force-push) the user authorized: with the checkout at it and no unpublished
   candidate, the state is re-pinned to it unaudited, keeping cycles used,

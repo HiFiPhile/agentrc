@@ -113,6 +113,12 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(ci['verdicts'], {'sonarGate': 1, 'rig-side': 1})
         self.assertEqual(list(ci['settledCells']), ['hil-tinyusb (tinyusb.json)'])
         self.assertEqual([f['check'] for f in ci['attention']], ['SonarCloud Code Analysis'], 'the gate needs attention')
+        greptile = {**gate, 'check': 'Greptile Review', 'verdict': 'real', 'state': 'greptileGate'}
+        o['result']['observation']['ci']['realFailures'] = [gate, greptile, failure('f072 cdc')]
+        rc, s = self.run_it(o)
+        ci = s['observation']['ci']
+        self.assertEqual(ci['verdicts'], {'sonarGate': 1, 'greptileGate': 1, 'rig-side': 1}, 'each gate counted apart, whatever its verdict')
+        self.assertEqual([f['check'] for f in ci['attention']], ['SonarCloud Code Analysis', 'Greptile Review'])
 
     def test_a_launch_that_threw_keeps_the_state_it_was_given(self):
         rc, s = self.run_it('', '--state-ref', '/t/w1.output:4841042f', '--checkout', self.repo())
@@ -122,6 +128,22 @@ class LaunchResultTest(unittest.TestCase):
         self.assertIn('threw before returning', s['blockers'][0])
         self.assertIn("the checkout is dirty: ['?? left.txt']", s['blockers'], 'even without a result')
         self.assertIn('no new state', s['notes'][0])
+
+    def test_pinned_is_the_state_s_config_or_the_state_ref_s_when_the_launch_threw(self):
+        config = {'pr': 7, 'reviewers': ['coderabbit'], 'autoRun': ['coderabbit'], 'checkoutDir': '.', 'ciWait': 30,
+                  'protected': '^(skills\\/cowork\\/)', 'generated': None}
+        rc, s = self.run_it(output(result={'state': {'expectedHead': NEXT, 'config': config}}))
+        self.assertEqual(s['pinned'], config)
+        rc, s = self.run_it(output(result={'state': None}))
+        self.assertIsNone(s['pinned'], 'no state, nothing pinned')
+        saved = self.dir / 'w1.output'
+        saved.write_text(json.dumps(output(result={'stateDigest': '4841042f', 'state': {'expectedHead': NEXT, 'config': config}})), encoding='utf-8')
+        rc, s = self.run_it('', '--state-ref', f'{saved}:4841042f')
+        self.assertEqual((s['stateRef']['digest'], s['pinned']), ('4841042f', config))
+        for ref, why in ((f'{saved}:0badf00d', 'holds no state of digest 0badf00d'), ('/t/missing.output:4841042f', 'pinned arguments are unread: cannot read')):
+            rc, s = self.run_it('', '--state-ref', ref)
+            self.assertIsNone(s['pinned'], ref)
+            self.assertTrue(any(why in n for n in s['notes']), s['notes'])
 
     def test_a_spent_cycle_budget_is_a_blocker(self):
         rc, s = self.run_it(output(result={'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}))

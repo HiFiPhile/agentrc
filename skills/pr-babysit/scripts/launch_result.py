@@ -15,7 +15,8 @@ and state, which are condensed; receipts are kept verbatim, each reply receipt
 with its `batch` and `findingVerdicts`, the verdicts of this harvest's findings on
 its comment (a refutedPosts reply answers stale findings as well as invalid ones).
 `budget` is the returned state's
-cyclesUsed and maxCycles. `blockers` lists what the caller must settle before
+cyclesUsed and maxCycles; `pinned` its config, the arguments a continuation
+passes unchanged, read from the --state-ref output when the launch returned no state. `blockers` lists what the caller must settle before
 trusting or continuing the launch, a spent cycle budget and a refused launch
 included, the latter with the caller's response, and a stop another launch on the same state would repeat,
 with what must change first; `notes` what is absent but harmless.
@@ -76,6 +77,13 @@ STALLED = {
     'ci-red-rig-side': 'CI is red only from rig-side failures: relaunch once they are repaired and re-run, or the user accepts them',
     'ci-red-sonar-gate': "the SonarCloud gate fails: relaunch only when markSonar has an answered issue to mark or the gate changed; "
                          "otherwise it is the user's to resolve or accept",
+    'ci-red-greptile-gate': "Greptile's confidence check fails: a score below the repository's threshold needs a new Greptile review "
+                            "of the head, else the user accepts it by its key; a check that could not be read as one (complete false) "
+                            "needs inspecting first",
+    'greptile-unreviewed': 'Greptile has not reviewed the head, and a greptileTrigger launch made its review required for every head of '
+                           'this run: its request failed, was uncertain (the detail names the attempt record) or ambiguous, or no '
+                           'review came within the cap after it; read `bots` and the PR, and relaunch once Greptile reviewed the head; '
+                           "shipping the head unreviewed is the user's decision",
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
     'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head, or a re-run named in `unregistered` never '
                 'registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
@@ -155,7 +163,7 @@ ATTENTION = ('check', 'cell', 'state', 'verdict', 'key', 'complete', 'files')
 
 
 def ci_summary(ci, keys=False):
-    """Counts by verdict, accepted and sonarGate apart; complete rig-side or accepted failures as their cells per check, or
+    """Counts by verdict, accepted and the gates apart; complete rig-side or accepted failures as their cells per check, or
     with keys as {cell, key}; every other failure by the fields a caller acts on, its firstError cut."""
     failures = ci.get('realFailures') or []
     settled = lambda f: f.get('complete') is True and f.get('state') in ('accepted', 'rigSide')
@@ -217,6 +225,20 @@ def ide_drift(line):
     return all(IDE_DRIFT.match(p) for p in line[3:].split(' -> '))
 
 
+def pinned_by(ref, notes):
+    """The config of the state a stateRef names, or None with a note saying why."""
+    try:
+        result = ((load_output(ref['outputFile']) or {}).get('result') or {})
+    except Unusable as e:
+        notes.append(f'the stateRef\'s pinned arguments are unread: {e}')
+        return None
+    config = (result.get('state') or {}).get('config')
+    if result.get('stateDigest') != ref['digest'] or not isinstance(config, dict):
+        notes.append(f"the stateRef's output holds no state of digest {ref['digest']}: its pinned arguments are unread")
+        return None
+    return config
+
+
 def checkout(path):
     return {'branch': git('-C', path, 'rev-parse', '--abbrev-ref', 'HEAD').strip(),
             'head': git('-C', path, 'rev-parse', 'HEAD').strip(),
@@ -225,7 +247,7 @@ def checkout(path):
 
 def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     blockers, notes = [], []
-    summary = {'launch': None, 'result': None, 'stateRef': None, 'budget': None, 'observation': None, 'receipts': None,
+    summary = {'launch': None, 'result': None, 'stateRef': None, 'budget': None, 'pinned': None, 'observation': None, 'receipts': None,
                'logs': [], 'checkout': tree, 'blockers': blockers, 'notes': notes}
     result = output.get('result') if output else None
     if output is None:
@@ -241,6 +263,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             summary['stateRef'] = {'outputFile': output_path, 'digest': result['stateDigest']}
             used, most = result['state'].get('cyclesUsed'), result['state'].get('maxCycles')
             summary['budget'] = {'cyclesUsed': used, 'maxCycles': most}
+            summary['pinned'] = result['state'].get('config')
             if result.get('pass') is not True and result.get('reason') not in ENDED and isinstance(used, int) and isinstance(most, int) and used >= most:
                 blockers.append(f'cycle budget spent: {used} of {most}; a relaunch needs a larger maxCycles, the user\'s decision')
         if result.get('reason') in REFUSED:
@@ -297,6 +320,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     if summary['stateRef'] is None and state_ref:
         summary['stateRef'] = state_ref
         notes.append('this launch returned no new state: continue from the stateRef it was given')
+        summary['pinned'] = pinned_by(state_ref, notes)
     return summary
 
 

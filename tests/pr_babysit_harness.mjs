@@ -93,9 +93,14 @@ const STATE_PIN = {
   prRepo: PIN.prRepo, prBranch: PIN.prBranch, prUrl: PIN.prUrl,
   remote: PIN.remote, pushUrls: PIN.pushUrls,
 }
-const chainAudit = (commits = [ADOPT], paths = ['src/adopted.c'], over = {}) => ({
-  from: HEAD, to: commits[commits.length - 1], commits, paths, unpublished: paths, mergeOnly: [], refusal: '', ...over,
-})
+// changes defaults to the tip commit changing every unpublished path.
+const chainAudit = (commits = [ADOPT], paths = ['src/adopted.c'], over = {}) => {
+  const unpublished = over.unpublished ?? paths
+  return {
+    from: HEAD, to: commits[commits.length - 1], commits, paths, unpublished, mergeOnly: [],
+    changes: unpublished.length ? [{ sha: commits[commits.length - 1], paths: unpublished }] : [], refusal: '', ...over,
+  }
+}
 const adoptionState = ({
   maxCycles = 4, cyclesUsed = 1, reviewers = ['coderabbit'], autoRun = reviewers,
   protected: protectedPattern = null, pin = STATE_PIN, ...over
@@ -511,6 +516,11 @@ async function run(opts = {}) {
       // coderabbit_trigger.py's line: the box ticked unless opts.crTrigger(label) answers otherwise, finished when the
       // validator last observed unless it says when; null is a dead relay.
       const answer = typeof opts.crTrigger === 'function' ? opts.crTrigger(label) : 'crTrigger' in opts ? opts.crTrigger : { outcome: 'ticked', detail: 'comment 5' }
+      return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
+    }
+    if (label.startsWith('greptile#')) {
+      // greptile_trigger.py's line: requested unless opts.gTrigger(label) answers otherwise, finished when the validator last observed.
+      const answer = typeof opts.gTrigger === 'function' ? opts.gTrigger(label) : 'gTrigger' in opts ? opts.gTrigger : { outcome: 'requested', detail: 'comment 7' }
       return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
     }
     if (label.startsWith('crrequest#')) {
@@ -944,7 +954,7 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
   assert.deepEqual(result.rollup, {
     cycles: [1], findings: { total: 3, fixed: 1, open: 0, refuted: 1, stale: 1, deferred: 0, held: 0 },
-    ci: { total: 0, fixed: 0, open: 0, accepted: 0, sonarGate: 0, rigSide: 0, unclassified: 0 }, ciChecks: { judged: 0, partial: 0, reused: 0, unchanged: 0 },
+    ci: { total: 0, fixed: 0, open: 0, accepted: 0, sonarGate: 0, greptileGate: 0, rigSide: 0, unclassified: 0 }, ciChecks: { judged: 0, partial: 0, reused: 0, unchanged: 0 },
     reran: 0, pushed: [shaFor(1).slice(0, 8)], replies: 3,
   })
 })
@@ -952,7 +962,7 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
 test('a launch rollup counts its own cycles, each finding and CI failure once', async () => {
   const red = redWith(RIG, PVS, UNPLACED).ci
   const first = await run({ args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING, ci: red })
-  assert.deepEqual(first.result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 1, sonarGate: 0, rigSide: 1, unclassified: 1 })
+  assert.deepEqual(first.result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 1, sonarGate: 0, greptileGate: 0, rigSide: 1, unclassified: 1 })
   const dry = await run({ args: { autoPush: false, maxCycles: 3 }, reviews: { findings: [finding()], replies: [], bots: 'reviewed' } })
   assert.deepEqual(dry.result.rollup.findings, { total: 1, fixed: 0, open: 1, refuted: 0, stale: 0, deferred: 0, held: 0 }, 'a dry run fixes nothing')
   const twice = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
@@ -5604,7 +5614,11 @@ test('N cycles over N launches dispatch the validator N times, no more', async (
 test('a state from a run with other arguments, or of another shape, is refused', async () => {
   const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
   await assert.rejects(run({ args: { maxCycles: 3, reviewers: ['coderabbit', 'copilot'], state: first.result.state } }),
-    /different arguments/)
+    /different arguments \(reviewers: \["coderabbit"\] vs \["coderabbit","copilot"\]\): \{"pr":3888,/)
+  const pinned = adoptionState({ protected: '^test/hil/' })
+  await assert.rejects(run({ args: { ...adoptionArgs(pinned), protected: undefined } }),
+    (e) => e.message.startsWith(`state was made by a run with different arguments (protected: ${JSON.stringify(pinned.config.protected)} vs null): {`),
+    'the differing key first, as the state and the launch have it')
   await assert.rejects(run({ args: { maxCycles: 3, state: { version: 0 } } }), /not a pr-babysit state/)
 })
 
@@ -5643,7 +5657,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.equal(JSON.stringify(result.state).includes('adoptHead'), false, 'the launch argument is not persisted')
   const audit = calls.find(c => c.label === 'adopt:audit')
   assert.equal(audit.phase, 'Triage')
-  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'refusal'])
+  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'changes', 'refusal'])
   assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE} --tip ${TIP}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
@@ -5728,7 +5742,7 @@ test('the audit script\'s refusal, or an audit of another range, is refused', as
 
 test('a merge whose base the checkout lacks stops as adopt-base-missing; other audit errors and refusals do not', async () => {
   const missing = `the PR's base ${TIP} is not in the checkout: fetch it`
-  const errored = error => ({ error, from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], refusal: '' })
+  const errored = error => ({ error, from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], changes: [], refusal: '' })
   for (const [audit, reason] of [
     [errored(missing), 'adopt-base-missing'],
     [errored('git rev-list: fatal: bad revision'), 'adopt-audit-failed'],
@@ -5746,7 +5760,7 @@ test('a merge whose base the checkout lacks stops as adopt-base-missing; other a
 test('a chain the audit script cannot read back is refused with its error', async () => {
   const { result, labels } = await run({
     args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD },
-    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], refusal: '' },
+    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], changes: [], refusal: '' },
   })
   assert.equal(result.reason, 'adopt-audit-failed')
   assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
@@ -5944,6 +5958,7 @@ test('adoptProtected admits a protected path only a base merge changes, and only
   const state = adoptionState({ protected: '^test/hil/' })
   const audit = (over) => chainAudit([ADOPT], roster, { mergeOnly: roster, ...over })
   const HINT = '; only a base merge changes them, which adoptProtected may permit'
+  const REVIEWED = "; adoptReviewedProtected may permit a reviewed commit's change to them, by its full SHA and each path"
   const merged = await run({
     args: adoptionArgs(state, { autoPush: true, adoptProtected: roster }), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit(),
   })
@@ -5952,9 +5967,9 @@ test('adoptProtected admits a protected path only a base merge changes, and only
   assert.ok(merged.logs.some(l => l.includes('protected path(s) test/hil/local.json, test/hil/other.json, named in adoptProtected')))
   for (const [name, over, args, refused] of [
     ['an unnamed path', {}, { adoptProtected: ['test/hil/local.json'] }, `test/hil/other.json${HINT}`],
-    ['an ordinary link touching the path too', { mergeOnly: ['test/hil/other.json'] }, { adoptProtected: roster }, 'test/hil/local.json'],
+    ['an ordinary link touching the path too', { mergeOnly: ['test/hil/other.json'] }, { adoptProtected: roster }, `test/hil/local.json${REVIEWED}`],
     ['no adoptProtected', {}, {}, `test/hil/local.json, test/hil/other.json${HINT}`],
-    ['one of two by an ordinary link', { mergeOnly: ['test/hil/other.json'] }, {}, 'test/hil/local.json, test/hil/other.json'],
+    ['one of two by an ordinary link', { mergeOnly: ['test/hil/other.json'] }, {}, `test/hil/local.json, test/hil/other.json${REVIEWED}`],
   ]) {
     const { result, labels } = await run({ args: adoptionArgs(state, { autoPush: true, ...args }), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit(over) })
     assert.equal(result.reason, 'adopt-audit-failed', name)
@@ -5979,6 +5994,88 @@ test('adoptProtected is refused unless it names distinct plain paths beside an a
   const trace = []
   await assert.rejects(run({ trace, args: { stateRef: { outputFile: '/tmp/w.output', digest: '0123abcd' }, adoptHead: ADOPT, adoptProtected: ['../x'] } }),
     /plain repository-relative paths/)
+  assert.deepEqual(trace, [], 'refused before the state loader starts an agent')
+})
+
+test('adoptReviewedProtected admits a protected change only in the commits it names, each by SHA and path (#186)', async () => {
+  const PY = 'skills/cowork/scripts/cowork.py', TEST = 'tests/test_cowork.py'
+  const state = adoptionState({ protected: '^(skills/cowork/|tests/test_cowork\\.py$)' })
+  const REVIEWED = "; adoptReviewedProtected may permit a reviewed commit's change to them, by its full SHA and each path"
+  const adopt = (audit, adoptReviewedProtected, over = {}) => run({
+    args: adoptionArgs(state, { autoPush: true, ...(adoptReviewedProtected && { adoptReviewedProtected }) }),
+    preflight: { head: ADOPT, prHead: HEAD, ...over }, adoptAudit: audit,
+  })
+  const one = chainAudit([ADOPT], [PY, TEST, 'src/a.c'])
+  const approved = await adopt(one, [{ sha: ADOPT, paths: [PY, TEST] }])
+  assert.notEqual(approved.result.reason, 'adopt-audit-failed', approved.result.detail)
+  assert.equal(approved.result.history[1].adoption.publication, 'pushed')
+  assert.ok(approved.logs.some(l => l.includes(`reviewed change(s) to protected path(s) 1111111 ${PY}, 1111111 ${TEST}, named in adoptReviewedProtected`)))
+  // Two commits on one path: approving one approves no other.
+  const two = chainAudit([ADOPT_MID, ADOPT], [PY], { changes: [{ sha: ADOPT_MID, paths: [PY] }, { sha: ADOPT, paths: [PY, 'src/a.c'] }] })
+  const renamed = chainAudit([ADOPT], ['skills/cowork/old.py', 'skills/cowork/new.py'])
+  for (const [name, audit, approval, refused, over] of [
+    ['none', one, undefined, `${PY}, ${TEST}`],
+    ['another SHA', one, [{ sha: ADOPT_MID, paths: [PY, TEST] }], `${PY}, ${TEST}`],
+    ['one path of two', one, [{ sha: ADOPT, paths: [PY] }], TEST],
+    ['a path by another spelling', one, [{ sha: ADOPT, paths: [PY, 'tests/test_cowork.PY'] }], TEST],
+    ['another commit on the same path', two, [{ sha: ADOPT, paths: [PY] }], PY],
+    ['a rename by its new name only', renamed, [{ sha: ADOPT, paths: ['skills/cowork/new.py'] }], 'skills/cowork/old.py'],
+    ['adoptProtected for an ordinary commit', one, undefined, `${PY}, ${TEST}`, { adoptProtected: [PY, TEST] }],
+  ]) {
+    const { result, labels } = await adopt(audit, approval, over)
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.equal(result.detail, `protected path(s) in the chain: ${refused}${REVIEWED}`, name)
+    assert.equal(labels.includes('adopt:push'), false, name)
+  }
+  for (const [name, audit, approval, over] of [
+    ['each commit on the path', two, [{ sha: ADOPT_MID, paths: [PY] }, { sha: ADOPT, paths: [PY] }]],
+    ['both sides of a rename', renamed, [{ sha: ADOPT, paths: ['skills/cowork/new.py', 'skills/cowork/old.py'] }]],
+    ['a deletion', chainAudit([ADOPT], [TEST]), [{ sha: ADOPT, paths: [TEST] }]],
+    // The PR already carries ADOPT_MID's change (#49): only ADOPT's is unpublished.
+    ['a published prefix', chainAudit([ADOPT_MID, ADOPT], [PY], { changes: [{ sha: ADOPT, paths: [PY] }] }), [{ sha: ADOPT, paths: [PY] }], { prHead: ADOPT_MID }],
+  ]) {
+    const { result } = await adopt(audit, approval, over)
+    assert.notEqual(result.reason, 'adopt-audit-failed', `${name}: ${result.detail}`)
+    assert.equal(result.history[1].adoption.publication, 'pushed', name)
+  }
+})
+
+test('adoptReviewedProtected covers a base merge only by its SHA, beside adoptProtected (#186)', async () => {
+  const F = 'test/hil/local.json'
+  const state = adoptionState({ protected: '^test/hil/' })
+  // A base merge resolving F, then an ordinary commit editing it: F is no longer mergeOnly.
+  const audit = chainAudit([ADOPT_MID, ADOPT], [F], { changes: [{ sha: ADOPT_MID, paths: [F] }, { sha: ADOPT, paths: [F] }] })
+  const adopt = (over) => run({ args: adoptionArgs(state, { autoPush: true, ...over }), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit })
+  const partial = await adopt({ adoptProtected: [F], adoptReviewedProtected: [{ sha: ADOPT, paths: [F] }] })
+  assert.equal(partial.result.reason, 'adopt-audit-failed', 'adoptProtected waives only a path no ordinary commit changes')
+  const both = await adopt({ adoptReviewedProtected: [{ sha: ADOPT_MID, paths: [F] }, { sha: ADOPT, paths: [F] }] })
+  assert.notEqual(both.result.reason, 'adopt-audit-failed', both.result.detail)
+})
+
+test('adoptReviewedProtected is refused unless it names full SHAs and distinct plain paths beside an adoptHead (#186)', async () => {
+  const state = adoptionState({ protected: '^test/hil/' })
+  const F = 'test/hil/local.json'
+  const SHAPE = /adoptReviewedProtected must be an array of \{ sha: full 40-hex commit SHA, paths: plain repository-relative paths \}/
+  for (const [adoptReviewedProtected, adoptHead, message] of [
+    [{ sha: ADOPT, paths: [F] }, ADOPT, SHAPE],
+    [[{ sha: ADOPT.slice(0, 7), paths: [F] }], ADOPT, SHAPE],
+    [[{ sha: ADOPT.toUpperCase().replace(/1/g, 'A'), paths: [F] }], ADOPT, SHAPE],
+    [[{ sha: ADOPT, paths: [] }], ADOPT, SHAPE],
+    [[{ sha: ADOPT, paths: F }], ADOPT, SHAPE],
+    [[{ sha: ADOPT, paths: ['./' + F] }], ADOPT, SHAPE],
+    [[{ sha: ADOPT, paths: ['../x'] }], ADOPT, SHAPE],
+    [[{ sha: ADOPT }], ADOPT, SHAPE],
+    [[{ sha: ADOPT, paths: [F], reason: 'reviewed' }], ADOPT, SHAPE],
+    [[{ sha: ADOPT, paths: [F] }, { sha: ADOPT, paths: ['test/hil/other.json'] }], ADOPT, /names a commit twice/],
+    [[{ sha: ADOPT, paths: [F, F] }], ADOPT, /names a path twice for one commit/],
+    [[{ sha: ADOPT, paths: [F] }], undefined, /goes with the adoptHead/],
+  ]) {
+    await assert.rejects(run({ args: adoptionArgs(state, { adoptReviewedProtected, adoptHead }), preflight: { head: ADOPT, prHead: HEAD } }), message,
+      JSON.stringify(adoptReviewedProtected))
+  }
+  const trace = []
+  await assert.rejects(run({ trace, args: { stateRef: { outputFile: '/tmp/w.output', digest: '0123abcd' }, adoptHead: ADOPT, adoptReviewedProtected: [{ sha: 'caa7f7f', paths: [F] }] } }),
+    SHAPE)
   assert.deepEqual(trace, [], 'refused before the state loader starts an agent')
 })
 
@@ -7364,7 +7461,7 @@ test('a SonarCloud gate is never a CI-lane fix: it stops the run on its own reas
   assert.equal(result.reason, 'ci-red-sonar-gate')
   assert.equal(result.cycles, 1, 'another cycle would meet the same gate')
   assert.ok(logs.some(l => /CI red from the SonarCloud gate \(condition failed: new_security_rating 3 > 1\) and 1 rig-side failure\(s\) — its failing condition needs resolving/.test(l)), logs.join('\n'))
-  assert.deepEqual(result.rollup.ci, { total: 2, fixed: 0, open: 0, accepted: 0, sonarGate: 1, rigSide: 1, unclassified: 0 })
+  assert.deepEqual(result.rollup.ci, { total: 2, fixed: 0, open: 0, accepted: 0, sonarGate: 1, greptileGate: 0, rigSide: 1, unclassified: 0 })
   assert.ok(logs.some(l => /\| left red: a SonarCloud gate, not a CI-lane fix +\| - /.test(l)), 'the cycle table names it, with no commit')
   // An Actions job running the scanner is an ordinary CI failure.
   const job = await run({ ci: { status: 'red', infraRerun: [], realFailures: [{ ...gate, check: 'SonarQube (stm32h743eval)', workflow: 'static_analysis' }] }, args: { autoPush: false, maxCycles: 1 } })
@@ -7432,9 +7529,80 @@ test('a gate with no condition read stops without claiming one, and a mixed pair
 test('gate evidence missing or doubled for a requested link re-arms', async () => {
   for (const gates of [(a) => ({ ...a, gates: [] }), (a) => ({ ...a, gates: [a.gates[0], a.gates[0]] })]) {
     const { labels, logs } = await gateRun([GATE], { gates, args: { autoPush: true, maxCycles: 1 } })
-    assert.ok(logs.some(l => /SonarCloud gate evidence came back for .*, asked for \["https:\/\/sonarcloud\.io[^"]*"\] — re-arming/.test(l)), logs.join('\n'))
+    assert.ok(logs.some(l => /cycle 1: gate evidence came back for .*, asked for \["https:\/\/sonarcloud\.io[^"]*"\] — re-arming/.test(l)), logs.join('\n'))
     assert.equal(labels.some(l => l.startsWith('ci:judge')), false)
   }
+})
+
+// Check run 118615785789 on hathach/agentrc PR 165: Greptile's confidence check, which collect.py reads as a gate.
+const GREPTILE_GATE = { check: 'Greptile Review', workflow: '', link: 'https://app.greptile.com/tinyusb/github/hathach/agentrc/-/pull/165',
+  firstError: 'Base review: Confidence 4/5 — below your required 5/5', files: [], verdict: 'real' }
+
+test("Greptile's confidence check is read by collect.py as a gate, never judged or fixed, and stops on its own reason", async () => {
+  const { calls, labels, result, logs } = await gateRun([GREPTILE_GATE])
+  assert.deepEqual(ciLabels(labels), ['ci:collect#1.1', 'ci:collect#1.f'], 'no judge, nothing remembered')
+  assert.match(calls.find(c => c.label === 'ci:collect#1.f').prompt, / failures --gate 'https:\/\/app\.greptile\.com\/[^']*\/pull\/165' --repo /)
+  assert.equal(labels.some(l => l.startsWith('fix:')), false, 'no local diff raises a review score')
+  assert.equal(result.reason, 'ci-red-greptile-gate')
+  assert.equal(result.cycles, 1, 'another cycle would meet the same gate')
+  assert.ok(logs.some(l => /CI red from Greptile's confidence check \(Base review: Confidence 4\/5 — below your required 5\/5\) — its review scored below the repository's threshold, which no CI-lane fix raises: a new score needs a new Greptile review of the head, or the caller accepts the gate by its key/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /Greptile confidence gate CI failure \(not fixing\): Greptile Review/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /\| left red: a Greptile confidence gate, not a CI-lane fix +\| - /.test(l)), 'the cycle table names it, with no commit')
+  assert.deepEqual(result.rollup.ci, { total: 1, fixed: 0, open: 0, accepted: 0, sonarGate: 0, greptileGate: 1, rigSide: 0, unclassified: 0 })
+  assert.deepEqual(result.observation.ci.realFailures.map(({ check, workflow, job, complete, signature, verdict, state }) => ({ check, workflow, job, complete, signature, verdict, state })),
+    [{ check: 'Greptile Review', workflow: '', job: 'Greptile Review', complete: true, signature: GREPTILE_GATE.firstError, verdict: 'real', state: 'greptileGate' }])
+  // A check the collector could not read as a threshold result is still the gate's: left red, never fixed.
+  const other = await gateRun([{ ...GREPTILE_GATE, gate: { failures: [{ firstError: 'check run 9 completed/failure is not a confidence threshold result', signature: 'x', complete: false }] } }])
+  assert.equal(other.result.reason, 'ci-red-greptile-gate')
+  assert.equal(other.labels.some(l => l.startsWith('fix:') || l.startsWith('ci:judge')), false)
+  assert.ok(other.logs.some(l => /— it is not a confidence result this reads: inspect the check on GitHub/.test(l)), other.logs.join('\n'))
+  // In the CI lane alone it is never fixed either.
+  const ciOnly = await run({ ci: { status: 'red', infraRerun: [], realFailures: [GREPTILE_GATE] }, args: { lane: 'ci', autoPush: true, yieldAfterCycle: true, maxCycles: 1 } })
+  assert.equal(ciOnly.labels.some(l => l.startsWith('fix:') || l.startsWith('ci:judge')), false, ciOnly.labels.join(', '))
+  // The same name from an Actions job is an ordinary CI failure.
+  const job = await gateRun([{ ...GREPTILE_GATE, workflow: 'review', link: undefined }], { args: { autoPush: false, maxCycles: 1 } })
+  assert.ok(job.labels.includes('ci:judge#1'), 'a job with a workflow is judged')
+})
+
+test('beside a SonarCloud gate the Greptile gate keeps its state, and the SonarCloud stop goes first', async () => {
+  const { result, logs } = await gateRun([GATE, GREPTILE_GATE, { check: 'hil / pico', workflow: 'Build', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }])
+  assert.equal(result.reason, 'ci-red-sonar-gate')
+  assert.deepEqual(result.observation.ci.realFailures.map(rf => rf.state), ['sonarGate', 'greptileGate', 'rigSide'])
+  assert.deepEqual(result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 0, sonarGate: 1, greptileGate: 1, rigSide: 1, unclassified: 0 })
+  assert.ok(logs.some(l => /SonarCloud gate \(condition failed: new_security_rating 3 > 1\) and 1 Greptile gate failure\(s\) and 1 rig-side failure\(s\) — /.test(l)), logs.join('\n'))
+})
+
+test('a Greptile gate accepted by its key passes with the accepted failure listed', async () => {
+  const key = keyOf({ ...GREPTILE_GATE, signature: GREPTILE_GATE.firstError })
+  const { result } = await gateRun([GREPTILE_GATE], { args: { autoPush: true, maxCycles: 2, acceptedFailures: [{ key, reason: 'score accepted for this PR', scope: 'this head' }] } })
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  assert.deepEqual(result.acceptedFailures.map(a => [a.check, a.key, a.reason]), [['Greptile Review', key, 'score accepted for this PR']])
+  assert.deepEqual(result.rollup.ci, { total: 1, fixed: 0, open: 0, accepted: 1, sonarGate: 0, greptileGate: 0, rigSide: 0, unclassified: 0 })
+})
+
+test('a Greptile gate waits while its review is still being read, rather than stopping', async () => {
+  const working = { findings: [], replies: [], bots: [bot('greptile', { state: 'working', sha: null, evidence: ['check run 9 completed/failure'], reason: 'confidence result at t, its review on the head not posted yet' })] }
+  const { result, logs } = await gateRun([GREPTILE_GATE], { reviews: working, args: { autoPush: true, maxCycles: 1, reviewers: ['greptile'], autoRun: ['greptile'] } })
+  assert.notEqual(result.reason, 'ci-red-greptile-gate', logs.join('\n'))
+  assert.equal(logs.some(l => /CI red from Greptile's confidence check/.test(l)), false)
+})
+
+test('a resumed state holding an old verdict for the Greptile link reads the gate afresh and drops that verdict', async () => {
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  const st = first.result.state
+  const [{ head }] = st.ciCache.entries
+  const old = { link: GREPTILE_GATE.link, bucket: 'fail', failures: [{ ...GREPTILE_GATE, job: GREPTILE_GATE.check, cell: null, runId: null, complete: true, signature: 'x', verdict: 'unclassified' }] }
+  store.set(`${head} ${old.link}`, old)
+  const carried = seal({ ...st, ciCache: { ...st.ciCache, entries: [...st.ciCache.entries, { head, link: old.link, bucket: 'fail', digest: 'deadbeef' }] } })
+  const again = await run({ store, args: { ...YIELD, state: carried }, reviews: { findings: [], replies: [], bots: 'reviewed' }, ci: redWith(RIG, GREPTILE_GATE).ci })
+  const asked = again.calls.filter(c => c.label.startsWith('ci:collect#2.r')).map(c => c.prompt).join('\n')
+  assert.doesNotMatch(asked, /greptile/, 'its stored verdict is not recalled')
+  assert.equal(again.labels.some(l => l.startsWith('fix:')), false)
+  assert.match(again.calls.find(c => c.label === 'ci:collect#2.f').prompt, /--gate 'https:\/\/app\.greptile\.com/)
+  assert.deepEqual(again.result.observation.ci.realFailures.map(rf => [rf.check, rf.state]), [['hil / pico', 'rigSide'], ['Greptile Review', 'greptileGate']])
+  assert.equal(again.result.reason, 'ci-red-greptile-gate')
+  assert.equal(again.result.state.ciCache.entries.some(e => e.link === old.link), false, 'the old verdict is not carried on')
 })
 
 test('yieldOnChange keeps a launch going through cycles that only waited, and pauses after one the caller must see', async () => {
@@ -7611,4 +7779,166 @@ test('a rejudge still refuses a repair that names no reply of ours', async () =>
   await assert.rejects(resumeAt(state, { reviews: { findings: [], replies: [], bots: 'reviewed' },
     args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, rejudge: [{ commentId: 2, reason: 'x' }] } }),
   /rejudge: comment 2 has no answer of ours in the state/)
+})
+
+// greptileTrigger (#185): Greptile reviews only on PR open in such a repository, so a pushed head is asked for once.
+const G = { reviewers: ['coderabbit', 'greptile'], autoRun: ['coderabbit'] }
+const GT = { ...G, greptileTrigger: true }
+const gAsks = (labels) => labels.filter(l => l.startsWith('greptile#'))
+const silentG = (over = {}) => quiet([bot('coderabbit'), absent('greptile', { reason: 'no check run and no applicable refusal on the head', ...over })])
+
+test('greptileTrigger waits out a grace with Greptile absent, asks once, then waits for its review', async () => {
+  let n = 0
+  const { result, logs, labels, calls } = await run({
+    args: { ...GT, maxCycles: 6 },
+    reviewsPerCycle: () => ++n < 5 ? silentG() : quiet([bot('coderabbit'), bot('greptile')]),
+  })
+  assert.equal(result.pass, true, result.reason)
+  assert.equal(result.cycles, 5)
+  assert.deepEqual(gAsks(labels), ['greptile#3'], 'two minutes after the first observation, once')
+  const call = calls.find(c => c.label === 'greptile#3')
+  assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
+  assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
+  assert.equal(labels.some(l => l.startsWith('prstate#')), false, 'the script reads the PR open at the head itself, just before it posts')
+  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /of those, coderabbit, greptile auto-run on every push.*--auto-run coderabbit,greptile`/)
+  assert.ok(logs.includes('cycle 3: greptile#3: requested (comment 7)'), logs.join('\n'))
+  assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), greptileAt: at(2) })
+  assert.equal(result.state.greptileRequired, true)
+  assert.equal(result.state.config.autoRun.join(), 'coderabbit', 'the switch is not pinned')
+})
+
+test('a head Greptile never reviews within the cap after the request stops greptile-unreviewed, never passing', async () => {
+  const { result, logs, labels } = await run({ args: { ...GT, maxCycles: 8 }, minutesPerCycle: 2, reviews: silentG() })
+  assert.equal(result.pass, false)
+  assert.equal(result.reason, 'greptile-unreviewed')
+  assert.equal(result.cycles, 7, 'ten minutes from the request at minute 2')
+  assert.deepEqual(gAsks(labels), ['greptile#2'])
+  assert.equal(result.head, HEAD)
+  assert.deepEqual(result.bots.map(b => [b.bot, b.state]), [['greptile', 'absent']])
+  assert.ok(logs.some(l => /cycle 7: PR green, but Greptile has not reviewed 0f1e2d3, and greptileTrigger made its review required: absent, wait expired after 10m: head unreviewed/.test(l)), logs.join('\n'))
+})
+
+test('a failed, uncertain or lost request stops greptile-unreviewed at once and is never repeated', async () => {
+  for (const [gTrigger, line] of [
+    [{ outcome: 'failed', detail: 'the head event time is unknown' }, 'failed (the head event time is unknown)'],
+    [{ outcome: 'uncertain', detail: 'comment 9 was posted and does not read back' }, 'uncertain (comment 9 was posted and does not read back)'],
+    [{ outcome: 'ambiguous', detail: 'comment 9 was made at the head event second' }, 'ambiguous (comment 9 was made at the head event second)'],
+    [{ error: 'gh: HTTP 502', outcome: '', detail: '', at: '' }, 'failed (gh: HTTP 502)'],
+    [null, 'failed (no answer)'],
+  ]) {
+    const { result, logs, labels } = await run({ args: { ...GT, maxCycles: 5 }, minutesPerCycle: 3, gTrigger, reviews: silentG() })
+    assert.equal(result.reason, 'greptile-unreviewed', line)
+    assert.equal(result.cycles, 2)
+    assert.deepEqual(gAsks(labels), gTrigger === null ? ['greptile#2', 'greptile#2.retry'] : ['greptile#2'])
+    assert.ok(logs.includes(`cycle 2: greptile#2: ${line}`), logs.join('\n'))
+    assert.equal(result.state.reviewClock.greptileAt, null, 'tried, and not tried again')
+    assert.equal(result.state.greptileRequired, true)
+  }
+  // notOpen posted nothing: the PR's state, read then, ends the launch, or, still open at another head, stops it.
+  const notOpen = { outcome: 'notOpen', detail: 'PR 3888 is closed at 0f1e2d3, not open at 0f1e2d3' }
+  const closed = await run({ args: { ...GT, maxCycles: 4 }, minutesPerCycle: 3, gTrigger: notOpen, prState: 'CLOSED', reviews: silentG() })
+  assert.equal(closed.result.reason, 'pr-closed')
+  assert.deepEqual(closed.labels.filter(l => /^(greptile|prstate)#/.test(l)), ['greptile#2', 'prstate#2-greptile'])
+  const moved = await run({ args: { ...GT, maxCycles: 4 }, minutesPerCycle: 3, gTrigger: { ...notOpen, detail: 'PR 3888 is open at c0ffee1, not open at 0f1e2d3' }, reviews: silentG() })
+  assert.equal(moved.result.reason, 'greptile-unreviewed')
+  assert.ok(moved.logs.includes('cycle 2: Greptile must review 0f1e2d3, and its request ended notOpen — stopping, the head unreviewed'), moved.logs.join('\n'))
+  assert.equal(moved.result.state.reviewClock.greptileAt, undefined, 'nothing was asked')
+})
+
+test('the obligation outlives the switch: a resume without greptileTrigger still waits and blocks, asking nothing', async () => {
+  const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
+  // Recorded during the grace, before the first yield.
+  const a = await run({ args: { ...YG, greptileTrigger: true }, reviews: silentG() })
+  assert.equal(a.result.reason, 'yielded')
+  assert.deepEqual(a.result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0) })
+  assert.equal(a.result.state.greptileRequired, true)
+  const b = await run({ args: { ...YG, state: a.result.state }, clockOffset: 3, reviews: silentG() })
+  assert.equal(b.result.reason, 'yielded', 'still waited on without the switch')
+  assert.deepEqual(gAsks(b.labels), [], 'and never asked without it')
+  assert.match(b.calls.find(c => c.label === 'reviews#2').prompt, /--auto-run coderabbit,greptile`/)
+  const c = await run({ args: { ...YG, state: b.result.state }, clockOffset: 10, reviews: silentG() })
+  assert.equal(c.result.reason, 'greptile-unreviewed')
+  // After a request, the cap runs from it.
+  const asked = await run({ args: { ...YG, greptileTrigger: true, state: a.result.state }, clockOffset: 3, reviews: silentG() })
+  assert.deepEqual(gAsks(asked.labels), ['greptile#2'])
+  assert.equal(asked.result.state.reviewClock.greptileAt, at(3))
+  const early = await run({ args: { ...YG, state: asked.result.state }, clockOffset: 12, reviews: silentG() })
+  assert.equal(early.result.reason, 'yielded', 'nine minutes after the request')
+  const late = await run({ args: { ...YG, state: asked.result.state }, clockOffset: 13, reviews: silentG() })
+  assert.equal(late.result.reason, 'greptile-unreviewed')
+  const reviewed = await run({ args: { ...YG, state: asked.result.state }, clockOffset: 5, reviews: quiet([bot('coderabbit'), bot('greptile')]) })
+  assert.equal(reviewed.result.pass, true, 'only its review discharges it')
+  await assert.rejects(run({ args: { ...YG, state: { ...asked.result.state, reviewClock: { ...asked.result.state.reviewClock, greptileAt: 'soon' } } } }), /not a pr-babysit state/)
+  await assert.rejects(run({ args: { ...YG, state: { ...asked.result.state, greptileRequired: false } } }), /not a pr-babysit state/)
+})
+
+test('a Greptile queued or working under the switch is required across a yield, and blocks unreviewed without it', async () => {
+  const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
+  for (const state of ['queued', 'working']) {
+    const seen = silentG({ state, sha: 'head', reason: `check run ${state}` })
+    const a = await run({ args: { ...YG, greptileTrigger: true }, reviews: seen })
+    assert.equal(a.result.reason, 'yielded', state)
+    assert.equal(a.result.state.greptileRequired, true, state)
+    assert.deepEqual(gAsks(a.labels), [], `${state}: Greptile is on it, nothing to ask`)
+    const b = await run({ args: { ...YG, state: a.result.state }, clockOffset: 3, reviews: seen })
+    assert.equal(b.result.reason, 'yielded', `${state}: still waited on`)
+    const c = await run({ args: { ...YG, state: b.result.state }, clockOffset: 11, reviews: silentG() })
+    assert.equal(c.result.reason, 'greptile-unreviewed', `${state}: gone without a review`)
+    assert.deepEqual(gAsks(c.labels), [])
+  }
+})
+
+test('a head Greptile already reviewed, or is scoring, is never asked again', async () => {
+  const below = bot('greptile', { reason: 'review posted, its confidence below the threshold: Base review: Confidence 4/5 — below your required 5/5' })
+  const { result, labels } = await gateRun([GREPTILE_GATE], { args: { ...GT, autoPush: true, maxCycles: 3 }, minutesPerCycle: 5, reviews: quiet([bot('coderabbit'), below]) })
+  assert.equal(result.reason, 'ci-red-greptile-gate')
+  assert.deepEqual(gAsks(labels), [])
+  const scoring = bot('greptile', { state: 'working', sha: 'head', reason: 'confidence result at t, its review on the head not posted yet' })
+  const waiting = await gateRun([GREPTILE_GATE], { args: { ...GT, autoPush: true, maxCycles: 3 }, minutesPerCycle: 5, reviews: quiet([bot('coderabbit'), scoring]) })
+  assert.deepEqual(gAsks(waiting.labels), [])
+  assert.equal(waiting.result.reason, 'reviews-pending')
+})
+
+test('without the switch Greptile is harvested only; the switch needs autoPush and greptile among the reviewers', async () => {
+  const { result, labels, calls } = await run({ args: { ...G, maxCycles: 3 } })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual(gAsks(labels), [])
+  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /--auto-run coderabbit`/)
+  assert.equal(result.state.greptileRequired, undefined)
+  await assert.rejects(run({ args: { ...GT, autoPush: false } }), /greptileTrigger comments `@greptileai` on the PR: it needs autoPush/)
+  await assert.rejects(run({ args: { ...GT, greptileTrigger: 'yes' } }), /greptileTrigger must be a boolean/)
+  await assert.rejects(run({ args: { greptileTrigger: true } }), /greptileTrigger needs greptile in reviewers \["coderabbit"\]/)
+  // With greptile auto-running too, the switch adds the request and the blocker.
+  const auto = await run({ args: { reviewers: ['greptile'], greptileTrigger: true, maxCycles: 8 }, minutesPerCycle: 2, reviews: quiet([absent('greptile')]) })
+  assert.equal(auto.result.reason, 'greptile-unreviewed')
+  assert.deepEqual(gAsks(auto.labels), ['greptile#2'])
+})
+
+test('the requirement latches for the run: a head adopted without the switch is still waited on and blocks unreviewed', async () => {
+  const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
+  const reviewedG = quiet([bot('coderabbit'), bot('greptile')])
+  // Latched even when Greptile already reviewed the head the switch first met.
+  for (const reviews of [silentG(), reviewedG]) {
+    const a = await run({ args: { ...YG, greptileTrigger: true }, reviews })
+    assert.equal(a.result.state.greptileRequired, true)
+    const b = await run({ args: { ...YG, state: a.result.state, adoptHead: ADOPT }, preflight: { head: ADOPT, prHead: HEAD }, clockOffset: 20, reviews: silentG() })
+    assert.equal(b.result.state.expectedHead, ADOPT)
+    assert.match(b.calls.find(c => c.label === 'reviews#2').prompt, /--auto-run coderabbit,greptile`/)
+    assert.equal(b.result.reason, 'yielded', 'the new head is waited on, not passed')
+    assert.deepEqual(gAsks(b.labels), [], 'nothing asked without the switch')
+    assert.equal(b.result.state.reviewClock.sha, ADOPT)
+    assert.equal(b.result.state.greptileRequired, true)
+    const c = await run({ args: { ...YG, state: b.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 31, reviews: silentG() })
+    assert.equal(c.result.reason, 'greptile-unreviewed')
+    const d = await run({ args: { ...YG, state: b.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 22, reviews: reviewedG })
+    assert.equal(d.result.pass, true, d.result.reason)
+  }
+  // With the switch back, the new head is asked about once, its timing fresh.
+  const a = await run({ args: { ...YG, greptileTrigger: true }, reviews: silentG() })
+  const b = await run({ args: { ...YG, greptileTrigger: true, state: a.result.state }, clockOffset: 3, reviews: silentG() })
+  assert.equal(b.result.state.reviewClock.greptileAt, at(3))
+  const pushed = await run({ args: { ...YG, greptileTrigger: true, state: b.result.state, adoptHead: ADOPT }, preflight: { head: ADOPT, prHead: HEAD }, clockOffset: 5, reviews: silentG() })
+  assert.deepEqual(pushed.result.state.reviewClock, { sha: ADOPT, eventAt: null, since: at(5) })
+  const asked = await run({ args: { ...YG, greptileTrigger: true, state: pushed.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 7, reviews: silentG() })
+  assert.deepEqual(gAsks(asked.labels), ['greptile#4'])
 })

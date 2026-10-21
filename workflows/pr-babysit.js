@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, greptileTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, adoptReviewedProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -132,6 +132,10 @@ const coderabbitTrigger = args.coderabbitTrigger ?? false
 if (typeof coderabbitTrigger !== 'boolean') throw new Error('coderabbitTrigger must be a boolean')
 if (coderabbitTrigger && args.autoPush !== true) throw new Error("coderabbitTrigger ticks CodeRabbit's Trigger review box: it needs autoPush")
 if (coderabbitTrigger && !autoRun.includes('coderabbit')) throw new Error(`coderabbitTrigger needs coderabbit in autoRun ${JSON.stringify(autoRun)}`)
+const greptileTrigger = args.greptileTrigger ?? false
+if (typeof greptileTrigger !== 'boolean') throw new Error('greptileTrigger must be a boolean')
+if (greptileTrigger && args.autoPush !== true) throw new Error('greptileTrigger comments `@greptileai` on the PR: it needs autoPush')
+if (greptileTrigger && !reviewers.includes('greptile')) throw new Error(`greptileTrigger needs greptile in reviewers ${JSON.stringify(reviewers)}`)
 const reviewLane = lane !== 'ci'
 // CodeRabbit's own check, by its exact name: the review lane waits on it, so CI leaves it out (#80). Never SonarCloud or code scanning, which are CI.
 const ciIgnored = reviewLane && autoRun.includes('coderabbit') ? ['CodeRabbit'] : []
@@ -168,6 +172,17 @@ if (!Array.isArray(adoptProtected) || adoptProtected.some(f => typeof f !== 'str
 }
 if (new Set(adoptProtected).size !== adoptProtected.length) throw new Error('adoptProtected names a path twice')
 if (adoptProtected.length && args.adoptHead == null) throw new Error('adoptProtected goes with the adoptHead it was given for')
+// The caller's word that each named commit's change to these protected paths passed the review those paths require (#186).
+const adoptReviewedProtected = args.adoptReviewedProtected ?? []
+if (!Array.isArray(adoptReviewedProtected) || adoptReviewedProtected.some(e => !e || typeof e !== 'object' ||
+    Object.keys(e).sort().join() !== 'paths,sha' || typeof e.sha !== 'string' || !FULL_SHA.test(e.sha) ||
+    !Array.isArray(e.paths) || !e.paths.length || e.paths.some(f => typeof f !== 'string' || !f || canon(f) !== f))) {
+  throw new Error('adoptReviewedProtected must be an array of { sha: full 40-hex commit SHA, paths: plain repository-relative paths }')
+}
+if (new Set(adoptReviewedProtected.map(e => e.sha)).size !== adoptReviewedProtected.length) throw new Error('adoptReviewedProtected names a commit twice')
+if (adoptReviewedProtected.some(e => new Set(e.paths).size !== e.paths.length)) throw new Error('adoptReviewedProtected names a path twice for one commit')
+if (adoptReviewedProtected.length && args.adoptHead == null) throw new Error('adoptReviewedProtected goes with the adoptHead it was given for')
+const reviewedChange = (sha, f) => adoptReviewedProtected.some(e => e.sha === sha && e.paths.includes(f))
 
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
@@ -271,10 +286,11 @@ if (args.state !== undefined && args.state !== null) {
     [st.deferrals, st.acceptedFailures, st.decisions, st.holds].every(Array.isArray) &&
     st.acceptedFailures.every(a => typeof (st.version === 3 ? a && a.key : a) === 'string') && (st.build === null || typeof st.build === 'string') &&
     (st.reanswer === undefined || Array.isArray(st.reanswer)) && ciCacheShaped(st.ciCache) &&
-    (st.last === null || (st.last && typeof st.last === 'object')) &&
+    (st.last === null || (st.last && typeof st.last === 'object')) && (st.greptileRequired === undefined || st.greptileRequired === true) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
+      (st.reviewClock.greptileAt == null || Number.isFinite(Date.parse(st.reviewClock.greptileAt))) &&
       (st.reviewClock.request === undefined || (st.reviewClock.request && Number.isFinite(Date.parse(st.reviewClock.request.retryAt)) &&
         (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
       (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
@@ -282,7 +298,10 @@ if (args.state !== undefined && args.state !== null) {
   if (!shaped) throw new Error(`state is not a pr-babysit state of version 3 or ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
-    throw new Error(`state was made by a run with different arguments: ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
+    const differ = [...new Set([...Object.keys(st.config), ...Object.keys(config)])]
+      .filter(k => JSON.stringify(st.config[k]) !== JSON.stringify(config[k]))
+      .map(k => `${k}: ${JSON.stringify(st.config[k]) ?? 'absent'} vs ${JSON.stringify(config[k]) ?? 'absent'}`)
+    throw new Error(`state was made by a run with different arguments (${differ.join('; ')}): ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
   }
   if (st.build !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(st.build)} → ${JSON.stringify(buildCmd)}`)
   restored = st.version === 3 ? { ...st, version: STATE_VERSION, acceptedFailures: st.acceptedFailures.map(a => a.key) } : st
@@ -543,7 +562,8 @@ const SONAR = withSeal({
   },
 })
 // outcome is checked in code: an error line's relay fills it with ''.
-const CRTRIGGER = withSeal({
+// A trigger script's line: coderabbit_trigger.py's, which --request adds retryAt to, or greptile_trigger.py's.
+const TRIGGER = withSeal({
   type: 'object', additionalProperties: false,
   required: ['outcome', 'detail', 'at'],
   properties: {
@@ -553,12 +573,19 @@ const CRTRIGGER = withSeal({
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'refusal'],
+  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'changes', 'refusal'],
   properties: {
     error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, published: { type: 'string' }, base: { type: 'string' },
     tip: { type: 'string' },
     commits: { type: 'array', items: { type: 'string' } }, paths: { type: 'array', items: { type: 'string' } },
     unpublished: { type: 'array', items: { type: 'string' } }, mergeOnly: { type: 'array', items: { type: 'string' } },
+    changes: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false, required: ['sha', 'paths'],
+        properties: { sha: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } } },
+      },
+    },
     refusal: { type: 'string' },
   },
 })
@@ -625,13 +652,14 @@ const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
 const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
 const SONAR_SCRIPT = '~/.claude/skills/pr-babysit/scripts/sonar.py'
 const CRTRIGGER_SCRIPT = '~/.claude/skills/pr-babysit/scripts/coderabbit_trigger.py'
+const GTRIGGER_SCRIPT = '~/.claude/skills/pr-babysit/scripts/greptile_trigger.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build.py'
 const SCOPE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/scope_check.py'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
-const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
+const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
@@ -807,7 +835,13 @@ let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
 // When the wait for a silent bot began, per head; kept across launches so a resume does not restart the cap.
 // triggeredAt: absent until this head's one CodeRabbit trigger, then when the script finished, or null when it failed.
+// greptileAt the same for its one `@greptileai` request.
 let reviewClock = restored ? restored.reviewClock : null
+// Latched by the first launch with greptileTrigger: from then on every head of this run needs Greptile's review, whatever
+// later launches pass; only posting the request stays with the switch.
+const greptileRequired = greptileTrigger || (!!restored && restored.greptileRequired === true)
+// The reviewers this cycle waits on: autoRun, and Greptile once its review is required.
+const waitedOn = greptileRequired && !autoRun.includes('greptile') ? [...autoRun, 'greptile'] : autoRun
 // A landed but unpushed commit is the caller's to decide, never the next baseline.
 const pendingOf = () => {
   const last = history[history.length - 1]
@@ -828,6 +862,7 @@ const pendingOf = () => {
 const stateOut = () => {
   const st = {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
+    ...(greptileRequired ? { greptileRequired } : {}),
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
     acceptedFailures: acceptedArg.map(a => a.key),
@@ -844,9 +879,12 @@ const stateOut = () => {
   return { ...st, digest: sealOf(st) }
 }
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
-// SonarCloud's own check, not an Actions job: its gate is never a CI-lane fix.
-const sonarGate = (rf) => !rf.workflow && /^SonarCloud\b/.test(rf.check)
-const ciState = (rf) => rf.accepted ? 'accepted' : sonarGate(rf) ? 'sonarGate' : rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real'
+// SonarCloud's own check, and Greptile's confidence check, a score of its review that collect.py reads by its app and
+// output: neither is an Actions job, and no local diff clears either gate.
+const gateOf = (rf) => rf.workflow ? null : /^SonarCloud\b/.test(rf.check) ? 'sonarGate' : rf.check === 'Greptile Review' ? 'greptileGate' : null
+const GATE_LABEL = { sonarGate: 'SonarCloud gate', greptileGate: 'Greptile confidence gate' }
+const ciState = (rf) => rf.accepted ? 'accepted'
+  : gateOf(rf) ?? (rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real')
 const launchRollup = () => {
   const findings = new Map()
   const ci = new Map()
@@ -873,7 +911,7 @@ const launchRollup = () => {
   return {
     cycles: history.slice(launchFrom).map(e => e.cycle),
     findings: tally(findings, ['fixed', 'open', 'refuted', 'stale', 'deferred', 'held']),
-    ci: tally(ci, ['fixed', 'open', 'accepted', 'sonarGate', 'rigSide', 'unclassified']),
+    ci: tally(ci, ['fixed', 'open', 'accepted', 'sonarGate', 'greptileGate', 'rigSide', 'unclassified']),
     ciChecks: { ...ciChecks }, reran: reran.size, pushed, replies,
   }
 }
@@ -976,7 +1014,7 @@ const reviewsWhy = (r) => {
     if ((b.state === 'settled') !== (b.kind !== null)) return `${b.bot} is ${b.state} with kind ${JSON.stringify(b.kind)}`
     if ((b.state === 'reviewed' || b.state === 'settled') && !b.evidence.some(e => e.trim())) return `${b.bot} ${b.state} with no evidence`
     if (b.state !== 'reviewed' && !b.reason.trim()) return `${b.bot} ${b.state} with no reason`
-    if (b.state === 'harvested' && (autoRun.includes(b.bot) || b.bot === 'copilot')) return `${b.bot} is harvested, a state only a reviewer whose state is not read takes`
+    if (b.state === 'harvested' && (waitedOn.includes(b.bot) || b.bot === 'copilot')) return `${b.bot} is harvested, a state only a reviewer whose state is not read takes`
     if (b.retryAt !== null && !(b.kind === 'limited' && Number.isFinite(Date.parse(b.retryAt)))) return `${b.bot} has retryAt ${JSON.stringify(b.retryAt)} on a ${b.state}/${b.kind} record`
   }
   const missing = reviewers.filter(bot => !seen.has(bot))
@@ -1001,7 +1039,7 @@ const settleBots = (r) => {
   const waitedMin = Math.floor((Date.parse(r.observedAt) - Date.parse(start)) / 60000)
   const unknown = {}
   const bots = r.bots.map(b => {
-    const done = !autoRun.includes(b.bot) || b.state === 'reviewed' || b.state === 'settled' ||
+    const done = !waitedOn.includes(b.bot) || b.state === 'reviewed' || b.state === 'settled' ||
       ((b.state === 'queued' || b.state === 'absent') && waitedMin >= REVIEW_CAP_MIN)
     if (done || b.state !== 'unknown') return { ...b, done }
     const reading = JSON.stringify([b.reason, b.evidence])
@@ -1015,7 +1053,7 @@ const settleBots = (r) => {
 }
 const botCell = (b, headWaitedMin) => {
   if (b.state === 'reviewed') return `reviewed ${b.sha.slice(0, 7)}`
-  if (!autoRun.includes(b.bot)) return `${b.state} (${b.kind ? `${b.kind}: ` : ''}${b.reason}; not waited on)`
+  if (!waitedOn.includes(b.bot)) return `${b.state} (${b.kind ? `${b.kind}: ` : ''}${b.reason}; not waited on)`
   const waitedMin = b.triggeredMin ?? headWaitedMin
   if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again after ${b.retryAt})`
   if (b.state === 'settled' && b.triggeredMin !== undefined) {
@@ -1347,7 +1385,7 @@ const cycleSummary = (entry) => {
       cell(rf.firstError),
       rf.verdict === 'real' ? 'ci-real' : rf.verdict,
       state === 'accepted' ? cell(`accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`, 60)
-      : state === 'sonarGate' ? 'left red: a SonarCloud gate, not a CI-lane fix'
+      : GATE_LABEL[state] ? `left red: a ${GATE_LABEL[state]}, not a CI-lane fix`
         : state === 'rigSide' ? 'left red for the rig'
           : state === 'unclassified' ? 'left red: not placed by its evidence'
             : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
@@ -1738,7 +1776,7 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   // Once per head, whatever the outcome: a failed tick is not retried into a storm.
   if (manual && reviewClock.triggeredAt === undefined) {
     if (await ended('crtrigger')) return
-    const { t, outcome } = await relayCodeRabbit(cycle, 'crtrigger', `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
+    const { t, outcome } = await relayTrigger(cycle, 'crtrigger', CRTRIGGER_SCRIPT, `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
       ['ticked', 'already', 'notSkipped', 'failed'])
     // notSkipped waits too: a review that started since the harvest, or a newer head, is for the next harvest to read.
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
@@ -1749,13 +1787,13 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   if (!asks.length || !(manual || cr.state === 'queued' || cr.state === 'absent')) return
   waitAfter(cr, asks.reduce((a, b) => Date.parse(a) >= Date.parse(b) ? a : b), r.observedAt)
 }
-// One coderabbit_trigger.py run through a relay: its line, and the outcome, `failed` for a line it cannot read.
-const relayCodeRabbit = async (cycle, kind, task, flag, outcomes) => {
+// One trigger script's run through a relay: its line, and the outcome, `failed` for a line it cannot read.
+const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
   const label = `${kind}#${cycle}`
   const t = await relayOnce(
-    `${IN_CHECKOUT}${task}: run \`python3 ${CRTRIGGER_SCRIPT} --pr ${args.pr} --head ${expectedHead}${flag}\` ` +
-    relayed(CRTRIGGER) + ' Change nothing on GitHub yourself.',
-    { label, phase: 'Push', model: 'haiku', effort: 'low', schema: CRTRIGGER })
+    `${IN_CHECKOUT}${task}: run \`python3 ${script} --pr ${args.pr} --head ${expectedHead}${flag}\` ` +
+    relayed(TRIGGER) + ' Change nothing on GitHub yourself.',
+    { label, phase: 'Push', model: 'haiku', effort: 'low', schema: TRIGGER })
   const known = !!t && !t.error && outcomes.includes(t.outcome)
   const outcome = known ? t.outcome : 'failed'
   const detail = known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`
@@ -1785,7 +1823,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   const dueMs = Date.parse(cr.retryAt) - Date.parse(r.observedAt)
   if (dueMs > 0) return retryLater(cr, cycle, dueMs)
   if (await ended('crrequest')) return
-  const { t, outcome } = await relayCodeRabbit(cycle, 'crrequest', `Ask CodeRabbit to review PR #${args.pr} after its rate limit`, ' --request',
+  const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} after its rate limit`, ' --request',
     ['requested', 'already', 'notDue', 'notLimited', 'failed'])
   const atOk = !!t && Number.isFinite(Date.parse(t.at))
   const reset = t && Number.isFinite(Date.parse(t.retryAt)) ? t.retryAt : null
@@ -1794,6 +1832,31 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   const asking = ['requested', 'already', 'notLimited'].includes(outcome) && atOk
   reviewClock.request = { at: asking ? t.at : null, retryAt: reset ?? cr.retryAt }
   if (asking) waitAfter(cr, t.at, r.observedAt)
+}
+
+// A Greptile that reviews only on PR open never sees a pushed head unasked: under greptileTrigger, one `@greptileai` per
+// head once it stayed absent through a grace, then the silent-bot cap counted from the request.
+const GREPTILE_GRACE_MIN = 2
+// Returns how Greptile's request ended when that leaves the head unreviewed.
+const requestGreptile = async (cycle, r, bots, lanes, ended) => {
+  const g = bots.bots.find(b => b.bot === 'greptile')
+  if (!g || !greptileRequired || (g.state !== 'absent' && g.state !== 'queued')) return null
+  if (greptileTrigger && g.state === 'absent' && reviewClock.greptileAt === undefined) {
+    g.done = false
+    // The script reads the PR open at the head itself, just before it posts; another lane's closure or rate limit holds it here.
+    if (bots.waitedMin < GREPTILE_GRACE_MIN || lanes.prState || githubLimit) return null
+    const { t, outcome } = await relayTrigger(cycle, 'greptile', GTRIGGER_SCRIPT, `Ask Greptile to review PR #${args.pr}`, '',
+      ['requested', 'already', 'notOpen', 'failed', 'uncertain', 'ambiguous'])
+    // Merged or closed ends the launch; open at another head stops: the head this run must have reviewed is not the PR's.
+    if (outcome === 'notOpen') return await ended('greptile') ? null : outcome
+    const asked = ['requested', 'already'].includes(outcome) && Number.isFinite(Date.parse(t.at))
+    // Once per head, whatever the outcome: a failed, uncertain or ambiguous request is never repeated into a second comment.
+    reviewClock.greptileAt = asked ? t.at : null
+    if (!asked) return outcome
+  }
+  if (typeof reviewClock.greptileAt === 'string') waitAfter(g, reviewClock.greptileAt, r.observedAt)
+  else if (reviewClock.greptileAt === null) g.done = true
+  return null
 }
 
 // The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none. Returns the ids settled.
@@ -1930,7 +1993,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (exhausted) entry.ciWaited = { head: inv.head, registered: inv.registered, pending: inv.pending, waiting: inv.waiting }
   // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
   if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
-  const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
+  const gated = failing.filter(c => gateOf({ check: c.name, workflow: c.workflow }))
+  // A gate is read afresh each time: a verdict an older launch stored for its link stands for nothing.
+  for (const c of gated) ciVerdicts.delete(c.link)
   // A re-run is timed from when it was asked; one carried from a state without that time, from this launch's first read (#123).
   for (const r of ciReruns) if (r.at === undefined) r.at = inv.observedAt
   const reruns = ciReruns.filter(r => r.head === inv.head)
@@ -2029,7 +2094,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     return null
   }
   if (!sameLinks(ev.gates.map(g => g.link), gated.map(c => c.link))) {
-    log(`cycle ${cycle}: SonarCloud gate evidence came back for ${JSON.stringify(ev.gates.map(g => g.link))}, asked for ${JSON.stringify(gated.map(c => c.link))} — re-arming`)
+    log(`cycle ${cycle}: gate evidence came back for ${JSON.stringify(ev.gates.map(g => g.link))}, asked for ${JSON.stringify(gated.map(c => c.link))} — re-arming`)
     return null
   }
   report.realFailures.push(...gated.flatMap(c => keyed(c, ev.gates.find(g => g.link === c.link).failures
@@ -2145,8 +2210,8 @@ const runLanes = async (cycle, entry, lanes) => {
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
       `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others: report one bot record for each; ` +
-      `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push` : 'none of them auto-run'}. ${IN_CHECKOUT}` +
-      `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${autoRun.length ? ` --auto-run ${autoRun.join(',')}` : ''}\`. ` +
+      `${waitedOn.length ? `of those, ${waitedOn.join(', ')} auto-run on every push` : 'none of them auto-run'}. ${IN_CHECKOUT}` +
+      `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
       `A drafted reply is posted only when each point has at most ${REPLY_WORDS} words and no line is over ${REPLY_LINE_CHARS} characters. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
@@ -2186,7 +2251,12 @@ const runLanes = async (cycle, entry, lanes) => {
       ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
       : settleBots(r)
     if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended)
+    const unasked = r !== nobody ? await requestGreptile(cycle, r, entry.bots, lanes, ended) : null
     if (lanes.prState) return prEnded(cycle, lanes.prState)
+    if (unasked) {
+      log(`cycle ${cycle}: Greptile must review ${expectedHead.slice(0, 7)}, and its request ended ${unasked} — stopping, the head unreviewed`)
+      return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: entry.bots.bots.filter(b => b.bot === 'greptile').map(botOut) })
+    }
     const reviewsSettled = !!entry.bots && entry.bots.bots.every(b => b.done)
     const pendingBots = entry.bots ? entry.bots.bots.filter(b => !b.done) : []
 
@@ -2580,7 +2650,7 @@ const runLanes = async (cycle, entry, lanes) => {
     // A mark may clear the SonarCloud gate this run failed on: read CI again rather than fix it.
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry, ended)
     if (lanes.prState) return prEnded(cycle, lanes.prState)
-    if (marked > 0 && c.realFailures.some(sonarGate)) {
+    if (marked > 0 && c.realFailures.some(rf => gateOf(rf) === 'sonarGate')) {
       log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
       return rearm()
     }
@@ -2599,7 +2669,7 @@ const runLanes = async (cycle, entry, lanes) => {
       if (!c.realFailures.some(rf => rf.key === a.key)) log(`cycle ${cycle}: accepted failure ${a.key} matches no failure on this head`)
     }
     const unfixable = c.realFailures.filter(rf => !['real', 'accepted'].includes(ciState(rf)))
-    for (const rf of unfixable) log(`cycle ${cycle}: ${sonarGate(rf) ? 'SonarCloud gate' : rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
+    for (const rf of unfixable) log(`cycle ${cycle}: ${GATE_LABEL[gateOf(rf)] ?? rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
     const fixable = c.realFailures.filter(rf => ciState(rf) === 'real')
     if (fixable.length > 0) {
       const work = groupWork(fixable.map(rf => ({
@@ -2661,6 +2731,12 @@ const runLanes = async (cycle, entry, lanes) => {
         }
         return unresolvedVerdict(cycle, owedNow)
       }
+      const unreviewed = greptileRequired && entry.bots.bots.find(b => b.bot === 'greptile' && b.state !== 'reviewed')
+      if (unreviewed) {
+        log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'}, but Greptile has not reviewed ${expectedHead.slice(0, 7)}, ` +
+          `and greptileTrigger made its review required: ${botCell(unreviewed, entry.bots.waitedMin)} — stopping`)
+        return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: [botOut(unreviewed)] })
+      }
       log(`cycle ${cycle}: ${acceptedOnly(c) ? `CI red only from ${c.realFailures.length} accepted failure(s)` : 'PR is green'} with no unresolved valid findings${deferrals.size ? `; ${deferrals.size} deferred` : ''}`)
       return {
         pass: true, cycles: cycle, history,
@@ -2675,14 +2751,24 @@ const runLanes = async (cycle, entry, lanes) => {
         log(`cycle ${cycle}: CI red with ${unclassified.length} failure(s) the watcher could not place — no justified fix; investigate before relaunching`)
         return stop(cycle, 'ci-red-unclassified', { outstanding: outstanding() })
       }
-      const gates = unfixable.filter(sonarGate)
+      const gates = unfixable.filter(rf => gateOf(rf) === 'sonarGate')
+      const greptile = unfixable.filter(rf => gateOf(rf) === 'greptileGate')
+      const rig = unfixable.length - gates.length - greptile.length
+      const beside = (n, what) => n ? ` and ${n} ${what}` : ''
+      // SonarCloud's stop takes precedence; both gates stay in the observation with their state.
       if (reviewsSettled && gates.length > 0) {
-        const rig = unfixable.length - gates.length
-        log(`cycle ${cycle}: CI red from the SonarCloud gate (${gates.map(rf => rf.firstError.slice(0, 80)).join('; ')})${rig ? ` and ${rig} rig-side failure(s)` : ''} — ` +
+        log(`cycle ${cycle}: CI red from the SonarCloud gate (${gates.map(rf => rf.firstError.slice(0, 80)).join('; ')})${beside(greptile.length, 'Greptile gate failure(s)')}${beside(rig, 'rig-side failure(s)')} — ` +
           (gates.some(rf => rf.complete)
             ? 'its failing condition needs resolving (a rating or issue count clears when the answered issues are marked, by markSonar or a human; coverage or duplication needs its own change), or the caller accepts the gate'
             : 'no failing condition was read: inspect the gate on SonarCloud, or relaunch once its check reports again'))
         return stop(cycle, 'ci-red-sonar-gate', { outstanding: outstanding() })
+      }
+      if (reviewsSettled && greptile.length > 0) {
+        log(`cycle ${cycle}: CI red from Greptile's confidence check (${greptile.map(rf => rf.firstError.slice(0, 120)).join('; ')})${beside(rig, 'rig-side failure(s)')} — ` +
+          (greptile.some(rf => rf.complete)
+            ? 'its review scored below the repository\'s threshold, which no CI-lane fix raises: a new score needs a new Greptile review of the head, or the caller accepts the gate by its key'
+            : 'it is not a confidence result this reads: inspect the check on GitHub, or relaunch once it reports again'))
+        return stop(cycle, 'ci-red-greptile-gate', { outstanding: outstanding() })
       }
       if (reviewsSettled) {
         log(`cycle ${cycle}: CI red only from rig-side failures — rig attention needed (the caller's), nothing to fix in the PR`)
@@ -2823,12 +2909,17 @@ if (adoptHead !== null) {
   const paths = audit ? audit.paths : []
   const badPath = paths.find(f => !canon(f))
   // A protected path the PR already carries is the caller's history; only what this run would publish is guarded (#49),
-  // unless only a base merge changes it and the caller named it in adoptProtected (#97).
+  // unless only a base merge changes it and the caller named it in adoptProtected (#97), or adoptReviewedProtected
+  // names every unpublished commit that changes it (#186).
   const mergeOnly = audit && !audit.error ? audit.mergeOnly.map(canon) : []
-  const guarded = [], waived = []
+  const guarded = [], waived = [], reviewed = []
   if (protectedRe && audit && !audit.error) {
     for (const f of new Set(audit.unpublished.map(canon))) {
-      if (f && protectedRe.test(f)) (mergeOnly.includes(f) && adoptProtected.includes(f) ? waived : guarded).push(f)
+      if (!f || !protectedRe.test(f)) continue
+      const by = audit.changes.filter(c => c.paths.some(p => canon(p) === f))
+      if (mergeOnly.includes(f) && adoptProtected.includes(f)) waived.push(f)
+      else if (by.length && by.every(c => reviewedChange(c.sha, f))) reviewed.push(...by.map(c => `${c.sha.slice(0, 7)} ${f}`))
+      else guarded.push(f)
     }
   }
   const why = !audit ? 'the audit agent died'
@@ -2838,7 +2929,8 @@ if (adoptHead !== null) {
     : audit.refusal ? audit.refusal
     : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
     : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}` +
-      (guarded.every(f => mergeOnly.includes(f)) ? '; only a base merge changes them, which adoptProtected may permit' : '')
+      (guarded.every(f => mergeOnly.includes(f)) ? '; only a base merge changes them, which adoptProtected may permit'
+        : "; adoptReviewedProtected may permit a reviewed commit's change to them, by its full SHA and each path")
     : null
   if (why) {
     log(`preflight: adoption refused — ${why}`)
@@ -2849,6 +2941,7 @@ if (adoptHead !== null) {
     return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: why }))
   }
   if (waived.length) log(`preflight: adopting a base merge's change to protected path(s) ${waived.join(', ')}, named in adoptProtected`)
+  if (reviewed.length) log(`preflight: adopting reviewed change(s) to protected path(s) ${reviewed.join(', ')}, named in adoptReviewedProtected`)
   if (prHead !== X && !shas.includes(prHead)) {
     log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor a commit of the chain to ${adoptHead.slice(0, 7)}`)
     return finish(stop(cyclesUsed, 'wrong-head', { head: prHead, expected: [X, adoptHead] }))
