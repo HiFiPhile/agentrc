@@ -392,6 +392,251 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.claude / 'CLAUDE.md').is_symlink())
         self.assertFalse((self.codex / 'AGENTS.md').is_symlink(), 'the relative Codex link is judged before Claude\'s goes')
 
+    def test_a_user_wide_install_writes_no_agentrc_dir(self):
+        self.ok('install', '--skill', '--agent', '--workflow')
+        self.assertNotIn('env', self.settings())
+        self.assertFalse((self.claude / 'settings.local.json').exists())
+
+
+AGENTS_MD = sorted(p.name for p in (ROOT / 'agents').glob('*.md'))
+WORKFLOWS = sorted(p.name for p in (ROOT / 'workflows').glob('*.js'))
+
+
+class ProjectInstallTest(unittest.TestCase):
+    """install.py --project: the Claude entries in one work tree's .claude, nothing user-wide."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=ROOT.parent if os.name == 'nt' else None)
+        top = Path(self.tmp.name)
+        self.home, self.repo, self.wt = top / 'home', top / 'repo', top / 'wt'
+        self.home.mkdir()
+        self.repo.mkdir()
+        self.git('init', '-q')
+        own = self.repo / '.claude' / 'skills' / 'own-skill'
+        own.mkdir(parents=True)
+        (own / 'SKILL.md').write_text('the project\'s own skill')
+        (self.repo / '.claude' / 'settings.json').write_text('{"model": "tracked"}')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'init')
+        self.exclude = self.repo / '.git' / 'info' / 'exclude'
+        self.exclude.parent.mkdir(exist_ok=True)
+        self.exclude.write_text('# the user\'s own\n*.local-note\n')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, *args, cwd=None):
+        done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'user.name=t', '-c', 'user.email=t@t',
+                               '-c', 'core.autocrlf=false', *args], cwd=cwd or self.repo, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout
+
+    def run_cli(self, *argv):
+        return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True,
+                              env={**os.environ, 'HOME': str(self.home), 'USERPROFILE': str(self.home)})
+
+    def ok(self, *argv):
+        done = self.run_cli(*argv)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout
+
+    def local(self, tree=None):
+        return json.loads(((tree or self.repo) / '.claude' / 'settings.local.json').read_text(encoding='utf-8'))
+
+    def block(self):
+        lines = self.exclude.read_text().splitlines()
+        if install.BLOCK[0] not in lines:
+            return None
+        return lines[lines.index(install.BLOCK[0]) + 1:lines.index(install.BLOCK[1])]
+
+    def status(self, tree=None):
+        return self.git('status', '--short', '--untracked-files=all', cwd=tree)
+
+    def snapshot(self):
+        return sorted(str(p) for p in Path(self.tmp.name).rglob('*') if '.git' not in p.parts), self.exclude.read_text()
+
+    def test_entries_link_into_the_work_tree_and_nothing_user_wide(self):
+        out = self.ok('install', '--project', str(self.repo), '--skill', '--agent', '--workflow')
+        claude = self.repo / '.claude'
+        self.assertEqual(sorted(p.name for p in (claude / 'skills').iterdir()), sorted(SKILLS + ['own-skill']))
+        self.assertTrue(os.path.samefile(claude / 'skills' / SKILL, ROOT / 'skills' / SKILL))
+        self.assertEqual(sorted(p.name for p in (claude / 'agents').iterdir()), AGENTS_MD, 'the .md only: no Codex toml')
+        self.assertEqual(sorted(p.name for p in (claude / 'workflows').iterdir()), WORKFLOWS)
+        self.assertEqual(sorted(p.name for p in (claude / 'hooks').iterdir()), SKILL_HOOKS)
+        self.assertEqual(os.listdir(self.home), [], 'no ~/.claude, ~/.codex or ~/.local')
+        self.assertEqual((claude / 'settings.json').read_text(), '{"model": "tracked"}', 'the tracked settings untouched')
+        data = self.local()
+        self.assertEqual(data['env'], {'AGENTRC_DIR': ROOT.as_posix()})
+        hooks = claude / 'hooks'
+        self.assertEqual(TestCommands.of(data), {
+            'PreToolUse': [guard_command(hooks / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')],
+            'UserPromptSubmit': [shlex.quote((hooks / 'simplify-gate' / 'simplify-gate').as_posix())],
+            'Stop': [shlex.quote((hooks / 'simplify-gate' / 'simplify-gate').as_posix())]})
+        self.assertFalse((claude / 'settings.local.json.before-agentrc').exists())
+        self.assertEqual(self.status(), '', 'every link and settings.local.json excluded')
+        block = self.block()
+        self.assertIn(f'/.claude/skills/{SKILL}', block)
+        self.assertIn('/.claude/settings.local.json', block)
+        self.assertEqual(len(block), len(SKILLS) + len(AGENTS_MD) + len(WORKFLOWS) + len(SKILL_HOOKS) + 1)
+        self.assertTrue(self.exclude.read_text().startswith('# the user\'s own\n*.local-note\n'))
+        self.assertIn('updated', out)
+        before = self.snapshot()
+        self.assertEqual(self.ok('install', '--project', str(self.repo), '--skill', '--agent', '--workflow'), '',
+                         'a rerun is silent')
+        self.assertEqual(self.snapshot(), before)
+
+    def test_remove_takes_out_links_hooks_env_and_the_block_but_nothing_else(self):
+        claude = self.repo / '.claude'
+        claude.joinpath('settings.local.json').write_text(json.dumps({'permissions': {'allow': ['Bash(ls)']}}))
+        self.ok('install', '--project', str(self.repo), '--skill', '--workflow')
+        self.ok('remove', '--project', str(self.repo), '--workflow')
+        self.assertEqual(self.local()['env'], {'AGENTRC_DIR': ROOT.as_posix()}, 'the skills still need it')
+        self.assertNotIn('/.claude/workflows/pr-babysit.js', self.block())
+        self.assertEqual(self.status(), '')
+        self.ok('remove', '--project', str(self.repo), '--skill')
+        self.assertEqual(self.local(), {'permissions': {'allow': ['Bash(ls)']}}, 'only ours went')
+        self.assertEqual(sorted(p.name for p in (claude / 'skills').iterdir()), ['own-skill'])
+        self.assertEqual(self.block(), ['/.claude/settings.local.json'], 'the file stays, so does its entry')
+        (claude / 'settings.local.json').unlink()
+        self.ok('install', '--project', str(self.repo), '--agent')
+        self.ok('remove', '--project', str(self.repo), '--agent')
+        self.assertFalse((claude / 'settings.local.json').exists(), 'a local file with nothing left goes')
+        self.assertEqual(self.exclude.read_text(), '# the user\'s own\n*.local-note\n', 'block gone, the rest kept')
+        self.assertEqual(self.status(), '')
+
+    def test_the_exclude_block_is_shared_by_worktrees(self):
+        self.git('worktree', 'add', '-q', str(self.wt))
+        self.ok('install', '--project', str(self.repo), '--workflow')
+        self.ok('install', '--project', str(self.wt), '--workflow')
+        self.assertEqual(self.local(self.wt)['env'], {'AGENTRC_DIR': ROOT.as_posix()})
+        self.assertFalse((self.wt / '.git' / 'info').exists(), 'a linked worktree uses the common exclude file')
+        self.ok('remove', '--project', str(self.repo), '--workflow')
+        self.assertEqual(self.status(self.wt), '', 'the worktree still has them: their entries stay')
+        self.assertEqual(self.status(), '')
+        self.ok('remove', '--project', str(self.wt), '--workflow')
+        self.assertIsNone(self.block())
+
+    def test_a_settings_local_file_already_ignored_gets_no_entry(self):
+        (self.repo / '.gitignore').write_text('.claude/settings.local.json\n')
+        self.git('add', '.gitignore')
+        self.git('commit', '-qm', 'ignore')
+        self.ok('install', '--project', str(self.repo), '--workflow')
+        self.assertNotIn('/.claude/settings.local.json', self.block())
+        self.assertEqual(self.status(), '')
+
+    def test_a_clash_refuses_before_any_change_unless_skipped(self):
+        def tracked_skill():
+            (self.repo / '.claude' / 'skills' / SKILL).mkdir()
+            (self.repo / '.claude' / 'skills' / SKILL / 'SKILL.md').write_text('project copy')
+            self.git('add', '-A')
+            self.git('commit', '-qm', 'clash')
+
+        def tracked_link():
+            os.symlink('elsewhere', self.repo / '.claude' / 'skills' / SKILL)
+            self.git('add', '-A')
+            self.git('commit', '-qm', 'clash')
+
+        def untracked_workflow():
+            (self.repo / '.claude' / 'workflows').mkdir()
+            (self.repo / '.claude' / 'workflows' / 'pr-babysit.js').write_text('local copy')
+
+        def bytecode_only():
+            cache = self.repo / '.claude' / 'skills' / SKILL / 'scripts' / '__pycache__'
+            cache.mkdir(parents=True)
+            (cache / 'x.cpython-312.pyc').write_bytes(b'')
+
+        cases = {'a tracked skill': (tracked_skill, 'is tracked'), 'a tracked symlink': (tracked_link, 'is tracked'),
+                 'an untracked real file': (untracked_workflow, 'real file'),
+                 'a leftover bytecode cache': (bytecode_only, 'bytecode caches')}
+        for case, (arrange, why) in cases.items():
+            with self.subTest(case):
+                self.tearDown()
+                self.setUp()
+                arrange()
+                before, untracked = self.snapshot(), self.status()
+                done = self.run_cli('install', '--project', str(self.repo), '--skill', '--agent', '--workflow')
+                self.assertEqual(done.returncode, 1, case)
+                self.assertIn(why, done.stderr)
+                self.assertIn('--skip-clashes', done.stderr)
+                self.assertEqual(self.snapshot(), before, 'nothing changed')
+                out = self.ok('install', '--project', str(self.repo), '--skill', '--agent', '--workflow', '--skip-clashes')
+                self.assertIn('skipped', out)
+                clash = self.repo / '.claude' / ('workflows/pr-babysit.js' if case == 'an untracked real file' else f'skills/{SKILL}')
+                self.assertFalse(install.ours(clash), 'not linked over')
+                self.assertEqual(self.status(), untracked, 'only what the project had shows')
+                self.assertNotIn('/' + clash.relative_to(self.repo).as_posix(), self.block())
+                self.assertIn('left alone', self.ok('remove', '--project', str(self.repo), '--skill', '--workflow',
+                                                    '--agent'))
+                self.assertTrue(clash.is_symlink() or clash.exists(), 'the project\'s own stays')
+
+    def test_a_clashing_hook_is_skipped_with_its_registration(self):
+        hook = self.repo / '.claude' / 'hooks' / 'headless-chief'
+        hook.mkdir(parents=True)
+        (hook / 'mine.py').write_text('')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'own hook')
+        self.ok('install', '--project', str(self.repo), '--skill', '--skip-clashes')
+        self.assertEqual(sorted(TestCommands.of(self.local())), ['Stop', 'UserPromptSubmit'], 'no PreToolUse guard')
+
+    def test_a_dead_link_of_ours_is_pruned_with_its_entry(self):
+        self.ok('install', '--project', str(self.repo), '--workflow')
+        gone = self.repo / '.claude' / 'workflows' / 'gone.js'
+        os.symlink(ROOT / 'workflows' / 'gone.js', gone)   # a workflow since removed from agentrc
+        lines = self.exclude.read_text().splitlines()
+        lines.insert(lines.index(install.BLOCK[1]), '/.claude/workflows/gone.js')
+        self.exclude.write_text(''.join(f'{line}\n' for line in lines))
+        self.ok('install', '--project', str(self.repo), '--workflow')
+        self.assertFalse(gone.is_symlink())
+        self.assertNotIn('/.claude/workflows/gone.js', self.block())
+        self.assertEqual(self.status(), '')
+
+    def test_another_agentrc_dir_refuses(self):
+        claude = self.repo / '.claude'
+        claude.joinpath('settings.local.json').write_text(json.dumps({'env': {'AGENTRC_DIR': '/other/agentrc'}}))
+        done = self.run_cli('install', '--project', str(self.repo), '--workflow')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('another checkout', done.stderr)
+        self.assertFalse((claude / 'workflows').exists())
+        claude.joinpath('settings.local.json').write_text('{"env": []}')
+        self.assertIn('fix it first', self.run_cli('install', '--project', str(self.repo), '--workflow').stderr)
+
+    def test_user_wide_flags_and_a_directory_that_is_no_top_level_are_refused(self):
+        for flag in ('--bin', '--claude-md', '--statusline', '--herdr-plugin'):
+            done = self.run_cli('install', '--project', str(self.repo), '--skill', flag)
+            self.assertEqual(done.returncode, 2, flag)
+            self.assertIn('user-wide', done.stderr)
+        self.assertEqual(self.run_cli('install', '--skill', '--skip-clashes').returncode, 2)
+        done = self.run_cli('install', '--project', str(self.repo / '.claude'), '--skill')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('not a work tree top level', done.stderr)
+        plain = Path(self.tmp.name) / 'plain'
+        plain.mkdir()
+        self.assertEqual(self.run_cli('install', '--project', str(plain), '--skill').returncode, 1)
+        self.assertEqual(self.run_cli('install', '--project', str(plain / 'missing'), '--skill').returncode, 1)
+        self.assertEqual(os.listdir(self.home), [])
+        self.assertFalse((self.repo / '.claude' / 'agents').exists())
+
+    def test_a_project_hook_runs_from_its_settings_command(self):
+        self.ok('install', '--project', str(self.repo), '--skill')
+        command = TestCommands.of(self.local())['PreToolUse'][0]
+        if os.name == 'nt':  # Claude Code runs it through bash
+            done = subprocess.run([shutil.which('bash'), '-c', f"printf '%s\n' {command}"], capture_output=True, text=True)
+            self.assertEqual(done.stdout.splitlines()[-1],
+                             (self.repo / '.claude' / 'hooks' / 'headless-chief' / 'shadow_guard.py').as_posix())
+        payload = json.dumps({'tool_name': 'Workflow', 'cwd': str(self.repo)})
+        bash = shutil.which('bash') if os.name == 'nt' else '/bin/sh'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_') or k.startswith('GIT_CONFIG')}
+        done = subprocess.run([bash, '-c', command], input=payload, capture_output=True, text=True,
+                              env={**env, 'CLAUDE_PROJECT_DIR': str(self.repo), 'HOME': str(self.home),
+                                   'USERPROFILE': str(self.home)})
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+
+class TestCommands:
+    @staticmethod
+    def of(data):
+        return {e: [h['command'] for g in gs for h in g['hooks']] for e, gs in data.get('hooks', {}).items()}
+
 
 class HerdrOnWindowsTest(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'herdr refuses only on Windows')

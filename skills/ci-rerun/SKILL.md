@@ -10,7 +10,7 @@ and that number is all `gh pr checks` gives. `scripts/circleci.py` turns it
 into the job's workflow and acts on that.
 
 ```bash
-C=~/.claude/skills/ci-rerun/scripts/circleci.py
+C=${AGENTRC_DIR:-$HOME/.claude}/skills/ci-rerun/scripts/circleci.py
 python3 $C log 391824                 # the failed steps' last 150 lines, to classify the failure
 python3 $C rerun 391824 391728 ...    # each job's workflow, once, from its failed jobs
 ```
@@ -33,7 +33,7 @@ often behind a rate limit. `scripts/rtd.py` works from that URL through the
 API.
 
 ```bash
-R=~/.claude/skills/ci-rerun/scripts/rtd.py
+R=${AGENTRC_DIR:-$HOME/.claude}/skills/ci-rerun/scripts/rtd.py
 python3 $R log <build-url>            # state, the failure reason RTD recorded, failed commands' tails
 python3 $R rerun <build-url>...       # a new build of each build's version
 ```

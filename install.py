@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Link parts of this checkout into ~/.claude, ~/.codex and ~/.local/bin, by explicit choice.
+"""Link parts of this checkout into ~/.claude, ~/.codex and ~/.local/bin, or into one work tree's
+.claude, by explicit choice.
 
     install.py install --skill --agent --workflow --bin --claude-md --statusline --herdr-plugin
     install.py remove --skill
+    install.py install --project <work tree> --skill --agent --workflow [--skip-clashes]
 
 Skills link into ~/.claude/skills and ~/.codex/skills; agents into
 ~/.claude/agents (the .md) and ~/.codex/agents (the .md and its .toml);
@@ -26,10 +28,32 @@ writes. A herdr plugin is linked unless herdr holds its id from elsewhere,
 and unlinked only when linked from this checkout; herdr steps run before any
 link, so herdr's own refusals (min_herdr_version, unlink without a running
 server) change nothing.
+
+--project <dir> scopes the install to one work tree instead, and leaves the
+user-wide directories alone. <dir> must be a repository's or a linked
+worktree's top level: Claude Code finds project skills, agents and workflows
+only up to the work tree root and reads project settings only from the
+session's start directory, so each worktree that needs them is installed.
+Skills, a skill's hooks, agents (the .md only) and workflows link into
+<dir>/.claude/{skills,hooks,agents,workflows}. The hooks are registered in
+<dir>/.claude/settings.local.json, never the tracked settings.json, by absolute
+path as above, beside env AGENTRC_DIR: this checkout with / separators, which
+the `${AGENTRC_DIR:-$HOME/.claude}` paths in the skills, agents and workflows
+resolve to; remove takes AGENTRC_DIR out once no link of ours is left there,
+and the file too when nothing else is in it. Codex, bin/, CLAUDE.md, the status
+line and herdr are user-wide, so --project refuses their flags. Each link, and
+settings.local.json unless git already ignores it, is an entry of one marked
+block in the repository's exclude file (`git rev-parse --git-common-dir`/info/
+exclude), which every worktree shares: an entry stays while any worktree of
+the repository has it, so `git status` stays clean. A destination the
+repository tracks, or a real file or nonempty directory there such as the
+project's own skill of that name, refuses before any change; --skip-clashes
+leaves it and skips that entry, and its hook's registration with it.
 """
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -42,6 +66,11 @@ REPO = Path(__file__).resolve().parent
 KINDS = ('skill', 'agent', 'hook', 'workflow', 'bin')
 FLAGS = ('skill', 'agent', 'workflow', 'bin')  # hooks come with the skill of the same name
 STATUSLINE = {'type': 'command', 'command': 'bash "$HOME/.claude/statusline.sh"'}
+PROJECT = None  # --project: the work tree whose .claude takes the Claude entries
+SETTINGS_LOCAL = '.claude/settings.local.json'
+BLOCK = ('# >>> agentrc install.py --project: managed by its install and remove',
+         '# <<< agentrc install.py --project')
+GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR')  # would name another repository
 
 
 def available(kind):
@@ -57,8 +86,14 @@ def available(kind):
     return sorted(p.name for p in (REPO / 'hooks').iterdir() if (p / 'hooks.json').exists())
 
 
+def claude_dir():
+    return PROJECT / '.claude' if PROJECT else Path.home() / '.claude'
+
+
 def dirs(kind):
     """Where entries of a kind are linked to."""
+    if PROJECT:
+        return [claude_dir() / {'skill': 'skills', 'agent': 'agents', 'hook': 'hooks', 'workflow': 'workflows'}[kind]]
     claude, codex = Path.home() / '.claude', Path.home() / '.codex'
     return {'skill': [claude / 'skills', codex / 'skills'], 'agent': [claude / 'agents', codex / 'agents'],
             'hook': [claude / 'hooks'], 'workflow': [claude / 'workflows'],
@@ -73,7 +108,7 @@ def links(kind, name):
     if kind == 'agent':
         md, toml = REPO / 'agents' / f'{name}.md', REPO / 'agents' / f'{name}.toml'
         pairs = [(md, d / md.name) for d in dirs(kind)]
-        return pairs + ([(toml, dirs(kind)[1] / toml.name)] if toml.exists() else [])
+        return pairs + ([(toml, dirs(kind)[1] / toml.name)] if toml.exists() and not PROJECT else [])
     if kind == 'hook':
         return [(REPO / 'hooks' / name, dirs(kind)[0] / name)]
     if kind == 'workflow':
@@ -190,7 +225,7 @@ def prune(kind):
 def hook_entry(hook, name):
     """Is this settings entry ours: does the command run out of the linked hook
     directory?"""
-    root = Path.home() / '.claude' / 'hooks' / name
+    root = claude_dir() / 'hooks' / name
     # bash quoting as written now; on Windows also the list2cmdline form earlier versions wrote
     for posix in (True, False) if os.name == 'nt' else (True,):
         try:
@@ -228,14 +263,15 @@ def strip(hooks, name):
 
 
 def settings():
-    return Path.home() / '.claude' / 'settings.json'
+    return PROJECT / SETTINGS_LOCAL if PROJECT else Path.home() / '.claude' / 'settings.json'
 
 
-def plan_settings(names, install, statusline):
+def plan_settings(names, install, statusline, keep_env=False):
     """(before, after) texts for registering or unregistering these hooks and
-    the status line, or None when nothing would change. Computed before any
+    the status line, and with --project AGENTRC_DIR, or None when nothing would
+    change; after is None for a project file left empty. Computed before any
     link moves, so a settings file of the wrong shape refuses instead of
-    leaving a half job."""
+    leaving a half job. keep_env: links of ours stay, so remove keeps AGENTRC_DIR."""
     path = settings()
     before = path.read_text(encoding='utf-8') if path.exists() else ''
     data = json.loads(before) if before else {}
@@ -244,7 +280,7 @@ def plan_settings(names, install, statusline):
         for name in names:
             strip(hooks, name)
             if install:
-                linked = Path.home() / '.claude' / 'hooks' / name
+                linked = claude_dir() / 'hooks' / name
                 for event, groups in json.loads((REPO / 'hooks' / name / 'hooks.json').read_text(encoding='utf-8')).items():
                     for group in groups:
                         entries = [{**h, 'command': quote_command(linked / h['command'])} for h in group['hooks']]
@@ -257,19 +293,129 @@ def plan_settings(names, install, statusline):
         data['statusLine'] = STATUSLINE
     elif statusline and data.get('statusLine') == STATUSLINE:
         del data['statusLine']
+    if PROJECT:
+        mine, env = REPO.as_posix(), data.get('env', {})
+        if not isinstance(env, dict):
+            raise TypeError('env is not an object')
+        if install:
+            if env.get('AGENTRC_DIR', mine) != mine:
+                refuse(f'{path} sets AGENTRC_DIR to {env["AGENTRC_DIR"]}, another checkout; remove it first')
+            data['env'] = {**env, 'AGENTRC_DIR': mine}
+        elif not keep_env and env.get('AGENTRC_DIR') == mine:
+            del env['AGENTRC_DIR']
+            if not env:
+                del data['env']
     if data == (json.loads(before) if before else {}):
         return None
-    return before, json.dumps(data, indent=2) + '\n'
+    return before, (json.dumps(data, indent=2) + '\n' if data or not PROJECT else None)
 
 
 def write_settings(before, after):
     path = settings()
+    if after is None:  # a project's local file with nothing left in it
+        path.unlink()
+        print(f'removed {path}')
+        return
     backup = path.with_name(path.name + '.before-agentrc')
-    if before and not backup.exists():
+    if before and not backup.exists() and not PROJECT:  # in a work tree it would be one more untracked file
         backup.write_text(before, encoding='utf-8')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(after, encoding='utf-8')
     print(f'updated {path}')
+
+
+# --- project mode: the work tree, clashes and git's exclude file ---------------
+
+def git(top, *args, check=True, stdin=None):
+    """git run in top, without fsmonitor, which would leave a daemon behind per repository."""
+    exe = shutil.which('git')
+    if not exe:
+        refuse('git is not on PATH; --project needs it')
+    done = subprocess.run([exe, '-c', 'core.fsmonitor=false', '-C', str(top), *args], capture_output=True, input=stdin,
+                          env={k: v for k, v in os.environ.items() if k not in GIT_LOCATION})
+    if check and done.returncode:
+        refuse(f'`git {" ".join(args)}` in {top} failed: {os.fsdecode(done.stderr).strip()}')
+    return done
+
+
+def work_tree(path):
+    """(the work tree's top level, its repository's exclude file, every work tree of the repository)."""
+    if not Path(path).is_dir():
+        refuse(f'--project {path} is not a directory')
+    out = os.fsdecode(git(path, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir').stdout)
+    top, common = map(Path, out.splitlines())
+    if canonical(os.path.realpath(top)) != canonical(os.path.realpath(path)):
+        refuse(f'--project {path} is not a work tree top level ({top} is): Claude Code reads project settings only '
+               'from the directory a session starts in')
+    listed = os.fsdecode(git(top, 'worktree', 'list', '--porcelain', '-z').stdout).split('\0')
+    trees = [Path(f[len('worktree '):]) for f in listed if f.startswith('worktree ')]
+    return top, common / 'info' / 'exclude', trees
+
+
+def relative(dst):
+    return dst.relative_to(PROJECT).as_posix()
+
+
+def clashes(pairs):
+    """{destination: why} for each one the repository tracks, or that holds a real file or a nonempty directory."""
+    rels = {relative(dst): dst for _, (_, dst) in pairs}
+    listed = git(PROJECT, 'ls-files', '-z', '--', *(f':(literal){rel}' for rel in rels)).stdout
+    tracked = set(os.fsdecode(listed).split('\0')) - {''}
+    found = {}
+    for rel, dst in rels.items():
+        if any(t == rel or t.startswith(rel + '/') for t in tracked):
+            found[dst] = 'is tracked by the repository'
+        elif dst.is_symlink() or not dst.exists() or (dst.is_dir() and not any(dst.iterdir())):
+            continue
+        elif dst.is_dir() and all('__pycache__' in p.relative_to(dst).parts for p in dst.rglob('*') if p.is_file()):
+            found[dst] = 'holds only Python bytecode caches, left by an earlier copy of the project; delete it'
+        else:
+            found[dst] = 'is a real file or directory'
+    return found
+
+
+def pattern(rel):
+    """An exclude line naming exactly the path rel."""
+    return '/' + re.sub(r'([][*?\\])', r'\\\1', rel)
+
+
+def read_block(exclude):
+    """(the exclude file's lines outside our block, the block's entries, the block's line range)."""
+    lines = exclude.read_text(encoding='utf-8').splitlines() if exclude.exists() else []
+    if BLOCK[0] not in lines:
+        return lines, [], range(0)
+    start = lines.index(BLOCK[0])
+    end = lines.index(BLOCK[1], start) if BLOCK[1] in lines[start:] else len(lines)
+    return lines[:start] + lines[end + 1:], [line for line in lines[start + 1:end] if line.startswith('/')], \
+        range(start + 2, end + 1)  # git's 1-based numbers of the lines between the markers
+
+
+def ignored_elsewhere(exclude, rel):
+    """Whether a pattern outside our block already ignores rel."""
+    done = git(PROJECT, 'check-ignore', '-v', '-z', '--no-index', '--stdin', check=False, stdin=os.fsencode(rel) + b'\0')
+    if done.returncode:
+        return False
+    source, line, rule = os.fsdecode(done.stdout).split('\0')[:3]  # -z: no quoting of the source's path
+    if rule.startswith('!'):
+        return False
+    ours = canonical(PROJECT / source) == canonical(exclude) and int(line) in read_block(exclude)[2]
+    return not ours
+
+
+def write_exclude(exclude, trees, added):
+    """Our block: its entries and the added ones, each kept while a work tree of the repository has it."""
+    rest, entries, _ = read_block(exclude)
+    paths = {rel: pattern(rel) for rel in added}
+    paths.update({re.sub(r'\\(.)', r'\1', e[1:]): e for e in entries})
+    keep = [entry for rel, entry in sorted(paths.items())
+            if any((tree / rel).is_file() if rel == SETTINGS_LOCAL else (tree / rel).is_symlink() for tree in trees)]
+    lines = rest + ([BLOCK[0], *keep, BLOCK[1]] if keep else [])
+    after = '\n'.join(lines) + '\n' if lines else ''
+    if after == (exclude.read_text(encoding='utf-8') if exclude.exists() else ''):
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(after, encoding='utf-8', newline='\n')
+    print(f'updated {exclude}')
 
 
 # --- herdr plugins ------------------------------------------------------------
@@ -335,7 +481,22 @@ def selection(parser, args):
     return chosen
 
 
+def project_clashes(args, pairs):
+    """The pairs left once the project's own entries are set aside: install refuses on one unless
+    --skip-clashes, and remove leaves each alone."""
+    found = clashes(pairs)
+    if found and args.action == 'install' and not args.skip_clashes:
+        refuse('\n'.join(f'{dst} {found[dst]}; agentrc\'s {kind} of that name would shadow it or be shadowed'
+                         for kind, (_, dst) in pairs if dst in found) +
+               '\nmove it aside first, or rerun with --skip-clashes to leave it and skip that entry')
+    for dst, why in found.items():
+        print(f'{dst} {why}, ' + ('skipped' if args.action == 'install' else 'left alone'))
+    return [(kind, pair) for kind, pair in pairs if pair[1] not in found]
+
+
 def main(argv=None):
+    global PROJECT
+    PROJECT = None
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('action', choices=('install', 'remove'))
     for kind in FLAGS:
@@ -343,17 +504,30 @@ def main(argv=None):
     parser.add_argument('--claude-md', action='store_true', help='instructions/user.md as ~/.claude/CLAUDE.md, also ~/.codex/AGENTS.md')
     parser.add_argument('--statusline', action='store_true', help='the Claude Code status line')
     parser.add_argument('--herdr-plugin', action='store_true', help='every plugins/* herdr plugin, through herdr')
+    parser.add_argument('--project', metavar='DIR', help="into this work tree's .claude, for Claude Code only")
+    parser.add_argument('--skip-clashes', action='store_true', help="with --project, skip an entry the project has itself")
     args = parser.parse_args(argv)
+    if args.skip_clashes and not args.project:
+        parser.error('--skip-clashes goes with --project')
+    if args.project and (user_wide := [f for f in ('bin', 'claude_md', 'statusline', 'herdr_plugin') if getattr(args, f)]):
+        parser.error(f'--project takes only --skill, --agent and --workflow: --{user_wide[0].replace("_", "-")} is user-wide')
     if args.herdr_plugin and os.name == 'nt':
         refuse('--herdr-plugin: herdr runs on Linux and macOS only')
     chosen = selection(parser, args)
+    if args.project:
+        PROJECT, exclude, trees = work_tree(args.project)
     pairs = [(kind, pair) for kind, name in chosen for pair in links(kind, name)]
+    if PROJECT:
+        pairs = project_clashes(args, pairs)
     herdr_steps = plan_herdr(args.action == 'install') if args.herdr_plugin else []
-    hooks = [name for kind, name in chosen if kind == 'hook']
+    hooks = [dst.name for kind, (_, dst) in pairs if kind == 'hook']  # a skipped hook's link is not registered
     planned = None
-    if hooks or args.statusline:
+    if hooks or args.statusline or PROJECT:
+        removing = {dst for _, (_, dst) in pairs}
+        keep_env = PROJECT and any(ours(p) and p not in removing for kind in ('skill', 'agent', 'hook', 'workflow')
+                                   for d in dirs(kind) if d.is_dir() for p in d.iterdir())
         try:
-            planned = plan_settings(hooks, args.action == 'install', args.statusline)
+            planned = plan_settings(hooks, args.action == 'install', args.statusline, keep_env)
         except (ValueError, TypeError, AttributeError, KeyError) as err:
             refuse(f'{settings()} cannot be edited ({err!r}); fix it first')
 
@@ -367,6 +541,8 @@ def main(argv=None):
                 unlink(dst)
         if planned:
             write_settings(*planned)
+        if PROJECT:
+            write_exclude(exclude, trees, [])
         return
 
     preflight([pair for _, pair in pairs])
@@ -377,6 +553,9 @@ def main(argv=None):
         prune(kind)
     if planned:
         write_settings(*planned)
+    if PROJECT:
+        local = [] if ignored_elsewhere(exclude, SETTINGS_LOCAL) else [SETTINGS_LOCAL]
+        write_exclude(exclude, trees, [relative(dst) for _, (_, dst) in pairs] + local)
 
 
 if __name__ == '__main__':
