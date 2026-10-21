@@ -17,6 +17,8 @@ from unittest import mock
 HOOK = Path(__file__).resolve().parents[1] / 'hooks' / 'simplify-gate' / 'simplify_gate.py'
 WRAPPER = HOOK.with_name('simplify-gate')
 GATE = Path(__file__).resolve().parents[1] / 'skills' / 'simplify-gate' / 'scripts' / 'gate.py'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import tmpdir  # noqa: E402
 spec = importlib.util.spec_from_file_location('simplify_gate', HOOK)
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
@@ -96,15 +98,10 @@ class Session:
 
 class GateTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        # as git reports it (Windows' long TEMP name): snapshot() keeps worktrees under root
-        self.base = Path(self.tmp.name).resolve()
+        self.base = tmpdir(self)  # as git reports it: snapshot() keeps worktrees under root
         self.root = make_repo(self.base / 'repo')
         self.s = Session(self.root, self.base / 'state')
         self.s.prompt('first')
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def write(self, name, text):
         (self.root / name).write_text(text)
@@ -168,7 +165,7 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.s.stop(), {})
 
     def test_symlinks_and_binaries_are_described_not_traversed(self):
-        outside = Path(self.tmp.name) / 'outside'
+        outside = self.base / 'outside'
         outside.mkdir()
         (outside / 'secret').write_text('nope\n')
         os.symlink(outside, self.root / 'deps')
@@ -237,7 +234,7 @@ class GateTest(unittest.TestCase):
     def test_non_ascii_text_reaches_codex_and_comes_back(self):
         text = 'caf\u00e9 \u2714 \u0151'  # outside the Windows ANSI code pages
         (self.root / 'a.txt').write_bytes(f'{text}\n'.encode())
-        seen = Path(self.tmp.name) / 'stdin'
+        seen = self.base / 'stdin'
         code = ('import sys; open(sys.argv[1], "wb").write(sys.stdin.buffer.read()); '
                 'open(sys.argv[2], "w", encoding="utf-8").write(sys.argv[3])')
         result = json.dumps({'findings': [{**FINDING, 'problem': text}]}, ensure_ascii=False)
@@ -254,7 +251,7 @@ class GateTest(unittest.TestCase):
         self.assertIn(f'wrote {text}', prompt)
 
     def test_a_submodule_is_left_out_of_scope_but_its_pointer_renders(self):
-        sub = make_repo(Path(self.tmp.name) / 'sub')
+        sub = make_repo(self.base / 'sub')
         sh(self.root, 'git', '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(sub), 'sub')
         sh(self.root, 'git', 'commit', '-qm', 'sub')
         self.new_turn()
@@ -283,7 +280,7 @@ class GateTest(unittest.TestCase):
         self.assertIn('-c\n', patch, 'the deletion is kept')
 
     def test_a_worktree_outside_the_checkout_is_another_sessions(self):
-        wt = Path(self.tmp.name) / 'sibling'
+        wt = self.base / 'sibling'
         sh(self.root, 'git', 'worktree', 'add', '-q', str(wt), '-b', 'sibling')
         (wt / 'a.txt').write_text('elsewhere\n')
         self.assertEqual(self.s.stop(), {})
@@ -740,7 +737,7 @@ class GateTest(unittest.TestCase):
         if os.name != 'nt':
             self.assertEqual(gate.codex_exe(), 'codex', 'POSIX execs it by name, as before')
             return
-        base = Path(self.tmp.name)
+        base = self.base
         for name in ('cwd/codex.exe', 'cwd/bin/codex.exe', 'cwd/rooted/codex.exe', 'first/codex.cmd',
                      'second/codex.exe', 'second/codex.cmd'):
             (base / name).parent.mkdir(parents=True, exist_ok=True)
@@ -762,7 +759,7 @@ class GateTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'nt', 'POSIX kills the direct child alone, as it always has')
     def test_a_timed_out_codex_is_killed_with_its_children(self):
-        late = Path(self.tmp.name) / 'late'
+        late = self.base / 'late'
         child = f'import time; time.sleep(2); open({str(late)!r}, "w").close()'
         parent = f'import subprocess, sys, time; subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(30)'
         with self.assertRaises(subprocess.TimeoutExpired):
@@ -778,7 +775,8 @@ class GateTest(unittest.TestCase):
         def taskkill(args, **kw):
             killed.append(args[1:3])
             os.kill(int(args[-1]), signal.SIGTERM)
-        with mock.patch.object(gate.os, 'name', 'nt'), mock.patch.object(subprocess, 'run', taskkill), \
+        with mock.patch.object(gate.os, 'name', 'nt'), mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                mock.patch.object(subprocess, 'run', taskkill), \
                 mock.patch.object(subprocess.Popen, 'communicate', side_effect=KeyboardInterrupt), \
                 self.assertRaises(KeyboardInterrupt):
             gate.run_tree([sys.executable, '-c', 'import time; time.sleep(30)'], input=b'', timeout=30)
@@ -849,7 +847,7 @@ class GateTest(unittest.TestCase):
         self.assertIn('written during the review', self.s.prompts[1])
 
     def test_a_stop_before_any_prompt_takes_a_baseline_and_says_so(self):
-        s = Session(self.root, Path(self.tmp.name) / 'fresh')
+        s = Session(self.root, self.base / 'fresh')
         self.write('a.txt', 'before the gate\n')
         self.assertIn('baseline taken', s.stop()['systemMessage'])
         s.prompt()
@@ -922,13 +920,9 @@ DAY = 86400
 
 class PruneTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name).resolve()  # as git reports it
+        self.base = tmpdir(self)  # as git reports it
         self.cache = self.base / 'cache'
         self.store = self.cache / gate.STORE
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def blob(self, text):
         content = text.encode()
@@ -1294,14 +1288,10 @@ class ActivationTest(unittest.TestCase):
 
 class SkillTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name).resolve()  # as git reports it
+        self.base = tmpdir(self)  # as git reports it
         self.root = make_repo(self.base / 'repo')
         self.marker = self.root / '.git' / 'simplify-gate'
         self.marker.unlink()
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def gate(self, *args, cwd=None):
         return subprocess.run([sys.executable, str(GATE), *args], cwd=cwd or self.root, capture_output=True, text=True)

@@ -21,6 +21,7 @@ workflows/     saved workflows (Claude only)
 bin/           commands for the human, such as lsusbt
 statusline/    the Claude Code status line, its Codex usage fetcher and its session-PR helper
 plugins/       herdr plugins, one folder each with a herdr-plugin.toml
+lib/           windows.py, the Windows runtime helpers the scripts reach through their resolved path
 tests/         unit tests for skill scripts, hooks and the installer
 ```
 
@@ -117,6 +118,8 @@ the skipped tests and notes for a port:
 - the capture scripts of `usb-sniffer` (`sniff.py`), `etm-trace`
   (`etm_capture.py`) and `target-debug` (`dual_capture.py`): usbfs, `/proc`
   and POSIX process control.
+- `target-debug`'s `esp_session.py`, which refuses there: it detaches openocd
+  as a POSIX session and identifies it through `/proc` (#130).
 - `install.py --herdr-plugin` refuses on Windows; `worktree-remove` has no
   Windows test.
 

@@ -9,10 +9,21 @@ script chief runs may still write or publish, and the grants in agents/chief.md 
 A write target passes only as a literal absolute path outside the worktree, so no shell state
 needs tracking; chief's own directory, `git rev-parse --git-path chief`, passes even inside a
 primary checkout. Exit 2 denies; a command it cannot parse is denied too, since Claude Code lets
-an erroring hook pass, and any error denies. On Windows, where Git Bash runs the command, a /-rooted
-path is judged both as bash maps it and as Windows reads it, command names match without case or .exe,
-and the programs whose command lines or links this cannot follow (cmd, PowerShell, WSL, mount, ...) are
-denied; it needs a native Windows Python there.
+an erroring hook pass, and any error denies.
+
+The boundary is deny what it cannot interpret, within the command families it knows (git, gh, shells,
+wrappers, xargs and find -exec, writers and linkers): it follows a few plain forms of those and refuses
+the rest rather than grow general parsing. A program outside them passes with its arguments.
+
+The cost is what chief can no longer run directly: piping commands into a shell, shell or wrapper options
+outside the small tables, git or a writer fed by xargs or find -exec, globs in a write target even
+outside the worktree, any curl beyond a plain GET, any tar but a listing, wget, patch and find -delete.
+It runs those as plain words or dispatches them to a unit.
+
+On Windows, where Git Bash runs the command, a /-rooted path is judged both as bash maps it and as
+Windows reads it, command names match without case or .exe, and the programs whose command lines or
+links this cannot follow (cmd, PowerShell, WSL, mount, ...) are denied; it needs a native Windows
+Python there.
 """
 import json
 import os
@@ -51,7 +62,15 @@ GIT_READ = {
     'show-ref', 'show-branch', 'count-objects', 'fetch', 'whatchanged', 'range-diff', 'cherry',
     'check-ignore', 'check-attr', 'diff-tree', 'diff-index', 'diff-files', 'var', 'help', 'version',
 }
-GIT_GLOBAL_WITH_VALUE = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env'}
+GIT_GLOBAL_WITH_VALUE = {'-C', '--git-dir', '--work-tree', '--namespace', '--exec-path'}
+# read subcommands' options that run a program, in any spelling git's option parser accepts: (long options with their
+# shortest prefix matched, short letters); the whole short cluster is read, so a letter that is an earlier one's value
+# (`grep -eO`) is denied too, and so is every word past `--`, which a value-taking option may consume (`grep -e --`)
+GIT_EXEC = {'fetch': ({'--upload-pack': 3, '--exec': 3}, 'u'), 'ls-remote': ({'--upload-pack': 3, '--exec': 3}, 'u'),
+            'grep': ({'--open-files-in-pager': 3}, 'O')}
+# `git -c key=value` is vetted against this allowlist: any value git may run a command from is kept out
+GIT_C_ALLOW = {'core.pager=cat', 'core.quotepath=off', 'core.quotepath=false', 'core.quotepath=on',
+               'core.quotepath=true', 'color.ui=never', 'color.ui=always', 'color.ui=auto'}
 # subcommand -> its read-only first words; bare, all but stash list
 GIT_READ_FORMS = {
     'stash': {'list', 'show'}, 'worktree': {'list'}, 'notes': {'list', 'show'}, 'reflog': {'show'},
@@ -75,13 +94,36 @@ WORKFLOW_ONLY = {'push.py', 'sonar.py'}
 PY_LAUNCHERS = {'py', 'pyw'} if os.name == 'nt' else set()
 # command prefixes that run the next word: name -> its options that take a value
 WRAPPERS = {
-    'command': set(), 'builtin': set(), 'nohup': set(), 'exec': {'-a'}, 'time': {'-f', '-o'},
-    'stdbuf': {'-i', '-o', '-e'}, 'nice': {'-n'}, 'timeout': {'-s', '--signal', '-k', '--kill-after'},
-    'sudo': {'-u', '-g'}, 'env': {'-u', '--unset', '-C', '--chdir'},
+    'command': set(), 'builtin': set(), 'nohup': set(), 'exec': {'-a'}, 'time': {'-f', '--format'},
+    'stdbuf': {'-i', '-o', '-e', '--input', '--output', '--error'}, 'nice': {'-n', '--adjustment'},
+    'timeout': {'-s', '--signal', '-k', '--kill-after'},
+    'sudo': {'-u', '--user', '-g', '--group', '-p', '--prompt', '-C', '--close-from', '-r', '--role', '-t', '--type',
+             '-h', '--host', '-U', '--other-user'},
+    'env': {'-u', '--unset', '-C', '--chdir'},
     'xargs': {'-n', '-L', '-P', '-s', '-I', '-d', '-E', '-a', '--max-args', '--max-lines', '--max-procs',
-              '--max-chars', '--delimiter', '--eof', '--arg-file'},
+              '--max-chars', '--delimiter', '--eof', '--arg-file', '--process-slot-var'},
 }
+# per-wrapper options that take no value; any option outside both tables is denied
+WRAPPER_FLAGS = {
+    'command': {'-p', '-v', '-V'}, 'builtin': set(), 'nohup': set(), 'exec': {'-c', '-l'},
+    'time': {'-p', '-a', '-v', '--append', '--verbose', '--portability', '--quiet'}, 'stdbuf': set(), 'nice': set(),
+    'timeout': {'--preserve-status', '--foreground', '-v', '--verbose'},
+    'sudo': {'-b', '-E', '-H', '-i', '-K', '-k', '-n', '-P', '-S', '-s', '-v', '-A'},
+    'env': {'-i', '-', '-0', '--null', '-v', '--debug', '--ignore-environment'},
+    'xargs': {'-0', '-r', '-t', '-p', '-x', '--null', '--no-run-if-empty', '--verbose', '--interactive', '--exit',
+              '--open-tty'},
+}
+# env assignments a tool runs as a command: a pager that is not cat, anything git executes from configuration, and
+# every GIT_CONFIG* variable (they inject configuration, core.fsmonitor included)
+PAGER_ENV = {'PAGER', 'GIT_PAGER'}
+RUN_ENV = {'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_EDITOR',
+           'EDITOR', 'VISUAL', 'GIT_SEQUENCE_EDITOR', 'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'BASHOPTS', 'TAR_OPTIONS'}
+# GIT_TRACE* values git reads as off or stderr; any other is an fd, an absolute path or a socket it appends trace to
+GIT_TRACE_QUIET = {'', '0', 'false', '1', '2', 'true'}
+# builtins whose assignment operands set the environment a later command inherits
+DECLARES = {'export', 'declare', 'typeset', 'readonly', 'local'}
 SHELLS = {'sh', 'bash', 'zsh', 'dash'}
+SHELL_LONG = {'--login', '--noprofile', '--norc', '--posix'}
 # Windows programs a bash command can start that run a command line of their own: powershell reads bare words
 # as -Command, cmd runs /k too, start and the terminals run their arguments
 FOREIGN_SHELLS = {'cmd', 'powershell', 'pwsh', 'wsl', 'start', 'winpty', 'mintty', 'conhost', 'git-bash', 'git-cmd',
@@ -103,17 +145,39 @@ KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}'}
 WRITERS_ALL = {'rm', 'rmdir', 'mv', 'touch', 'mkdir', 'truncate', 'tee', 'shred', 'unlink'}
 WRITERS_LAST = {'cp', 'ln', 'install', 'rsync'}
 WRITERS_AFTER_FIRST = {'chmod', 'chown', 'chgrp'}
+# curl: a plain GET only; any other option is denied, an output is judged as a write target
+CURL_FLAGS = {'--silent', '--show-error', '--fail', '--location'}
+CURL_VALUES = {'-H': 'header', '--header': 'header', '-X': 'request', '--request': 'request', '-o': 'output',
+               '--output': 'output'}
+# find primaries that delete or write files: the paths they act on are only known at run time
+FIND_WRITES = {'-delete', '-fprint', '-fprint0', '-fprintf', '-fls'}
+# what xargs or find -exec may run: a read; git, gh, shells, eval, interpreters and every writer are denied there
+INDIRECT_DENY = ({'git', 'gh', 'eval', 'sed', 'perl', 'curl', 'tar', 'dd', 'sort', 'find', 'link'} | SHELLS | WORKFLOW_ONLY
+                 | PY_LAUNCHERS | WRITERS_ALL | WRITERS_LAST | WRITERS_AFTER_FIRST)
 SEPARATORS = {';', '&&', '||', '|', '&', '(', ')', '|&', ';;'}
 REDIRECTS = {'>', '>>', '&>', '&>>', '>|', '>&'}
 STREAMS = REDIRECTS | {'<', '<<', '<<<'}
 OPERATORS = sorted(SEPARATORS | STREAMS, key=len, reverse=True)
 PUNCTUATION = ';&|<>()'
-# a quoted or escaped operator character stays a word character: these stand in for it until a path is judged
-QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(PUNCTUATION)}
+# unquoted, these expand a write target to several paths or none; a quoted one is a literal path character
+GLOB = '{}*?['
+GLOBSET = set(GLOB)
+# a quoted or escaped operator or glob character stays a word character: these stand in for it until a path is judged
+SPECIAL = PUNCTUATION + GLOB
+QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(SPECIAL)}
 UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
 HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
-ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
+ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
 UNKNOWN = '\0'
+STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as '
+              'plain words, or dispatch to a unit')
+# a script operand naming a descriptor (/dev/stdin, /dev/fd/0, /proc/self/fd/0) reads the commands piped in
+STDIN_PATH = re.compile(r'(^|/)(stdin|fd/\d+)$')
+WRITE_RULE = 'chief writes only its artifacts, named by a literal absolute path outside the task worktree; a worktree change goes to a writer'
+LINK_RULE = ('on Windows a link to the task worktree is a path this guard cannot follow; a link names a literal absolute '
+             'source outside it, not one holding it') if os.name == 'nt' else \
+    ('a link to the task worktree lets a later write reach it unseen (a hard link through chief\'s directory, a symlink '
+     'made in the same command); a link names a literal absolute source outside the worktree, not one holding it')
 
 
 class Denied(Exception):
@@ -178,8 +242,9 @@ class Guard:
     def __init__(self, payload):
         self.payload, self.root = payload, None
 
-    def inside(self, path):
-        """Is this absolute path in the worktree, chief's own directory apart; the worktree is read once, on first use."""
+    def inside(self, path, ancestors=False):
+        """Is this absolute path in the worktree, chief's own directory apart, or with ancestors one holding it; the
+        worktree is read once, on first use."""
         if self.root is None:
             try:
                 root, chief = project(self.payload, timeout=remaining())
@@ -187,19 +252,23 @@ class Guard:
                 raise Denied(TOO_LONG) from None
             self.root, self.chief = resolved(root), chief and resolved(chief)
         p = resolved(path)
-        return p.is_relative_to(self.root) and not (self.chief and p.is_relative_to(self.chief))
+        return (p.is_relative_to(self.root) and not (self.chief and p.is_relative_to(self.chief))
+                or ancestors and self.root.is_relative_to(p))
 
-    def outside(self, path):
+    def outside(self, path, ancestors=False):
         """Is this word a literal absolute path outside the worktree."""
         path = path.translate(UNQUOTED)
         if path == '/dev/null':
             return True
-        return not (UNKNOWN in path or '$' in path or not (places := absolute(path)) or any(self.inside(p) for p in places))
+        return not (UNKNOWN in path or '$' in path or not (places := absolute(path)) or any(self.inside(p, ancestors) for p in places))
 
-    def writes(self, path, why):
-        if not self.outside(path):
-            raise Denied(f'{why} would write {path.translate(UNQUOTED)}: chief writes only its artifacts, named by a literal '
-                         'absolute path outside the task worktree; a worktree change goes to a writer')
+    def writes(self, path, why, glob=True, verb='write', rule=WRITE_RULE):
+        if glob and GLOBSET & set(path):
+            raise Denied(f'{why} would {verb} {path.translate(UNQUOTED)}, which names an unquoted glob or brace: it must name '
+                         'one literal path; quote it if it is a literal path, or dispatch the step to a unit')
+        # a link to a directory holding the worktree reaches it as a link to the worktree does
+        if not self.outside(path, ancestors=verb == 'link'):
+            raise Denied(f'{why} would {verb} {path.translate(UNQUOTED)}: {rule}')
 
     def command(self, command, depth=0):
         if depth > 3:
@@ -229,27 +298,54 @@ class Guard:
             else:
                 seg.append(t)
 
-    def segment(self, words, depth):
+    def segment(self, words, depth, indirect=False):
         remaining()
         for k, w in enumerate(words[:-1]):
             if w in REDIRECTS and not (w == '>&' and words[k + 1].isdigit()):
                 self.writes(words[k + 1], 'the redirect')
-        if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)=.*winsymlinks', w) for w in words):
+        if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)\+?=.*winsymlinks', w) for w in words):
             raise Denied('winsymlinks makes links this guard cannot follow on Windows; dispatch the step to a unit')
-        words = unwrap([w for k, w in enumerate(words) if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
+        words, xargs, replace, bare = unwrap([w for k, w in enumerate(words)
+                                              if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
         if not words:
+            if (indirect or xargs) and not bare:
+                raise Denied('a wrapper under xargs or find -exec with no program runs one known only at run time; name the '
+                             'program')
             return
-        cmd, args = program(os.path.basename(words[0])), words[1:]
+        if indirect and '{}' in words[0].translate(UNQUOTED):
+            raise Denied('`find -exec {}` runs a found path as the command, known only at run time; name the program')
+        if replace and replace.translate(UNQUOTED) in words[0].translate(UNQUOTED):
+            raise Denied('`xargs -I` puts its input in the command word, known only at run time; name the program')
+        if UNKNOWN in words[0] or '$' in words[0] or GLOBSET & set(words[0]):
+            raise Denied('the command word is set at runtime, so this guard cannot tell what runs; name the program directly')
+        name = program(os.path.basename(words[0]))
+        # a dashed builtin runs the subcommand without the `git` word: judged as `git <sub>`
+        cmd, args = ('git', [name[4:]] + words[1:]) if name.startswith('git-') else (name, words[1:])
+        if (indirect or xargs) and (cmd in INDIRECT_DENY or cmd.startswith('python')):
+            raise Denied(f'`{cmd}` under xargs or find -exec takes arguments known only at run time; run it with literal '
+                         'arguments, or dispatch the step to a unit')
         if os.name == 'nt':
-            self.windows(words[0], cmd, args)
+            self.windows(words[0], name)
+        for source in link_sources(cmd, args, symlinks=os.name == 'nt'):
+            self.writes(source, f'`{cmd}`', verb='link', rule=LINK_RULE)
+        if cmd == 'shopt' and 'expand_aliases' in [a.translate(UNQUOTED) for a in args]:
+            raise Denied('`shopt expand_aliases` lets a later alias run a command under another name this guard cannot see')
+        if cmd in DECLARES:
+            for a in args:
+                if ASSIGNMENT.match(a):
+                    forbidden_env(a)
+        if cmd == 'alias' and any('=' in a for a in args):
+            raise Denied('an alias runs a command under another name this guard cannot see; run the command itself')
         if cmd in SHELLS:
-            for k, a in enumerate(args):
-                if re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', a):
-                    return self.command((args[k + 1] if k + 1 < len(args) else '').translate(UNQUOTED), depth + 1)
+            return self.shell(args, depth)
         if cmd == 'eval':
             return self.command(' '.join(args).translate(UNQUOTED), depth + 1)
+        if cmd == 'find':
+            self.find_exec(args, depth)
         if cmd == 'git':
             self.git(args)
+        elif cmd == 'scalar':
+            raise Denied('`scalar` clones, registers and runs maintenance on a repository; chief only reads: dispatch a writer or the workflow')
         elif cmd == 'gh':
             gh(args)
         elif cmd in WORKFLOW_ONLY or ((cmd.startswith('python') or cmd in PY_LAUNCHERS)
@@ -257,39 +353,53 @@ class Guard:
             raise Denied('this publisher runs only inside its workflow (autoPush, markSonar)')
         elif cmd in ('sed', 'perl') and any(re.match(r'-[a-zA-Z]*i|--in-place', a) for a in args):
             raise Denied(f'`{cmd}` in place edits a file; chief writes its artifacts whole with Write, and a worktree change goes to a writer')
+        elif cmd == 'wget':
+            raise Denied('`wget` writes files and logs at paths this guard cannot place; fetch with `curl -o <absolute path outside the worktree>`, or dispatch to a unit')
+        elif cmd == 'patch':
+            raise Denied('`patch` edits files in place; chief writes its artifacts whole with Write, and a worktree change goes to a writer')
+        elif cmd == 'tar' and (os.environ.get('TAR_OPTIONS') or
+                               not (len(args) == 2 and re.fullmatch(r'-?tv?f', args[0]) and ':' not in args[1])):
+            raise Denied('`tar` other than a listing (`tar tf <local file>`) extracts, writes or runs a program this guard '
+                         'cannot place; dispatch the step to a unit')
+        elif cmd == 'curl':
+            self.curl(args)
         for path in written(cmd, args):
             self.writes(path, f'`{cmd}`')
 
-    def windows(self, word, cmd, args):
-        """Git Bash on Windows: what starts a command line, a writer or a link this guard cannot follow."""
-        if cmd in FOREIGN_SHELLS or wsl(word, cmd):
-            raise Denied(f'`{cmd}` runs a command line this guard cannot follow; run it as plain bash words, or dispatch it to a unit')
-        if cmd in WINDOWS_WRITERS:
-            raise Denied(f'`{cmd}` writes or maps paths this guard cannot follow on Windows; dispatch the step to a unit')
-        sources = []
-        if cmd in ('ln', 'link') or (cmd == 'cp' and links(args)):
-            operands, directories = getopt(args)
-            # link, unlisted as a writer, names its target too; ln's lone operand is linked into the cwd
-            sources = operands if cmd == 'link' or directories or len(operands) < 2 else operands[:-1]
-        elif cmd == 'rsync':
-            sources = [a.split('=', 1)[1] if '=' in a else args[k + 1] for k, a in enumerate(args)
-                       if re.fullmatch(r'--(link|copy|compare)-dest(=.*)?', a) and ('=' in a or k + 1 < len(args))]
-        for source in sources:
-            if not self.outside(source):
-                    raise Denied(f'`{cmd}` would link {source.translate(UNQUOTED)}: on Windows a link to the task worktree is a '
-                                 'path this guard cannot follow; a link names a literal absolute source outside it')
+    def windows(self, word, name):
+        """Git Bash on Windows: a program that starts a command line or writes paths this guard cannot follow (git-bash
+        and git-cmd are named before the dashed-git rule reads them as git)."""
+        if name in FOREIGN_SHELLS or wsl(word, name):
+            raise Denied(f'`{name}` runs a command line this guard cannot follow; run it as plain bash words, or dispatch it to a unit')
+        if name in WINDOWS_WRITERS:
+            raise Denied(f'`{name}` writes or maps paths this guard cannot follow on Windows; dispatch the step to a unit')
 
     def git(self, args):
         i = 0
         while i < len(args) and args[i].startswith('-'):
-            i += 2 if args[i] in GIT_GLOBAL_WITH_VALUE else 1
+            a = args[i]
+            if a == '--config-env' or a.startswith(('--config-env=', '--exec-path=')):
+                raise Denied(f'`git {a}` takes configuration or programs this guard cannot vet; dispatch the step to a unit')
+            if a == '-c':
+                self.git_c(args[i + 1] if i + 1 < len(args) else '')
+                i += 2
+                continue
+            if a.startswith('-c') and len(a) > 2:
+                self.git_c(a[2:])
+                i += 1
+                continue
+            i += 2 if a in GIT_GLOBAL_WITH_VALUE else 1
         if i >= len(args):
             return
         sub, rest = args[i], args[i + 1:]
+        if UNKNOWN in sub or '$' in sub:
+            raise Denied('the git subcommand is set at runtime, so this guard cannot tell what runs; name it directly')
         for k, a in enumerate(rest):
             out = a.split('=', 1)[1] if a.startswith('--output=') else rest[k + 1] if a == '--output' and k + 1 < len(rest) else None
             if out is not None:
                 self.writes(out, f'`git {sub} --output`')
+        if sub in GIT_EXEC and (a := spelled([w for w in rest if w != '--'], *GIT_EXEC[sub])):
+            raise Denied(f'`git {sub} {a}` runs a program this guard cannot vet (locally for a `.` remote); use the plain read')
         if sub in GIT_READ:
             return
         flags = {a.split('=')[0] for a in rest if a.startswith('-')}
@@ -311,16 +421,118 @@ class Guard:
                 return
         raise Denied(f'`git {sub}` changes the repository; chief only reads it: dispatch a writer, or the workflow that owns the step')
 
+    def git_c(self, kv):
+        """`git -c key=value`: only a value git cannot run a command from passes."""
+        if kv.translate(UNQUOTED) not in GIT_C_ALLOW:
+            raise Denied(f'`git -c {kv.translate(UNQUOTED)}` sets configuration this guard cannot vet (some keys run a command); '
+                         'only the read allowlist passes: core.pager=cat, core.quotepath, color.ui')
 
-def links(args):
-    """Does a cp make links: --link or --symbolic-link, abbreviated as getopt allows, or l or s in a short option
-    cluster before the letter that takes the rest as its value."""
-    for a in args:
+    def shell(self, args, depth):
+        """A shell runs its `-c` string (checked) or a script operand (not followed, like any program). Any option outside
+        a small known set is denied, and so is reading commands from stdin, which this guard cannot see."""
+        command, k = False, 0
+        while k < len(args) and args[k][:1] in ('-', '+') and args[k] != '-':
+            a = args[k]
+            k += 1
+            if a == '--':
+                break
+            if a not in SHELL_LONG and not re.fullmatch(r'-[celuvx]+', a):
+                raise Denied(f'`{a}` is a shell option this guard does not follow; pass the commands to `-c`, or dispatch to a unit')
+            command = command or 'c' in a[1:] and not a.startswith('--')
+        operand = args[k] if k < len(args) else None
+        if command:
+            return self.command((operand or '').translate(UNQUOTED), depth + 1)
+        if operand is None or operand == '-' or STDIN_PATH.search(posixpath.normpath(operand.translate(UNQUOTED))):
+            raise Denied(STDIN_RULE)
+
+    def find_exec(self, args, depth):
+        """`find -exec`/`-execdir`/`-ok`/`-okdir` runs a command on the paths it finds, known only at run time: only a
+        read passes there."""
+        if writes := FIND_WRITES.intersection(a.translate(UNQUOTED) for a in args):
+            raise Denied(f'`find {sorted(writes)[0]}` writes or deletes at paths this guard cannot place (the found paths are '
+                         'unknown here); dispatch the step to a unit')
+        i = 0
+        while i < len(args):
+            if args[i].translate(UNQUOTED) in ('-exec', '-execdir', '-ok', '-okdir'):
+                clause, i = [], i + 1
+                while i < len(args) and args[i].translate(UNQUOTED) not in (';', '+'):
+                    clause.append(args[i])
+                    i += 1
+                if clause:
+                    self.segment(clause, depth, indirect=True)
+            else:
+                i += 1
+
+    def curl(self, args):
+        """curl passes only as a plain GET with the options chief needs; each output is judged as a write target."""
+        k = 0
+        while k < len(args):
+            a = args[k]
+            k += 1
+            if a == '--':
+                return
+            if not a.startswith('-') or a in CURL_FLAGS or re.fullmatch(r'-[sSfL]+', a):
+                continue
+            name, eq, value = a.partition('=') if a.startswith('--') else (a[:2], '', a[2:])
+            kind = CURL_VALUES.get(name)
+            if kind is None:
+                raise Denied(f'`curl {a}` is not a plain GET this guard follows; use -sSfL, -H, -X GET and -o <absolute path '
+                             'outside the worktree>, or dispatch the fetch to a unit')
+            if not (eq or value):
+                value, k = (args[k] if k < len(args) else ''), k + 1
+            if kind == 'request' and value != 'GET':
+                raise Denied(f'`curl -X {value}` publishes; it goes through the workflow or the unit holding the grant')
+            if kind == 'output' and value != '-':
+                if '#' in value:
+                    raise Denied('`curl -o` with `#` names its file from the URL at run time; give one literal path')
+                self.writes(value, '`curl -o`')
+
+def spelled(args, longs, letters, valued='', valued_longs=None):
+    """The first word before `--` that spells one of these options as getopt reads it: a long option (longs maps it to
+    the shortest prefix length matched) abbreviated or not, or one of letters in a short cluster before the first
+    letter in valued, which takes the rest as its value, else the next word, as a long option in valued_longs does
+    without `=`; None when none does."""
+    def matches(name, table):
+        return any(len(name) >= n and o.startswith(name) for o, n in table.items())
+    words = iter(args)
+    for a in words:
         if a == '--':
-            break
-        if re.match(r'--(l|sy)|-[^-St]*[ls]', a):
-            return True
-    return False
+            return None
+        if a.startswith('--'):
+            name, eq, _ = a.partition('=')
+            if matches(name, longs):
+                return a
+            if not eq and matches(name, valued_longs or {}):
+                next(words, None)
+        elif a.startswith('-'):
+            for k, ch in enumerate(a[1:], 1):
+                if ch in letters:
+                    return a
+                if ch in valued:
+                    if k == len(a) - 1:
+                        next(words, None)
+                    break
+    return None
+
+
+# cp's long options that take the next word as their value, with the shortest prefix getopt matches
+CP_VALUED = {'--suffix': 4, '--target-directory': 3, '--sparse': 4, '--no-preserve': 6}
+
+
+def link_sources(cmd, args, symlinks):
+    """The paths a command links from. A hard link to a task-worktree file lets a later write reach it through chief's
+    exempt directory, which `resolved()` cannot detect; a symlink lets a write in the same command reach it, as every
+    path is placed before any of the command runs; on Windows (symlinks) an rsync reference directory into the worktree
+    is a path this guard cannot follow too. cp counts both its link options in any getopt spelling."""
+    if cmd == 'rsync':
+        dest = r'--(link|copy|compare)-dest' if symlinks else r'--link-dest'
+        return [a.split('=', 1)[1] if '=' in a else args[k + 1] for k, a in enumerate(args)
+                if re.fullmatch(dest + '(=.*)?', a) and ('=' in a or k + 1 < len(args))]
+    if cmd in ('link', 'ln') or (cmd == 'cp' and spelled(args, {'--link': 3, '--symbolic-link': 4}, 'ls', 'St', CP_VALUED)):
+        operands, directories = getopt(args)
+        # link, unlisted as a writer, names its target too; ln's lone operand is linked into the cwd
+        return operands if cmd == 'link' or directories or len(operands) < 2 else operands[:-1]
+    return []
 
 
 def getopt(args):
@@ -442,24 +654,104 @@ def absolute(path):
 
 
 def unwrap(words):
-    """The command a word list runs, past assignments, keywords and wrappers with their options."""
+    """(the command a word list runs, past assignments, keywords and wrappers with their options; whether xargs runs it,
+    with arguments known only at run time; xargs' -I replace string; whether xargs was the last wrapper, so a missing
+    command is its echo). An assignment a tool runs as a command, a wrapper option outside the wrapper's known table,
+    a wrapper word expanded at run time, and sudo starting a shell with no command, which reads stdin, are denied."""
+    xargs, replace, name = False, None, None
     while words:
         w = words[0]
-        if ASSIGNMENT.match(w) or w in KEYWORDS:
+        if w in KEYWORDS:
             words = words[1:]
             continue
-        w = program(w)
-        if w == 'command' and any(re.fullmatch(r'-[pvV]*[vV][pvV]*', o) for o in options(words[1:])):
-            return []  # looks the names up, runs none
-        elif w in WRAPPERS:
+        if ASSIGNMENT.match(w):
+            forbidden_env(w)
             words = words[1:]
-            while words and (words[0].startswith('-') or (w == 'env' and '=' in words[0])):
-                words = words[2:] if words[0] in WRAPPERS[w] else words[1:]
-            if w == 'timeout' and words:
+            continue
+        name = program(os.path.basename(w))
+        if name == 'command' and any(re.fullmatch(r'-[pvV]*[vV][pvV]*', o) for o in options(words[1:])):
+            return [], False, None, True  # looks the names up, runs none
+        if name in WRAPPERS:
+            if name == 'xargs' and xargs:
+                raise Denied('xargs under xargs substitutes into the inner command at run time; run one xargs')
+            xargs = xargs or name == 'xargs'
+            given = words[1:]
+            words, values = strip_wrapper_options(name, given)
+            replace = values.get('-I', replace) if name == 'xargs' else replace
+            if name == 'sudo' and not words and ('-s' in values or '-i' in values):
+                raise Denied(STDIN_RULE)
+            if name == 'timeout' and words:
                 words = words[1:]  # the duration
+            # bash splits an expansion into words, so one option value or assignment may hold the program
+            if any('$' in w or UNKNOWN in w for w in given[:len(given) - len(words)]):
+                raise Denied(f'`{name}` takes a word expanded at run time, which may split into more words and hide the '
+                             'program; give its options and assignments literally')
         else:
             break
-    return words
+    return words, xargs, replace, name == 'xargs'
+
+
+def strip_wrapper_options(name, words):
+    """(a wrapper's words past its leading options, {option: value, or True for a flag}). Each long option, and each
+    letter of a short cluster, must be in the wrapper's table with a known value: a letter taking a value takes the
+    rest of its cluster, else the next word."""
+    value, flags = WRAPPERS[name], WRAPPER_FLAGS.get(name, set())
+    given, ended = {}, False
+
+    def unknown(a):
+        return Denied(f'`{name}` has an option `{a}` this guard does not follow; run the command as plain words, or dispatch it to a unit')
+    while words:
+        a, words = words[0], words[1:]
+        if a == '--' and not ended:
+            ended = True
+            continue
+        # env reads every word holding `=` before its program as an assignment, past `--` too; sudo one before `--` not
+        # starting with `/`, then reads options again
+        if '=' in a and (name == 'env' and (ended or not a.startswith('-'))
+                         or name == 'sudo' and not (ended or a.startswith(('-', '/')))):
+            forbidden_env(a, bash=False)
+            continue
+        if ended or not a.startswith('-') or (a == '-' and '-' not in flags):
+            return [a] + words, given
+        if a == '-' or a.startswith('--'):
+            opt, eq, _ = a.partition('=')
+            if opt not in value | flags or (eq and opt not in value):
+                raise unknown(a)
+            if opt in value and not eq:
+                given[opt], words = words[0] if words else '', words[1:]
+            elif opt in flags:
+                given[opt] = True
+            continue
+        for pos, ch in enumerate(a[1:], 1):
+            opt = '-' + ch
+            if opt not in value | flags:
+                raise unknown(a)
+            if opt in flags:
+                given[opt] = True
+            if opt in value:
+                if pos == len(a) - 1:
+                    given[opt], words = words[0] if words else '', words[1:]
+                else:
+                    given[opt] = a[pos + 1:]
+                break
+    return words, given
+
+
+def forbidden_env(word, bash=True):
+    """An env assignment a tool runs as a command: a pager other than cat, or a variable git executes from; or a
+    GIT_TRACE* naming where git writes trace output. Only bash reads `NAME+=value` as an append; env sets a variable
+    named `NAME+`."""
+    name, _, value = word.partition('=')
+    append = bash and name.endswith('+')
+    name = name.removesuffix('+') if append else name
+    # an append extends a value this guard cannot see
+    if name in PAGER_ENV and (append or value.translate(UNQUOTED) not in ('cat', '')):
+        raise Denied(f'`{word.translate(UNQUOTED)}` runs a command as the pager; only `{name}=cat` passes')
+    if name in RUN_ENV or name.startswith('GIT_CONFIG'):
+        raise Denied(f'`{name}` makes a tool run a command this guard cannot vet; dispatch the step to a unit')
+    if name.startswith('GIT_TRACE') and (append or value.translate(UNQUOTED).lower() not in GIT_TRACE_QUIET):
+        raise Denied(f'`{word.translate(UNQUOTED)}` makes git write trace output to a file this guard cannot vet; only '
+                     f'`{name}=1` (stderr) or `{name}=0` passes')
 
 
 def options(words):
@@ -511,6 +803,10 @@ def gh(args):
 def written(cmd, args):
     """The paths a file-writing command names as its targets."""
     names = [a for a in args if not a.startswith('-')]
+    if cmd == 'dd':
+        return [a.split('=', 1)[1] for a in args if a.startswith('of=')]
+    if cmd == 'sort':
+        return sort_outputs(args)
     if cmd in WRITERS_LAST:
         if cmd == 'rsync':    # its -t keeps times
             return names[-1:]
@@ -522,6 +818,25 @@ def written(cmd, args):
     return names if cmd in WRITERS_ALL else []
 
 
+def sort_outputs(args):
+    """The files sort writes: only a separate `-o PATH` or `--output=PATH`; a cluster holding o, another spelling of
+    --output and --compress-program (which runs a program) are denied. Words past `--` are read too: a value-taking
+    option (`-T --`) may consume it."""
+    out, k = [], 0
+    while k < len(args):
+        a, k = args[k], k + 1
+        if a == '--':
+            continue
+        if a == '-o':
+            out.append(args[k] if k < len(args) else '')
+            k += 1
+        elif a.startswith('--output='):
+            out.append(a.split('=', 1)[1])
+        elif spelled([a], {'--output': 3, '--compress-program': 3}, 'o'):
+            raise Denied(f'`sort {a}` writes or runs what this guard does not follow; use `-o <absolute path>` as its own word')
+    return out
+
+
 def main(payload):
     guard = Guard(payload)
     data = payload.get('tool_input') or {}
@@ -529,7 +844,7 @@ def main(payload):
         if sys.platform in ('cygwin', 'msys'):   # os.name 'posix' there would skip every Windows check
             raise Denied(f'chief_guard needs a native Windows Python; this is {sys.platform}')
         if payload.get('tool_name') == 'Write':
-            guard.writes(data.get('file_path', ''), 'this Write')
+            guard.writes(data.get('file_path', ''), 'this Write', glob=False)
         elif payload.get('tool_name') == 'Bash':
             guard.command(data.get('command', ''))
     except Denied as e:
