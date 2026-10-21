@@ -19,6 +19,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -48,6 +49,8 @@ case "$ACTION" in
   survivor) setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   survivor-same-group) sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   hang) sleep 30; exit 0 ;;
+  signals) exec grep -E '^Sig(Blk|Ign):' /proc/$$/status > "$ARGV_OUT.sig" ;;
+  trap) exec bash -c 'trap "echo TRAPPED; exit 7" TERM; trap "echo HUP TRAPPED" HUP; for _ in $(seq 50); do sleep 0.1; done' ;;
   refuse) exit 3 ;;
   refuse-drop) mv "$SYS_DEVICES/3-1.4.1" "$SYS_DEVICES/.gone"; exit 3 ;;
   probe-locks) python3 - "$LOCK_DIR" > "$ARGV_OUT.locks" <<'PY'
@@ -110,6 +113,15 @@ class Child:
             if 'BLOCKER' in line:
                 return line
         return ''
+
+    def through_blocker(self):
+        """Everything printed up to and including the blocker line."""
+        out = []
+        for line in self.stdout:
+            out.append(line)
+            if 'BLOCKER' in line:
+                break
+        return ''.join(out)
 
     def token(self):
         return token_of(self.blocker())
@@ -489,11 +501,11 @@ class Run(Fixture):
 
     def test_a_record_write_that_fails_halfway_refuses_and_clears_what_it_wrote(self):
         def patch(m):
-            def write_record(fh, reason, **extra):
+            def write_record(fh, *a):
                 fh.write(json.dumps({'pid': os.getpid(), 'reason': 'half'}))
                 fh.flush()
                 raise OSError('disk full')
-            m.hil_lock.write_record = write_record
+            m.hil_lock._write_record = write_record
         p = self.run_run(patch=patch)
         out = p.output()
         self.assertEqual((p.returncode, 'board lock unavailable: holder record: disk full' in out), (1, True), out)
@@ -601,10 +613,11 @@ class Run(Fixture):
         self.assertEqual(self.held(), set())
 
     def test_a_command_that_cannot_start_releases_the_locks_and_refuses(self):
+        empty = Path(self.td.name) / 'empty'
+        empty.mkdir()
+
         def patch(m):
-            def popen(*a, **k):
-                raise FileNotFoundError(2, 'No such file or directory', 'sudo')
-            m.subprocess.Popen = popen
+            os.environ['PATH'] = str(empty)         # no sudo to find
         p = self.run_run(patch=patch)
         out = p.output()
         self.assertEqual(p.returncode, 1, out)
@@ -739,6 +752,20 @@ class Run(Fixture):
                 p.kill()
                 self.recovered()
 
+    def test_a_survivor_stays_a_child_of_the_cleanup_holder_until_the_token_release(self):
+        p = self.run_run(action='survivor')
+        token = p.token()
+        orphan = int(Path(str(self.argv_out) + '.pid').read_text())
+        self.addCleanup(lambda: os.kill(orphan, signal.SIGKILL) if hr.hil_lock.proc_start(orphan) else None)
+        ppid = Path(f'/proc/{orphan}/stat').read_text().rpartition(')')[2].split()[1]
+        self.assertEqual(int(ppid), p.pid)       # the holder is this process, still the subreaper
+        self.assert_cleanup_holder(p, token)
+        self.assertNotIn('receipts', self.records()['raspberry_pi_pico2'])     # no release predicate
+        rc, out = main('release', '--token', token)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(), 1)
+        self.assertEqual(self.held(), set())
+
     def test_sigterm_during_the_command_is_forwarded_and_ends_as_a_blocker(self):
         p = self.run_run(action='hang')
         self.wait_for(lambda: self.argv_out.exists(), 'the command to start')
@@ -748,20 +775,78 @@ class Run(Fixture):
         self.assertIn('SIGTERM forwarded', line)
         self.assertIn('command exited -15', line)
 
-    def test_a_signal_during_the_spawn_waits_for_the_group_and_is_forwarded(self):
-        def patch(m):
-            real = m.subprocess.Popen
+    def test_a_signal_during_the_spawn_waits_for_the_group_and_follows_the_command_policy(self):
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            for when in ('before', 'after'):
+                with self.subTest(sig=sig.name, when=when):
+                    def patch(m, sig=sig, when=when):
+                        # a second thread, as a sysfs reader can be: the kernel may hand it the signal
+                        threading.Thread(target=time.sleep, args=(60,), daemon=True).start()
+                        real = m.os.posix_spawnp
 
-            def popen(*a, **k):
-                proc = real(*a, **k)
-                os.kill(os.getpid(), signal.SIGTERM)       # lands while the spawn is still in progress
-                return proc
-            m.subprocess.Popen = popen
-        p = self.run_run(action='hang', patch=patch)
-        line = p.blocker()
-        self.assertIn('SIGTERM forwarded', line)
-        self.assertIn('command exited -15', line)
-        self.assertEqual(self.records()['raspberry_pi_pico2']['role'], 'cleanup-holder')
+                        def spawn(*a, **k):
+                            if when == 'before':
+                                os.kill(os.getpid(), sig)      # lands just before the spawn
+                            pid = real(*a, **k)
+                            if when == 'after':
+                                os.kill(os.getpid(), sig)      # lands before the group is recorded
+                            return pid
+                        m.os.posix_spawnp = spawn
+                    p = self.run_run(action='hang', patch=patch)
+                    if sig == signal.SIGHUP:            # noted, the command runs on until a SIGTERM
+                        self.wait_for(lambda: self.argv_out.exists(), 'the command to start')
+                        time.sleep(0.3)
+                        self.assertIsNone(p.poll())
+                        p.send_signal(signal.SIGTERM)
+                    line = p.blocker()
+                    if sig == signal.SIGHUP:
+                        self.assertIn('SIGHUP ignored during command', line)
+                    self.assertIn('SIGTERM forwarded', line)
+                    self.assertIn('command exited -15', line)
+                    self.assertEqual(self.records()['raspberry_pi_pico2']['role'], 'cleanup-holder')
+                    p.kill()
+                    self.argv_out.unlink(missing_ok=True)      # a SIGTERM may end the stub before it writes
+                    self.recovered()
+
+    def test_the_command_starts_unblocked_with_default_dispositions_and_the_mask_is_restored(self):
+        mask_after = Path(self.td.name) / 'mask-after'
+
+        def patch(m):
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR2, signal.SIGHUP})   # blocked before run
+            real = m.Reservation.run
+
+            def run(res, argv):
+                rc = real(res, argv)
+                mask_after.write_text(' '.join(sorted(s.name for s in signal.pthread_sigmask(signal.SIG_BLOCK, []))))
+                return rc
+            m.Reservation.run = run
+        p = self.run_run(action='signals', patch=patch)
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(mask_after.read_text(), 'SIGHUP SIGUSR2')
+        status = dict(line.split(':\t') for line in Path(str(self.argv_out) + '.sig').read_text().splitlines())
+        bit = lambda s: 1 << (s - 1)
+        self.assertEqual(int(status['SigBlk'], 16), 0)
+        ignored = int(status['SigIgn'], 16)
+        for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGPIPE, signal.SIGXFSZ):
+            self.assertFalse(ignored & bit(s), s.name)
+        self.assertTrue(ignored & bit(signal.SIGUSR1))      # inherited, as Popen left it
+
+    def test_a_forwarded_sigterm_reaches_the_commands_trap_and_a_hangup_does_not(self):
+        p = self.run_run(action='trap')
+        self.wait_for(lambda: self.argv_out.exists(), 'the command to start')
+        time.sleep(0.3)
+        p.send_signal(signal.SIGHUP)                    # not forwarded: the trap must not fire
+        time.sleep(0.3)
+        self.assertIsNone(p.poll())
+        p.send_signal(signal.SIGTERM)
+        out = p.through_blocker()
+        self.assertIn('TRAPPED\n', out)
+        self.assertNotIn('HUP TRAPPED', out)
+        self.assertIn('SIGHUP ignored during command', out)
+        self.assertIn('SIGTERM forwarded', out)
+        self.assertIn('command exited 7', out)
+        self.assert_cleanup_holder(p, token_of(out.splitlines()[-1]))
 
     def test_a_lost_progress_reader_does_not_abandon_the_command(self):
         marker = Path(self.td.name) / 'progress-attempted'
@@ -987,13 +1072,14 @@ class RootCycleScript(Fixture):
         self.assertEqual(self.runs(), ['check', 'off'])          # no power-on after a survivor
         self.assert_cleanup_holder(p, token_of(line))
 
-    def test_a_hung_off_ended_at_the_bound_keeps_every_reservation_though_power_was_restored(self):
-        # not signal delivery: the command inherits SIGINT/SIGTERM/SIGHUP blocked from run()'s
-        # spawn, so the forwarded SIGTERM stays pending in bash and the hung off ends at the bound
+    def test_a_sigterm_during_a_hung_off_powers_on_and_keeps_every_reservation(self):
+        # the forwarded SIGTERM ends the off request and fires the script's trap, well before the bound
         p = self.run_run(action='off=hang')
         self.wait_for(lambda: 'off' in self.runs(), 'the power-off run')
         p.send_signal(signal.SIGTERM)
-        line = p.blocker()
+        out = p.through_blocker()
+        line = out.splitlines()[-1]
+        self.assertIn('failed (off 143, on 0, interrupted); power-on restored', out)
         self.assertIn('SIGTERM forwarded', line)
         self.assertIn('command exited 1', line)
         self.assertEqual(self.runs(), ['check', 'off', 'on'])

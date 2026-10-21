@@ -29,6 +29,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import functools
+import glob
 import hashlib
 import json
 import os
@@ -354,8 +356,19 @@ def differing(pinned, staged, prefixes=()):
                    *(p for p in pinned if p.startswith(tuple(prefixes)) and p not in staged)})
 
 
+@functools.cache
+def _git_local_vars():
+    names = subprocess.run(['git', 'rev-parse', '--local-env-vars'], capture_output=True, text=True).stdout.split()
+    if not names:
+        fail('git rev-parse --local-env-vars listed nothing: cannot keep a caller\'s GIT_* off the checkout')
+    return frozenset(names)
+
+
 def git(root, *argv):
-    out = subprocess.run(['git', '-C', str(root), *argv], capture_output=True, text=True)
+    """git in root, deaf to the GIT_* that would aim it elsewhere or reconfigure it (a hook's
+    GIT_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS...)."""
+    env = {k: v for k, v in os.environ.items() if k not in _git_local_vars()}
+    out = subprocess.run(['git', '-C', str(root), *argv], capture_output=True, text=True, env=env)
     if out.returncode:
         fail(f'git {" ".join(argv)}: {out.stderr.strip()}')
     return out.stdout.strip()
@@ -366,7 +379,7 @@ def checkout_drift(root, head, files=None):
     or root-relative: sha256}) as pinned; empty when it is. What is staged from the live
     checkout is head's only then."""
     now = git(root, 'rev-parse', 'HEAD')
-    dirty = git(root, 'status', '--porcelain', '--untracked-files=no')
+    dirty = git(root, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '--untracked-files=no')
     why = [head != now and f'it is for {head[:12]} but the checkout is at {now[:12]}',
            dirty and f'tracked files changed since HEAD: {", ".join(ln.split(None, 1)[1] for ln in dirty.splitlines()[:5])}',
            *(f'{p} is not the one it was built from' for p, d in (files or {}).items() if digest(Path(root) / p) != d)]
@@ -1144,17 +1157,25 @@ def _settle(dest):
     """Finish a publication a collector was interrupted in: with dest gone its previous collection
     goes back, else dest is the replacement and the one set aside goes."""
     old = _aside(dest)
+    if (old.exists() or old.is_symlink()) and not (dest.exists() or dest.is_symlink()):
+        old.rename(dest)
+    _drop(dest)
+
+
+DROP_TOKEN_BYTES = 8   # debris names end in this many random bytes, hex
+
+
+def _drop(dest):
+    """Remove the collection dest has replaced, renamed first to a name _settle never restores, so
+    a removal that fails part-way leaves debris rather than a collection; debris that resists
+    waits for the next _settle."""
+    old = _aside(dest)
     if old.exists() or old.is_symlink():
-        if dest.exists() or dest.is_symlink():
-            _drop(old)
-        else:
-            old.rename(dest)
-
-
-def _drop(old):
-    """Remove a set-aside collection dest has replaced; one that resists waits for the next _settle."""
-    with contextlib.suppress(OSError):
-        _remove(old)
+        with contextlib.suppress(OSError):
+            old.rename(dest.with_name(f'.{dest.name}.drop-{secrets.token_hex(DROP_TOKEN_BYTES)}'))
+    for debris in dest.parent.glob(f'.{glob.escape(dest.name)}.drop-' + '[0-9a-f]' * (2 * DROP_TOKEN_BYTES)):
+        with contextlib.suppress(OSError):
+            _remove(debris)
 
 
 def _publish(tmp, dest):
@@ -1171,7 +1192,7 @@ def _publish(tmp, dest):
             old.rename(dest)
         raise
     if aside:
-        _drop(old)
+        _drop(dest)
 
 
 def _uncovered(held, groups, optional):

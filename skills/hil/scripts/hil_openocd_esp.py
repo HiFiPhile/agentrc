@@ -90,11 +90,16 @@ USJ_VID_PID = ('303a', '1001')       # interface/esp_usb_jtag.cfg's `adapter usb
 USB_LOCATION_MAX = 15
 
 CLEANUP_TIMEOUT = 30                 # seconds for the reviewed end: reset run, shutdown, exit
+# seconds from the call to resolving the USJ and starting the server. An empirical workaround, not a
+# silicon rule: on the htpc P4 rev v1.0 a session whose init came within ms of another tool's hard reset
+# failed every reset-assert-post hook, one ~150 ms or more later passed (#160). The P4 TRM, errata and
+# datasheets give no post-reset debug window; the TRM says only that SRST does not reset the USJ
+# controller itself (book 4889, v1.3 TRM §49.3.3 p2467), not that the USJ survives every hard reset.
+BOOT_SETTLE = 1.0
 # a GitHub Actions job sets these, and one set even to '' counts: the runner kills the processes
 # carrying the job's tracking id at job end (actions/runner v2.337.0 src/Runner.Worker/JobExtension.cs:586-592, 880-926)
 CI_JOB_ENV = ('RUNNER_TRACKING_ID', 'GITHUB_ACTIONS')
 
-_UID_RE = re.compile(r'[A-Za-z0-9_.:+-]+')
 _PATH_RE = re.compile(r'/[A-Za-z0-9_./+-]*')    # a path that reaches a Tcl command unquoted
 _CHIP = r'esp32[a-z0-9]*'
 
@@ -121,7 +126,7 @@ def admit(flasher: dict) -> tuple:
     if (flasher.get('name') or '') != 'openocd_esp':
         raise ValueError(f'not an openocd_esp flasher: {flasher.get("name")!r}')
     uid = flasher.get('uid')
-    if not isinstance(uid, str) or not _UID_RE.fullmatch(uid):
+    if not isinstance(uid, str) or not hil_flash.UID_RE.fullmatch(uid):
         raise ValueError(f'openocd_esp uid {uid!r}: want the USJ serial (letters, digits and _ . : + -)')
     if 'vid_pid' in flasher:
         raise ValueError('openocd_esp takes no vid_pid: interface/esp_usb_jtag.cfg selects 303a:1001 and the '
@@ -505,11 +510,14 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None):
     """Admit, resolve and start a session in a new directory under `workdir`, init it, run
     `work(session)` within `timeout` seconds, then end it as the module docstring says; `record`
     joins the operation's `session`. Refusals raise before anything starts; an exception after
-    the start carries `.operation`."""
+    the start carries `.operation`. The USJ is resolved and the server started no earlier than
+    BOOT_SETTLE seconds after the call; admission runs inside that window, `timeout` after it."""
+    t0 = time.monotonic()
     chip, cfgs = admit(flasher)
     workdir = _workdir(workdir)
     tool = find_openocd(openocd)
     check_cfgs(chip, cfgs, tool['scripts'])
+    time.sleep(max(0, t0 + BOOT_SETTLE - time.monotonic()))
     location = usj_location(flasher['uid'])
     out = tempfile.mkdtemp(prefix='hil_openocd_esp_', dir=workdir)
     port, token = esp_session.free_ports(1)[0], secrets.token_hex(8)

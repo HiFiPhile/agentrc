@@ -337,13 +337,15 @@ class UsbScan(unittest.TestCase):
             return real(path, *a, **k)
         patch(self, uo, 'read_sysfs', counting)
 
-    def dev(self, name, vid, pid, serial='S1'):
+    def dev(self, name, vid, pid, serial='S1', **attrs):
         d = self.root / name
         d.mkdir()
         (d / 'idVendor').write_text(vid + '\n')
         (d / 'idProduct').write_text(pid + '\n')
         if serial is not None:
             (d / 'serial').write_text(serial + '\n')
+        for attr, value in attrs.items():
+            (d / attr).write_text(value + '\n')
         return d
 
     def test_a_mismatched_vid_pid_costs_no_serial_read(self):
@@ -351,8 +353,53 @@ class UsbScan(unittest.TestCase):
         self.dev('1-2', 'cafe', '4010', serial='UID1')
         devs = uo.usb_scan(vid_pid=('cafe', '4010'))
         self.assertEqual(devs, [{'busport': '1-2', 'dir': str(self.root / '1-2'),
-                                 'vid': 'cafe', 'pid': '4010', 'serial': 'UID1'}])
+                                 'ino': os.stat(self.root / '1-2').st_ino,
+                                 'vid': 'cafe', 'pid': '4010', 'serial': 'UID1', 'busnum': None,
+                                 'devnum': None, 'speed': None, 'bcdDevice': None}])
         self.assertNotIn(str(self.root / '1-1' / 'serial'), self.reads)
+
+    def test_the_lock_free_attributes_come_with_each_device(self):
+        self.dev('3-2', 'cafe', '4010', serial='UID1', busnum='3', devnum='17', speed='480',
+                 bcdDevice='0102')
+        [d] = uo.usb_scan(vid_pid=('cafe', '4010'))
+        self.assertEqual((d['busnum'], d['devnum'], d['speed'], d['bcdDevice']), (3, 17, '480', '0102'))
+
+    def test_an_absent_or_malformed_new_attribute_never_drops_a_device(self):
+        """busnum/devnum/speed/bcdDevice were added for usbtest's lookup: a device every caller
+        received before them must still be returned, with the gap as None."""
+        self.dev('1-1', 'cafe', '4010', serial='UID1', busnum='x', devnum='', speed='12')
+        (self.root / '1-1' / 'bcdDevice').mkdir()            # unreadable as a file
+        [d] = uo.usb_scan(vid_pid=('cafe', '4010'))
+        self.assertEqual((d['busport'], d['serial']), ('1-1', 'UID1'))
+        self.assertEqual((d['busnum'], d['devnum'], d['speed'], d['bcdDevice']), (None, None, '12', None))
+
+    def test_a_device_re_enumerated_during_its_serial_read_is_left_to_the_next_scan(self):
+        """busnum/devnum come from the walk; a serial read across a re-enumeration answers for
+        the new device, and pairing the two would hand out the old node."""
+        self.dev('1-1', 'cafe', '4010', serial='OLD', busnum='1', devnum='2')
+        real = uo.read_sysfs
+
+        def replacing(path, *a, **k):
+            os.rename(self.root / '1-1', self.root / 'old')       # the new node gets a new inode
+            self.dev('1-1', 'cafe', '4010', serial='NEW', busnum='1', devnum='3')
+            return real(path, *a, **k)
+        patch(self, uo, 'read_sysfs', replacing)
+        self.assertEqual(uo.usb_scan(vid_pid=('cafe', '4010')), [])
+        patch(self, uo, 'read_sysfs', real)
+        self.assertEqual([(d['devnum'], d['serial']) for d in uo.usb_scan()], [(3, 'NEW')])
+
+    def test_usb_devices_never_reads_serial(self):
+        self.dev('1-1', 'cafe', '4010', serial='UID1', devnum='5')
+        self.dev('1-2', 'cafe', '4011', serial=None)
+        self.assertEqual(sorted((d['busport'], d['devnum']) for d in uo.usb_devices(vid='cafe')),
+                         [('1-1', 5), ('1-2', None)])
+        self.assertEqual(self.reads, [])
+
+    def test_an_unfiltered_walk_skips_a_device_without_both_ids(self):
+        self.dev('1-1', 'cafe', '4010')
+        self.dev('1-2', 'cafe', '')
+        (self.dev('1-3', 'cafe', '4010') / 'idVendor').unlink()
+        self.assertEqual([d['busport'] for d in uo.usb_devices()], ['1-1'])
 
     def test_root_hubs_interfaces_and_serialless_devices_are_left_out(self):
         self.dev('usb1', '1d6b', '0002', serial='0000:00:14.0')
@@ -398,6 +445,37 @@ class FakeRig:
         if udev_serial is not None:
             (self.root / 'udev' / f'c{devt}').write_text(
                 f'I:1\nE:ID_SERIAL=X_{udev_serial}\nE:ID_SERIAL_SHORT={udev_serial}\n')
+
+
+class JLinkSerial(unittest.TestCase):
+    """J-Link reports a numeric serial zero-padded (681295394 is 000681295394); probe_state keeps
+    the same rule so it runs copied alone, held to this table."""
+    TABLE = (('681295394', '681295394', 'exact'), ('E6614C311B597D32', 'e6614c311b597d32', 'exact'),
+             ('681295394', '000681295394', 'padded'), ('000681295394', '681295394', 'padded'),
+             ('0681295394', '00681295394', 'padded'),
+             ('123456', '000123456', 'padded'), ('000123456', '123456', 'padded'), ('123456', '000123457', None),
+             ('000', '0', None), ('0', '', None), ('000', '000', 'exact'),
+             ('12a', '012a', None), ('681295394', '6812953940', None))
+
+    def test_the_rule_and_probe_states_copy_of_it(self):
+        spec = importlib.util.spec_from_file_location(
+            'probe_state', SCRIPT.parents[2] / 'target-debug' / 'scripts' / 'probe_state.py')
+        probe_state = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe_state)
+        for uid, serial, want in self.TABLE:
+            with self.subTest(uid=uid, serial=serial):
+                self.assertEqual(uo.jlink_serial_match(uid, serial), want)
+                self.assertEqual(probe_state.jlink_serial_match(uid, serial), want is not None)
+
+    def test_candidates_prefer_an_exact_match_over_a_padded_one(self):
+        serials = {'1-1': '000681295394', '1-2': '681295394', '1-3': '123456'}
+        self.assertEqual(uo.jlink_serial_candidates('681295394', serials), ['1-2'])
+        del serials['1-2']
+        self.assertEqual(uo.jlink_serial_candidates('681295394', serials), ['1-1'])
+        self.assertEqual(uo.jlink_serial_candidates('000', {'1-1': '0'}), [])
+        self.assertEqual(uo.jlink_serial_candidates('123456', {'1-1': '123456', '1-2': '0123456'}), ['1-1'])
+        self.assertEqual(uo.jlink_serial_candidates('123456', {'1-2': '0123456', '1-1': '000123456', '1-3': '1'}),
+                         ['1-1', '1-2'], 'every best-tier match stays visible')
 
 
 class HolderLookup(unittest.TestCase):

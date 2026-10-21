@@ -931,6 +931,34 @@ class Drift(unittest.TestCase):
             rc_.git(self.root / 'nope', 'rev-parse', 'HEAD')
         self.assertIn('git rev-parse HEAD', e.exception.code)
 
+    def test_a_hooks_git_environment_neither_redirects_nor_reconfigures_it(self):
+        # TemporaryDirectory, not mkdtemp+rmtree: its cleanup clears git's read-only objects on Windows
+        tmp = tempfile.TemporaryDirectory(dir=self.root.parent)
+        self.addCleanup(tmp.cleanup)
+        other = Path(tmp.name)
+        subprocess.run(['git', '-C', str(other), 'init', '-q'], check=True)
+        (other / 'a').write_text('a')
+        subprocess.run(['git', '-C', str(other), 'add', 'a'], check=True)
+        before = (other / '.git' / 'index').read_bytes()
+        (self.root / 'é.txt').write_text('x')
+        self.commit('non-ascii')
+        head = rc_.git(self.root, 'rev-parse', 'HEAD')
+        (self.root / 'é.txt').write_text('edited')
+        os.environ.update({'GIT_DIR': str(other / '.git'), 'GIT_WORK_TREE': str(other),
+                           'GIT_INDEX_FILE': str(other / '.git' / 'index'),
+                           'GIT_OBJECT_DIRECTORY': str(other / '.git' / 'objects'),
+                           'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.quotePath', 'GIT_CONFIG_VALUE_0': 'false'})
+        self.assertEqual(rc_.checkout_drift(self.root, head),
+                         ['tracked files changed since HEAD: "\\303\\251.txt"'])
+        self.assertEqual((other / '.git' / 'index').read_bytes(), before)
+
+    def test_status_never_runs_the_checkouts_fsmonitor_hook(self):
+        marker = self.root.parent / f'{self.root.name}.fsmonitor'
+        self.addCleanup(marker.unlink, missing_ok=True)
+        self.git('config', 'core.fsmonitor', f'touch {shlex.quote(str(marker))}; false')
+        self.assertEqual(rc_.checkout_drift(self.root, self.head), [])
+        self.assertFalse(marker.exists())
+
 
 class RunRecords(unittest.TestCase):
     """A wrapper's local started/done records and the wait on them. No rig: the body is stubbed,
@@ -1731,7 +1759,7 @@ class Attempts(Rig):
         self.assertEqual((col['state'], col['unaccepted']), ('complete', []))
         self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
 
-    def test_a_set_aside_collection_that_cannot_be_removed_waits_for_the_next_collector(self):
+    def test_a_replaced_collection_that_cannot_be_removed_waits_for_the_next_collector(self):
         tree = self.done_attempt()
         dest = self.tmp / 'got'
         rc_.collect(tree, dest, optional=['out/'])
@@ -1739,15 +1767,49 @@ class Attempts(Rig):
         real = rc_._remove
 
         def remove(p):
-            if Path(p).name == '.got.old':
+            if Path(p).name.startswith('.got.drop-'):
                 raise PermissionError(13, 'Permission denied')
             return real(p)
         with mock.patch.object(rc_, '_remove', remove):
             col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
             self.assertEqual((col['state'], (dest / 'out/late.json').read_text()), ('complete', 'late'))
             self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
-        self.assertTrue((self.tmp / '.got.old').exists())
+        self.assertEqual([p.name[:10] for p in self.tmp.glob('.got.[!c]*')], ['.got.drop-'])
         self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
+
+    def test_debris_removal_spares_a_sibling_that_only_shares_its_prefix(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        rc_.collect(tree, dest, optional=['out/'])
+        (self.tmp / '.got.drop-backup').mkdir()
+        (self.tmp / '.got.drop-backup/keep').write_text('mine')
+        (self.base / 'a1/out/late.json').write_text('late')
+        rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((self.tmp / '.got.drop-backup/keep').read_text(), 'mine')
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock', '.got.drop-backup'])
+
+    def test_a_partly_removed_collection_is_never_restored(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        rc_.collect(tree, dest, optional=['out/'])
+        (self.base / 'a1/out/late.json').write_text('late')
+        real = rc_._remove
+        partly = []
+
+        def remove(p):
+            if Path(p).name == '.got.old' or Path(p).name.startswith('.got.drop-'):
+                (Path(p) / 'out/report.json').unlink()
+                partly.append(p)
+                raise OSError(5, 'Input/output error')
+            return real(p)
+        with mock.patch.object(rc_, '_remove', remove):
+            rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual(len(partly), 1)
+        shutil.rmtree(dest)
+        (self.base / 'a1/out/report.json').write_text('fetched again')
+        col = rc_.collect(tree, dest, optional=['out/'])
+        self.assertEqual((col['state'], (dest / 'out/report.json').read_text()), ('complete', 'fetched again'))
         self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
 
     def test_running_partial_then_dead_never_complete_nor_relaunched(self):
