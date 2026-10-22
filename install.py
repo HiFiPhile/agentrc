@@ -50,9 +50,13 @@ exclude), which every worktree shares: an entry stays while any worktree of
 the repository has it, so `git status` stays clean. A destination the
 repository tracks, or a real file or nonempty directory there such as the
 project's own skill of that name, refuses before any change; --skip-clashes
-leaves it and skips that entry, and its hook's registration with it.
+leaves it and skips that entry, and its hook's registration with it, and a
+skipped skill's hook. A symlinked directory between <dir> and a destination,
+and a settings.local.json that is tracked or a link, refuse both actions;
+pruning leaves a tracked link alone.
 """
 import argparse
+import functools
 import json
 import os
 import re
@@ -220,13 +224,15 @@ def prune(kind):
     """Drop our links whose source left the repo, or is a skill directory without SKILL.md; leave every other link
     alone, and never the directory a link names."""
     source = REPO / {'skill': 'skills', 'agent': 'agents', 'hook': 'hooks', 'workflow': 'workflows', 'bin': 'bin'}[kind]
-    for parent in dirs(kind):
-        for path in parent.iterdir() if parent.is_dir() else ():
-            if not path.is_symlink():
-                continue
-            gone = not path.exists() or kind == 'skill' and not (path / 'SKILL.md').is_file()
-            if gone and inside(target(path), source):
-                unlink(path)
+    dead = [path for parent in dirs(kind) for path in (parent.iterdir() if parent.is_dir() else ())
+            if path.is_symlink() and (not path.exists() or kind == 'skill' and not (path / 'SKILL.md').is_file())
+            and inside(target(path), source)]
+    listed = tracked([relative(path) for path in dead]) if PROJECT else set()
+    for path in dead:
+        if PROJECT and is_tracked(relative(path), listed):
+            print(f'{path} is tracked by the repository, left alone')
+        else:
+            unlink(path)
 
 
 # --- hook registration in settings.json --------------------------------------
@@ -275,17 +281,20 @@ def settings():
     return PROJECT / SETTINGS_LOCAL if PROJECT else Path.home() / '.claude' / 'settings.json'
 
 
-def plan_settings(names, install, statusline, keep_env=False):
+def plan_settings(names, install, statusline, keep_env=False, drop=()):
     """(before, after) texts for registering or unregistering these hooks and
     the status line, and with --project AGENTRC_DIR, or None when nothing would
     change; after is None for a project file left empty. Computed before any
     link moves, so a settings file of the wrong shape refuses instead of
-    leaving a half job. keep_env: links of ours stay, so remove keeps AGENTRC_DIR."""
+    leaving a half job. keep_env: links of ours stay, so remove keeps AGENTRC_DIR. drop: hooks unregistered
+    whatever the action."""
     path = settings()
     before = path.read_text(encoding='utf-8') if path.exists() else ''
     data = json.loads(before) if before else {}
-    if names:
+    if names or drop:
         hooks = data.setdefault('hooks', {})
+        for name in drop:
+            strip(hooks, name)
         for name in names:
             strip(hooks, name)
             if install:
@@ -365,14 +374,54 @@ def relative(dst):
     return dst.relative_to(PROJECT).as_posix()
 
 
+@functools.cache
+def ignorecase(top):
+    """Whether git treats the work tree's names case-insensitively, as on a Windows or macOS file system."""
+    return git(top, 'config', '--bool', 'core.ignorecase', check=False).stdout.strip() == b'true'
+
+
+def tracked(rels):
+    """The paths the repository tracks among rels and below them, matched as git matches names."""
+    if not rels:
+        return set()
+    magic = 'literal,icase' if ignorecase(PROJECT) else 'literal'
+    listed = git(PROJECT, 'ls-files', '-z', '--', *(f':({magic}){rel}' for rel in rels)).stdout
+    return set(os.fsdecode(listed).split('\0')) - {''}
+
+
+def is_tracked(rel, listed):
+    if ignorecase(PROJECT):
+        rel, listed = rel.casefold(), {t.casefold() for t in listed}
+    return any(t == rel or t.startswith(rel + '/') for t in listed)
+
+
+def is_link(path):
+    """A symlink, or on Windows a junction, which is_symlink() does not count."""
+    return path.is_symlink() or getattr(path, 'is_junction', lambda: False)()
+
+
+def contained(paths):
+    """Refuse a symlinked directory between the work tree and a destination, which would carry the install
+    and a remove out of the work tree, and a settings.local.json that is tracked or a link: it is rewritten."""
+    for path in paths:
+        for parent in path.parents:
+            if parent == PROJECT:
+                break
+            if is_link(parent):
+                refuse(f'{parent} is a symlink or junction; a project install stays inside {PROJECT}, '
+                       'so make it a directory')
+    local = PROJECT / SETTINGS_LOCAL
+    if is_link(local) or is_tracked(SETTINGS_LOCAL, tracked([SETTINGS_LOCAL])):
+        refuse(f'{local} is tracked or a link, and install.py rewrites it; make it an untracked file first')
+
+
 def clashes(pairs):
     """{destination: why} for each one the repository tracks, or that holds a real file or a nonempty directory."""
     rels = {relative(dst): dst for _, (_, dst) in pairs}
-    listed = git(PROJECT, 'ls-files', '-z', '--', *(f':(literal){rel}' for rel in rels)).stdout
-    tracked = set(os.fsdecode(listed).split('\0')) - {''}
+    listed = tracked(list(rels))
     found = {}
     for rel, dst in rels.items():
-        if any(t == rel or t.startswith(rel + '/') for t in tracked):
+        if is_tracked(rel, listed):
             found[dst] = 'is tracked by the repository'
         elif dst.is_symlink() or not dst.exists() or (dst.is_dir() and not any(dst.iterdir())):
             continue
@@ -491,8 +540,8 @@ def selection(parser, args):
 
 
 def project_clashes(args, pairs):
-    """The pairs left once the project's own entries are set aside: install refuses on one unless
-    --skip-clashes, and remove leaves each alone."""
+    """(the pairs left once the project's own entries are set aside, the hook destinations of skipped skills):
+    install refuses on one unless --skip-clashes, and remove leaves each alone."""
     found = clashes(pairs)
     if found and args.action == 'install' and not args.skip_clashes:
         refuse('\n'.join(f'{dst} {found[dst]}; agentrc\'s {kind} of that name would shadow it or be shadowed'
@@ -500,7 +549,15 @@ def project_clashes(args, pairs):
                '\nmove it aside first, or rerun with --skip-clashes to leave it and skip that entry')
     for dst, why in found.items():
         print(f'{dst} {why}, ' + ('skipped' if args.action == 'install' else 'left alone'))
-    return [(kind, pair) for kind, pair in pairs if pair[1] not in found]
+    kept = [(kind, pair) for kind, pair in pairs if pair[1] not in found]
+    orphaned = []  # agentrc's hook of a skill the project has itself would guard the wrong skill
+    if args.action == 'install':
+        skipped = {dst.name for kind, (_, dst) in pairs if kind == 'skill' and dst in found}
+        orphaned = [dst for kind, (_, dst) in kept if kind == 'hook' and dst.name in skipped]
+        for dst in orphaned:
+            print(f'{dst} belongs to the skipped skill {dst.name}, skipped')
+        kept = [(kind, pair) for kind, pair in kept if pair[1] not in orphaned]
+    return kept, orphaned
 
 
 def main(argv=None):
@@ -528,8 +585,10 @@ def main(argv=None):
     if args.project:
         PROJECT, exclude, trees = work_tree(args.project)
     pairs = [(kind, pair) for kind, name in chosen for pair in links(kind, name)]
+    orphaned = []
     if PROJECT:
-        pairs = project_clashes(args, pairs)
+        contained([dst for _, (_, dst) in pairs] + [settings()])
+        pairs, orphaned = project_clashes(args, pairs)
     herdr_steps = plan_herdr(args.action == 'install') if args.herdr_plugin else []
     hooks = [dst.name for kind, (_, dst) in pairs if kind == 'hook']  # a skipped hook's link is not registered
     planned = None
@@ -538,7 +597,8 @@ def main(argv=None):
         keep_env = PROJECT and any(ours(p) and p not in removing for p in [PROJECT / 'CLAUDE.local.md'] + [
             p for kind in ('skill', 'agent', 'hook', 'workflow') for d in dirs(kind) if d.is_dir() for p in d.iterdir()])
         try:
-            planned = plan_settings(hooks, args.action == 'install', args.statusline, keep_env)
+            planned = plan_settings(hooks, args.action == 'install', args.statusline, keep_env,
+                                    [dst.name for dst in orphaned if ours(dst)])  # a project's own hook keeps its own
         except (ValueError, TypeError, AttributeError, KeyError) as err:
             refuse(f'{settings()} cannot be edited ({err!r}); fix it first')
 
@@ -562,6 +622,9 @@ def main(argv=None):
     run_herdr(herdr_steps)
     for _, (src, dst) in pairs:
         link(src, dst)
+    for dst in orphaned:  # linked by an earlier install, before the project had the skill
+        if ours(dst):
+            unlink(dst)
     for kind in {kind for kind, _ in chosen if kind in KINDS}:
         prune(kind)
     if planned:

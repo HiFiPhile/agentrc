@@ -109,9 +109,13 @@ and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
 - A destination the repository tracks, or a real file or nonempty directory
   there, such as the project's own skill of the same name, refuses before any
   change; `--skip-clashes` leaves it and skips that agentrc entry (and the
-  hook registration with a skipped hook). A directory left with only
-  `__pycache__` from a skill the project has since moved out is named as such;
-  delete it.
+  hook registration with a skipped hook, and a skipped skill's hook, whose
+  link and registration from an earlier install go). A
+  directory left with only `__pycache__` from a skill the project has since
+  moved out is named as such; delete it. Pruning leaves a tracked link alone.
+- Both actions refuse a symlinked directory between `<dir>` and a destination,
+  `.claude` itself included, which would carry them out of the work tree, and a
+  `settings.local.json` that is tracked or a link, since they rewrite it.
 - Project mode is Claude Code only: `--bin`, `--statusline` and
   `--herdr-plugin` are user-wide and refused with `--project`, and Codex has
   no project install, so its agents still need the user-wide `--agent`. A
