@@ -4,7 +4,7 @@
 
     install.py install --skill --agent --workflow --bin --claude-md --statusline --herdr-plugin
     install.py remove --skill
-    install.py install --project <work tree> --skill --agent --workflow [--skip-clashes]
+    install.py install --project <work tree> --skill --agent --workflow --claude-md [--skip-clashes]
 
 Skills link into ~/.claude/skills and ~/.codex/skills; agents into
 ~/.claude/agents (the .md) and ~/.codex/agents (the .md and its .toml);
@@ -35,13 +35,15 @@ worktree's top level: Claude Code finds project skills, agents and workflows
 only up to the work tree root and reads project settings only from the
 session's start directory, so each worktree that needs them is installed.
 Skills, a skill's hooks, agents (the .md only) and workflows link into
-<dir>/.claude/{skills,hooks,agents,workflows}. The hooks are registered in
+<dir>/.claude/{skills,hooks,agents,workflows}, and --claude-md links
+instructions/user.md as <dir>/CLAUDE.local.md, Claude Code's per-user
+instructions for that project. The hooks are registered in
 <dir>/.claude/settings.local.json, never the tracked settings.json, by absolute
 path as above, beside env AGENTRC_DIR: this checkout with / separators, which
 the `${AGENTRC_DIR:-$HOME/.claude}` paths in the skills, agents and workflows
 resolve to; remove takes AGENTRC_DIR out once no link of ours is left there,
-and the file too when nothing else is in it. Codex, bin/, CLAUDE.md, the status
-line and herdr are user-wide, so --project refuses their flags. Each link, and
+and the file too when nothing else is in it. Codex, bin/, the status line and
+herdr are user-wide, so --project refuses their flags. Each link, and
 settings.local.json unless git already ignores it, is an entry of one marked
 block in the repository's exclude file (`git rev-parse --git-common-dir`/info/
 exclude), which every worktree shares: an entry stays while any worktree of
@@ -118,6 +120,8 @@ def links(kind, name):
     if kind == 'statusline':  # statusline.sh runs its helpers from $HOME/.claude
         return [(REPO / 'statusline' / f, Path.home() / '.claude' / f)
                 for f in ('statusline.sh', 'statusline-codex-usage.py', 'statusline-prs.py')]
+    if PROJECT:  # a link, not an @-import: Claude Code skips an import from outside the project until approved
+        return [(REPO / 'instructions' / 'user.md', PROJECT / 'CLAUDE.local.md')]
     return [(REPO / 'instructions' / 'user.md', Path.home() / '.claude' / 'CLAUDE.md'),
             (Path('../.claude/CLAUDE.md'), Path.home() / '.codex' / 'AGENTS.md')]
 
@@ -152,6 +156,15 @@ def refuse(reason):
     sys.exit(1)
 
 
+def directories_for(path):
+    """Refuse unless each missing directory above path can be made: the nearest existing one is a real directory."""
+    for parent in path.parents:
+        if parent.is_dir():
+            break
+        if parent.exists() or parent.is_symlink():
+            refuse(f'{parent} is not a directory; move it aside first')
+
+
 def preflight(pairs):
     """Every destination must be absent, a symlink or an empty directory; every
     directory linked into, and each missing one's ancestors, must be a real
@@ -163,11 +176,7 @@ def preflight(pairs):
             except OSError as err:
                 refuse(f'cannot create symlinks ({err.strerror}); turn on Developer Mode or run elevated')
     for _, dst in pairs:
-        for parent in dst.parents:
-            if parent.is_dir():
-                break
-            if parent.exists() or parent.is_symlink():
-                refuse(f'{parent} is not a directory; move it aside first')
+        directories_for(dst)
         if dst.is_symlink() or not dst.exists():
             continue
         if dst.is_dir() and not any(dst.iterdir()):
@@ -501,7 +510,8 @@ def main(argv=None):
     parser.add_argument('action', choices=('install', 'remove'))
     for kind in FLAGS:
         parser.add_argument(f'--{kind}', action='store_true', help=f'every {kind}')
-    parser.add_argument('--claude-md', action='store_true', help='instructions/user.md as ~/.claude/CLAUDE.md, also ~/.codex/AGENTS.md')
+    parser.add_argument('--claude-md', action='store_true', help='instructions/user.md as ~/.claude/CLAUDE.md, also '
+                                                                    '~/.codex/AGENTS.md; with --project as its CLAUDE.local.md')
     parser.add_argument('--statusline', action='store_true', help='the Claude Code status line')
     parser.add_argument('--herdr-plugin', action='store_true', help='every plugins/* herdr plugin, through herdr')
     parser.add_argument('--project', metavar='DIR', help="into this work tree's .claude, for Claude Code only")
@@ -509,8 +519,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.skip_clashes and not args.project:
         parser.error('--skip-clashes goes with --project')
-    if args.project and (user_wide := [f for f in ('bin', 'claude_md', 'statusline', 'herdr_plugin') if getattr(args, f)]):
-        parser.error(f'--project takes only --skill, --agent and --workflow: --{user_wide[0].replace("_", "-")} is user-wide')
+    if args.project and (user_wide := [f for f in ('bin', 'statusline', 'herdr_plugin') if getattr(args, f)]):
+        parser.error(f'--project takes only --skill, --agent, --workflow and --claude-md: '
+                     f'--{user_wide[0].replace("_", "-")} is user-wide')
     if args.herdr_plugin and os.name == 'nt':
         refuse('--herdr-plugin: herdr runs on Linux and macOS only')
     chosen = selection(parser, args)
@@ -524,8 +535,8 @@ def main(argv=None):
     planned = None
     if hooks or args.statusline or PROJECT:
         removing = {dst for _, (_, dst) in pairs}
-        keep_env = PROJECT and any(ours(p) and p not in removing for kind in ('skill', 'agent', 'hook', 'workflow')
-                                   for d in dirs(kind) if d.is_dir() for p in d.iterdir())
+        keep_env = PROJECT and any(ours(p) and p not in removing for p in [PROJECT / 'CLAUDE.local.md'] + [
+            p for kind in ('skill', 'agent', 'hook', 'workflow') for d in dirs(kind) if d.is_dir() for p in d.iterdir()])
         try:
             planned = plan_settings(hooks, args.action == 'install', args.statusline, keep_env)
         except (ValueError, TypeError, AttributeError, KeyError) as err:
@@ -546,6 +557,8 @@ def main(argv=None):
         return
 
     preflight([pair for _, pair in pairs])
+    if planned and planned[1] is not None:  # CLAUDE.local.md alone does not check the .claude it is written into
+        directories_for(settings())
     run_herdr(herdr_steps)
     for _, (src, dst) in pairs:
         link(src, dst)

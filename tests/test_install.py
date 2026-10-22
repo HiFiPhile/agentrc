@@ -516,6 +516,41 @@ class ProjectInstallTest(unittest.TestCase):
         self.ok('remove', '--project', str(self.wt), '--workflow')
         self.assertIsNone(self.block())
 
+    def test_claude_md_is_the_projects_claude_local_md(self):
+        local = self.repo / 'CLAUDE.local.md'
+        self.ok('install', '--project', str(self.repo), '--claude-md')
+        self.assertTrue(os.path.samefile(local, ROOT / 'instructions' / 'user.md'))
+        self.assertIn('/CLAUDE.local.md', self.block())
+        self.assertEqual(self.status(), '')
+        self.assertEqual(os.listdir(self.home), [], 'no ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md')
+        self.ok('remove', '--project', str(self.repo), '--claude-md')
+        self.assertFalse(local.is_symlink() or local.exists())
+        self.assertIsNone(self.block())
+        local.write_text('the user\'s own')
+        done = self.run_cli('install', '--project', str(self.repo), '--claude-md')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('real file', done.stderr)
+        self.assertIn('skipped', self.ok('install', '--project', str(self.repo), '--claude-md', '--skip-clashes'))
+        self.assertIn('left alone', self.ok('remove', '--project', str(self.repo), '--claude-md'))
+        self.assertEqual(local.read_text(), 'the user\'s own')
+
+    def test_claude_md_keeps_agentrc_dir_while_it_stays(self):
+        self.ok('install', '--project', str(self.repo), '--claude-md', '--workflow')
+        self.ok('remove', '--project', str(self.repo), '--workflow')
+        self.assertEqual(self.local()['env'], {'AGENTRC_DIR': ROOT.as_posix()}, 'CLAUDE.local.md is still ours')
+        self.ok('remove', '--project', str(self.repo), '--claude-md')
+        self.assertFalse((self.repo / '.claude' / 'settings.local.json').exists())
+        self.assertIsNone(self.block())
+
+    def test_claude_md_alone_refuses_a_claude_dir_it_cannot_write_into(self):
+        shutil.rmtree(self.repo / '.claude')
+        (self.repo / '.claude').write_text('not a directory')
+        before = self.snapshot()
+        done = self.run_cli('install', '--project', str(self.repo), '--claude-md')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('is not a directory', done.stderr)
+        self.assertEqual(self.snapshot(), before, 'no CLAUDE.local.md left behind')
+
     def test_a_settings_local_file_already_ignored_gets_no_entry(self):
         (self.repo / '.gitignore').write_text('.claude/settings.local.json\n')
         self.git('add', '.gitignore')
@@ -601,7 +636,7 @@ class ProjectInstallTest(unittest.TestCase):
         self.assertIn('fix it first', self.run_cli('install', '--project', str(self.repo), '--workflow').stderr)
 
     def test_user_wide_flags_and_a_directory_that_is_no_top_level_are_refused(self):
-        for flag in ('--bin', '--claude-md', '--statusline', '--herdr-plugin'):
+        for flag in ('--bin', '--statusline', '--herdr-plugin'):
             done = self.run_cli('install', '--project', str(self.repo), '--skill', flag)
             self.assertEqual(done.returncode, 2, flag)
             self.assertIn('user-wide', done.stderr)
