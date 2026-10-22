@@ -76,9 +76,9 @@ install, user-wide or per project.
 and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
 
 ```sh
-~/code/agentrc/install.py install --project ~/code/tinyusb --skill --agent --workflow
-~/code/agentrc/install.py install --project ~/code/tinyusb/.worktrees/<branch> --skill --agent --workflow
-~/code/agentrc/install.py remove --project ~/code/tinyusb --skill --agent --workflow
+~/code/agentrc/install.py install --project ~/code/tinyusb --skill --agent --workflow --claude-md
+~/code/agentrc/install.py install --project ~/code/tinyusb/.worktrees/<branch> --skill --agent --workflow --claude-md
+~/code/agentrc/install.py remove --project ~/code/tinyusb --skill --agent --workflow --claude-md
 ```
 
 - `<dir>` must be a repository's or a linked worktree's top level. Claude Code
@@ -94,6 +94,11 @@ and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
   `${AGENTRC_DIR:-$HOME/.claude}/...` (`$HOME/.codex` for Codex), so it
   resolves to this checkout in a project install and to the user-wide links
   otherwise; a model that reads one by path expands it in the shell first.
+- `--claude-md` links `instructions/user.md` as `<dir>/CLAUDE.local.md`,
+  Claude Code's per-user instructions for that project, so the user-wide
+  rules and the co-words hold in that work tree only. A link, because an
+  `@`-import of a file outside the project loads only once approved
+  interactively, never in a headless session.
 - Each link, and `settings.local.json` unless git already ignores it, gets a
   line in one marked block of the repository's `.git/info/exclude`, which its
   worktrees share; a line stays while any worktree has that entry, so `git
@@ -106,9 +111,10 @@ and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
   hook registration with a skipped hook). A directory left with only
   `__pycache__` from a skill the project has since moved out is named as such;
   delete it.
-- Project mode is Claude Code only: `--bin`, `--claude-md`, `--statusline` and
+- Project mode is Claude Code only: `--bin`, `--statusline` and
   `--herdr-plugin` are user-wide and refused with `--project`, and Codex has
-  no project install, so its agents still need the user-wide `--agent`.
+  no project install, so its agents still need the user-wide `--agent`. A
+  Codex coworker needs no `CLAUDE.local.md`: `cowork` sends it its rules.
 - With a user-wide install as well, both apply, and its hooks fire too. The
   `headless-chief` shadow check never counts a project link to this checkout
   as a stale copy.
