@@ -19,6 +19,8 @@ import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -33,6 +35,10 @@ def load(name, where=SCRIPTS):
 
 tt = load('hil_tt')
 hp = load('hil_process')
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class TtPort(unittest.TestCase):
@@ -167,22 +173,16 @@ class ChildClosure(unittest.TestCase):
         alone = self.dir / 'alone'
         alone.mkdir()
         shutil.copy(SCRIPTS / 'hil_tt.py', alone / 'hil_tt.py')
-        copy = load('hil_tt', alone)
-        ran = []
-
-        def run(cmd, **kw):
-            ran.append(cmd)
-            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                  timeout=kw['timeout'])
-        # the parent reads the failure through the hil_process a deployment keeps beside it
-        with mock.patch.object(copy, '_hil_process', hp):
-            ok, err = self.reset(copy, run)
-        self.assertEqual(ran[0][2], str(alone / 'hil_tt.py'))
-        self.assertTrue(ok)
-        self.assertIn('Inappropriate ioctl', err)
-        self.assertNotIn('Error while finding', err)
-        self.assertNotIn('ModuleNotFoundError', err)
+        r = subprocess.run([sys.executable, '-I', str(alone / 'hil_tt.py'), str(self.node), '2'],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=tt.HELPER_TIMEOUT)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('Inappropriate ioctl', r.stdout)
+        self.assertNotIn('Error while finding', r.stdout)
+        self.assertNotIn('ModuleNotFoundError', r.stdout)
         self.assertEqual([p.name for p in alone.glob('*.py')], ['hil_tt.py'])
+
+    def test_the_child_is_this_file(self):
+        self.assertEqual(tt.child_argv('node', 2)[1:3], ['-I', str(SCRIPTS / 'hil_tt.py')])
 
     def test_the_default_runner_launches_the_real_child(self):
         ok, err = self.reset(tt)

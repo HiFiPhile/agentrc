@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import shlex
 import shutil
 import signal
 import subprocess
@@ -24,6 +25,8 @@ import time
 import types
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -40,6 +43,7 @@ eng = load('hil_farm_check')
 hf = load('hil_flash')
 lk = eng.hil_lock
 core = eng.report_core
+RECHECK = eng.hil_process.recheck   # before Engine stubs it: hil_lock's release predicate is the same instance
 
 BOARD = {'name': 'b', 'uid': 'U', 'flasher': {'name': 'lm4flash', 'uid': 'P', 'args': ''}}
 LOCAL = {'kind': 'local', 'receipt': 'build-receipt.json'}
@@ -49,6 +53,10 @@ def patch(test, obj, name, value):
     p = mock.patch.object(obj, name, value)
     p.start()
     test.addCleanup(p.stop)
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class StubProfile:
@@ -146,7 +154,7 @@ class Engine(unittest.TestCase):
 
     def tracked(self, cmd, cwd=None, *, timeout, settle, state_dir, **kw):
         self.assertEqual(state_dir, str(self.state))
-        name = cmd.rsplit('/', 1)[-1]
+        name = (shlex.join(cmd) if isinstance(cmd, list) else cmd).rsplit('/', 1)[-1]
         self.ran.append(name)
         out = self.outcomes.get(name, (0, 'done', 'ok'))
         if isinstance(out, BaseException):
@@ -567,8 +575,9 @@ class Engine(unittest.TestCase):
     def test_a_holder_that_registers_late_is_ended(self):
         real = lk._holder_argv
 
-        def late(job):
-            return ['sh', '-c', 'sleep 3; exec "$@"', 'sh', *real(job)]
+        def late(job):      # the delay in the holder's own process, so ending it leaves no survivor
+            return [sys.executable, '-c', 'import os, sys, time; time.sleep(3); os.execv(sys.argv[1], sys.argv[1:])',
+                    *real(job)]
         self.assert_failed_handoff(self.handoff(late))
         self.assertNotIn('role', lk.read_record('b'))
 
@@ -700,6 +709,7 @@ class Engine(unittest.TestCase):
         self.assertTrue(lk.is_cleanup_holder(rec))
         self.assertTrue(lk._holds_flock(rec['pid'], lk.lock_path('b')))
         self.assertTrue(rec['receipts'])         # its release predicate
+        patch(self, eng.hil_process, 'recheck', RECHECK)
         signals = []
         with mock.patch.object(lk.signal, 'pidfd_send_signal', lambda fd, sig: signals.append(sig)):
             # its receipt cannot be rechecked: unknown, refused up front naming it and the holder

@@ -27,6 +27,8 @@ import types
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors, pid_alive  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_lock.py'
 
@@ -112,6 +114,10 @@ def make_receipt(test, state: Path, uid=None):
         fh.close()
     return {'token': 't', 'supervisor': {'pid': 4242, 'start': '1', 'lock': [st.st_dev, st.st_ino]},
             'lock': str(lock), 'record': str(record), 'log': str(state / 'hil_op_t.log'), 'survivors': None}, done
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class LockDir(unittest.TestCase):
@@ -626,9 +632,7 @@ class DetachedHolder(LockDir):
             pid = int(text)
             self.addCleanup(self.kill_quietly, pid, signal.SIGKILL)     # a takeover holder ignores SIGTERM
             while time.monotonic() < deadline:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
+                if not pid_alive(pid):
                     return True
                 _sleep(0.02)
             return False
@@ -1449,7 +1453,7 @@ class HandOver(LockDir):
         return make_receipt(self, Path(self.dir, 'state'))
 
     def hand_over(self, receipts=(), boards=(BOARD,)):
-        handles = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in boards}
+        handles = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=list(boards)) for b in boards}
         try:
             token = hil_lock.hand_to_cleanup_holder(handles, 'selftest run', detail='park failed', receipts=receipts,
                                                     wait=5, holder='selftest')
@@ -1459,6 +1463,10 @@ class HandOver(LockDir):
         pid = hil_lock.read_record(boards[0])['pid']
         self.addCleanup(DetachedHolder.kill_quietly, pid, signal.SIGKILL)
         return token, pid
+
+    def group(self):
+        boards = [BOARD, self.OTHER]
+        return {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards) for b in boards}
 
     def signals(self):
         sent = []
@@ -1528,7 +1536,7 @@ class HandOver(LockDir):
             self.acquire()
 
     def test_a_failed_multi_board_handoff_leaves_a_takeover_of_one_board_the_whole_group(self):
-        fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in (BOARD, self.OTHER)}
+        fhs = self.group()
         self.patch(hil_lock, '_holder_argv', lambda job: [sys.executable, '-c', 'pass'])
         with self.assertRaisesRegex(hil_lock.LockUnavailable, 'cleanup holder handoff failed: .*no readiness'):
             hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
@@ -1601,7 +1609,7 @@ class HandOver(LockDir):
             return real(fh, *a, **k)
         for fault, raised in ((no_space, hil_lock.LockUnavailable), (interrupt_second, KeyboardInterrupt)):
             with self.subTest(fault=fault.__name__):
-                fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in (BOARD, self.OTHER)}
+                fhs = self.group()
                 with mock.patch.object(hil_lock, 'write_record', fault), self.assertRaises(raised):
                     hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
                 for fh in fhs.values():
@@ -1636,6 +1644,438 @@ class HandOver(LockDir):
             hil_lock.release_board_lock(fh)
         self.assertEqual(fork_child(holder), 0, 'the release stayed pending behind the inherited mask')
         self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
+
+
+class ProtectedGroup(LockDir):
+    """agentrc#197: a protected taker declares its whole group on its first record, so a takeover
+    from any member, the one whose hand-over rewrite failed or was cut short included, takes the
+    group; an older helper's record, which declares none, adds every board naming it."""
+
+    A, B = BOARD, BOARD + '-2'
+
+    def group(self):
+        boards = [self.A, self.B]
+        return {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards) for b in boards}
+
+    def recover(self, board) -> list:
+        _, handles = hil_lock.take_over(board, 'selftest recovery')
+        hil_lock.end_takeover(handles)
+        return sorted(handles)
+
+    def no_holder(self):
+        self.patch(hil_lock, '_holder_argv', lambda job: [sys.executable, '-c', 'pass'])
+
+    def test_the_group_is_declared_on_the_first_record_and_a_malformed_one_touches_nothing(self):
+        fh = hil_lock.take_board_lock(self.A, 'selftest run', protected=True)
+        self.addCleanup(fh.close)
+        self.assertEqual(hil_lock.read_record(self.A)['locks'], [self.A])
+        for locks in ([self.A], [self.B, self.B], [self.B, '../x'], [self.B, 1], self.B, None):
+            with self.subTest(locks=locks), self.assertRaises(ValueError):
+                hil_lock.take_board_lock(self.B, 'selftest run', protected=True, locks=locks)
+        self.assertFalse(os.path.exists(hil_lock.lock_path(self.B)))
+
+    def test_recovery_from_the_member_whose_rewrite_failed_takes_the_group(self):
+        fhs = self.group()
+        real = hil_lock.write_record
+
+        def fail_on_b(fh, *a, **k):
+            if fh is fhs[self.B]:
+                raise OSError(28, 'No space left on device')
+            return real(fh, *a, **k)
+        self.no_holder()
+        with mock.patch.object(hil_lock, 'write_record', fail_on_b):
+            with self.assertRaisesRegex(hil_lock.LockUnavailable, rf'not written on {self.B}: \[Errno 28\]'):
+                hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
+        for fh in fhs.values():
+            fh.close()
+        self.assertEqual(hil_lock.read_record(self.A)['detail'], 'park failed')
+        self.assertNotIn('detail', hil_lock.read_record(self.B))      # its prior record
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            hil_lock.take_board_lock(self.B, 'rival')
+        self.assertEqual(self.recover(self.B), [self.A, self.B])
+
+    def test_recovery_from_the_member_whose_rewrite_was_cut_short_takes_the_group(self):
+        def hand_over_and_die():
+            fhs = self.group()
+            real, b = hil_lock._pwrite_all, fhs[self.B].fileno()
+
+            def die(fd, data, offset):
+                if fd == b and offset == 1:          # past its REWRITING byte
+                    os.pwrite(fd, data[:5], offset)
+                    os._exit(9)
+                return real(fd, data, offset)
+            hil_lock._pwrite_all = die
+            hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
+        self.assertEqual(fork_child(hand_over_and_die), 9)
+        self.assertEqual(hil_lock.record_state(self.B)[0], 'unreadable')
+        self.assertEqual(hil_lock.read_record(self.A)['locks'], [self.A, self.B])
+        self.assertEqual(self.recover(self.B), [self.A, self.B])
+
+    def test_an_older_helpers_record_without_a_group(self):
+        old = load_pre154()
+        self.patch(old, 'BOARD_LOCK_DIR', self.dir)
+        old.take_board_lock(self.B, 'selftest run', protected=True).close()
+        self.assertNotIn('locks', hil_lock.read_record(self.B))
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            hil_lock.take_board_lock(self.B, 'rival')
+        self.assertEqual(self.recover(self.B), [self.B], 'alone: that board, as before')
+        # an older pin's hand-over that rewrote A naming both and failed on B
+        fhs = {b: old.take_board_lock(b, 'selftest run', protected=True) for b in (self.A, self.B)}
+        old.write_record(fhs[self.A], 'selftest run', protected=True, detail='park failed', locks=[self.A, self.B])
+        for fh in fhs.values():
+            fh.close()
+        self.assertEqual(self.recover(self.B), [self.A, self.B])
+
+    def test_a_group_present_but_not_a_list_of_names_refuses_the_takeover(self):
+        for locks in (self.B, False, 0, '', {}, [], None, [1]):
+            with self.subTest(locks=locks):
+                Path(hil_lock.lock_path(self.A)).write_text(json.dumps(
+                    {'pid': 999999999, 'reason': 'selftest run', 'protected': True, 'locks': locks}))
+                with self.assertRaisesRegex(hil_lock.LockUnavailable, 'is not a list of names'):
+                    hil_lock.take_over(self.A, 'selftest recovery')
+                self.assertEqual(hil_lock.journal_names(), [])
+
+    def test_a_malformed_group_still_names_its_readable_members_and_refuses(self):
+        Path(hil_lock.lock_path(self.A)).write_text('{}')                  # declares nothing
+        held = {'pid': 999999999, 'reason': 'selftest run', 'protected': True}
+        for where in ('record', 'journal'):
+            with self.subTest(where=where):
+                journal = Path(self.dir, self.B + hil_lock.JOURNAL)
+                if where == 'record':
+                    Path(hil_lock.lock_path(self.B)).write_text(json.dumps({**held, 'locks': [self.A, 1]}))
+                else:
+                    Path(hil_lock.lock_path(self.B)).write_text(json.dumps(held))
+                    journal.write_text(json.dumps({'token': 'selftest', 'locks': [self.A, 1]}))
+                before = Path(hil_lock.lock_path(self.B)).read_bytes()
+                with self.assertRaisesRegex(hil_lock.LockUnavailable, f'{self.B}: lock set .* is not a list of names'):
+                    hil_lock.take_over(self.A, 'selftest recovery')
+                self.assertEqual(Path(hil_lock.lock_path(self.B)).read_bytes(), before)
+                self.assertEqual(hil_lock.read_record(self.A), {})
+                self.assertEqual(hil_lock.journal_names(), [self.B] if where == 'journal' else [])
+
+    def test_a_member_whose_chain_is_partly_unreadable_still_names_the_group_and_refuses(self):
+        Path(hil_lock.lock_path(self.A)).write_bytes(b'#{"pid": 9')        # cut short: declares nothing
+        Path(hil_lock.lock_path(self.B)).write_text(json.dumps(
+            {'pid': 999999999, 'reason': 'selftest run', 'protected': True, 'locks': [self.A, self.B]}))
+        Path(self.dir, self.B + hil_lock.JOURNAL).write_text('{"locks": [')
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, f'{self.B}{hil_lock.JOURNAL} cannot be read'):
+            hil_lock.take_over(self.A, 'selftest recovery')
+        self.assertEqual(hil_lock.journal_names(), [self.B])
+
+    def test_a_partial_acquisition_rolls_back_and_a_failed_rollback_blocks_the_whole_group(self):
+        boards = [self.A, self.B]
+        rival = hil_lock.take_board_lock(self.B, 'rival')
+
+        def acquire():
+            taken = []
+            try:
+                for b in boards:
+                    taken.append(hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards))
+            except hil_lock.BoardLocked:
+                for fh in taken:
+                    hil_lock.release_board_lock(fh)
+                raise
+        with self.assertRaises(hil_lock.BoardLocked):
+            acquire()
+        hil_lock.release_board_lock(hil_lock.take_board_lock(self.A, 'next'))     # free again
+        with mock.patch.object(hil_lock, 'clear_record', lambda fh: False), self.assertRaises(hil_lock.BoardLocked):
+            acquire()
+        self.assertEqual(hil_lock.read_record(self.A)['locks'], boards)
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            hil_lock.take_board_lock(self.A, 'next')
+        with self.assertRaises(hil_lock.BoardLocked):        # the rival's board: nothing modified
+            hil_lock.take_over(self.A, 'selftest recovery')
+        self.assertEqual(hil_lock.journal_names(), [])
+        hil_lock.release_board_lock(rival)
+        self.assertEqual(self.recover(self.A), boards)
+
+    def test_a_handoff_of_boards_other_than_the_declared_group_changes_nothing(self):
+        fhs = self.group()
+        for fh in fhs.values():
+            self.addCleanup(fh.close)
+        before = {b: Path(hil_lock.lock_path(b)).read_bytes() for b in fhs}
+        self.patch(hil_lock, '_holder_argv', lambda job: self.fail('a holder was started'))
+        with self.assertRaisesRegex(ValueError, rf'not the handed boards \[.{self.A}.\] .*nothing changed'):
+            hil_lock.hand_to_cleanup_holder({self.A: fhs[self.A]}, 'selftest run', detail='park failed')
+        self.assertEqual({b: Path(hil_lock.lock_path(b)).read_bytes() for b in fhs}, before)
+
+
+PENDING_AS = r'''
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.BOARD_LOCK_DIR, lock, uid = sys.argv[2], sys.argv[3], int(sys.argv[4])
+os.setgroups([])
+os.setresgid(uid, uid, uid)
+os.setresuid(uid, uid, uid)
+out = {}
+for name, f in (('read', lambda: m.PendingSessions(lock, 'selftest').read()),
+                ('add', lambda: m.PendingSessions(lock, 'selftest').add([{'receipt': 'theirs'}])),
+                ('clear', lambda: m.PendingSessions(lock, 'selftest').clear(lambda e: True)),
+                ('own', lambda: m.PendingSessions(lock + '-theirs', 'selftest').add([{'receipt': 'theirs'}]))):
+    try:
+        out[name] = ['ok', f()]
+    except Exception as e:
+        out[name] = [type(e).__name__, str(e)]
+print(json.dumps(out))
+'''
+
+
+class Pending(LockDir):
+    """PendingSessions: a board's pending-session record beside its lock, read, extended and
+    cleared under its own mutex, replaced atomically; it reads TinyUF2's existing marks
+    (<lock>.tinyuf2-openocd-pending.json) unchanged. Whether a session ended stays the caller's."""
+
+    KIND = 'tinyuf2-openocd'
+
+    def setUp(self):
+        super().setUp()
+        self.mark = hil_lock.PendingSessions(BOARD, self.KIND)
+
+    def file(self, suffix=''):
+        return Path(self.dir, f'{BOARD}.{self.KIND}-pending.json{suffix}')
+
+    @staticmethod
+    def sessions(*names):
+        return [{'cmd': 'openocd', 'receipt': f'/run/{n}/receipt.json', 'pid': 1, 'start': 2} for n in names]
+
+    def test_reads_and_writes_tinyuf2_marks_unchanged(self):
+        old, new = self.sessions('a'), self.sessions('b')
+        with open(self.file('.mutex'), 'w'):            # TinyUF2 made the mutex first
+            pass
+        self.file().write_text(json.dumps({'sessions': old}, indent=1))     # its write_mark
+        logged = {'mark': str(self.file()), 'sessions': old, 'notEnded': [], 'note': 'n', 'hold': {}, 'at': 'x'}
+        self.file('.cleared.jsonl').write_text(json.dumps(logged) + '\nnot json\n')
+        self.assertEqual((os.fspath(self.mark), str(self.mark)), (str(self.file()), str(self.file())))
+        self.assertEqual(self.mark.read(), old)
+        self.assertEqual(self.mark.cleared(), [logged])
+        self.assertEqual(self.mark.add(new + old), old + new)
+        self.assertEqual(self.file().read_text(), json.dumps({'sessions': old + new}, indent=1))
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted(p.name for p in (
+            self.file(), self.file('.mutex'), self.file('.cleared.jsonl'))))
+        for name in (f'{BOARD}.lock', f'{BOARD}.takeover'):
+            self.assertNotIn(name, os.listdir(self.dir))
+        self.assertEqual((hil_lock.lock_names(), hil_lock.journal_names()), ([], []))
+
+    def test_modes_ignore_the_umask(self):
+        old = os.umask(0o077)
+        self.addCleanup(os.umask, old)
+        self.mark.add(self.sessions('a'))
+        self.mark.clear(lambda e: False, note='reviewed')
+        self.mark.add(self.sessions('b'))
+        modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in Path(self.dir).iterdir()}
+        self.assertEqual(modes, {self.file().name: 0o644, self.file('.mutex').name: 0o666,
+                                 self.file('.cleared.jsonl').name: 0o666})
+
+    def test_an_unreadable_record_is_kept_and_refuses_until_a_reviewed_clear(self):
+        for data in (b'{', b'[]', b'{"sessions": "x"}', b'{"sessions": [1]}', b'{"sessions": [{"pid": 1}]}',
+                     b'\xff'):
+            with self.subTest(data=data):
+                self.file().write_bytes(data)
+                self.assertIsNone(self.mark.read())
+                with self.assertRaisesRegex(hil_lock.PendingRefused, 'unreadable: kept'):
+                    self.mark.add(self.sessions('a'))
+                with self.assertRaisesRegex(hil_lock.PendingRefused, 'unreadable: a session may still be pending'):
+                    self.mark.clear(lambda e: True)
+                self.assertEqual(self.file().read_bytes(), data)
+                cleared = self.mark.clear(lambda e: True, note='reviewed', hold={'pid': 7})
+                self.assertFalse(self.file().exists())
+                self.assertEqual((cleared['sessions'], cleared['unreadable'], cleared['hold']),
+                                 (None, data.decode(errors='replace'), {'pid': 7}))
+                self.assertEqual(self.mark.cleared()[-1]['unreadable'], data.decode(errors='replace'))
+
+    def test_a_clear_is_refused_while_a_session_is_not_ended(self):
+        a, b = self.sessions('a', 'b')
+        self.mark.add([a, b])
+        before = self.file().read_bytes()
+
+        def only_a(e):
+            if e is not a and e['receipt'] == b['receipt']:
+                raise RuntimeError('receipt unreadable')
+            return e['receipt'] == a['receipt']
+        for ended in (only_a, lambda e: 'yes'):
+            with self.subTest(ended=ended):
+                with self.assertRaisesRegex(hil_lock.PendingRefused, 'not ended'):
+                    self.mark.clear(ended)
+                self.assertEqual(self.file().read_bytes(), before)
+        self.assertFalse(self.file('.cleared.jsonl').exists())
+        self.assertEqual(self.mark.clear(lambda e: True), {'mark': str(self.file()), 'sessions': [a, b],
+                                                           'notEnded': []})
+        self.assertFalse(self.file().exists())
+        self.assertEqual(self.mark.clear(lambda e: False), {'mark': str(self.file()), 'sessions': [],
+                                                            'notEnded': []})
+        self.mark.add([a, b])
+        cleared = self.mark.clear(only_a, note='ended by hand', hold={'pid': 7})
+        self.assertEqual((cleared['notEnded'], cleared['note']), ([b['receipt']], 'ended by hand'))
+        logged = self.mark.cleared()
+        self.assertEqual(len(logged), 1)
+        self.assertEqual({k: v for k, v in logged[0].items() if k != 'at'}, cleared)
+        self.assertFalse(self.file().exists())
+
+    def test_a_failed_append_leaves_no_torn_entry_and_loses_none(self):
+        a = self.sessions('a')[0]
+        self.mark.add([a])
+        self.mark.clear(lambda e: False, note='first')
+        self.mark.add([a])
+        real, calls = os.write, []
+
+        def short_then_full(fd, data):
+            calls.append(1)
+            if len(calls) == 1:
+                return real(fd, data[:10])
+            raise OSError(28, 'No space left on device')
+        with mock.patch.object(hil_lock.os, 'write', short_then_full), self.assertRaises(OSError):
+            self.mark.clear(lambda e: False, note='second')
+        self.assertTrue(self.file().exists())
+        self.assertFalse(self.file('.cleared.jsonl').read_bytes().endswith(b'\n'))
+        self.assertEqual([e['note'] for e in self.mark.cleared()], ['first'])
+        self.mark.clear(lambda e: False, note='retry')
+        self.assertFalse(self.file().exists())
+        self.assertEqual([e['note'] for e in self.mark.cleared()], ['first', 'retry'])
+        self.assertEqual(len(self.file('.cleared.jsonl').read_bytes().splitlines()), 2)
+
+    def test_the_log_is_durable_in_its_dir_before_the_record_goes(self):
+        self.mark.add(self.sessions('a'))
+        events, fsync, unlink = [], os.fsync, os.unlink
+
+        def logged_fsync(fd):
+            events.append('dir' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+            return fsync(fd)
+
+        def logged_unlink(name, *a, **k):
+            events.append(f'unlink {name}')
+            return unlink(name, *a, **k)
+        with mock.patch.object(hil_lock.os, 'fsync', logged_fsync), \
+                mock.patch.object(hil_lock.os, 'unlink', logged_unlink):
+            self.mark.clear(lambda e: False, note='reviewed')
+        self.assertEqual(events, ['file', 'dir', f'unlink {self.file().name}'])
+
+    def test_a_malformed_session_is_refused_before_anything_is_touched(self):
+        for sessions in ([{'pid': 1}], [{'receipt': 3}], ['x']):
+            with self.subTest(sessions=sessions), self.assertRaises(ValueError):
+                self.mark.add(sessions)
+        self.assertEqual(os.listdir(self.dir), [])
+        with self.assertRaises(OSError):
+            hil_lock.PendingSessions('../x', self.KIND)
+
+    def test_concurrent_updates_lose_nothing(self):
+        def writer(n):
+            def body():
+                for i in range(10):
+                    self.mark.add(self.sessions(f'{n}-{i}'))
+            return body
+        pids = []
+        for n in range(8):
+            pid = os.fork()
+            if pid == 0:
+                code = 1
+                try:
+                    writer(n)()
+                    code = 0
+                finally:
+                    os._exit(code)
+            pids.append(pid)
+        self.assertEqual([os.waitstatus_to_exitcode(os.waitpid(p, 0)[1]) for p in pids], [0] * 8)
+        got = [e['receipt'] for e in self.mark.read()]
+        self.assertEqual(sorted(got), sorted(f'/run/{n}-{i}/receipt.json' for n in range(8) for i in range(10)))
+        self.assertEqual([f for f in os.listdir(self.dir) if f.startswith('.')], [])
+
+    def interrupted(self, action):
+        """For each k, a child running action() killed right before its k-th call that can persist
+        or remove anything; yields after each, until one completes."""
+        names = ('open', 'fchmod', 'pwrite', 'write', 'fsync', 'close', 'rename', 'unlink')
+        for k in range(1, 60):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    calls = []
+
+                    def counted(real):
+                        def call(*a, **kw):
+                            calls.append(1)
+                            if len(calls) == k:
+                                os._exit(9)
+                            return real(*a, **kw)
+                        return call
+                    for name in names:
+                        setattr(os, name, counted(getattr(os, name)))
+                    action()
+                    os._exit(0)
+                finally:
+                    os._exit(1)
+            code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+            self.assertIn(code, (0, 9))
+            yield code
+            if code == 0:
+                return
+        self.fail('never completed')
+
+    def reset(self, *sessions):
+        for f in os.listdir(self.dir):
+            os.unlink(os.path.join(self.dir, f))
+        self.mark.add(sessions)
+
+    def test_an_interrupted_add_leaves_the_old_record_or_the_new_one(self):
+        a, b = self.sessions('a', 'b')
+        seen = set()
+        self.reset(a)
+        for code in self.interrupted(lambda: self.mark.add([b])):
+            got = self.mark.read()
+            self.assertIn(got, ([a], [a, b]))
+            seen.add(len(got))
+            self.assertEqual(self.mark.add([b]), [a, b])     # the next writer is never stuck
+            self.reset(a)
+        self.assertEqual(seen, {1, 2})
+
+    def test_an_interrupted_reviewed_clear_never_removes_the_record_before_its_note_is_logged(self):
+        a = self.sessions('a')[0]
+        seen = set()
+        self.reset(a)
+        for code in self.interrupted(lambda: self.mark.clear(lambda e: False, note='reviewed')):
+            logged = [e for e in self.mark.cleared() if e.get('note') == 'reviewed']
+            present = self.file().exists()
+            self.assertTrue(present or logged, 'removed without its note')
+            seen.add((present, bool(logged)))
+            if present:
+                self.assertEqual(self.mark.read(), [a])
+            self.reset(a)
+        self.assertIn((True, False), seen)
+        self.assertIn((False, True), seen)
+
+    def test_another_os_user_reads_the_record_and_can_neither_replace_nor_remove_it(self):
+        if os.geteuid() == 0:
+            argv = [sys.executable]
+        elif shutil.which('sudo') and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode == 0:
+            argv = ['sudo', '-n', sys.executable]
+        else:
+            self.skipTest('needs root, or sudo -n, to act as another OS user')
+        shared = tempfile.mkdtemp(prefix='hil-lock-pending-', dir='/tmp')
+        root = argv[:-1]                    # [] as root, else sudo -n
+        self.addCleanup(subprocess.run, [*root, 'rm', '-rf', shared])
+        os.chmod(shared, 0o1777)
+        subprocess.run([*root, 'chown', '0:0', shared], check=True)    # as the host step makes it: root's
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', shared)
+        ours = hil_lock.PendingSessions(BOARD, 'selftest')
+        ours.add([{'receipt': 'ours'}])
+        before = Path(ours.path).read_bytes()
+        r = subprocess.run([*argv, '-I', '-c', PENDING_AS, str(SCRIPT), shared, BOARD, '65534'],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out['read'], ['ok', [{'receipt': 'ours'}]])
+        self.assertEqual((out['add'][0], out['clear'][0]), ('PermissionError', 'PermissionError'))
+        self.assertEqual(out['own'], ['ok', [{'receipt': 'theirs'}]])
+        self.assertEqual(Path(ours.path).read_bytes(), before)
+        theirs = hil_lock.PendingSessions(BOARD + '-theirs', 'selftest')
+        self.assertEqual(theirs.read(), [{'receipt': 'theirs'}])
+        if os.geteuid() != 0:
+            with self.assertRaises(PermissionError):
+                theirs.add([{'receipt': 'ours'}])
+            with self.assertRaises(PermissionError):
+                theirs.clear(lambda e: True)
+            self.assertEqual(theirs.read(), [{'receipt': 'theirs'}])
+        self.assertEqual([f for f in os.listdir(shared) if f.startswith('.')], [])
 
 
 class RechecksAs(LockDir):

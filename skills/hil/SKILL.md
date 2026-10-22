@@ -69,9 +69,16 @@ nothing in it through a link.
   as that user or root.
 - A taker whose interrupted run needs recovery takes with `protected=True` and
   ends with `release_board_lock`, or hands its held locks to a cleanup holder
-  with `hand_to_cleanup_holder`, which loads `scripts/hil_process.py` from
-  beside the lock helper, so a consumer stages both; given the receipts of runs
-  not proven ended, that holder clears only once each rechecks `done`, and
+  with `hand_to_cleanup_holder`. A protected take declares the run's whole
+  group, `locks=` every board it takes (default the board alone), on the
+  board's first record, before any hardware access, so a takeover from any
+  member takes the group; a taker failing partway ends what it took, and a
+  record it could not clear stays a blocker naming the group. The hand-over
+  refuses, changing nothing, unless the handed boards are exactly that group,
+  and loads `scripts/hil_process.py` (in the lock helper's `FILES`, below). A
+  record that declares no group (an older helper's, or one cut short) is
+  taken over with every board whose record names it. Given the receipts of runs
+  not proven ended, the handed-over holder clears only once each rechecks `done`, and
   `release --token` refuses up front naming the open receipt, rechecked as the
   holder's OS user when root releases it. A cleanup holder of its own waits in
   `wait_for_release` and then ends its hold itself. `takeover_predecessor`
@@ -82,6 +89,18 @@ nothing in it through a link.
   carries none and is
   taken like any other: protection across projects holds once every project
   on the host runs this helper.
+- A session a consumer cannot prove ended outlives its run in the board's
+  pending-session record, `hil_lock.PendingSessions(<lock>, <kind>)`
+  (`<lock>.<kind>-pending.json` in the lock dir), so every later invocation,
+  whatever its run dir or project, refuses while it lists one or cannot be
+  read; an unreadable record is kept. `add` lists sessions, each a dict with a
+  `receipt`; `clear(ended)` removes the record only once the consumer's
+  `ended` holds for every session, otherwise refusing with their receipts;
+  `clear(ended, note=..., **evidence)`, only after a separately reviewed
+  recovery, removes it whatever it holds, once note, evidence and content are
+  logged (`cleared()`). It needs no board lock; another OS user can read it
+  but not replace or remove it. What a receipt means and how its session is
+  recovered stay the consumer's; the class docstring has the mechanics.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's
@@ -127,11 +146,16 @@ recovery stay the contract's. Linux only.
 
 - A flasher is a dict: `name` (`jlink`, `stlink`, `openocd`, `lm4flash`,
   `esptool`, `pyocd`), `uid` (the probe's serial), `args` (passed to the tool
-  verbatim), and optionally `vid_pid` (openocd's complete `0xVVVV 0xPPPP`
-  pairs; pyocd requires exactly one) and `verify`. A malformed `vid_pid` raises
-  `ValueError` before the tool runs. Every call takes an explicit `timeout`;
-  `run=` injects the caller's runner, by default `scripts/hil_process.py`'s
-  `run_cmd`.
+  as the words a shell would split them into, never expanded), and optionally
+  `vid_pid` (openocd's complete `0xVVVV 0xPPPP` pairs; pyocd requires exactly
+  one) and `verify`. A malformed `vid_pid` raises `ValueError` before the tool
+  runs. Every call takes an explicit `timeout`; `run=` injects the caller's
+  runner, by default `scripts/hil_process.py`'s `run_cmd`. Every command is an
+  argv list, never a shell string: a runner is called as `run(argv,
+  timeout=...)`, and for esptool `run(argv, cwd=..., env=..., timeout=...)`,
+  `env` the variables to add to the inherited environment (`run_cmd(env=)` and
+  `run_tracked(env=)` take it). `flash_esptool(esptool=)` names the esptool
+  executable, by default `esptool` on PATH.
 - A flash or reset returns an `Operation`: the last run's `CompletedProcess`
   fields plus `attempts`, each run's command, command file, output and rc on
   its own, never concatenated; `retried` is every attempt but the last. An
@@ -158,43 +182,53 @@ recovery stay the contract's. Linux only.
   command file in `workdir`; `sysresetreq_jlink` and `sysresetreq_stlink` write
   AIRCR SYSRESETREQ through such a session, a reset distinct from the probe's
   (`reset_jlink`, `reset_stlink`). Their results are raw: judging the
-  transcript, retrying and recovering stay the caller's.
-- `run_openocd_commands` and `sysresetreq_openocd` are the same pair for
-  openocd: one `openocd_cmd_base` session running `init`, the caller's Tcl
-  commands and `shutdown` from a unique script in `workdir`. openocd logs to
-  stderr and stops at the first failing command with exit 1.
+  transcript and recovering stay the caller's. `run_jlink_commands` and
+  `sysresetreq_jlink` take an optional `retry_if(attempt)`: while it answers
+  true the whole session reruns, at most `retries` times (default 1),
+  `retry_delay` s apart, each run its own `timeout`. A rerun is refused after
+  an attempt whose cleanup is not an explicit `done` or that names a receipt;
+  the operation's `retry_refused` then says why.
+- `run_openocd_commands` runs one `openocd_cmd_base` session: `init`, the
+  caller's Tcl commands and `shutdown`, from a unique script in `workdir`;
+  `sysresetreq_openocd` writes AIRCR SYSRESETREQ through it. openocd logs to
+  stderr and stops at the first failing command with exit 1. Neither takes
+  `retry_if`: judging, retrying and recovering stay the caller's.
 - `openocd_esp` is `scripts/hil_openocd_esp.py`'s (`flash_openocd_esp`,
   `reset_openocd_esp`): an Espressif chip's built-in USB-Serial/JTAG through
   openocd-esp32 v0.12.0-esp32-20260703 only, found by `HIL_OPENOCD_ESP`, else
-  `openocd` on PATH. `uid` is the USJ serial; `args`
-  is `-f board/<chip>-builtin.cfg` or `-f interface/esp_usb_jtag.cfg -f
-  target/<chip>.cfg` and nothing else. The USJ's bus-port is resolved by
-  serial, exactly one match, and pinned before init; it is never convoy-safe.
-  The caller hard-resets the chip out of its ROM loader first: one left there
-  (esptool `--after no-reset`) faults the flash stub after `reset init`; the
-  provider resolves the USJ and starts openocd no earlier than `BOOT_SETTLE`
-  (1 s) after the call, its own admission counting toward it, so a caller's
-  hard reset needs no wait of its own. A
-  command whose log shows a failed target event hook (`Execution of event
-  <name> failed:`), or cannot be read, fails although openocd answers success:
-  a flash writes nothing after three such `reset init`s, and such a `reset run`
-  leaves the session pending.
-  A flash takes the caller's ordered segments (sector-aligned offset, raw
-  binary file, size), programs each with verify, stops at the first failure
-  and reads every segment back byte for byte. It also requires `security`, the
-  caller's evidence read from the chip before programming (for tinyuf2, with
-  esptool over the same USJ's serial port):
-  `{"flashEncryption": "off", "secureBoot": "off", "source": <where it was
-  read>}`. Without it, or with either feature not `off`, the flash is refused
-  before anything starts; the provider never infers or defaults the chip's
-  security state, and records the evidence in the operation. Each operation is
-  one session that is never killed: after a command that returned, `reset run`
-  and a confirmed shutdown end it; an init failure, a command outstanding at
-  the timeout or interrupt, or a failed reset or shutdown leaves cleanup
-  `pending` with the session's receipt, for the caller's cleanup holder, and no
-  retry, restore or test may overlap it. Under a CI job (`RUNNER_TRACKING_ID`
-  or `GITHUB_ACTIONS` set) flash and reset are refused, and a consumer calls
-  `ci_refusal()` before its own preparatory sessions; `end` stays available.
+  `openocd` on PATH. `uid` is the USJ serial; `args` is
+  `-f board/<chip>-builtin.cfg` or `-f interface/esp_usb_jtag.cfg -f
+  target/<chip>.cfg` and nothing else. It is never convoy-safe. The caller
+  hard-resets the chip out of its ROM loader first and needs no wait of its
+  own (`BOOT_SETTLE`). A command whose log shows a failed target event hook
+  fails although openocd answers success. A flash takes the caller's ordered
+  segments (sector-aligned offset, raw binary file, size, optionally its
+  `sha256`), verifies each and reads every one back;
+  `segments_from_flash_args(build_dir, chip, timeout=)` gives them from an
+  ESP-IDF build's `flash_args`, refusing a build openocd would not write as
+  esptool does.
+  A flash also requires `security`, the caller's evidence read from the chip
+  before programming: `{"flashEncryption": "off", "secureBoot": "off",
+  "source": <where it was read>}`. Without it, or with either feature not
+  `off`, the flash is refused before anything starts; the provider never
+  infers or defaults the chip's security state. `read_security(serial, chip=,
+  workdir=, timeout=, retains_lock=True)` reads it and hard-resets the chip;
+  `security_evidence(result, chip=, source=)` reads a `security` op of the
+  caller's own `scripts/esptool_session.py`. Unknown or contradictory
+  evidence, or a chip outside `SECURITY_CHIPS` (ESP32-P4, ESP32-S3), is
+  refused.
+  Flash, reset and `read_security` run only for a caller that passes
+  `retains_lock=True`, declaring it keeps the board lock through a session
+  left pending, and never under a CI job (`RUNNER_TRACKING_ID` or
+  `GITHUB_ACTIONS` set; `end` stays available); anything else is refused before any access, and a
+  consumer calls `refusal(retains_lock=True)` before its own preparatory
+  sessions. Each operation is one session, bounded by its `timeout`, that is
+  never killed: it ends with `reset run` and a confirmed shutdown, or leaves
+  cleanup `pending` with the session's receipt for the caller's cleanup
+  holder, and no retry, restore or test may overlap it.
+  `session_state(receipt)` is a session's state for lock retention, by pid
+  and start time alone. The module and function docstrings have the
+  mechanics, `usj_tty` and `usj_node` included.
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
   a pending session with `reset run` and a confirmed shutdown, within one
   deadline and never signalling it. It refuses on any doubt: the session (or
@@ -225,6 +259,7 @@ recovery stay the contract's.
 
 | Script | Gives |
 |---|---|
+| `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (`farm-check` skill) |
 | `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
@@ -234,6 +269,16 @@ recovery stay the contract's.
 | `hil_usbtest.py` | usbtest binding, the device under test by serial (`find_device`), and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 
+- Load agentrc files through `hil_load.py` (its docstring has the bootstrap):
+  `load(name, path)` reuses the module already loaded from that file under any
+  name, so the harness's names and the scripts' own `agentrc_<stem>` loads are
+  one instance (one strand memo, one runner), and refuses a second checkout or
+  pin under one name. A harness loader of its own is reused only when it
+  registers what it loads in `sys.modules`, before the scripts load it.
+- Each script exports `FILES`, a literal of the agentrc-root-relative files it
+  loads or launches by path, transitively, and refuses at import naming any
+  that is missing. What a harness requires and stages is each script it loads
+  plus its `FILES`, never a restated list; `hil_report_notice.py` loads alone.
 - The farm check engine releases a board it reserved (`protected=True`) only
   once every process it started there is proven ended: `run_tracked`'s
   `done`, or a `recheck` of its receipt that answers `done`. Anything else

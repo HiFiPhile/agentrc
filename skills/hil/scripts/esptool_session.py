@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """One esptool connection for a HIL runner (`hil` skill), run as its own child so the runner can time it out,
 kill it and see it survive: connect into download mode, run the ops in order, then reset or not. Stdlib only
-besides the esptool it drives, which must be ESPTOOL_VERSION: any other is refused before connecting.
+besides the esptool it drives, whose version the result line reports.
 
   esptool_session.py --port DEV --chip CHIP --baud N --after hard-reset|no-reset OPS.json
 
 OPS.json is a list of {"op": "read", "addr", "size", "file"} and {"op": "md5", "addr", "size"}: no write, which
 is the provider's flash. A {"op": "security"} first reads the chip's flash encryption and secure boot state on the
 ROM loader, before the stub runs.
-The last stdout line is JSON: {"ok": true, "esptool", "results": [...]} or {"ok": false, "error", "results"}, the
-results of the ops that completed; exit 0 or 1 with it.
+The last stdout line is JSON: {"ok": true, "esptool", "results": [...]} or {"ok": false, "esptool", "error",
+"results"}, the results of the ops that completed and `esptool` null when it could not be imported; exit 0 or 1
+with it.
 """
 
 import argparse
@@ -18,11 +19,11 @@ import sys
 
 sys.dont_write_bytecode = True
 
-ESPTOOL_VERSION = '5.2.0'   # the API this session is written and bench-checked against
+FILES = ()   # loads and launches nothing by path (hil_load.py)
 
 
 def security(esp):
-    """The chip's flash encryption and secure boot state from two sources, both on the ROM loader: esptool 5.2.0's
+    """The chip's flash encryption and secure boot state from two sources, both on the ROM loader: esptool's
     GET_SECURITY_INFO (loader.py get_security_info: flags bit 0 SECURE_BOOT_EN, flash_crypt_cnt enabled when its
     count of 1 bits is odd) and its eFuse register reads (targets/*.py get_flash_encryption_enabled,
     get_secure_boot_enabled; on the P4 EFUSE_RD_REPEAT_DATA1_REG [20:18] SPI_BOOT_CRYPT_CNT and
@@ -60,12 +61,10 @@ def main():
     ap.add_argument('--after', choices=('hard-reset', 'no-reset'), required=True)
     ap.add_argument('ops')
     args = ap.parse_args()
-    results, esp = [], None
+    results, esp, version = [], None, None
     try:
         import esptool
-        if esptool.__version__ != ESPTOOL_VERSION:
-            raise RuntimeError(f'esptool {esptool.__version__} is installed for {sys.executable}; '
-                               f'this session needs esptool {ESPTOOL_VERSION}')
+        version = esptool.__version__
         from esptool import cmds
         ops = json.load(open(args.ops))
         if any(op['op'] == 'security' for op in ops[1:]):
@@ -83,9 +82,9 @@ def main():
             results.append(dict(run(esp, op), op=op['op']))
         if args.after == 'hard-reset':
             cmds.reset_chip(esp, 'hard-reset')
-        out = {'ok': True, 'esptool': esptool.__version__, 'results': results}
+        out = {'ok': True, 'esptool': version, 'results': results}
     except Exception as e:   # every failure is reported, never raised past the JSON line
-        out = {'ok': False, 'error': f'{type(e).__name__}: {e}', 'results': results}
+        out = {'ok': False, 'esptool': version, 'error': f'{type(e).__name__}: {e}', 'results': results}
     finally:
         if esp is not None:
             esp._port.close()

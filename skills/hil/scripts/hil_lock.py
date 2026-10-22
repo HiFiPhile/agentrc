@@ -4,6 +4,7 @@ flocks in BOARD_LOCK_DIR and their holder records (`hil` skill, Board locks), wi
 hold/release/status CLI. A project's HIL contract wraps it for its roster and lock names.
 """
 import argparse
+import contextlib
 import errno
 import fcntl
 import importlib.util
@@ -19,6 +20,24 @@ import subprocess
 import sys
 import time
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py')
+
+
+def _hil_load():
+    """hil_load.py from beside this file, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, 'hil_load.py'))
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin)
+
+
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
 
 BOARD_LOCK_DIR = '/tmp/tinyusb-hil-locks'
 CI_REASON = 'hil_test.py'
@@ -131,6 +150,28 @@ def _read_file(board, suffix):
         return f.read()
 
 
+def _replace_file(dfd, name, data: bytes) -> None:
+    """Replace `name` in the lock dir `dfd` with `data`, atomically and durably: a crash leaves
+    the old file or the new one, and the rename itself is fsynced through the dir. 0644 whatever
+    the umask, so another OS user reads it; in a sticky dir only its owner or root replaces it.
+    A failed replace removes its temp file; one a crash leaves is hidden and never read."""
+    tmp = f'.{name}.{os.getpid()}.{secrets.token_hex(4)}'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+    try:
+        try:
+            os.fchmod(fd, 0o644)
+            _pwrite_all(fd, data, 0)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp, dir_fd=dfd)
+        raise
+    os.fsync(dfd)
+
+
 def _parse(data):
     """'absent', 'empty', 'unreadable' or 'record', with the record's dict."""
     if data is None:
@@ -190,8 +231,17 @@ def _pwrite_all(fd, data, offset) -> None:
     while data:
         n = os.pwrite(fd, data, offset)
         if n <= 0:
-            raise OSError(errno.EIO, f'holder record write made no progress at offset {offset}')
+            raise OSError(errno.EIO, f'write made no progress at offset {offset}')
         data, offset = data[n:], offset + n
+
+
+def _write_all(fd, data) -> None:
+    """os.write until every byte is written, for an O_APPEND fd; no progress raises."""
+    while data:
+        n = os.write(fd, data)
+        if n <= 0:
+            raise OSError(errno.EIO, 'write made no progress')
+        data = data[n:]
 
 
 def write_record(fh, reason: str, **extra) -> None:
@@ -340,6 +390,12 @@ def _unavailable(e) -> LockUnavailable:
     return LockUnavailable(f'board lock unavailable: {e}{hint}')
 
 
+def _valid_group(locks, board) -> bool:
+    """A protected group as its taker declares it: unique valid lock names, `board` among them."""
+    return (isinstance(locks, (list, tuple)) and all(isinstance(b, str) and _NAME.match(b) for b in locks)
+            and board in locks and len(set(locks)) == len(locks))
+
+
 def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     """Take the board's flock and record ourselves as its holder; returns the open handle
     (keep it referenced; release_board_lock ends it). Raises BoardLocked when another session
@@ -347,7 +403,23 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     and LockUnavailable when the lock cannot be taken or recorded (fail-closed).
 
     `protected` marks the record: `release` never signals it, and a record left on a free
-    flock is a recovery blocker, so its taker must end with release_board_lock."""
+    flock is a recovery blocker, so its taker must end with release_board_lock. It also
+    declares the taker's group on that first record, before any hardware access: `locks`,
+    the names of every board the run takes (unique, this one among them; default this board
+    alone), so a takeover from any member takes the group (agentrc#197). A taker of several
+    boards that fails partway ends the ones it took with release_board_lock; a record that
+    could not be cleared stays a blocker naming the whole group. A malformed group raises
+    ValueError before anything is touched."""
+    if protected:
+        try:
+            _check_name(board)
+        except OSError as e:
+            raise _unavailable(e) from e
+        locks = extra.get('locks', [board])
+        if not _valid_group(locks, board):
+            raise ValueError(f'protected group {locks!r:.200} must be unique valid lock names, {board} among them')
+        locks = list(locks)
+        extra = {'protected': True, **extra, 'locks': locks}
     try:
         fh = flock_nb(board)
     except BlockingIOError:
@@ -363,8 +435,6 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         fh.close()
         raise RecoveryBlocked(f'board {board}: {why} ({RECOVERY_BLOCKER}: '
                               f'`hil_lock.py hold --take-over {board}` under a recovery dispatch)')
-    if protected:
-        extra = {'protected': True, **extra}
     # announce ourselves so the other side's conflict message is truthful
     try:
         _write_record(fh, ACQUIRING, reason, extra)
@@ -493,20 +563,9 @@ def _wait_cleared(boards, pid, start, deadline) -> list:
         time.sleep(0.05)
 
 
-_hil_process = None
-
-
 def _process():
-    """hil_process, loaded from beside this file on first use: only the hand-over and a release
-    predicate need it."""
-    global _hil_process
-    if _hil_process is None:
-        spec = importlib.util.spec_from_file_location(
-            'agentrc_hil_process', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hil_process.py'))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _hil_process = mod
-    return _hil_process
+    """hil_process, loaded on first use: only the hand-over and a release predicate need it."""
+    return hil_load.load_file('skills/hil/scripts/hil_process.py')
 
 
 def _receipt_text(r) -> str:
@@ -708,45 +767,73 @@ def release_token(token: str):
 
 
 # --- recovery takeover ----------------------------------------------------------------------
+def _links(b):
+    """(names, problem): the boards `b`'s readable record and journal chain declare as their lock
+    sets (None when they declare none: an older helper's record, or one cut short mid-write),
+    and why the set they cover is unknown, or '': a journal that cannot be read, or a `locks`
+    present but not a non-empty list of names, whose names still count so discovery reaches
+    this board and refuses there."""
+    names, problem = None, ''
+    journal = journal_state(b)
+    if journal == {}:
+        problem = f'{b}{JOURNAL} cannot be read'
+    chain = [read_record(b)]
+    while isinstance(journal, dict) and journal:
+        chain.append(journal)
+        journal = journal.get('prior')
+    for rec in chain:
+        if not isinstance(rec, dict) or 'locks' not in rec:
+            continue
+        locks = rec['locks']
+        if not isinstance(locks, list) or not locks or not all(isinstance(n, str) for n in locks):
+            problem = problem or f'{b}: lock set {locks!r:.80} is not a list of names'
+        readable = [n for n in locks if isinstance(n, str)] if isinstance(locks, list) else []
+        if readable:
+            names = (names or []) + readable
+    return names, problem
+
+
+def _declared(b):
+    """_links' names; OSError when the set they cover is unknown."""
+    names, problem = _links(b)
+    if problem:
+        raise OSError(errno.EINVAL, f'{problem}, so the lock set it covers is unknown: inspect it by hand')
+    return names
+
+
+def _naming() -> dict:
+    """{board: [every board whose readable record or journal chain names it]}: a board whose
+    chain is partly unknown still names what is readable; the takeover refuses on reaching it."""
+    named = {}
+    for b in sorted(set(lock_names()) | set(journal_names())):
+        for n in _links(b)[0] or []:
+            named.setdefault(n, []).append(b)
+    return named
+
+
 def _lock_set(board) -> list:
-    """The board plus every board its record or journal chain names, transitively."""
-    todo, seen = [board], set()
+    """The board plus every board its record or journal chain names, transitively. A board
+    that names none also adds every board naming it, so a group its other members declare is
+    taken whole from any member (agentrc#197)."""
+    todo, seen, naming = [board], set(), None
     while todo:
         b = todo.pop()
         if b in seen:
             continue
         _check_name(b)
         seen.add(b)
-        names = []
-        rec = read_record(b)
-        if isinstance(rec, dict):
-            names += rec.get('locks') or []
-        journal = journal_state(b)
-        if journal == {}:
-            raise OSError(errno.EINVAL, f'{b}{JOURNAL} cannot be read, so the lock set it covers is unknown: '
-                                        f'inspect it by hand')
-        while isinstance(journal, dict) and journal:
-            names += journal.get('locks') or []
-            journal = journal.get('prior')
-        todo += [n for n in names if isinstance(n, str)]
+        names = _declared(b)
+        if names is None:
+            if naming is None:
+                naming = _naming()
+            names = naming.get(b, [])
+        todo += names
     return sorted(seen)
 
 
 def _write_journal(dfd, board, content) -> None:
     """Replace <board>.takeover durably: a crash leaves the old journal or the new one."""
-    tmp = f'.{board}{JOURNAL}.{os.getpid()}.{secrets.token_hex(4)}'
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
-    try:
-        os.fchmod(fd, 0o644)                # umask-proof: another OS user's takeover reads it
-    except OSError:
-        os.close(fd)
-        raise
-    with os.fdopen(fd, 'wb') as f:          # a buffered write is all or an exception
-        f.write(json.dumps(content).encode())
-        f.flush()
-        os.fsync(f.fileno())
-    os.rename(tmp, board + JOURNAL, src_dir_fd=dfd, dst_dir_fd=dfd)
-    os.fsync(dfd)
+    _replace_file(dfd, board + JOURNAL, json.dumps(content).encode())
 
 
 def _foreign_journals(boards) -> str:
@@ -783,7 +870,8 @@ def _drop_flocks(handles) -> None:
 
 
 def take_over(board: str, reason: str, detail=''):
-    """Recovery takeover of `board` and every board its record or journal chain names, all
+    """Recovery takeover of `board` and every board its record or journal chain names (one
+    naming none, an older helper's record or one cut short, adds every board naming it), all
     or nothing; returns (token, {board: handle}). Each board first gets a journal holding
     its predecessor's record bytes and any earlier journal, then a cleanup-holder record:
     a crash anywhere leaves a journal, so the boards stay blocked. Only release_token of
@@ -910,36 +998,41 @@ def _holder_argv(job: dict) -> list:
     return [sys.executable, '-I', os.path.abspath(__file__), '--cleanup-holder', json.dumps(job)]
 
 
-def _protected_handle(fh) -> bool:
+def _handed_group(board, fh):
+    """The group the protected record behind `fh` declares (a record without one: `board`
+    alone), or None when the record is not shown protected."""
     try:
         state, rec = _parse(_handle_record(fh))
     except OSError:
-        return False
-    return state == 'record' and rec.get('protected') is True
+        return None
+    if state != 'record' or rec.get('protected') is not True:
+        return None
+    return rec.get('locks', [board])
 
 
 def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF_WAIT, **extra) -> str:
-    """Hand the flocks of `handles` ({board: handle} the caller took with take_board_lock(...,
+    """Hand the flocks of `handles` ({board: handle} taken with take_board_lock(...,
     protected=True)) to a cleanup holder, a fresh interpreter given their descriptors, so the
-    caller can go on or exit; returns its token once its records name it and it confirmed the
-    hold. A handle whose record is not shown protected raises ValueError before anything is
-    touched: the caller still owns every handle, and must end or protect them itself.
-    Otherwise each record is first rewritten with `detail`, `receipts` and the lock set, so
-    a takeover of any rewritten board covers them all; a board whose rewrite failed keeps
-    its prior record, so its own takeover covers only what that names (the failure message
-    names it); a rewrite cut short leaves the protected record or an unreadable one, both
-    recovery blockers. A handoff that fails, each of its waits bounded by `wait`, raises
-    LockUnavailable with such a record, or a cleanup-holder record naming the holder it
-    ended, left as the blocker; an interrupt ends it the same way and propagates. With
-    `receipts` (hil_process.run_tracked's) the holder's release predicate is every one
-    rechecking `done`. `extra` adds fields to the cleanup-holder record. Past the ValueError
+    caller can go on or exit; returns its token once the holder confirmed the hold. Unless
+    every record is shown protected and declares exactly the handed boards as its group,
+    raises ValueError with nothing touched: the caller still owns every handle. Otherwise a
+    failed handoff, each wait bounded by `wait`, raises LockUnavailable (an interrupt
+    propagates) and leaves every board a recovery blocker whose takeover takes the group.
+    With `receipts` (hil_process.run_tracked's) the holder releases only once every one
+    rechecks `done`; `extra` adds fields to the cleanup-holder record. Past the ValueError
     the caller closes its handles either way, never clearing them. Needs hil_process.py
-    beside this file, with or without receipts."""
-    unprotected = [b for b, fh in handles.items() if not _protected_handle(fh)]
+    beside this file."""
+    receipts, locks = list(receipts), sorted(handles)
+    groups = {b: _handed_group(b, fh) for b, fh in handles.items()}
+    unprotected = [b for b, g in groups.items() if g is None]
     if unprotected:
         raise ValueError(f'cleanup holder handoff refused: {", ".join(unprotected)} not taken protected; '
                          f'nothing changed, the caller still holds every board')
-    receipts, locks = list(receipts), sorted(handles)
+    other = [f'{b} declares {g!r:.80}' for b, g in groups.items()
+             if not _valid_group(g, b) or sorted(g) != locks]
+    if other:
+        raise ValueError(f'cleanup holder handoff refused: the group taken protected is not the handed boards '
+                         f'{locks} ({"; ".join(other)}); nothing changed, the caller still holds every board')
     unwritten = []
     for b, fh in handles.items():
         try:
@@ -1017,6 +1110,168 @@ def _handed_holder(job: dict) -> int:
     for fh in handles:
         release_board_lock(fh)
     return 0
+
+
+# --- pending sessions -----------------------------------------------------------------------
+PENDING = '-pending.json'           # <lock>.<kind>-pending.json, beside the board's lock file
+PENDING_MUTEX = '.mutex'            # <record>.mutex: never replaced or removed; not '.lock', a board's suffix
+PENDING_CLEARED = '.cleared.jsonl'  # <record>.cleared.jsonl: every clear made after a reviewed recovery
+
+
+class PendingRefused(RuntimeError):
+    """A pending-session record was kept as it is: it cannot be read, or lists a session its
+    consumer has not proven ended."""
+
+
+def _sessions_ok(sessions) -> bool:
+    return isinstance(sessions, list) and all(isinstance(e, dict) and isinstance(e.get('receipt'), (str, dict))
+                                              for e in sessions)
+
+
+class PendingSessions(os.PathLike):
+    """A board's pending-session record, <lock>.<kind>-pending.json in BOARD_LOCK_DIR: the
+    sessions a consumer (`kind`, e.g. `tinyuf2-openocd`) left on the board without proving them
+    ended, so a later invocation, whatever its run dir or project, refuses until they are.
+    `{"sessions": [...]}`, each session a dict whose `receipt` (a path or a record) identifies
+    it; what a receipt means, when its session counts as ended and what a refusal does stay the
+    consumer's. Every read, write and removal holds an flock on <record>.mutex (0666, never
+    removed), so the board lock need not be held; the record is replaced atomically and fsynced
+    with its dir (_replace_file), 0644. A record that cannot be parsed, or lists a malformed
+    session, is unreadable: kept as it is, and it refuses."""
+
+    def __init__(self, lock, kind):
+        _check_name(lock)
+        _check_name(kind)
+        self.lock, self.suffix = lock, f'.{kind}{PENDING}'
+        self.name = lock + self.suffix
+
+    @property
+    def path(self) -> str:
+        return os.path.join(BOARD_LOCK_DIR, self.name)
+
+    def __fspath__(self):
+        return self.path
+
+    def __str__(self):
+        return self.path
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """The mutex held; yields the lock dir's fd, created on first use."""
+        dfd = _open_dir(create=True)
+        try:
+            fd = _open_file(dfd, self.name + PENDING_MUTEX, os.O_RDWR, create=True)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield dfd
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dfd)
+
+    def _read(self):
+        try:
+            data = _read_file(self.lock, self.suffix)
+            rec = data is not None and json.loads(data)
+        except (OSError, ValueError):
+            return None
+        if data is None:
+            return []
+        sessions = rec.get('sessions') if isinstance(rec, dict) else None
+        return sessions if _sessions_ok(sessions) else None
+
+    def read(self):
+        """The sessions it lists, [] without a record; None when it is unreadable."""
+        with self._locked():
+            return self._read()
+
+    def add(self, sessions) -> list:
+        """List `sessions` too, each one whose receipt no listed session has, and return what the
+        record lists. ValueError for a malformed session and PendingRefused for an unreadable
+        record, both before anything is written; OSError when the record cannot be replaced (in
+        a sticky dir, another OS user's), the previous one kept."""
+        sessions = list(sessions)
+        if not _sessions_ok(sessions):
+            raise ValueError(f'a pending session is a dict with a receipt: {sessions!r:.200}')
+        with self._locked() as dfd:
+            merged = self._read()
+            if merged is None:
+                raise PendingRefused(f'{self.path} is unreadable: kept as it is')
+            listed = len(merged)
+            for e in sessions:
+                if all(e['receipt'] != m['receipt'] for m in merged):
+                    merged.append(e)
+            if len(merged) > listed:
+                _replace_file(dfd, self.name, json.dumps({'sessions': merged}, indent=1).encode())
+            return merged
+
+    def clear(self, ended, note=None, **evidence) -> dict:
+        """Remove the record once `ended(session)`, the consumer's reading of its receipt, is
+        True for every session it lists (one that raises is not ended); or, given the `note` of a
+        separately reviewed recovery, whatever it holds, once the note, `evidence` (e.g. the
+        hold that proved it) and the record's sessions, or an unreadable record's text, are
+        appended to <record>.cleared.jsonl and fsynced. PendingRefused otherwise, naming the
+        receipts, the record kept; OSError when it cannot be logged or removed (in a sticky dir,
+        another OS user's), the record kept. Returns {mark, sessions, notEnded} plus what was
+        logged."""
+        with self._locked() as dfd:
+            sessions = self._read()
+            if sessions is None and note is None:
+                raise PendingRefused(f'{self.path} is unreadable: a session may still be pending; it is cleared only '
+                                     f'with the note of a separately reviewed recovery')
+            left = [e['receipt'] for e in sessions or [] if not _ended(ended, e)]
+            if left and note is None:
+                raise PendingRefused(f'{self.path}: sessions {left} are not ended')
+            cleared = {'mark': self.path, 'sessions': sessions, 'notEnded': left}
+            if note is not None:
+                cleared.update(note=note, **evidence)
+                raw = _read_file(self.lock, self.suffix) if sessions is None else None
+                if raw:
+                    cleared['unreadable'] = raw.decode(errors='replace')
+                line = json.dumps(dict(cleared, at=time.strftime('%Y-%m-%dT%H:%M:%S%z'))) + '\n'
+                fd = _open_file(dfd, self.name + PENDING_CLEARED, os.O_RDWR | os.O_APPEND, create=True)
+                try:
+                    os.ftruncate(fd, _whole_lines(fd))     # an earlier append's torn line goes
+                    _write_all(fd, line.encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.fsync(dfd)                          # the log's entry durable before the record goes
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.name, dir_fd=dfd)     # a removal a crash loses only refuses again
+            return cleared
+
+    def cleared(self) -> list:
+        """Every entry <record>.cleared.jsonl holds, oldest first; a line that is not a JSON
+        object, or a last one without its newline (an append that failed), is skipped."""
+        with self._locked():
+            data = _read_file(self.lock, self.suffix + PENDING_CLEARED) or b''
+        found = []
+        for line in data[:data.rfind(b'\n') + 1].splitlines():
+            with contextlib.suppress(ValueError):
+                entry = json.loads(line)
+                if isinstance(entry, dict):
+                    found.append(entry)
+        return found
+
+
+def _whole_lines(fd) -> int:
+    """The size of `fd`'s file up to and including its last newline."""
+    end = os.fstat(fd).st_size
+    while end > 0:
+        start = max(0, end - 4096)
+        chunk = os.pread(fd, end - start, start)
+        if b'\n' in chunk:
+            return start + chunk.rindex(b'\n') + 1
+        end = start
+    return 0
+
+
+def _ended(ended, session) -> bool:
+    try:
+        return ended(session) is True
+    except Exception:
+        return False
 
 
 # --- operator CLI (hold/release/status) ------------------------------------
