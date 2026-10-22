@@ -5,7 +5,7 @@ export const meta = {
   phases: [{ title: 'Check' }, { title: 'Context' }, { title: 'Review' }, { title: 'Judge' }, { title: 'Draft' }],
 }
 
-const AGENTRC = '${AGENTRC_DIR:-$HOME/.claude}'  // shell text: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
+const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: { pr, repo: 'owner/name', head, mergeBase, scopeBase (full SHAs: prepare.py's
 //          pins; scopeBase is mergeBase on a full review, the last reviewed head on an
 //          incremental one), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's

@@ -5,7 +5,7 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-const AGENTRC = '${AGENTRC_DIR:-$HOME/.claude}'  // shell text: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
+const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: see skills/pr-babysit/ARGUMENTS.md.
 if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }

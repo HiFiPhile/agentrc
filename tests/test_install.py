@@ -582,6 +582,113 @@ class ProjectInstallTest(unittest.TestCase):
                                                     '--agent'))
                 self.assertTrue(clash.is_symlink() or clash.exists(), 'the project\'s own stays')
 
+    def test_a_skipped_skill_takes_its_hook_with_it(self):
+        own = self.repo / '.claude' / 'skills' / 'headless-chief'
+        own.mkdir(parents=True)
+        (own / 'SKILL.md').write_text('the project\'s own headless-chief')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'own skill')
+        out = self.ok('install', '--project', str(self.repo), '--skill', '--skip-clashes')
+        self.assertIn('belongs to the skipped skill headless-chief', out)
+        self.assertFalse((self.repo / '.claude' / 'hooks' / 'headless-chief').exists())
+        self.assertNotIn('PreToolUse', TestCommands.of(self.local()), 'its guards are not registered')
+        self.assertIn('Stop', TestCommands.of(self.local()), 'another skill\'s hook still is')
+
+    def test_a_skill_the_project_takes_over_later_loses_agentrcs_hook(self):
+        self.ok('install', '--project', str(self.repo), '--skill')
+        skill = self.repo / '.claude' / 'skills' / 'headless-chief'
+        skill.unlink()
+        skill.mkdir()
+        (skill / 'SKILL.md').write_text('the project\'s own headless-chief')
+        self.ok('install', '--project', str(self.repo), '--skill', '--skip-clashes')
+        self.assertFalse((self.repo / '.claude' / 'hooks' / 'headless-chief').is_symlink(), 'the earlier link went')
+        self.assertNotIn('PreToolUse', TestCommands.of(self.local()), 'and its registration')
+        self.assertNotIn('/.claude/hooks/headless-chief', self.block())
+
+    def test_a_skipped_skills_hook_of_the_projects_own_keeps_its_registration(self):
+        skill = self.repo / '.claude' / 'skills' / 'headless-chief'
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_text('the project\'s own headless-chief')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'own skill')
+        own_hook = Path(self.tmp.name) / 'own-hook'
+        own_hook.mkdir()
+        hook = self.repo / '.claude' / 'hooks' / 'headless-chief'
+        hook.parent.mkdir()
+        os.symlink(own_hook, hook, target_is_directory=True)
+        command = shlex.quote((hook / 'project_guard.py').as_posix())
+        (self.repo / '.claude' / 'settings.local.json').write_text(json.dumps(
+            {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command}]}]}}))
+        self.ok('install', '--project', str(self.repo), '--skill', '--skip-clashes')
+        self.assertTrue(os.path.samefile(hook, own_hook), 'the project\'s hook link untouched')
+        self.assertIn(command, TestCommands.of(self.local())['PreToolUse'], 'and its registration')
+
+    @unittest.skipUnless(os.name == 'nt', 'a junction is Windows\' own link')
+    def test_a_junction_on_the_way_refuses_before_any_change(self):
+        elsewhere = Path(self.tmp.name) / 'elsewhere'
+        elsewhere.mkdir()
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(self.repo / '.claude' / 'workflows'), str(elsewhere)],
+                       check=True, capture_output=True)
+        done = self.run_cli('install', '--project', str(self.repo), '--workflow')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('symlink or junction', done.stderr)
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_a_tracked_settings_local_file_is_found_in_any_case_where_git_ignores_case(self):
+        if self.git('config', '--bool', '--default', 'false', 'core.ignorecase').strip() != 'true':
+            self.skipTest('git matches names case-sensitively here')
+        blob = subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=self.repo, input='{"model": "team"}',
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.git('update-index', '--add', '--cacheinfo', f'100644,{blob},.CLAUDE/settings.local.json')  # tracked in other case
+        (self.repo / '.claude' / 'settings.local.json').write_text('{"model": "team"}')
+        done = self.run_cli('install', '--project', str(self.repo), '--workflow')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn('tracked or a link', done.stderr)
+
+    def test_a_tracked_or_linked_settings_local_file_refuses_before_any_change(self):
+        def tracked(local, _):
+            local.write_text('{"model": "team"}')
+            self.git('add', '-A')
+            self.git('commit', '-qm', 'tracked local settings')
+
+        for case, arrange in {'tracked': tracked, 'a link': lambda local, elsewhere: os.symlink(elsewhere, local)}.items():
+            with self.subTest(case):
+                self.tearDown()
+                self.setUp()
+                local = self.repo / '.claude' / 'settings.local.json'
+                elsewhere = Path(self.tmp.name) / 'settings.json'
+                elsewhere.write_text('{}')
+                arrange(local, elsewhere)
+                before = self.snapshot()
+                for action in ('install', 'remove'):
+                    done = self.run_cli(action, '--project', str(self.repo), '--workflow')
+                    self.assertEqual(done.returncode, 1, action)
+                    self.assertIn('tracked or a link', done.stderr)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(elsewhere.read_text(), '{}', 'the file a link names is untouched')
+
+    def test_a_symlinked_directory_on_the_way_refuses_before_any_change(self):
+        elsewhere = Path(self.tmp.name) / 'elsewhere'
+        elsewhere.mkdir()
+        shutil.rmtree(self.repo / '.claude')
+        os.symlink(elsewhere, self.repo / '.claude', target_is_directory=True)
+        for action in ('install', 'remove'):
+            done = self.run_cli(action, '--project', str(self.repo), '--workflow')
+            self.assertEqual(done.returncode, 1, action)
+            self.assertIn('is a symlink', done.stderr)
+        self.assertEqual(os.listdir(elsewhere), [], 'nothing written where the link points')
+
+    def test_pruning_leaves_a_tracked_link_alone(self):
+        workflows = self.repo / '.claude' / 'workflows'
+        workflows.mkdir()
+        os.symlink(ROOT / 'workflows' / 'gone.js', workflows / 'gone.js')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'a tracked link into agentrc')
+        out = self.ok('install', '--project', str(self.repo), '--workflow')
+        self.assertIn('is tracked by the repository, left alone', out)
+        self.assertTrue((workflows / 'gone.js').is_symlink())
+        self.assertEqual(self.status(), '')
+
     def test_a_clashing_hook_is_skipped_with_its_registration(self):
         hook = self.repo / '.claude' / 'hooks' / 'headless-chief'
         hook.mkdir(parents=True)

@@ -5,7 +5,7 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Co-plan' }, { title: 'Implement' }, { title: 'Verify' }, { title: 'Report' }],
 }
 
-const AGENTRC = '${AGENTRC_DIR:-$HOME/.claude}'  // shell text: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
+const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: the target string (slash form) or { target, repo?, verify?, scope?, batch?, planLane? }.
 // A string is never JSON-parsed: "28" is a target, not a number.
 if (typeof args === 'string' || typeof args === 'number') args = { target: String(args) }
