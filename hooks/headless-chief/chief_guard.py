@@ -15,7 +15,9 @@ The boundary is deny what it cannot interpret, within the command families it kn
 wrappers, xargs and find -exec, writers and linkers): it follows a few plain forms of those and refuses
 the rest rather than grow general parsing. It is mistake-only, not an allowlist: a program outside them passes
 with its arguments by design, even one that runs them as a command (setsid, ssh, awk, ...), and such a program
-is not a defect to patch one by one.
+is not a defect to patch one by one. Likewise a variable named in arithmetic or an array subscript, whose value
+bash evaluates as code (#223): `let`, `declare -i`, `${!name}` and `${name@P}`, which evaluate a value the same way,
+are denied, but no value is followed.
 
 The cost is what chief can no longer run directly: piping commands into a shell, shell or wrapper options
 outside the small tables, git or a writer fed by xargs or find -exec, globs in a write target even
@@ -185,28 +187,34 @@ QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(SPECIAL)}
 UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
 SEPARATORS_BACK = str.maketrans({QUOTED[c]: c for c in ',.'})
 BRACES_QUOTED = str.maketrans({c: QUOTED[c] for c in '{}'})
+# marks where a quote or escape starts in a word, until segment() reads whether bash takes it as an assignment
+QUOTING = chr(0xE000 + len(SPECIAL))
 
 
 def literal(word):
     """The word with its brace separators back; bash expands no brace whose separators are all quoted, so its braces
     then take their stand-ins."""
     plain = word.translate(SEPARATORS_BACK)
-    return plain.translate(BRACES_QUOTED) if braces(plain) and not braces(word) else plain
+    separators_quoted = braces(plain.replace(QUOTING, '')) and not braces(word.replace(QUOTING, ''))
+    return plain.translate(BRACES_QUOTED) if separators_quoted else plain
 
 
 # the operators bash reads across a line continuation, longest first; `<(` and `>(` are process substitutions
 TOKENS = ('<<<', '$((', '<<', '$(', '${', '$[', "$'", '((', '<(', '>(')
 # the delimiter as bash reads it, a plain or fully quoted word that a metacharacter ends
 DELIMITER = re.compile(r"""(-)?[ \t]*(['"]?)(\w+)\2(?=[ \t\n;&|<>()]|$)""")
-# the arithmetic this guard reads as bash does: names, numbers, `$NAME`, operators, blanks and parentheses; one way to
-# match each character, so a mismatch fails in linear time
+# the arithmetic whose bounds this guard reads as bash does: names, numbers, `$NAME`, operators, blanks and parentheses;
+# one way to match each character, so a mismatch fails in linear time
 ARITHMETIC = re.compile(r'(?:[\w\s+\-*/%<>=!&|^~?:,#\[\]()]|\$(?=[A-Za-z_])|\$\{[A-Za-z_]\w*\})*')
+# the `${!...}` forms that list names or keys; any other reads a variable named by a value
+NAME_LISTS = re.compile(r'![A-Za-z_]\w*([*@]|\[[*@]\])')
 # a case pattern's `)` closes a substitution here, not in bash
 CASE = re.compile(r'(?<![^\s;&|()])case(?![^\s;&|()<>])')
 CONTINUED = re.compile(r'(?<!\\)(?:\\\\)*\\\n')  # an odd run of backslashes before a newline
 WORD_START = ' \t\n;&|()'
 CLOSERS = {')': '(', '}': '{'}
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
+DECLARED = re.compile(r'[A-Za-z_]\w*(\[[^]]*\])?\+?=')  # declare's assignment, which bash neither splits nor globs
 UNKNOWN = '\0'
 STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as '
               'plain words, or dispatch to a unit')
@@ -243,7 +251,7 @@ def ahead(text, i):
 
 def arithmetic(text, i):
     """The index past the `))` that closes the arithmetic starting at i: the first unmatched `)` directly followed by
-    another. Denied unless its body is ARITHMETIC, read alike by bash and this guard."""
+    another. Denied unless its body is ARITHMETIC, whose bounds bash and this guard read alike."""
     depth, j = 0, i
     while (j := past(text, j)) < len(text):
         remaining()
@@ -280,7 +288,9 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
             continue
         if c == '\\':
             if text[i + 1:i + 2] != '\n':  # a line continuation: bash removes it before it reads words or operators
-                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]))
+                # a trailing backslash stays bare, for shlex to deny
+                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2])
+                           + (QUOTING if mode == 'shell' and i + 1 < len(text) else ''))
             i += 2
             continue
         token, j = ahead(text, i) if c in '$<>(' else ('', i)
@@ -314,7 +324,10 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
             i = arithmetic(text, j)
             out.append(UNKNOWN if token == '$((' else ':')
         elif token == '${':
-            _, subs, i = lexed(text, j, '}', 'param', depth + 1)
+            body, subs, i = lexed(text, j, '}', 'param', depth + 1)
+            if body.startswith('!') and not NAME_LISTS.fullmatch(body) or body.endswith('@P'):
+                raise Denied('`${!name}` and `${name@P}` evaluate a value as a name or a prompt, running any '
+                             'substitution in it, which this guard cannot see; expand the variable directly')
             frames.extend(subs)
             out.append(UNKNOWN)
         elif token == '<<<' and shell:
@@ -364,7 +377,7 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
                 single = True
             elif double and c in QUOTED:
                 c = QUOTED[c]
-            out.append(c)
+            out.append(QUOTING + c if mode == 'shell' and c in '"\'' else c)
             i += 1
     if close:
         raise Denied(f'this command leaves a substitution open (no `{close}`), which bash does not read as this guard '
@@ -422,7 +435,7 @@ def operators(token):
 
 class Guard:
     def __init__(self, payload):
-        self.payload, self.root = payload, None
+        self.payload, self.root, self.evaluated = payload, None, False
 
     def inside(self, path, ancestors=False):
         """Is this absolute path in the worktree, chief's own directory apart, or with ancestors one holding it; the
@@ -480,13 +493,14 @@ class Guard:
 
     def segment(self, words, depth, indirect=False):
         remaining()
+        marked = [w for k, w in enumerate(words) if w not in STREAMS and not (k and words[k - 1] in STREAMS)]
+        words = [w.replace(QUOTING, '') for w in words]
         for k, w in enumerate(words[:-1]):
             if w in REDIRECTS and not (w == '>&' and words[k + 1].isdigit()):
                 self.writes(words[k + 1], 'the redirect')
         if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)\+?=.*winsymlinks', w) for w in words):
             raise Denied('winsymlinks makes links this guard cannot follow on Windows; dispatch the step to a unit')
-        words, xargs, replace, bare = unwrap([w for k, w in enumerate(words)
-                                              if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
+        words, xargs, replace, bare = unwrap([w.replace(QUOTING, '') for w in marked])
         if not words:
             if (indirect or xargs) and not bare:
                 raise Denied('a wrapper under xargs or find -exec with no program runs one known only at run time; name the '
@@ -524,11 +538,24 @@ class Guard:
             for a in args:
                 if ASSIGNMENT.match(a):
                     forbidden_env(a)
+        if cmd in ('declare', 'typeset', 'local'):
+            # bash reads an operand as declare's assignment only past an unquoted command word that keywords and
+            # assignments alone precede, and with its name unquoted; eval's operands it splits and globs first
+            assigns = not self.evaluated and QUOTING not in marked[-len(words)] and all(
+                w in KEYWORDS or ASSIGNMENT.match(w) for w in marked[:len(marked) - len(words)])
+            if any(not (assigns and DECLARED.match(m)) and (UNKNOWN in a or '$' in a or (GLOBSET - set('{}')) & set(a))
+                   for a, m in zip(args[:args.index('--')] if '--' in args else args, marked[len(marked) - len(args):])):
+                raise Denied(f'`{cmd}` takes a word expanded at run time, which may supply `-i` where this guard cannot '
+                             'see it; give its options literally, a glob quoted')
+        if cmd == 'let' or (cmd in DECLARES and spelled(args, {}, 'i')):
+            raise Denied(f'`{cmd}` evaluates values as arithmetic, where a name runs any substitution its value holds, '
+                         'which this guard cannot see; compute with `$((...))`')
         if cmd == 'alias' and any('=' in a for a in args):
             raise Denied('an alias runs a command under another name this guard cannot see; run the command itself')
         if cmd in SHELLS:
             return self.shell(args, depth)
         if cmd == 'eval':
+            self.evaluated = True
             return self.command(' '.join(args).translate(UNQUOTED), depth + 1)
         if cmd == 'find':
             self.find_exec(args, depth)

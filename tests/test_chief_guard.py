@@ -279,6 +279,36 @@ class ChiefGuard(unittest.TestCase):
                 self.check(c)
                 self.assertLess(time.monotonic() - start, 3)
 
+    def test_a_value_bash_evaluates_again_is_denied_where_the_command_says_so(self):
+        # #223: these evaluate a variable's value as a name, a prompt or arithmetic, running any substitution it holds
+        for c in ("x='b[$(git push)]'; let x", "x='b[$(git push)]'; declare -i y; y=x", 'typeset -i y', 'local -ir y',
+                  'declare -gi y', 'builtin let x', 'command declare -i y', "bash -c 'let x'",
+                  "x='a[$(git push)]'; echo ${!x}", "x='$(git push)'; echo ${x@P}", "x='`git push`'; echo ${x@P}",
+                  'echo "${x@\\\nP}"', "eval 'echo ${!x}'",
+                  # an option expanded at run time, a glob matching a file `-i` included
+                  'flags=-i; declare $flags y', 'declare -$f y', 'local ${f:--i} y', 'declare "$f" y',
+                  'typeset `echo -i` y', 'declare -? y', 'declare $n=1',
+                  # an assignment-shaped operand bash splits and globs as any word: nullglob drops `z=*` from '* -i y=x'
+                  'builtin declare z=$flags', 'command declare z=$flags', 'builtin typeset z=$flags',
+                  "declare 'z='$flags", 'declare z"="$flags', 'declare \\z=$flags', 'eval declare z=$flags',
+                  'f(){ builtin local z=$flags; }; f', '\\declare z=$flags', "'declare' z=$flags"):
+            with self.subTest(c=c):
+                self.assert_denied(c, 'this guard cannot see')
+        for c in ('echo ${!prefix*} ${!prefix@} ${!arr[@]} ${!arr[*]}', 'echo ${x@Q}', 'declare -a a', 'declare +i x',
+                  'declare x=1', 'local -r y=1', 'echo $((i+1))', '((n++))', 'echo ${a[1]}', 'declare x=$v',
+                  'local a[$i]=$v', 'declare -- $x', "declare '-?' y", 'export $n', 'local z=$v', 'a=1 declare z=$v',
+                  'if declare z=$v; then :; fi'):
+            with self.subTest(c=c):
+                self.assert_allowed(c)
+        self.assert_denied('echo ${x:-@P}', 'this guard cannot see')  # a trailing @P is read as the operator
+        # a name in arithmetic or a subscript: bash evaluates its value, which this guard does not follow (module
+        # docstring); denying names there would deny every counter and indexed read
+        for c in ("x='b[$(git push)]'; echo $((x))", "x='b[$(git push)]'; ((x))", "x='b[$(git push)]'; echo $(($x))",
+                  "x='b[$(git push)]'; echo ${a[x]}", 'x="a[\\$(git push)]"; echo $((x))',
+                  "d='$'; y=\"a[${d}(git push)]\"; echo $((y))", "k='b[$(git push)]'; echo \"${a[$k]}\""):
+            with self.subTest(c=c):
+                self.assert_allowed(c)
+
     def test_gh_reads_pass(self):
         for c in ('gh pr view 12 --json state', 'gh pr checks 12', 'gh -R o/r pr list', 'gh issue view 3',
                   'gh run view 99 --log-failed', 'gh api repos/o/r/pulls/1', 'gh api -X GET search/issues -f q=x',
@@ -372,6 +402,13 @@ class ChiefGuard(unittest.TestCase):
 
     def test_an_unparsable_command_is_denied(self):
         self.assert_denied('echo "unterminated', 'cannot parse')
+
+    def test_a_trailing_backslash_is_denied(self):
+        # bash keeps it literal: `wt/..\` is a file `..\` in the worktree, not the worktree's parent
+        for c in (f'touch {self.wt}/..\\', f'echo x > {self.wt}/..\\', f'cp /etc/hostname {self.wt}/..\\',
+                  f'git log -1 --output={self.wt}/..\\', f"bash -c 'touch {self.wt}/..\\'",
+                  f'eval "touch {self.wt}/..\\\\"', 'echo a\\', 'git status\\'):
+            self.assert_denied(c, 'cannot parse')
 
     def test_dashed_git_words_and_scalar_are_denied(self):
         # a dashed builtin runs the subcommand without the `git` word; judge it as `git <sub>`
