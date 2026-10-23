@@ -36,10 +36,12 @@ class AgentFiles(unittest.TestCase):
                     self.assertIn(f'~/.codex/agents/{stem}.md', toml['developer_instructions'])
 
     def test_chief_accepts_the_changed_criteria_hw_debugger_reports_on(self):
-        """chief cannot read hw-debugger.md, so each carries the list of what counts
-        as a changed round; the two copies must not drift."""
-        lists = [re.search(r'a valid first reproduction;[^.]*?demonstrated', (AGENTS / f'{name}.md').read_text())
-                 for name in ('chief', 'hw-debugger')]
+        """chief adjudicates a round from the hardware reference its Hardware section names, not from
+        hw-debugger.md, so each carries the list of what counts as a changed round; the two copies must not drift."""
+        named = re.search(r'read `~/\.claude/skills/([^`]+)` in full', (AGENTS / 'chief.md').read_text())
+        self.assertTrue(named, "chief.md no longer names its hardware reference")
+        lists = [re.search(r'a valid first reproduction;[^.]*?demonstrated', path.read_text())
+                 for path in (SKILLS / named[1], AGENTS / 'hw-debugger.md')]
         self.assertTrue(all(lists), 'the criteria list is no longer found')
         self.assertEqual(lists[0][0], lists[1][0])
 
@@ -53,8 +55,8 @@ class AgentFiles(unittest.TestCase):
                 self.assertIn(trigger, ' '.join((AGENTS / f'{name}.md').read_text().split()))
 
     def test_pr_review_validator_keeps_the_keys_tinyusb_dismissals_are_keyed_on(self):
-        """tinyusb's pr-babysit keys dismissal debt on findingId and detects
-        edited comments through commentDigest; its tests read this file."""
+        """pr-babysit.js keys deferrals on findingId and detects edited
+        comments through commentDigest."""
         body = (AGENTS / 'pr-review-validator.md').read_text()
         example = self.contract_example('pr-review-validator.md')
         finding = example['findings'][0]
@@ -117,10 +119,10 @@ class AgentFiles(unittest.TestCase):
         debugger = ' '.join((AGENTS / 'hw-debugger.md').read_text().split())
         self.assertIn('zero new hardware use, and `n-a` for every hardware cleanup action it did not perform', debugger)
 
-    def test_hardware_commit_recipes_put_options_before_the_pathspec(self):
+    def test_commit_recipes_put_options_before_the_pathspec(self):
         """An option after `--` is read as a path, so the recipe must carry -m before it."""
-        for name in ('chief.md', 'hw-debugger.md'):
-            body = (AGENTS / name).read_text()
+        for path in (AGENTS / 'chief.md', AGENTS / 'hw-debugger.md', AGENTS.parent / 'workflows' / 'fix-issue.js'):
+            body, name = path.read_text(), path.name
             self.assertIn('git commit --only -m "<subject>" -- <same paths>', body, name)
             self.assertNotIn('git commit --only -- <same paths>', body, name)
 
@@ -226,10 +228,11 @@ class AgentFiles(unittest.TestCase):
         for arg in ('yieldOnChange', 'yieldAfterCycle', 'markSonar', 'stateRef'):
             self.assertIn(f'args.{arg}', workflow)
         self.assertNotIn('the grant includes SonarCloud marking', chief)
-        relaunch = chief.split('A `ci-red-sonar-gate` stop')[1].split('Only a unit')[0]
-        self.assertIn('Relaunch with `markSonar`, unless the human withheld Sonar marking, only when', relaunch)
+        self.assertIn('a relaunch sets `markSonar` only from the grant, unless the human withheld Sonar marking', chief)
         switches = chief.split('A workflow carries a grant only through')[1].split('A workflow with no such argument')[0]
-        self.assertIn('a grant covering those answers covers `markSonar` on that PR unless the human withheld Sonar marking', switches)
+        self.assertIn('(the ones the interactive default lists)', switches)
+        default = chief.split('Interactive default:')[1].split('Exception for a headless PR launch:')[0]
+        self.assertIn('marking false positive the SonarCloud issues behind its code-scanning comments', default)
 
     def test_hil_operator_refuses_hardware_work_without_the_project_contract(self):
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())

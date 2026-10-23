@@ -187,6 +187,9 @@ const reviewedChange = (sha, f) => adoptReviewedProtected.some(e => e.sha === sh
 
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
+// state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
+const STATE_MAX = 64 * 1024
+const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.match(/[^\x00-\x7e]/g) || []).length }
 if (args.stateRef != null) {
   const ref = args.stateRef
   // The path goes into a shell command, single-quoted; a Windows one (C:\...) in its C:/... spelling. A leading // is
@@ -199,7 +202,6 @@ if (args.stateRef != null) {
   // A model copying text "corrects" it, so the loader copies state_transfer.py's base64 chunks, each with a sum, and the seal checks the whole. Sonnet: Haiku mis-copies the same chunks on every retry.
   const SIZE = 512
   const PER_CALL = 4 // more chunks to a call come back truncated and spliced
-  const MAX = 64 * 1024
   const ROUNDS = 6
   const ENVELOPE = {
     type: 'object', additionalProperties: false,
@@ -218,7 +220,7 @@ if (args.stateRef != null) {
   const failed = new Map()
   const padded = (i) => (failed.get(i) || 0) % 2 === 1
   const reset = (reason) => { why = reason; length = 0; got = new Map() }
-  const fresh = (env) => env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
+  const fresh = (env) => env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= STATE_MAX &&
     env.digest === ref.digest && Array.isArray(env.chunks)
   const take = (env, asked, pad) => {
     if (!env) return false
@@ -273,22 +275,24 @@ if (args.stateRef != null) {
 const ciCacheShaped = (c) => c && typeof c === 'object' &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean' &&
     (r.at === undefined || Number.isFinite(Date.parse(r.at)))) &&
-  Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket', 'digest'].every(k => typeof e[k] === 'string') &&
-    (e.placedWith === undefined || typeof e.placedWith === 'string'))
+  Array.isArray(c.entries) && c.entries.every(e => e && ['link', 'bucket', 'digest'].every(k => typeof e[k] === 'string') &&
+    (e.head === undefined || typeof e.head === 'string') && (e.placedWith === undefined || typeof e.placedWith === 'string'))
 const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
   const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
-  // Version 3 differs only in acceptedFailures as [{ key }]; it is sealed as saved, then migrated.
-  const shaped = st && [3, STATE_VERSION].includes(st.version) && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
+  const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
     Number.isInteger(st.maxCycles) && st.maxCycles >= 1 &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
     typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) &&
     [st.deferrals, st.acceptedFailures, st.decisions, st.holds].every(Array.isArray) &&
-    st.acceptedFailures.every(a => typeof (st.version === 3 ? a && a.key : a) === 'string') && (st.build === null || typeof st.build === 'string') &&
+    st.acceptedFailures.every(a => typeof a === 'string') && (st.build === null || typeof st.build === 'string') &&
     (st.reanswer === undefined || Array.isArray(st.reanswer)) && ciCacheShaped(st.ciCache) &&
     (st.last === null || (st.last && typeof st.last === 'object')) && (st.greptileRequired === undefined || st.greptileRequired === true) &&
     (st.coderabbitRequired === undefined || st.coderabbitRequired === true) &&
+    (st.coderabbitRead === undefined || (st.coderabbitRead && ['head', 'state', 'reason'].every(k => typeof st.coderabbitRead[k] === 'string') &&
+      (st.coderabbitRead.kind === null || typeof st.coderabbitRead.kind === 'string') &&
+      (st.coderabbitRead.retryAt === null || Number.isFinite(Date.parse(st.coderabbitRead.retryAt))))) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
@@ -297,7 +301,7 @@ if (args.state !== undefined && args.state !== null) {
         (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
       (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
         Object.values(st.reviewClock.unknown).every(u => u && typeof u.reading === 'string' && Number.isFinite(Date.parse(u.since)))))))
-  if (!shaped) throw new Error(`state is not a pr-babysit state of version 3 or ${STATE_VERSION}`)
+  if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
     const differ = [...new Set([...Object.keys(st.config), ...Object.keys(config)])]
@@ -306,7 +310,7 @@ if (args.state !== undefined && args.state !== null) {
     throw new Error(`state was made by a run with different arguments (${differ.join('; ')}): ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
   }
   if (st.build !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(st.build)} → ${JSON.stringify(buildCmd)}`)
-  restored = st.version === 3 ? { ...st, version: STATE_VERSION, acceptedFailures: st.acceptedFailures.map(a => a.key) } : st
+  restored = st
 }
 const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 16)
 if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
@@ -574,7 +578,7 @@ const TRIGGER = withSeal({
   required: ['outcome', 'detail', 'at'],
   properties: {
     error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
-    retryAt: { type: ['string', 'null'] },
+    retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] },
   },
 })
 const ADOPT_AUDIT = withSeal({
@@ -809,9 +813,10 @@ const noteRerun = (r) => {
   else if (r.sure) ciReruns[i] = r
 }
 const ciVerdicts = new Map()
-if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
+// Saved entries are of the state's expectedHead; one saved before the head was left out names it too.
+if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e, head: restored.expectedHead })
 const ciChecks = { judged: 0, partial: 0, reused: 0, unchanged: 0 }
-const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed', 'ciWaited']
+const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed', 'ciWaited', 'ciCollectFailed']
 // commentId -> { how, digest, sonar?, sonarOf? }: the answer and the body digest it addressed; an edit owes again. sonar: a code-scanning answer until its
 // SonarCloud issue settles; sonarOf: the { how, digest } of our earlier answer it belongs to, when the caller's reply settled the comment since.
 const answeredWith = new Map(restored ? restored.answeredWith : [])
@@ -820,7 +825,7 @@ const reanswer = new Set((restored && restored.reanswer) || [])
 // commentId -> { dismissals, notes }: standing debt, not a snapshot; a harvest that drops a finding settles nothing. edited: the comment changed
 // after its ids were carried: they may now name other points, so only the caller settles it.
 const debt = new Map(restored
-  ? restored.debt.map(([id, { seenSinceEdit, ...d }]) => [id, { ...d, dismissals: new Set(d.dismissals), notes: new Set(d.notes), ...(seenSinceEdit ? { edited: true } : {}) }])
+  ? restored.debt.map(([id, d]) => [id, { ...d, dismissals: new Set(d.dismissals), notes: new Set(d.notes) }])
   : [])
 for (const key of restored ? restored.acceptedFailures : []) {
   if (!acceptedArg.some(x => x.key === key)) log(`accepted failure not renewed by this launch, no longer accepted: key ${key}`)
@@ -874,10 +879,12 @@ const pendingOf = () => {
   return null
 }
 const stateOut = () => {
+  const crRead = coderabbitRead()
   const st = {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
     ...(greptileRequired ? { greptileRequired } : {}),
     ...(coderabbitRequired ? { coderabbitRequired } : {}),
+    ...(crRead ? { coderabbitRead: crRead } : {}),
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
     acceptedFailures: acceptedArg.map(a => a.key),
@@ -886,12 +893,27 @@ const stateOut = () => {
     ...(reanswer.size ? { reanswer: [...reanswer] } : {}),
     ciCache: {
       reruns: ciReruns.filter(r => r.head === expectedHead),
-      entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest, placedWith }) => ({ head, link, bucket, digest, ...(placedWith ? { placedWith } : {}) })),
+      entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ link, bucket, digest, placedWith }) => ({ link, bucket, digest, ...(placedWith ? { placedWith } : {}) })),
     },
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.edited ? { edited: d.edited } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.rejudge ? { rejudge: d.rejudge } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
-  return { ...st, digest: sealOf(st) }
+  const sized = (entries) => {
+    const state = { ...st, ciCache: { ...st.ciCache, entries } }
+    state.digest = sealOf(state)
+    return { state, size: stateBytes(state) }
+  }
+  // A state the loader refuses dead-ends the run; the verdict digests are a cache, recalled or judged again: the oldest
+  // go first, and none when leaving them all out would not make it loadable either.
+  const { entries } = st.ciCache
+  let out = sized(entries)
+  if (out.size > STATE_MAX && entries.length && sized([]).size <= STATE_MAX) {
+    const bytes = out.size
+    let dropped = 0
+    while (out.size > STATE_MAX) out = sized(entries.slice(++dropped))
+    log(`state: ${bytes} bytes, over the ${STATE_MAX} a launch loads — the ${dropped} oldest of ${entries.length} CI verdict digest(s) left out, judged again by a later launch`)
+  }
+  return out
 }
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
 // SonarCloud's own check, and Greptile's confidence check, a score of its review that collect.py reads by its app and
@@ -996,6 +1018,7 @@ const launchRollup = () => {
     }
     for (const rf of (e.ci && e.ci.realFailures) || []) {
       const state = ciState(rf)
+      // Counts judged entries: a re-judgement that relabels a cell (#36) counts twice; an acceptance key can group several.
       ci.set(failureKey(rf), state !== 'real' ? state : fixedBy(e.ciFixes, rf.id, e.ciPush) ? 'fixed' : 'open')
       row(`ci ${failureKey(rf)}`, { lane: 'ci', source: `ci:${rf.check}`, check: rf.check, cell: rf.cell ?? null,
         firstError: String(rf.firstError || '').slice(0, 200), verdict: rf.verdict, state, ...(state === 'accepted' ? { accepted: rf.accepted.reason } : {}) },
@@ -1025,7 +1048,7 @@ const actionsOf = (e) => ({
   reviewFixes: e.reviewFixes || null, ciFixes: e.ciFixes || null,
   reviewPush: e.reviewPush || e.reviewPushFailed || null, ciPush: e.ciPush || e.ciPushFailed || null,
   refutedPosts: e.refutedPosts || null, fixNotePosts: e.fixNotePosts || null, deferralPosts: e.deferralPosts || null, error: e.error || null,
-  adoption: e.adoption || null,
+  adoption: e.adoption || null, ...(e.botAsks ? { botAsks: e.botAsks } : {}),
 })
 // status: complete, paused (a cycle ran, another may follow) or blocked.
 const finish = (verdict, status) => {
@@ -1041,15 +1064,18 @@ const finish = (verdict, status) => {
       findings: ((e.reviews && e.reviews.findings) || []).map(f => ({ commentId: f.commentId, verdict: f.verdict })),
     })),
   }
-  const state = stateOut()
+  const { state, size } = stateOut()
+  if (size > STATE_MAX) log(`state: ${size} bytes, over the ${STATE_MAX} a launch loads — no launch can continue from it`)
   const handoffs = handoffList()
   if (!settlementsTried) for (const s of settlementsArg) settlements.push({ commentId: s.commentId, outcome: 'not processed', why: 'no review harvest in this launch' })
   const sonarUnmarked = !markSonar ? [] : [...answeredWith].filter(([, a]) => a.sonar)
     .map(([commentId, a]) => ({ commentId, how: (a.sonarOf || a).how, last: sonarLast.get(commentId) || (sonarDown ? { outcome: 'not asked', detail: sonarDown } : null) }))
   const { reason, pass, cycles, history: cycleHistory, ...rest } = verdict
+  const crAsk = !pass && !['pr-merged', 'pr-closed'].includes(reason) ? unreviewedCodeRabbit() : null
+  if (crAsk) rest.coderabbitAsk = coderabbitAskOf(crAsk)
   return {
     stateDigest: state.digest, status: status || (pass ? 'complete' : 'blocked'), ...(reason !== undefined ? { reason } : {}), pass, cycles,
-    rollup: launchRollup(), ...rest, ...(corrections.length ? { corrections } : {}), ...(handoffs.length ? { handoffs } : {}), ...(settlements.length ? { settlements } : {}), ...(sonarUnmarked.length ? { sonarUnmarked } : {}), history: cycleHistory, observation, state,
+    rollup: launchRollup(), ...rest, ...(size > STATE_MAX ? { stateTooLarge: size } : {}), ...(corrections.length ? { corrections } : {}), ...(handoffs.length ? { handoffs } : {}), ...(settlements.length ? { settlements } : {}), ...(sonarUnmarked.length ? { sonarUnmarked } : {}), history: cycleHistory, observation, state,
   }
 }
 // Comments the caller answers; a replySettlements entry then settles each.
@@ -1720,7 +1746,7 @@ const backoff = (cycle) => 60000 * Math.min(cycle, 10)
 let waited = false
 const rearm = () => { waited = true; return null }
 // The cycle before this one, the state's last included: history holds this cycle's entry already.
-const ciWaitedBefore = () => history.length > 1 ? history[history.length - 2].ciWaited : null
+const before = (k) => history.length > 1 ? history[history.length - 2][k] : null
 
 // A digest recorded before CodeRabbit rewrote its comment's end is one of the comment's aliases now (comment_digest.py): the same body.
 const repin = (cycle, findings) => {
@@ -1874,12 +1900,17 @@ const settleSonar = async (cycle, entry, ended) => {
 
 // A repository below CodeRabbit's open-source threshold gets a manual-review skip on every push until its Trigger review box is ticked.
 const MANUAL_SKIP = /^review skipped: manual review required/i
+const manualSkip = (cr) => cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
+// The ask CodeRabbit's state leaves a coderabbitTrigger launch on the head of `clock`, one of each per head (#243): a tick of a
+// manual skip's box, or a request after a rate limit with a known reset, whenever that reset comes; null when neither is left.
+const coderabbitAskable = (cr, clock) => manualSkip(cr) && clock.triggeredAt === undefined ? 'tick'
+  : cr.state === 'settled' && cr.kind === 'limited' && cr.retryAt !== null && !clock.request ? 'request' : null
 const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitRequired || !cr) return
-  const manual = cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
+  const manual = manualSkip(cr)
   // Once per head, whatever the outcome: a failed tick is not retried into a storm. Without the switch, only an earlier ask is waited on.
-  if (coderabbitTrigger && manual && reviewClock.triggeredAt === undefined) {
+  if (coderabbitTrigger && coderabbitAskable(cr, reviewClock) === 'tick') {
     if (await ended('crtrigger')) return
     const { t, outcome } = await relayTrigger(cycle, 'crtrigger', CRTRIGGER_SCRIPT, `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
       ['ticked', 'already', 'notSkipped', 'failed'])
@@ -1901,9 +1932,39 @@ const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: TRIGGER })
   const known = !!t && !t.error && outcomes.includes(t.outcome)
   const outcome = known ? t.outcome : 'failed'
+  // An uncertain request posted a comment it could not read back: a receipt, not a verified one.
+  if (known && ['ticked', 'requested', 'already', 'uncertain'].includes(outcome) && Number.isInteger(t.commentId)) {
+    const entry = history[history.length - 1]
+    const [bot, ask] = ASK_OF[kind]
+    entry.botAsks = [...(entry.botAsks || []), { bot, kind: ask, outcome, commentId: t.commentId, at: t.at, sha: expectedHead }]
+  }
   const detail = known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`
   log(`cycle ${cycle}: ${label}: ${outcome}${detail ? ` (${detail})` : ''}`)
   return { t: known ? t : null, outcome }
+}
+// A trigger script's comment, a receipt in its cycle's botAsks (#272); `already` found one standing, maybe a lost line's.
+const ASK_OF = { crtrigger: ['coderabbit', 'tick'], crrequest: ['coderabbit', 'request'], greptile: ['greptile', 'request'] }
+// The last reading of a required CodeRabbit on the head: this launch's, else the one carried from an earlier launch, so a
+// launch that stops before its own harvest still names the ask.
+const coderabbitRead = () => {
+  if (!coderabbitRequired) return null
+  const read = history.slice(launchFrom).reverse().find(e => e.bots)
+  if (!read) return restored && restored.coderabbitRead && restored.coderabbitRead.head === expectedHead ? restored.coderabbitRead : null
+  const cr = read.head === expectedHead && read.bots.bots.find(b => b.bot === 'coderabbit')
+  return cr ? { head: read.head, state: cr.state, kind: cr.kind, reason: cr.reason, retryAt: cr.retryAt } : null
+}
+const unreviewedCodeRabbit = () => {
+  const cr = coderabbitRead()
+  return cr && cr.state !== 'reviewed' ? cr : null
+}
+// This run's asks of CodeRabbit on the stopped head, and which one a relaunch with coderabbitTrigger would still make. An ask
+// whose `at` is null was tried and failed.
+const coderabbitAskOf = (cr) => {
+  const clock = reviewClock && reviewClock.sha === expectedHead ? reviewClock : {}
+  const asked = [...(clock.triggeredAt !== undefined ? [{ ask: 'tick', at: clock.triggeredAt }] : []),
+    ...(clock.request ? [{ ask: 'request', at: clock.request.at }] : [])]
+  const relaunchAsks = coderabbitAskable(cr, clock)
+  return { relaunchAsks, asked, ...(relaunchAsks === 'request' ? { retryAt: cr.retryAt } : {}) }
 }
 const waitAfter = (cr, askedAt, observedAt) => {
   cr.triggeredMin = Math.floor((Date.parse(observedAt) - Date.parse(askedAt)) / 60000)
@@ -1924,7 +1985,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
     if (asked.at !== null && Date.parse(asked.retryAt) === Date.parse(cr.retryAt)) waitAfter(cr, asked.at, r.observedAt)
     return
   }
-  if (!coderabbitTrigger || cr.retryAt === null) return
+  if (!coderabbitTrigger || coderabbitAskable(cr, reviewClock) !== 'request') return
   const dueMs = Date.parse(cr.retryAt) - Date.parse(r.observedAt)
   if (dueMs > 0) return retryLater(cr, cycle, dueMs)
   if (await ended('crrequest')) return
@@ -2015,10 +2076,13 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     log(`cycle ${cycle}: CI not collected — no PR repository in ${JSON.stringify(pin && pin.prUrl)}`)
     return null
   }
+  // The head the last collector call queried, its retry too: a review-lane push moves expectedHead while one runs.
+  let queried = expectedHead
   const collect = (label, command, schema, payload) => {
+    const head = queried = expectedHead
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file, a name without quotes, and ' : ''}` +
-      `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}${payload ? " < '<that file>'" : ''}\` ` +
+      `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
       'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
       (payload ? `\n${JSON.stringify(payload)}` : '')
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema }
@@ -2034,9 +2098,12 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
   const sameLinks = (got, want) => got.length === want.length && want.every(l => got.includes(l))
+  // The script's own error, or the relay's death, kept so the same failure on the next cycle stops the launch.
+  const collectFailed = (error) => { entry.ciCollectFailed = { head: queried, error } }
   const inventoryFailed = (inv) => {
     if (inv && !inv.error) return false
     log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
+    collectFailed(inv ? inv.error : 'the collector died')
     return true
   }
   const endLanes = (inv) => {
@@ -2045,7 +2112,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     return { headSha: inv.head, status: inv.status, infraRerun: [], realFailures: [] }
   }
   // A head on which a whole wait found no check registered is read again at once, not waited out every cycle.
-  const prior = ciWaitedBefore()
+  const prior = before('ciWaited')
   const unregistered = !!prior && prior.head === expectedHead && prior.registered === 0
   const ignoring = ciIgnored.map(name => ` --ignore-check ${shq(name)}`).join('')
   // Only the review lane's checks registered, and its pass is done: they are its to wait on. The pass is a grace
@@ -2196,6 +2263,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const evFault = faultOf(ev, inv.head)
   if (evFault) {
     log(`cycle ${cycle}: CI evidence not collected — ${evFault}`)
+    collectFailed(evFault)
     return null
   }
   if (!sameLinks(ev.gates.map(g => g.link), gated.map(c => c.link))) {
@@ -2313,9 +2381,7 @@ const runLanes = async (cycle, entry, lanes) => {
 
     const owedLastCycle = outstanding().map(commentId => ({ commentId, findingIds: owedIds(commentId) }))
     const reviewPrompt =
-      `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
-      `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others: report one bot record for each; ` +
-      `${waitedOn.length ? `of those, ${waitedOn.join(', ')} auto-run on every push` : 'none of them auto-run'}. ${IN_CHECKOUT}` +
+      `Validate the bot review findings on PR #${args.pr} per your procedure. ${IN_CHECKOUT}` +
       `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
       `A drafted reply is posted only when each point has at most ${REPLY_WORDS} words and no line is over ${REPLY_LINE_CHARS} characters. ` +
       (owedLastCycle.length > 0
@@ -2696,7 +2762,7 @@ const runLanes = async (cycle, entry, lanes) => {
       }
       if (args.autoPush !== true) {
         log('autoPush not set: review-lane fixes left uncommitted (dry run)')
-        return { pass: false, cycles: cycle, history, dryRun: true }
+        return stop(cycle, 'dry-run', { dryRun: true })
       }
       if (!ok) {
         log(`cycle ${cycle}: review-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
@@ -2747,7 +2813,14 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     const c = await ciPromise
     if (!c) {
+      const now = entry.ciCollectFailed, prev = before('ciCollectFailed')
+      if (now && prev && now.head === prev.head && now.error === prev.error) {
+        log(`cycle ${cycle}: collect.py failed the same way two cycles running — ${now.error}`)
+        entry.error = `collect.py failed: ${now.error}`
+        return stop(cycle, 'ci-collect-failed', { detail: now.error })
+      }
       log(`cycle ${cycle}: CI lane gave no report — re-arming`)
+      napMs = backoff(cycle)
       return null
     }
     if (lanes.prState) return prEnded(cycle, lanes.prState)
@@ -2789,7 +2862,7 @@ const runLanes = async (cycle, entry, lanes) => {
       entry.ciFixes = fixes
       if (args.autoPush !== true) {
         log('autoPush not set: CI-lane fixes left uncommitted (dry run)')
-        return { pass: false, cycles: cycle, history, dryRun: true }
+        return stop(cycle, 'dry-run', { dryRun: true })
       }
       if (!ok) {
         log(`cycle ${cycle}: CI-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
@@ -2805,8 +2878,8 @@ const runLanes = async (cycle, entry, lanes) => {
       entry.ciPush = ciPush
       return null
     }
-    const now = entry.ciWaited, before = ciWaitedBefore()
-    if (c.status === 'running' && now && now.registered > 0 && before && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === before[k])) {
+    const now = entry.ciWaited, prev = before('ciWaited')
+    if (c.status === 'running' && now && now.registered > 0 && prev && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === prev[k])) {
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} still running with the same ${now.pending} pending check(s) after two whole waits — observe them before relaunching`)
       return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending })
     }
@@ -2824,7 +2897,7 @@ const runLanes = async (cycle, entry, lanes) => {
         if (args.autoPush !== true) {
           // In a dry run nothing is postable, so the debt is no deferral.
           log('autoPush not set: replies left unposted (dry run)')
-          return { pass: false, cycles: cycle, history, dryRun: true }
+          return stop(cycle, 'dry-run', { dryRun: true })
         }
         // Another cycle cannot answer a comment handed to the caller, or one held for the caller's decision: stop rather than burn the budget waiting.
         const progressing = owedNow.filter(id => !handedOff(id) && !callerHeld(id))
@@ -3142,4 +3215,4 @@ return finish(outstanding().length > 0
   ? unresolvedVerdict(maxCycles, outstanding(), args.autoPush !== true)
   : stillPending.length > 0
     ? stop(maxCycles, 'reviews-pending', { head: expectedHead, pending: stillPending.map(botOut) })
-    : stop(maxCycles, 'maxCycles reached'))
+    : stop(maxCycles, 'budget-exhausted'))
