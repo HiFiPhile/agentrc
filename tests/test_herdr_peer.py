@@ -395,5 +395,13 @@ class AwaitTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 5)
 
 
+class CommitRecipeTest(unittest.TestCase):
+    def test_the_commit_recipe_puts_options_before_the_pathspec(self):
+        """An option after `--` is read as a path, so the recipe must carry -m before it."""
+        body = ' '.join((ROOT / 'skills' / 'herdr-peer' / 'SKILL.md').read_text().split())
+        self.assertIn('`git commit --only -m "<subject>" -- <same paths>`', body)
+        self.assertNotIn('git commit --only -- <same paths>', body)
+
+
 if __name__ == '__main__':
     unittest.main()
