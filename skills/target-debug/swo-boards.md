@@ -58,12 +58,22 @@ on hardware before its row can cite the fixture.
   0x5C003000 ignores debugger writes); `stm32h7x.tpiu` is the parallel port and rejects `uart`. The J-Link route, which
   programs the core TPIU, is refused for this entry.
 - `stm32h7x.cfg`'s examine sets DBGMCU_CR (D1/D3 debug clocks, TRACECLKEN) and SWTF_CTRL (ENS0, ENS1); the entry
-  checks them and does not write them.
+  checks them and does not write them. A system reset keeps SWTF_CTRL, and with the debug clocks off it reads 0 and
+  ignores writes. TinyUSB's `TRACE_SWO=1` build sets DBGMCU_CR to 0x00700000, ENS0 and PB3 AF0 itself (read back
+  with the examine handler disabled).
 - The SWO unit's input clock is not named in RM0433. 400 MHz worked, with rcc_c_ck and pll1_r_ck both 400 MHz in
   this BSP's clock tree; a slower guess gives ratio-garbled bytes, a faster one silence. Re-measure when a project
   changes either clock.
-- STLINK-V3 (J12M3) through OpenOCD drops or corrupts a byte now and then at a 2 KiB-multiple offset (3 in 178 KB,
-  1 in 263 KB); the decode flags each.
+- STLINK-V3 (J12M3) through OpenOCD 0.12.0+dev-02620-g0ce743125 loses a single byte now and then, two ways (fixture,
+  10 s captures), and lost none with one of the two sources below at 4 and 8 MHz. The decode flags each loss as an
+  unknown header or unexpected source and resynchronizes.
+  - Breaking 0 to 5 bytes past a 2 KiB-multiple stream offset, at 16 MHz only: 2, 0 and 1 with exception trace alone
+    (200 KB each), 6, 5 and 2 with PC sampling alone (1.55 MB each), none at 8 or 4 MHz. OpenOCD reads what the probe
+    holds, up to 4096 bytes, every 1 ms (`stlink_usb_trace_read`, unchanged upstream), with no 2 KiB unit on its
+    side; another probe firmware is untried.
+  - With exception trace and PC sampling together, inside a packet next to a sleep PC sample and an exception packet,
+    anywhere in the stream: 74 to 191 per 1.75 MB at 16 MHz, 81 to 200 at 8, 174 to 260 at 4. The same sources on
+    stm32f407disco through J-Link lose nothing (1.14 MB); target and probe are not told apart here.
 - OpenOCD's `-pin-freq 0` picks 24 MHz, not a divisor of 400 MHz: always name the rate.
 
 ## ra6m5_ek
