@@ -192,13 +192,18 @@ class ExceptionReport(unittest.TestCase):
                          + gts1(0x1, 4, wrap=True) + self.GTS2, ts_clock_hz=1_000_000)
         self.assertEqual([e.get('gts') for e in evts if e['kind'] == 'gts1'], [None, 3 << 26 | 1])
 
-    def test_a_periodic_packet_lost_without_an_overflow_is_counted(self):
+    def test_a_periodic_packet_lost_without_an_overflow_is_counted_over_its_run(self):
         cyc = hw(0, 1 << 5, 1)
         data = cyc + lts(1) + cyc + lts(16384) + cyc + lts(32768) + cyc + lts(16384)
         s, _ = decode(data, ts_clock_hz=1_000_000, periods={'Cyc': 16384})
         self.assertEqual(s['integrity']['periodic_missed'], {'Cyc': 1})
         s, _ = decode(cyc + lts(1) + cyc + lts(64, 1) + cyc + lts(64), ts_clock_hz=1_000_000, periods={'Cyc': 64})
         self.assertEqual(s['integrity']['periodic_missed'], {'Cyc': 0})   # a delayed one was still received
+        late = cyc + lts(16384) + exc(71, 1) + lts(16381) + cyc + cyc + lts(16387)   # one behind the exception, its
+        s, _ = decode(late, ts_clock_hz=1_000_000, periods={'Cyc': 16384})     # own timestamp lost (stm32f407disco)
+        self.assertEqual(s['integrity']['periodic_missed'], {'Cyc': 0})
+        s, _ = decode(cyc + cyc + lts(64) + cyc + lts(128), ts_clock_hz=1_000_000, periods={'Cyc': 64})
+        self.assertEqual(s['integrity']['periodic_missed'], {'Cyc': 1})   # the late first one hides no later loss
         self.assertEqual(dec.periods({'pc_sample': [1, 15], 'cyc_event': [0, 3]}), {'pc': 16384, 'Cyc': 256})
 
     def test_profiling_counter_wraps_become_a_share_of_the_span(self):

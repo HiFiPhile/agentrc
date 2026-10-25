@@ -30,6 +30,7 @@ Exit 0 decoded, 1 the input held no packet at all, 2 bad usage or an unreadable 
 import argparse
 import bisect
 import collections
+import itertools
 import json
 import os
 import sys
@@ -470,16 +471,22 @@ def event_shares(evts, ticks_hz, clock_hz):
 
 
 def periodic_missed(evts, periods, prescale):
-    """{source: packets missing}: a periodic source ('pc' samples, 'Cyc' events) whose consecutive packets, both
-    synchronously timestamped in one segment, lie k periods apart lost k - 1 between them. Measured on an STM32F407:
-    such packets go missing without an Overflow packet, which ARMv7-M Appendix D.2.3 would have the DWT emit."""
+    """{source: packets missing}: a periodic source ('pc' samples, 'Cyc' events) whose packets, between its first and
+    last synchronously timestamped one in a segment, number fewer than the periods they span. Counted over the run,
+    not between neighbours: a packet the ITM outputs late, behind another, can lose its own Local timestamp and take
+    the next one (ARMv7-M D.2.4), which neighbours would read as one lost and one early (measured on an STM32F407)."""
     out = {}
     for name, period in (periods or {}).items():
         mine = [e for e in evts if (e['kind'] == 'pc' if name == 'pc' else e['kind'] == 'evcnt' and e['bits'] >> 5 & 1)]
         missed = 0
-        for a, b in zip(mine, mine[1:]):   # neighbours as received: a delayed one between breaks the comparison
-            if a['seg'] == b['seg'] and a.get('tq') == b.get('tq') == 'sync':
-                missed += max(0, round((b['t'] - a['t']) * prescale / period) - 1)
+        for _, run in itertools.groupby(mine, key=lambda e: e['seg']):
+            run = list(run)
+            stamped = [k for k, e in enumerate(run) if e.get('tq') == 'sync']
+            if len(stamped) > 1:
+                first, last = stamped[0], stamped[-1]
+                while first < last and run[first + 1]['t'] == run[first]['t']:   # the late ones before it are earlier
+                    first += 1
+                missed += max(0, round((run[last]['t'] - run[first]['t']) * prescale / period) - (last - first))
         out[name] = missed
     return out
 
@@ -546,7 +553,7 @@ def print_text(s, out=sys.stdout):
             w(f"  unknown header {u['header']} at {u['off']}, {u['bytes']} bytes skipped to the next sync\n")
     for name, n in i.get('periodic_missed', {}).items():
         if n:
-            w(f'  {n} {name} packet(s) missing between timestamped neighbours (no Overflow packet marks them)\n')
+            w(f'  {n} {name} packet(s) missing from their timestamped run (no Overflow packet marks them)\n')
     if i.get('teardown_overflow'):
         w(f"  {i['teardown_overflow']} overflow(s) after the capture began switching its sources off\n")
     if i.get('overflow'):
