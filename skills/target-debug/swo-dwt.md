@@ -227,9 +227,8 @@ Manchester (TPIU_DEVID). A CMSIS-DAP probe with SWO support wired to a target's 
   source and resynchronizes; the counts and what was ruled out are in `swo-boards.md`.
 - A periodic DWT packet due while another is output comes out after it and can lose its own Local timestamp, taking
   the next one (ARMv7-M D.2.4, p937): on stm32f407disco a Cyc event due at a TIM7 entry arrived one period late,
-  sharing the following event's timestamp. Nothing was lost; an earlier decode compared neighbours and reported 365
-  such packets missing. `periodic_missed` now counts each source's packets over its run in a segment, and stays a check
-  for packets lost without an Overflow packet (none seen since).
+  sharing the following event's timestamp. `periodic_missed` counts each source's packets over its run in a segment,
+  so a late packet is not counted lost; it flags packets lost without an Overflow packet.
 - The 8-bit profiling counters wrap fast: `sleep`, `cpi` and `lsu` on a busy core outrun a 1.5 MHz link (about 75
   thousand overflows in 4 s on stm32f407disco); enable one at a time, or use `exc` and `fold`, which wrap rarely.
 - Halting the core stops SysTick but not peripheral timers unless their DBGMCU freeze bit is set: phase relations the

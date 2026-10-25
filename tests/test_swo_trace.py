@@ -244,32 +244,33 @@ class Formatter(unittest.TestCase):
     EXAMPLE = bytes.fromhex('07aaa6a72ba85452525407cac6c7c81c')   # IHI0029 Figure D4-2
 
     def test_the_architecture_example_frame(self):
-        streams, counts = dec.deformat(dec.FULL_SYNC + self.EXAMPLE)
+        streams, raw, counts = dec.deformat(dec.FULL_SYNC + self.EXAMPLE)
         self.assertEqual({i: [bytes(b).hex() for b in segs] for i, segs in streams.items()},
                          {0x03: ['aaa6a7a8cac6c7c8'], 0x15: ['55525354']})   # Table D4-2
+        self.assertEqual(list(raw[0x03][0]), [5, 6, 7, 9, 15, 16, 17, 18])   # offsets in the stream
         self.assertEqual(counts['frames'], 1)
 
     def test_syncs_are_dropped_and_a_cut_frame_breaks_each_source(self):
         e = self.EXAMPLE
         data = b'\x12' + dec.FULL_SYNC + e[:6] + b'\xff\x7f' + e[6:] + dec.FULL_SYNC + e[:4] + dec.FULL_SYNC + e
-        streams, counts = dec.deformat(data)
+        streams, _, counts = dec.deformat(data)
         self.assertEqual([bytes(b).hex() for b in streams[0x03]], ['aaa6a7a8cac6c7c8', 'aaa6a7a8cac6c7c8'])
         self.assertEqual((counts['preamble_bytes'], counts['half_syncs'], counts['lost_frames'], counts['frames']),
                          (1, 1, 1, 2))
-        streams, counts = dec.deformat(dec.FULL_SYNC + e[:2] + b'\xff\x01' + e + dec.FULL_SYNC + e)   # ID 0x7F
+        streams, _, counts = dec.deformat(dec.FULL_SYNC + e[:2] + b'\xff\x01' + e + dec.FULL_SYNC + e)   # ID 0x7F
         self.assertEqual((counts['lost_frames'], counts['frames'], len(streams[0x03])), (1, 1, 1))
 
     def test_an_id_in_byte_14_starts_with_the_next_frame(self):
         last = bytearray(self.EXAMPLE)
         last[14], last[15] = 0x15 << 1 | 1, last[15] & 0x7F   # its aux bit reserved, 0
         data_only = bytes(range(2, 32, 2)) + b'\x00'   # 15 data bytes, bit 0 clear, aux byte 0
-        streams, _ = dec.deformat(dec.FULL_SYNC + bytes(last) + data_only)
+        streams, _, _ = dec.deformat(dec.FULL_SYNC + bytes(last) + data_only)
         self.assertEqual(bytes(streams[0x03][0])[-1:], b'\xc7')
         self.assertEqual(bytes(streams[0x15][-1])[-15:], data_only[:15])
 
     def test_bytes_after_a_lost_frame_wait_for_the_next_id(self):
         data_only = bytes(range(2, 32, 2)) + b'\x00'
-        streams, counts = dec.deformat(dec.FULL_SYNC + frames(1, bytes(14)) + frames(2, bytes(14))[:6] +
+        streams, _, counts = dec.deformat(dec.FULL_SYNC + frames(1, bytes(14)) + frames(2, bytes(14))[:6] +
                                        dec.FULL_SYNC + data_only)
         self.assertEqual(([len(b) for b in streams[1]], 2 in streams), ([14], False))
         self.assertEqual(counts['unattributed_bytes'], 15)
@@ -442,10 +443,10 @@ class FakeRA(FakeTarget):
 class FakeV8(FakeTarget):
     """A Cortex-M33: each DWT_FUNCTIONn.ID read-only, comparator 0 the only one matching the cycle counter, and no
     DWT_MASKn, any access to one recorded."""
-    ID = 1 << cap.FUNCTION_ID + 3   # data address
+    ID = 1 << cap.FUNCTION_ID + cap.ID_DATA_ADDR   # data address
 
     def __init__(self, regs=None):
-        super().__init__({cap.CPUID: 0x410FD214, **{cap.DWT_COMP + 16 * n + 8: self.ID | (n == 0) << cap.FUNCTION_ID
+        super().__init__({cap.CPUID: 0x410FD214, **{cap.dwt_function(n): self.ID | (n == 0) << cap.FUNCTION_ID
                                                      for n in range(4)}, **(regs or {})})
         self.masks = []
 
@@ -552,7 +553,7 @@ class Ownership(unittest.TestCase):
 
     def before(self, regs=None):
         b = {cap.ITM_TCR: 0, cap.ITM_TER: 0, cap.DWT_CTRL: 0x40000000}
-        b.update({cap.DWT_COMP + 16 * n + 8: 0 for n in range(4)})
+        b.update({cap.dwt_function(n): 0 for n in range(4)})
         b.update(regs or {})
         return b
 
@@ -575,19 +576,23 @@ class Ownership(unittest.TestCase):
 
     def test_taking_the_itm_drops_sources_the_capture_did_not_ask_for(self):
         busy = self.before({cap.DWT_CTRL: 0x40001001 | 1 << 10})   # PC sampling on
-        _, _, steps, _ = cap.plan_config(args(take_itm=True), {'numcomp': 4}, busy)
-        self.assertEqual(steps[-1] & cap.CTRL_TRACE_SOURCES, cap.CTRL_EXCTRCENA)
+        _, _, ctrl, _ = cap.plan_config(args(take_itm=True), {'numcomp': 4}, busy)
+        self.assertEqual(ctrl & cap.CTRL_TRACE_SOURCES, cap.CTRL_EXCTRCENA)
 
     def test_pc_sampling_writes_its_period_before_enabling(self):
-        _, _, steps, _ = cap.plan_config(args(exc=False, pc_sample=(1, 15)), {'numcomp': 4}, self.before())
+        before = self.before()
+        _, _, ctrl, _ = cap.plan_config(args(exc=False, pc_sample=(1, 15)), {'numcomp': 4}, before)
+        steps = cap.write_steps(cap.DWT_CTRL, before[cap.DWT_CTRL], ctrl)
         self.assertEqual(len(steps), 2)
         self.assertFalse(steps[0] & cap.CTRL_PCSAMPLENA)
         self.assertEqual((steps[0] >> 5 & 0xF, steps[0] >> 1 & 0xF), (15, 15))   # POSTINIT, POSTPRESET
         self.assertEqual(steps[1], steps[0] | cap.CTRL_PCSAMPLENA)
 
     def test_cycle_events_and_profiling_counters(self):
-        _, _, steps, _ = cap.plan_config(args(exc=False, cyc_event=(0, 3), profile=['sleep', 'cpi']),
-                                         {'numcomp': 4}, self.before())
+        before = self.before()
+        _, _, ctrl, _ = cap.plan_config(args(exc=False, cyc_event=(0, 3), profile=['sleep', 'cpi']),
+                                         {'numcomp': 4}, before)
+        steps = cap.write_steps(cap.DWT_CTRL, before[cap.DWT_CTRL], ctrl)
         self.assertFalse(steps[0] & (cap.CTRL_CYCEVTENA | cap.CTRL_PCSAMPLENA))
         self.assertEqual(steps[1], steps[0] | cap.CTRL_CYCEVTENA)
         self.assertEqual(steps[1] & (0x1F << 17), 1 << 19 | 1 << 17)
@@ -605,7 +610,7 @@ class Ownership(unittest.TestCase):
             cap.plan_config(args(cycmatch=0), {'numcomp': 4, 'dwt_ctrl': 1 << 25}, self.before())
 
     def test_v8_comparators_are_chosen_by_what_their_id_says_they_match(self):
-        data_address, cycles = 1 << cap.FUNCTION_ID + 3, 1 << cap.FUNCTION_ID
+        data_address, cycles = 1 << cap.FUNCTION_ID + cap.ID_DATA_ADDR, 1 << cap.FUNCTION_ID
         w = cap.parse_watch('addr=0x20000000,access=w,emit=val,size=4', None)
         ids = self.before({cap.DWT_COMP + 8: cycles, cap.DWT_COMP + 0x18: data_address | 1 << 24})   # + MATCHED
         _, _, _, watches = cap.plan_config(args(cycmatch=0x1000, watch=[w]), self.V8, ids)
@@ -620,7 +625,7 @@ class Ownership(unittest.TestCase):
             cap.plan_config(args(watch=[cap.parse_watch('addr=0x20000000,access=w,emit=val', None)]), self.V8, ids)
 
     def test_v8_never_takes_a_comparator_of_a_linked_pair(self):
-        data_address = 1 << cap.FUNCTION_ID + 3
+        data_address = 1 << cap.FUNCTION_ID + cap.ID_DATA_ADDR
         w = cap.parse_watch('addr=0x20000000,access=w,emit=val,size=4', None)
         for limit in (0b0011, 0b0111, 0b1011):
             with self.subTest(limit=limit):
@@ -701,10 +706,14 @@ class Capture(unittest.TestCase):
         record, failures = self.run_capture(t, pc_sample=(1, 8), take_itm=True)
         self.assertEqual((failures, record['restore'], t.mem[cap.DWT_CTRL]), ([], 'complete', 0x40001061))
 
+    def test_teardown_stops_pc_sampling_before_postinit_too(self):
+        t = FakeTarget({cap.ITM_TCR: 0x1000D, cap.ITM_TER: 1})   # the firmware runs the ITM
+        record, failures = self.run_capture(t, pc_sample=(1, 8), observe_itm=True, exc=False)
+        self.assertEqual((failures, record['restore'], t.mem[cap.DWT_CTRL]), ([], 'complete', 0x40000000))
+
     def sampling(self, t, ctrl=0x40001311):   # PC sampling 1:8 set up as a capture does
         s = self.session(t)
-        for value in cap.write_steps(cap.DWT_CTRL, t.mem[cap.DWT_CTRL], ctrl):
-            s.write(cap.DWT_CTRL, value)
+        s.write(cap.DWT_CTRL, ctrl)
         return s
 
     def test_restore_from_a_killed_sampling_run_restores_postinit(self):
@@ -1316,7 +1325,8 @@ class CaptureCli(unittest.TestCase):
         self.assertEqual(b.name, 'openocd')
         self.assertIn('a jlink connect writes nothing', self.error(self.JLINK + ['--caps', '--accept-attach-writes']))
         self.assertIn('--rtt: only the J-Link route', self.error(oocd + ['--accept-attach-writes', '--rtt']))
-        self.assertIn('--formatter: an OpenOCD trace unit', self.error(oocd + ['--accept-attach-writes', '--formatter']))
+        self.assertIn('--formatter: an OpenOCD trace unit',
+                      self.error(oocd + ['--accept-attach-writes', '--formatter']))
         with tempfile.TemporaryDirectory() as d:
             out = self.error(oocd[:-1] + ['--accept-attach-writes', '--out', d + '/x', '--observe-itm'])
         self.assertIn("would not be the firmware's", out)

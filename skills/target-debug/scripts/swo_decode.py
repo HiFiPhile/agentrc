@@ -28,6 +28,7 @@ durations are withheld with the reason.
 Exit 0 decoded, 1 the input held no packet at all, 2 bad usage or an unreadable input.
 """
 import argparse
+import array
 import bisect
 import collections
 import itertools
@@ -119,15 +120,15 @@ FULL_SYNC = b'\xff\xff\xff\x7f'   # 0x7FFFFFFF, least significant byte first (Co
 SPECIAL_IDS = {0x00: 'null', 0x7B: 'flush', 0x7D: 'trigger'}   # D4.2.4
 
 
-def deformat(data, mark=None):
+def deformat(data):
     """({trace source ID: [bytearray, ...]}, counts) of a TPIU formatter stream (IHI0029 D4.2): 16-byte frames from
     the first full sync on, whose even bytes are an ID when bit 0 is set, else data[7:1] completed by the aux byte 15,
     and whose odd bytes are data. An ID byte's aux bit says whether the byte after it is still the old ID's. A halfword
     starting 0xFF is a sync, ID 0x7F never being used: FF 7F a half sync, FF FF the start of a full one. A frame a sync
     or ID 0x7F cuts short is lost, with any ID change it held: every source's bytes after it start a new segment, and
-    bytes stay unattributed until the next ID. counts['before_mark'] is each source's byte count before raw byte `mark`."""
+    bytes stay unattributed until the next ID. `raw` gives each segment byte's offset in `data`."""
     counts = collections.Counter()
-    out, before = {}, collections.Counter()
+    out, raw = {}, {}
     start = data.find(FULL_SYNC)
     i = counts['preamble_bytes'] = len(data) if start < 0 else start
     cur, broken, frame, at = None, set(), bytearray(), []
@@ -136,13 +137,13 @@ def deformat(data, mark=None):
         if cur is None or cur in SPECIAL_IDS:
             counts[f"{SPECIAL_IDS.get(cur, 'unattributed')}_bytes"] += 1
             return
-        if mark is not None and at[j // 2] + j % 2 < mark:
-            before[cur] += 1
-        segs = out.setdefault(cur, [bytearray()])
+        segs, offs = out.setdefault(cur, [bytearray()]), raw.setdefault(cur, [array.array('Q')])
         if cur in broken:
             broken.discard(cur)
             segs.append(bytearray())
+            offs.append(array.array('Q'))
         segs[-1].append(byte)
+        offs[-1].append(at[j // 2] + j % 2)
 
     while i + 2 <= len(data):
         if data[i] != 0xFF:
@@ -184,21 +185,19 @@ def deformat(data, mark=None):
                 cur = b >> 1
                 emit(frame[2 * k + 1], 2 * k + 1)
         frame, at = bytearray(), []
-    if mark is not None:
-        counts['before_mark'] = dict(before)
-    return out, counts
+    return out, raw, counts
 
 
-def deformatted_packets(segments):
+def deformatted_packets(segments, raw):
     """packets() over one source's segments, each read from its first synchronization packet: the formatter was
-    switched on with the ITM running, and a lost frame leaves no packet boundary. Offsets count the source's bytes."""
-    base = 0
-    for n, seg in enumerate(segments):
+    switched on with the ITM running, and a lost frame leaves no packet boundary. Offsets are the raw stream's, of
+    each packet's first byte."""
+    for n, (seg, offs) in enumerate(zip(segments, raw)):
         if n:
-            yield {'off': base, 'kind': 'resync'}
+            yield {'off': offs[0], 'kind': 'resync'}
         for p in packets(bytes(seg), False):
-            yield dict(p, off=p['off'] + base)
-        base += len(seg)
+            p['off'] = offs[p['off']] if p['off'] < len(offs) else offs[-1] + 1
+            yield p
 
 
 def packets(data, synced):
@@ -594,15 +593,12 @@ def global_report(evts, ticks_hz):
 def summarize(data, meta, syms, top):
     fmt = meta.get('formatter')
     if fmt:
-        teardown = meta.get('teardown_byte')
-        streams, counts = deformat(data, teardown)
-        pkts = deformatted_packets(streams.get(fmt['itm_id'], []))
-        if teardown is not None:   # events() compares it with the ITM source's own offsets
-            teardown = counts.pop('before_mark').get(fmt['itm_id'], 0)
+        streams, raw, counts = deformat(data)
+        pkts = deformatted_packets(streams.get(fmt['itm_id'], []), raw.get(fmt['itm_id'], []))
         counts['other_ids'] = {i: sum(map(len, segs)) for i, segs in streams.items() if i != fmt['itm_id']}
     else:
-        pkts, teardown = packets(data, meta['synced']), meta.get('teardown_byte')
-    evts, integ, unknown = events(pkts, meta.get('sources'), teardown)
+        pkts = packets(data, meta['synced'])
+    evts, integ, unknown = events(pkts, meta.get('sources'), meta.get('teardown_byte'))
     clock = meta.get('ts_clock_hz')
     ticks_hz = clock / meta['ts_prescale'] if clock else None
     timing = None
@@ -641,9 +637,9 @@ def print_text(s, out=sys.stdout):
       f"  segments {i['segments']}\n")
     if 'formatter' in i:
         f = i['formatter']
-        w(f"  formatter: frames {f.get('frames', 0)}  lost {f.get('lost_frames', 0)}  full syncs {f.get('full_syncs', 0)}"
-          f"  half syncs {f.get('half_syncs', 0)}  before the first sync {f['preamble_bytes']} bytes  other sources "
-          f"{f['other_ids'] or 'none'}\n")
+        w(f"  formatter: frames {f.get('frames', 0)}  lost {f.get('lost_frames', 0)}  "
+          f"full syncs {f.get('full_syncs', 0)}  half syncs {f.get('half_syncs', 0)}  "
+          f"before the first sync {f['preamble_bytes']} bytes  other sources {f['other_ids'] or 'none'}\n")
     for k in ('unsynced_bytes', 'unknown_bytes', 'unexpected', 'truncated_bytes', 'untimed'):
         if i.get(k):
             w(f'  {k.replace("_", " ")} {i[k]}\n')
