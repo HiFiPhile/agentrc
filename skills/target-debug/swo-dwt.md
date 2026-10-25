@@ -143,8 +143,36 @@ every encoding below verified through `swo_capture.py` on a Cortex-M4 (stm32f407
 
 Read-only and write-only comparators exist: a variable the main loop polls need not flood the pin. `mask=N` ignores
 the address's low N bits; a comparator implements fewer than 31 (an STM32F407 reads back at most 15), and a larger
-one fails the capture's read-back. The comparator stays disarmed after the capture. Armv8-M redesigns DWT_FUNCTION
-(MATCH/ACTION) and is not driven yet.
+one fails the capture's read-back. The comparator stays disarmed after the capture.
+
+## DWT data trace encodings (Armv8-M)
+
+Armv8-M redesigns DWT_FUNCTIONn as MATCH[3:0], ACTION[5:4] and DATAVSIZE[11:10] (Armv8-M ARM book 6539, D1.2.64,
+Tables RCNHN and RPSBJ). `--watch` takes a data address comparator for `pc` and a Data Address With Value one for
+`val` and `pcval`, matching `size=1|2|4` bytes at an address aligned to it, by default the size of a 1, 2 or 4-byte
+ELF symbol:
+
+| access | emit `val` | `pc` | `pcval` |
+|--------|------------|------|---------|
+| rw     | 0x2C       | 0x34 | 0x3C    |
+| r      | 0x2E       | 0x36 | 0x3E    |
+| w      | 0x2D       | 0x35 | 0x3D    |
+
+plus DATAVSIZE (0, 1, 2 for 1, 2, 4 bytes) at bit 10. A read-only or write-only `pc` exists here. There is no DWT_MASKn:
+`mask=`, `offset` and `offval` need a linked comparator pair, which the script does not program, and are refused.
+`--cycmatch` writes MATCH 0b0001 with ACTION 0b11 (0x31) on comparator 0. A comparator is used only when its
+DWT_FUNCTIONn.ID names the match (data address for a watch, cycle counter for `--cycmatch`); `--caps` lists each one's.
+A comparator in a linked pair, a limit or linked value comparator (MATCH 0b0011, 0b0111, 0b1011) and the one before it,
+is never used or taken, and a restore leaves alone one that has joined a pair since: changing one changes what the other
+matches (B14.2.5). A DWT whose DWT_CTRL.NOTRCPKT is set sends no trace packets, and every DWT source is refused there.
+
+Reading DWT_FUNCTIONn clears its MATCHED bit on both architectures, so `--caps` and a capture's first read consume a
+match the firmware or another debugger had not yet seen.
+
+The decode reads two packets ARMv7-M does not send: a Data Trace Match packet (`match` in DATA; it also stands in for a
+PC that Secure state does not let be traced, p359), and Short and Medium PC Value packets carrying PC bits [7:0] or
+[15:0], whose upper bits are DWT_COMP<CMPN>'s (F1.2.3, F1.2.4): it completes them from the comparator address in
+`capture.json`, and prints the bits alone for `--bin` input.
 
 ## Feature matrix
 
@@ -169,7 +197,7 @@ Cortex-M7.
 | CYCMATCH                                                  | yes         | stm32h743nucleo                                     |
 | Global timestamps                                         | yes         | stm32h743nucleo (TSG behind AP2)                    |
 | Armv8-M SWO, trace clock gate                             | yes         | ra6m5_ek (fixture: exc, ITM, failed gate check)     |
-| Armv8-M data trace (`--watch`, `--cycmatch`)              | no          | refused on Armv8-M                                  |
+| Armv8-M data trace (`--watch`, `--cycmatch`)              | yes         | ra6m5_ek (`w,val`, `r,pc`, `rw,pcval`, CYCMATCH)    |
 | Manchester SWO, TPIU formatter, parallel trace, CMSIS-DAP | no          | deferred                                            |
 
 ## Known faults

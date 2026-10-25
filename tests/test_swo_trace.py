@@ -87,6 +87,16 @@ class Packets(unittest.TestCase):
                                  ('lts', 1000), ('dval', 0x1234), ('pc', 0x08000123), ('pc', None),
                                  ('overflow', None), ('sync', None)])
 
+    def test_armv8m_match_and_compressed_pc_packets(self):
+        data = hw(10, 0x01, 1) + hw(10, 0x24, 1) + hw(8, 0x1234, 2) + hw(8, 0x08000124, 4)
+        pkts = [(p['kind'], p.get('cmp'), p.get('size')) for p in dec.packets(data, True)]
+        self.assertEqual(pkts, [('dmatch', 1, None), ('dpc', 1, 1), ('dpc', 0, 2), ('dpc', 0, 4)])
+        data_ = decode(data, sources=['dpc', 'dmatch'], comparators={0: 0x08001000, 1: 0x08000300})[0]['data']
+        self.assertEqual(data_[1]['match'], 1)
+        self.assertEqual(dict(data_[1]['pcs']), {'0x08000324': 1})   # bits [31:8] from DWT_COMP1
+        self.assertEqual(dict(data_[0]['pcs']), {'0x08001234': 1, '0x08000124': 1})
+        self.assertEqual(dict(decode(data[2:4])[0]['data'][1]['pcs']), {'PC[7:0] 0x24': 1})   # no comparator known
+
     def test_an_unsynced_stream_is_read_from_its_first_sync(self):
         pkts = list(dec.packets(b'\x12\x34' + SYNC + stim(0, 9), False))
         self.assertEqual([p['kind'] for p in pkts], ['unsynced', 'sync', 'stim'])
@@ -349,6 +359,31 @@ class FakeRA(FakeTarget):
         return bool(self.mem[self.TRCKCR] & 0x80)
 
 
+class FakeV8(FakeTarget):
+    """A Cortex-M33: each DWT_FUNCTIONn.ID read-only, comparator 0 the only one matching the cycle counter, and no
+    DWT_MASKn, any access to one recorded."""
+    ID = 1 << cap.FUNCTION_ID + 3   # data address
+
+    def __init__(self, regs=None):
+        super().__init__({cap.CPUID: 0x410FD214, **{cap.DWT_COMP + 16 * n + 8: self.ID | (n == 0) << cap.FUNCTION_ID
+                                                     for n in range(4)}, **(regs or {})})
+        self.masks = []
+
+    def check(self, addr):
+        if cap.DWT_COMP <= addr < cap.DWT_COMP + 64 and addr % 16 == 4:
+            self.masks.append(addr)
+
+    def read32(self, addr, target=None):
+        self.check(addr)
+        return super().read32(addr, target)
+
+    def write32(self, addr, value, target=None):
+        self.check(addr)
+        if cap.comparator_of(addr) is not None and addr % 16 == 8:
+            value = value & ~(0x1F << cap.FUNCTION_ID) | self.mem[addr] & 0x1F << cap.FUNCTION_ID
+        super().write32(addr, value, target)
+
+
 class CoreKind(unittest.TestCase):
     def test_a_core_is_named_by_its_implementer_and_part(self):
         self.assertEqual(cap.core_kind(0x410FD310), ('armv8-m', 'Cortex-M35P'))
@@ -378,15 +413,40 @@ class Rates(unittest.TestCase):
         self.assertEqual(cap.check_rates(args(), (4_500_000, 1))[0], 112)
 
 
+def function(text, kind='armv7-m', symbols=None):
+    return cap.watch_function(cap.parse_watch(text, symbols), kind)[0]
+
+
 class Watch(unittest.TestCase):
     def test_v7_encodings_include_read_only_and_write_only(self):
-        self.assertEqual(cap.parse_watch('addr=0x20000000,access=w,emit=val', None)['function'], 0b1101)
-        self.assertEqual(cap.parse_watch('addr=0x20000000,access=r,emit=val', None)['function'], 0b1100)
-        self.assertEqual(cap.parse_watch('addr=0x20000000,access=rw,emit=offset', None)['function'], 0b100001)
+        self.assertEqual(function('addr=0x20000000,access=w,emit=val'), 0b1101)
+        self.assertEqual(function('addr=0x20000000,access=r,emit=val'), 0b1100)
+        self.assertEqual(function('addr=0x20000000,access=rw,emit=offset'), 0b100001)
 
-    def test_a_pc_alone_on_one_direction_has_no_encoding(self):
-        with self.assertRaisesRegex(ValueError, 'no ARMv7-M data trace encoding'):
-            cap.parse_watch('addr=0x20000000,access=w,emit=pc', None)
+    def test_a_pc_alone_on_one_direction_has_no_v7_encoding(self):
+        with self.assertRaisesRegex(cap.Refused, 'no ARMv7-M data trace encoding'):
+            function('addr=0x20000000,access=w,emit=pc')
+        with self.assertRaisesRegex(cap.Refused, "size= is Armv8-M's"):
+            function('addr=0x20000000,access=w,emit=val,size=4')
+
+    def test_v8_encodings_carry_match_action_and_size(self):
+        self.assertEqual(function('addr=0x20000000,access=w,emit=val,size=4', 'armv8-m'), 0b1101 | 0b10 << 4 | 2 << 10)
+        self.assertEqual(function('addr=0x20000000,access=r,emit=pc,size=1', 'armv8-m'), 0b0110 | 0b11 << 4)
+        self.assertEqual(function('addr=0x20000002,access=rw,emit=pcval,size=2', 'armv8-m'),
+                         0b1100 | 0b11 << 4 | 1 << 10)
+        syms = [('var', 0x20000010, 2, 1, 3), ('big', 0x20000020, 8, 1, 3)]
+        self.assertEqual(function('addr=var,access=w,emit=val', 'armv8-m', syms) >> 10 & 3, 1)   # the symbol's size
+        with self.assertRaisesRegex(cap.Refused, 'give size='):
+            function('addr=big,access=w,emit=val', 'armv8-m', syms)
+        with self.assertRaisesRegex(cap.Refused, 'give size='):
+            function('addr=0x20000000,access=w,emit=val', 'armv8-m')
+
+    def test_v8_refuses_what_takes_a_comparator_pair(self):
+        for text in ('addr=0x20000000,access=w,emit=offset,size=4', 'addr=0x20000000,access=w,emit=val,mask=2,size=4'):
+            with self.subTest(text=text), self.assertRaisesRegex(cap.Refused, 'linked comparator pair'):
+                function(text, 'armv8-m')
+        with self.assertRaisesRegex(ValueError, 'aligned'):
+            cap.parse_watch('addr=0x20000002,access=w,emit=val,size=4', None)
 
     def test_a_symbol_needs_an_elf_and_one_data_object(self):
         with self.assertRaisesRegex(ValueError, 'needs --elf'):
@@ -408,6 +468,8 @@ class Watch(unittest.TestCase):
 
 
 class Ownership(unittest.TestCase):
+    V8 = {'numcomp': 4, 'architecture': 'armv8-m'}
+
     def before(self, regs=None):
         b = {cap.ITM_TCR: 0, cap.ITM_TER: 0, cap.DWT_CTRL: 0x40000000}
         b.update({cap.DWT_COMP + 16 * n + 8: 0 for n in range(4)})
@@ -462,6 +524,47 @@ class Ownership(unittest.TestCase):
         with self.assertRaisesRegex(cap.Refused, 'NOCYCCNT'):
             cap.plan_config(args(cycmatch=0), {'numcomp': 4, 'dwt_ctrl': 1 << 25}, self.before())
 
+    def test_v8_comparators_are_chosen_by_what_their_id_says_they_match(self):
+        data_address, cycles = 1 << cap.FUNCTION_ID + 3, 1 << cap.FUNCTION_ID
+        w = cap.parse_watch('addr=0x20000000,access=w,emit=val,size=4', None)
+        ids = self.before({cap.DWT_COMP + 8: cycles, cap.DWT_COMP + 0x18: data_address | 1 << 24})   # + MATCHED
+        _, _, _, watches = cap.plan_config(args(cycmatch=0x1000, watch=[w]), self.V8, ids)
+        self.assertEqual([(x['comparator'], x['function']) for x in watches], [(0, 0x31), (1, 0x82D)])
+        _, _, _, watches = cap.plan_config(args(watch=[w]), self.V8, ids)   # comparator 0 matches no data address
+        self.assertEqual(watches[0]['comparator'], 1)
+        with self.assertRaisesRegex(cap.Refused, 'does not match the cycle counter'):
+            cap.plan_config(args(cycmatch=0), self.V8, self.before({cap.DWT_COMP + 8: data_address}))
+        with self.assertRaisesRegex(cap.Refused, 'free data trace comparators'):
+            cap.plan_config(args(watch=[w, w]), self.V8, ids)
+        with self.assertRaisesRegex(cap.Refused, 'give size='):
+            cap.plan_config(args(watch=[cap.parse_watch('addr=0x20000000,access=w,emit=val', None)]), self.V8, ids)
+
+    def test_v8_never_takes_a_comparator_of_a_linked_pair(self):
+        data_address = 1 << cap.FUNCTION_ID + 3
+        w = cap.parse_watch('addr=0x20000000,access=w,emit=val,size=4', None)
+        for limit in (0b0011, 0b0111, 0b1011):
+            with self.subTest(limit=limit):
+                pair = self.before({cap.DWT_COMP + 8: data_address | 1 << cap.FUNCTION_ID,
+                                    cap.DWT_COMP + 0x18: data_address | limit,
+                                    cap.DWT_COMP + 0x28: data_address, cap.DWT_COMP + 0x38: data_address})
+                _, _, _, watches = cap.plan_config(args(watch=[w]), self.V8, pair)
+                self.assertEqual(watches[0]['comparator'], 2)   # 0 heads the pair 1 ends
+                with self.assertRaisesRegex(cap.Refused, 'comparators 0 and 1 are a linked pair'):
+                    cap.plan_config(args(cycmatch=0), self.V8, pair)
+                for n in (0, 1):
+                    with self.assertRaisesRegex(cap.Refused, f'--take-comparator {n}: comparators 0 and 1'):
+                        cap.plan_config(args(watch=[w], take_comparator=n), self.V8, pair)
+        v7 = self.before({cap.DWT_COMP + 0x18: 0b0111})   # an ARMv7-M FUNCTION 0b0111: no pair there
+        v7_watch = cap.parse_watch('addr=0x20000000,access=w,emit=val', None)
+        _, _, _, watches = cap.plan_config(args(watch=[v7_watch]), {'numcomp': 4}, v7)
+        self.assertEqual(watches[0]['comparator'], 0)
+
+    def test_a_dwt_without_trace_packets_is_refused(self):
+        w = cap.parse_watch('addr=0x20000000,access=w,emit=val,size=4', None)
+        for a in (args(), args(exc=False, watch=[w]), args(exc=False, cycmatch=0)):
+            with self.assertRaisesRegex(cap.Refused, 'NOTRCPKT'):
+                cap.plan_config(a, dict(self.V8, dwt_ctrl=cap.CTRL_NOTRCPKT), self.before())
+
     def test_a_comparator_in_use_is_taken_only_by_name(self):
         w = cap.parse_watch('addr=0x20000000,access=w,emit=val', None)
         used = self.before({cap.DWT_COMP + 8: 0x5})
@@ -493,7 +596,7 @@ class Capture(unittest.TestCase):
         j = cap.Journal(os.path.join(self.dir, 'journal.jsonl'),
                         dict({'identity': t.identity(), 'host': socket.gethostname(), 'cpuid': t.mem[cap.CPUID],
                               'image': image}, **header))
-        return cap.Session(t, j)
+        return cap.Session(t, j, cap.core_kind(t.mem[cap.CPUID])[0])
 
     def test_a_capture_restores_every_register_it_or_the_probe_tool_changed(self):
         t = FakeTarget()
@@ -547,6 +650,49 @@ class Capture(unittest.TestCase):
             elif addr == f0:
                 function = value
         self.assertEqual((t.mem[cap.DWT_COMP], t.mem[f0] & 0xFF), (0x20001000, 0x5))
+
+    def test_v8_watches_program_no_mask_register_and_are_restored(self):
+        t = FakeV8()
+        before = dict(t.mem)
+        w = cap.parse_watch('addr=0x20000000,access=w,emit=val,size=4', None)
+        record, failures = self.run_capture(t, watch=[w], cycmatch=0x1000)
+        self.assertEqual((failures, record['restore'], t.masks), ([], 'complete', []))
+        functions = [(a, v & 0xFFF) for a, v in t.writes if a in (cap.DWT_COMP + 8, cap.DWT_COMP + 0x18) and v & 0xF]
+        self.assertEqual(functions, [(cap.DWT_COMP + 8, 0x31), (cap.DWT_COMP + 0x18, 0x82D)])
+        self.assertEqual({k: t.mem.get(k, 0) for k in before}, before)
+        self.assertIn('dmatch', record['sources'])
+        comparators = cap.caps_report(t)['comparators']
+        self.assertEqual([c['matches'] for c in comparators[:2]], [['cycle counter', 'data address'], ['data address']])
+
+    def test_v8_restore_from_a_killed_run_leaves_no_mask_register_to_restore(self):
+        f1 = cap.DWT_COMP + 0x18
+        t = FakeV8({cap.DWT_COMP + 0x10: 0x20001000, f1: FakeV8.ID | 0x2D})
+        s = self.session(t)
+        s.baseline(cap.comparator_regs(1, 'armv8-m'))
+        s.write(f1, 0)
+        s.write(cap.DWT_COMP + 0x10, 0x20000000)
+        s.write(f1, 0x82D)
+        t.writes.clear()
+        report, problems = cap.restore_from(t, self.dir)
+        self.assertEqual((problems, t.masks), ([], []))
+        self.assertEqual([(a, v & 0xFFF if a == f1 else v) for a, v in t.writes],
+                         [(f1, 0), (cap.DWT_COMP + 0x10, 0x20001000), (f1, 0x2D)])
+
+    def test_v8_restore_leaves_a_comparator_someone_since_linked_alone(self):
+        f0, f1 = cap.DWT_COMP + 8, cap.DWT_COMP + 0x18
+        t = FakeV8()
+        s = self.session(t)
+        s.baseline(cap.comparator_regs(0, 'armv8-m'))
+        s.write(cap.DWT_COMP, 0x20000000)
+        s.write(f0, 0x82D)   # killed here; then someone makes comparator 1 a data address limit
+        t.mem.update({cap.DWT_COMP + 0x10: 0x20000100, f1: FakeV8.ID | 0b0111})
+        t.writes.clear()
+        report, problems = cap.restore_from(t, self.dir)
+        self.assertRegex(problems[0], r'comparator 0: comparators 0 and 1 are a linked pair.*left alone')
+        self.assertEqual([a for a, _ in t.writes if cap.comparator_of(a) is not None], [])
+        t.mem[f1] = FakeV8.ID   # the pair gone, the comparator is still owed
+        report, problems = cap.restore_from(t, self.dir)
+        self.assertEqual((problems, t.mem[cap.DWT_COMP], t.mem[f0] & 0xF), ([], 0, 0))
 
     def test_the_elf_must_be_what_the_target_runs(self):
         t = FakeTarget()
@@ -891,7 +1037,7 @@ class Capture(unittest.TestCase):
 
     def test_restore_returns_each_register_to_its_first_original(self):
         t = FakeTarget({cap.ITM_TCR: 0x5})
-        s = cap.Session(t, cap.Journal(os.path.join(self.dir, 'j.jsonl'), {}))
+        s = cap.Session(t, cap.Journal(os.path.join(self.dir, 'j.jsonl'), {}), 'armv7-m')
         with s.probe_op([cap.ITM_TCR], 'start_swo'):
             t.mem[cap.ITM_TCR] = 0
         s.write(cap.ITM_TCR, 0x1000F)
@@ -900,7 +1046,7 @@ class Capture(unittest.TestCase):
 
     def test_read_only_status_bits_do_not_fail_a_read_back(self):
         t = FakeTarget({cap.DWT_COMP + 0x18: 0x200})   # comparator 1 reads LNK1ENA
-        s = cap.Session(t, cap.Journal(os.path.join(self.dir, 'j.jsonl'), {}))
+        s = cap.Session(t, cap.Journal(os.path.join(self.dir, 'j.jsonl'), {}), 'armv7-m')
         s.write(cap.DWT_COMP + 8, 0xD)   # reads back with MATCHED
         t.write32 = lambda addr, value, w=t.write32: w(addr, value | (0x200 if addr == cap.DWT_COMP + 0x18 else 0))
         s.write(cap.DWT_COMP + 0x18, 0)

@@ -10,7 +10,7 @@ known rates.
 |-----------------|-------------------------------------|---------|---------------------|----------------------|-------------------------------------------------------------------------|
 | stm32f407disco  | on-board J-Link (ST-Link reflashed) | stm32f4 | HCLK 168 MHz        | 1.5 MHz (4.5 MHz/3)  | exc, LTS, ITM, data trace, PC sample, observe, comparator, PB3, restore |
 | stm32h743nucleo | STLINK-V3, OpenOCD `stlink-dap.cfg` | stm32h7 | 400 MHz (see notes) | 16 MHz               | exc, LTS, ITM, data trace, PC sample, PB3, restore                      |
-| ra6m5_ek        | on-board J-Link OB (S124)           | ra6m5   | TRCLK 100 MHz       | 500 kHz (3 MHz/6)    | exc, LTS, ITM, trace clock gate, restore, failed gate check             |
+| ra6m5_ek        | on-board J-Link OB (S124)           | ra6m5   | TRCLK 100 MHz       | 500 kHz (3 MHz/6)    | exc, LTS, ITM, data trace, CYCMATCH, comparator, gate, restore          |
 
 ## Fixture
 
@@ -81,4 +81,9 @@ on hardware before its row can cite the fixture.
   timestamps gives the fixture's counts with no overflow, but about one packet a second decodes as a reserved exception
   function or an unknown header, at 250 kHz as at 500 kHz: stream corruption on this route, its cause not located.
   PC sampling at its slowest (`1:15`, about 12 k samples/s at 200 MHz) would not fit.
+- The Cortex-M33's four comparators read DWT_FUNCTIONn.ID 0b01011, 0b11010, 0b01010, 0b11110 (`--caps`): comparator 0
+  alone matches the cycle counter, 1 and 3 link, 3 alone matches a data value. With the fixture, `w,val`, `r,pc` (all
+  Long PC packets, no Short or Medium seen), `rw,pcval`, `--cycmatch` (one PC per CYCCNT wrap, 21.5 s), a comparator
+  in use skipped or taken by `--take-comparator`, kill -9 then `--restore`, and SIGINT all left the comparators as
+  found.
 - J-Link Commander halts the core: run it with `r` and `g` before a capture (DHCSR 0x00130003 gave a 1-byte stream).

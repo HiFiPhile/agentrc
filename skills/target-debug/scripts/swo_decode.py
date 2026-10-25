@@ -14,7 +14,7 @@ Reports, each over the whole capture:
   INTEGRITY   always: bytes, packets, syncs, overflows, skipped and unknown bytes, segments
   EXCEPTIONS  per exception: entries, and with a timestamp clock, duration and self-time percentiles
   PC          periodic PC samples by function (--elf), sleep and prohibited samples
-  DATA        DWT data trace per comparator: PC, address offset, read and write values
+  DATA        DWT data trace per comparator: PC, address offset, read and write values, matches
   TEXT        ITM stimulus per port: byte count, and the bytes as text
   GLOBAL TIMESTAMPS  complete global timestamps, first and last, and their clock against local time
   EVENTS      DWT event counter packets per counter: wraps of each 8-bit counter, Cyc periods, and with
@@ -106,6 +106,8 @@ def source_packet(h, payload):
         if a < 16:
             if a & 1:
                 return {'kind': 'daddr', 'cmp': cmp, 'size': len(payload), 'value': value}
+            if len(payload) == 1 and value & 1:   # Armv8-M: a Match packet, not a Short PC (DDI0553 F1.2.3)
+                return {'kind': 'dmatch', 'cmp': cmp}
             return {'kind': 'dpc', 'cmp': cmp, 'size': len(payload), 'value': value}
         return {'kind': 'dval', 'cmp': cmp, 'access': 'write' if a & 1 else 'read', 'size': len(payload),
                 'value': value}
@@ -397,19 +399,31 @@ def pc_report(evts, syms, top):
             'top': counts.most_common(top)}
 
 
-def data_report(evts, syms):
+def full_pc(e, comps):
+    """The PC of a dpc event, or None. An Armv8-M Short or Medium PC packet carries bits [7:0] or [15:0], the rest
+    being DWT_COMP<CMPN>'s (DDI0553 F1.2.4): `comps` gives what the capture programmed."""
+    if e['size'] == 4:
+        return e['value']
+    comp = comps.get(e['cmp'])
+    return None if comp is None else comp & -(1 << 8 * e['size']) | e['value']
+
+
+def data_report(evts, syms, comps=None):
     out = collections.defaultdict(lambda: collections.Counter())
     pcs = collections.defaultdict(collections.Counter)
     offsets = collections.defaultdict(collections.Counter)
     last = {}
     for e in evts:
-        if e['kind'] in ('dpc', 'daddr', 'dval'):
-            key = e['kind'] if e['kind'] != 'dval' else e['access']
+        if e['kind'] in ('dpc', 'daddr', 'dval', 'dmatch'):
+            key = {'dval': e.get('access'), 'dmatch': 'match'}.get(e['kind'], e['kind'])
             out[e['cmp']][key] += 1
             if e['kind'] == 'dpc':
-                pcs[e['cmp']][syms.function(e['value']) if syms else f"0x{e['value']:08x}"] += 1
-            if e['kind'] == 'daddr':   # data address bits [15:0]
-                offsets[e['cmp']][f"0x{e['value']:04x}"] += 1
+                pc = full_pc(e, comps or {})
+                name = f"PC[{8 * e['size'] - 1}:0] 0x{e['value']:0{2 * e['size']}x}" if pc is None else \
+                    syms.function(pc) if syms else f'0x{pc:08x}'
+                pcs[e['cmp']][name] += 1
+            if e['kind'] == 'daddr':   # data address bits [15:0] (ARMv7-M), or its low 1, 2 or 4 bytes (Armv8-M)
+                offsets[e['cmp']][f"0x{e['value']:0{2 * e['size']}x}"] += 1
             if e['kind'] == 'dval':
                 last[e['cmp']] = e['value']
     return {c: dict(out[c], last_value=last.get(c), pcs=pcs[c].most_common(5), offsets=offsets[c].most_common(8))
@@ -502,7 +516,7 @@ def summarize(data, meta, syms, top):
         'exceptions': {(syms.exception(n) if syms else exception_name(n)) + f' ({n})': r for n, r in exc.items()},
         'exception_anomalies': anomalies,
         'pc': pc_report(evts, syms, top),
-        'data': data_report(evts, syms),
+        'data': data_report(evts, syms, meta.get('comparators')),
         'text': text_report(evts),
         'events': event_report(evts),
         'global_ts': global_report(evts, ticks_hz if not timing else None),
@@ -598,7 +612,8 @@ def load_input(a):
         meta = {'synced': cap['stream_start'] == 'synced', 'ts_clock_hz': ts.get('clock_hz'),
                 'ts_clock_source': ts.get('clock_source'), 'ts_prescale': ts.get('prescale', 1),
                 'sources': cap.get('sources'), 'teardown_byte': cap.get('teardown_byte'),
-                'periods': periods(cap.get('features') or {})}
+                'periods': periods(cap.get('features') or {}),
+                'comparators': {w['comparator']: w['addr'] for w in cap.get('watches') or []}}
         if a.ts_clock_hz or a.ts_prescale:
             raise Usage('a capture dir carries its timestamp clock; --ts-clock-hz is for a raw file')
     else:

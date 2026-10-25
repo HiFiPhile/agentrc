@@ -77,7 +77,7 @@ ITM_TPR = 0xE0000E40
 ITM_TCR = 0xE0000E80
 ITM_CIDR = 0xE0000FF0
 DWT_CTRL = 0xE0001000
-DWT_COMP = 0xE0001020   # + 16 n; MASK + 4, FUNCTION + 8
+DWT_COMP = 0xE0001020   # + 16 n; MASK + 4 (ARMv7-M only), FUNCTION + 8
 TPIU = 0xE0040000
 TPIU_CSPSR = TPIU + 0x004
 TPIU_ACPR = TPIU + 0x010
@@ -99,6 +99,7 @@ CTRL_PCSAMPLENA = 1 << 12
 CTRL_EXCTRCENA = 1 << 16
 CTRL_CYCEVTENA = 1 << 22
 CTRL_NOPRFCNT = 1 << 24
+CTRL_NOTRCPKT = 1 << 27
 PROFILE_BITS = {'cpi': 1 << 17, 'exc': 1 << 18, 'sleep': 1 << 19, 'lsu': 1 << 20, 'fold': 1 << 21}   # ...EVTENA
 CTRL_TRACE_SOURCES = CTRL_PCSAMPLENA | CTRL_EXCTRCENA | (0x3F << 17)   # sampling, exception trace, event counters
 SPPR_NRZ = 2
@@ -115,6 +116,19 @@ WATCH_FUNCTION_V7 = {
     ('r', 'val'): 0b1100, ('r', 'offset'): 0b1100 | E, ('r', 'pcval'): 0b1110, ('r', 'offval'): 0b1110 | E,
     ('w', 'val'): 0b1101, ('w', 'offset'): 0b1101 | E, ('w', 'pcval'): 0b1111, ('w', 'offval'): 0b1111 | E,
 }
+# Armv8-M DWT_FUNCTIONn (DDI0553 D1.2.64, Tables RCNHN and RPSBJ): (access, emit) -> MATCH[3:0] | ACTION[5:4], on data
+# address (0b01xx) or Data Address With Value (0b11xx) comparators; ACTION 0b10 a Data Value packet, 0b11 a PC one
+DATA_PACKET, PC_PACKET = 0b10 << 4, 0b11 << 4
+WATCH_FUNCTION_V8 = {
+    ('rw', 'pc'): 0b0100 | PC_PACKET, ('w', 'pc'): 0b0101 | PC_PACKET, ('r', 'pc'): 0b0110 | PC_PACKET,
+    ('rw', 'val'): 0b1100 | DATA_PACKET, ('w', 'val'): 0b1101 | DATA_PACKET, ('r', 'val'): 0b1110 | DATA_PACKET,
+    ('rw', 'pcval'): 0b1100 | PC_PACKET, ('w', 'pcval'): 0b1101 | PC_PACKET, ('r', 'pcval'): 0b1110 | PC_PACKET,
+}
+CYCMATCH_V8 = 0b0001 | PC_PACKET
+LINKED_MATCH = {0b0011, 0b0111, 0b1011}   # limit and linked value comparators: n pairs with n - 1 (DDI0553 B14.2.5)
+DATAVSIZE = {1: 0, 2: 1, 4: 2}   # bytes -> DWT_FUNCTIONn.DATAVSIZE, bits [11:10]
+FUNCTION_ID = 27   # Armv8-M DWT_FUNCTIONn.ID[31:27], one bit per capability below (DDI0553 B14.2)
+FUNCTION_IDS = ('cycle counter', 'instruction address', 'data value', 'data address', 'linking')
 ARMV7M_PARTS = {0xC23: 'Cortex-M3', 0xC24: 'Cortex-M4', 0xC27: 'Cortex-M7'}
 ARMV8M_MAIN_PARTS = {0xD21: 'Cortex-M33', 0xD22: 'Cortex-M55', 0xD23: 'Cortex-M85', 0xD31: 'Cortex-M35P'}
 ARM_CHINA_ARMV8M_MAIN_PARTS = {0xD24: 'Cortex-M52'}   # implementer 0x63, Arm China
@@ -133,9 +147,10 @@ START_SIDE_EFFECTS = {'stm32f4': [DBGMCU_CR_F4]}
 DRAIN_S = 0.3
 CLEANING = threading.Event()   # set once a capture's teardown began
 READ_CHUNK = 1024
-# read-only bits a read-back ignores: ITM_TCR.BUSY; DWT_FUNCTIONn.MATCHED and LNK1ENA (ARMv7-M Table C1-39)
+# read-only bits a read-back ignores: ITM_TCR.BUSY; DWT_FUNCTIONn.MATCHED, LNK1ENA (ARMv7-M Table C1-39) and ID
+# (Armv8-M)
 VOLATILE_BITS = {ITM_TCR: 1 << 23}
-VOLATILE_BITS.update({DWT_COMP + 16 * n + 8: 1 << 24 | 1 << 9 for n in range(4)})
+VOLATILE_BITS.update({DWT_COMP + 16 * n + 8: 0x1F << FUNCTION_ID | 1 << 24 | 1 << 9 for n in range(4)})
 SIZED = {}   # address -> (bits, key): a register narrower than a word, accessed at its width, `key` ORed into writes
 
 
@@ -684,19 +699,19 @@ def parse_period(flag, text):
 
 
 def parse_watch(text, symbols):
+    """The watch `text` names; which encoding it takes waits for the core's architecture (watch_function)."""
     fields = {}
     for part in text.split(','):
         k, sep, v = part.partition('=')
-        if not sep or k not in ('addr', 'access', 'emit', 'mask'):
+        if not sep or k not in ('addr', 'access', 'emit', 'mask', 'size'):
             raise ValueError(f'--watch {text!r}: expected '
-                             f'addr=..,access=r|w|rw,emit=val|pc|pcval|offset|offval[,mask=N]')
+                             f'addr=..,access=r|w|rw,emit=val|pc|pcval|offset|offval[,mask=N][,size=1|2|4]')
         fields[k] = v.strip()
     if 'addr' not in fields or 'access' not in fields or 'emit' not in fields:
         raise ValueError(f'--watch {text!r}: addr, access and emit are required')
     key = (fields['access'], fields['emit'])
-    if key not in WATCH_FUNCTION_V7:
-        raise ValueError(f'--watch {text!r}: no ARMv7-M data trace encoding for access={key[0]} emit={key[1]} '
-                         f'(read-only and write-only comparators cannot emit the PC alone)')
+    if key not in WATCH_FUNCTION_V7 and key not in WATCH_FUNCTION_V8:
+        raise ValueError(f'--watch {text!r}: access is r, w or rw and emit val, pc, pcval, offset or offval')
     addr = fields['addr']
     if re.fullmatch(r'0x[0-9a-fA-F]+|\d+', addr):
         value, source = int(addr, 0), 'given'
@@ -710,8 +725,38 @@ def parse_watch(text, symbols):
     mask = int(fields.get('mask', '0'), 0)
     if not 0 <= mask <= 31 or value & ((1 << mask) - 1):
         raise ValueError(f'--watch {text!r}: mask {mask} must be 0-31 bits and the address aligned to it')
-    return {'addr': value, 'addr_source': source, 'mask': mask, 'access': key[0], 'emit': key[1],
-            'function': WATCH_FUNCTION_V7[key]}
+    w = {'addr': value, 'addr_source': source, 'mask': mask, 'access': key[0], 'emit': key[1]}
+    if 'size' in fields:
+        if fields['size'] not in ('1', '2', '4') or value % int(fields['size']):
+            raise ValueError(f'--watch {text!r}: size is 1, 2 or 4 bytes and the address aligned to it')
+        w['size'] = int(fields['size'])
+    elif source != 'given' and found[0][1] in DATAVSIZE and not value % found[0][1]:
+        w['object_size'] = found[0][1]
+    return w
+
+
+def watch_function(w, kind):
+    """(DWT_FUNCTIONn value, the capability ID bit it needs or None) for watch `w` on a core of `kind`; Refused
+    when that architecture has no single-comparator encoding for it."""
+    what = f"--watch access={w['access']},emit={w['emit']}"
+    if kind != 'armv8-m':
+        if w['access'] != 'rw' and w['emit'] == 'pc':
+            raise Refused(f'{what}: no ARMv7-M data trace encoding (read-only and write-only comparators cannot '
+                          f'emit the PC alone); Armv8-M has one')
+        if 'size' in w:
+            raise Refused(f'{what}: size= is Armv8-M\'s; an ARMv7-M comparator matches by address and mask=')
+        return WATCH_FUNCTION_V7[w['access'], w['emit']], None
+    if w['emit'] in ('offset', 'offval'):
+        raise Refused(f'{what}: an Armv8-M address offset takes a linked comparator pair, which --watch does not '
+                      f'program')
+    if w['mask']:
+        raise Refused(f'{what}: Armv8-M has no DWT_MASKn; a range takes a linked comparator pair, which --watch '
+                      f'does not program')
+    size = w.get('size', w.get('object_size'))
+    if size is None:
+        raise Refused(f'{what}: an Armv8-M comparator matches size= bytes (1, 2 or 4) at its address: give size=, '
+                      f'or a symbol of that size')
+    return WATCH_FUNCTION_V8[w['access'], w['emit']] | DATAVSIZE[size] << 10, 3
 
 
 def check_rates(a, probe_rates):
@@ -795,8 +840,8 @@ def snapshot(backend, regs):
 
 
 class Session:
-    def __init__(self, backend, journal):
-        self.b, self.j = backend, journal
+    def __init__(self, backend, journal, kind):
+        self.b, self.j, self.kind = backend, journal, kind
 
     def write(self, reg, value, kind='write', requires=None):
         original = unit_read(self.b, reg)
@@ -849,7 +894,7 @@ class Session:
         failures = []
         for n, originals in comparators(firsts):
             try:
-                settled, _, problems = restore_comparator(self.b, n, originals)
+                settled, _, problems = restore_comparator(self.b, n, originals, self.kind)
             except (ToolError, OSError) as err:
                 settled, problems = {}, [f'comparator {n}: {err}']
             for addr, value in settled.items():
@@ -879,6 +924,12 @@ class Session:
         return failures
 
 
+def comparator_regs(n, kind):
+    """Comparator n's DWT_COMPn, DWT_MASKn and DWT_FUNCTIONn; Armv8-M has no DWT_MASKn (DDI0553 D1.2.64)."""
+    base = DWT_COMP + 16 * n
+    return (base, base + 8) if kind == 'armv8-m' else (base, base + 4, base + 8)
+
+
 def comparator_of(addr):
     """n when addr is DWT_COMPn, DWT_MASKn or DWT_FUNCTIONn (n 0-3), else None."""
     off = addr - DWT_COMP
@@ -894,25 +945,40 @@ def comparators(firsts):
     return sorted(out.items())
 
 
-def restore_comparator(b, n, originals, allowed=None):
+def linked_pair(n, function_of, numcomp):
+    """The Armv8-M linked pair comparator n belongs to, as text, or None: n a limit or linked value comparator, or the
+    one before such a comparator, which changing either changes what the other matches (DDI0553 B14.2.5)."""
+    for limit in (n, n + 1):
+        if limit < numcomp and function_of(limit) & 0xF in LINKED_MATCH:
+            return f'comparators {limit - 1} and {limit} are a linked pair (DWT_FUNCTION{limit} MATCH ' \
+                   f'0b{function_of(limit) & 0xF:04b})'
+    return None
+
+
+def restore_comparator(b, n, originals, kind, allowed=None):
     """(settled {addr: value}, report, problems): comparator n's journalled registers (`originals`, {addr: value})
-    back as found. With `allowed` ({addr: values the journal explains}) every register is checked first, and one
-    value that is neither original nor explained leaves the whole comparator alone. Its function is disarmed and
-    verified before its address or mask changes, and restored last."""
-    base = DWT_COMP + 16 * n
-    func = base + 8
-    now = {r: b.read32(r) for r in (base, base + 4, func)}
+    back as found, on a core of `kind`. With `allowed` ({addr: values the journal explains}) every register is
+    checked first, and one value that is neither original nor explained leaves the whole comparator alone. Its
+    function is disarmed and verified before its address or mask changes, and restored last. An Armv8-M comparator
+    found in a linked pair, formed since the capture, is left alone."""
+    *addrs, func = regs = comparator_regs(n, kind)
+    now = {r: b.read32(r) for r in regs}
+    if kind == 'armv8-m':
+        pair = linked_pair(n, lambda m: now[func] if m == n else b.read32(DWT_COMP + 16 * m + 8),
+                           b.read32(DWT_CTRL) >> 28)
+        if pair:
+            return {}, [], [f'comparator {n}: {pair}, which the capture never armed; the comparator is left alone']
     if allowed is not None:
         foreign = [r for r, v in originals.items()
                    if not same(r, now[r], v) and not any(same(r, now[r], x) for x in allowed[r])]
         if foreign:
             return {}, [], [f'comparator {n}: ' + ', '.join(f'{reg_name(r)} 0x{now[r]:08x}' for r in foreign) +
                             ' neither as found nor written by this capture; the comparator is left alone']
-    if func in originals and originals[func] & 0xF and not {base, base + 4} <= originals.keys():
+    if func in originals and originals[func] & 0xF and not set(addrs) <= originals.keys():
         return {}, [], [f'comparator {n}: its original address and mask were not journalled, so its function '
                         f'0x{originals[func]:08x} is not re-armed; FUNCTION left at 0x{now[func]:08x}']
     settled, report = {}, []
-    moves = [r for r in (base, base + 4) if r in originals and not same(r, now[r], originals[r])]
+    moves = [r for r in addrs if r in originals and not same(r, now[r], originals[r])]
     if moves and now[func] & 0xF:
         if func not in originals:
             return {}, [], [f'comparator {n}: armed by someone else (FUNCTION 0x{now[func]:08x}); its address and mask '
@@ -955,6 +1021,9 @@ def plan_config(a, caps, before, itm_set_by_probe=False):
     if a.observe_itm and dwt_busy and ctrl_sources(a):
         raise Refused('--observe-itm keeps DWT_CTRL as found, and it already has trace sources on; --exc, '
                       '--pc-sample, --cyc-event and --profile need --take-itm')
+    if dwt_sources(a) and caps.get('dwt_ctrl', 0) & CTRL_NOTRCPKT:
+        raise Refused('this DWT sends no trace packets (DWT_CTRL.NOTRCPKT): --exc, --pc-sample, --cyc-event, '
+                      '--profile, --watch and --cycmatch need them')
     if a.profile and caps.get('dwt_ctrl', 0) & CTRL_NOPRFCNT:
         raise Refused('--profile: this DWT has no profiling counters (DWT_CTRL.NOPRFCNT)')
     if a.observe_itm:
@@ -995,28 +1064,54 @@ def plan_config(a, caps, before, itm_set_by_probe=False):
         steps.append(base)
         ctrl = base | enable
     steps.append(ctrl)
+    v8 = caps.get('architecture') == 'armv8-m'
+
+    def found(n):
+        return before.get(DWT_COMP + 16 * n + 8, 0)
+
+    def able(n, id_bit):   # an Armv8-M comparator names what it can match in FUNCTION.ID
+        return id_bit is None or not v8 or found(n) >> FUNCTION_ID + id_bit & 1
+
+    def pair(n):
+        return v8 and linked_pair(n, found, caps['numcomp'])
+
+    if a.take_comparator is not None and pair(a.take_comparator):
+        raise Refused(f'--take-comparator {a.take_comparator}: {pair(a.take_comparator)}; taking one would change '
+                      f'the other, so both are left alone')
     free = [n for n in range(min(caps['numcomp'], 4))
-            if not before[DWT_COMP + 16 * n + 8] & 0xF or n == a.take_comparator]
+            if not pair(n) and (not found(n) & 0xF or n == a.take_comparator)]
     watches = []
-    if a.cycmatch is not None:   # comparator 0 only (ARMv7-M C1-863): a Data trace PC packet when CYCCNT == COMP0
+    # --cycmatch: comparator 0 only, a Data trace PC packet when CYCCNT == COMP0 (ARMv7-M C1-863, DDI0553 D1.2.64)
+    if a.cycmatch is not None:
         if caps.get('dwt_ctrl', 0) & 1 << 25:
             raise Refused('--cycmatch: this DWT has no cycle counter (DWT_CTRL.NOCYCCNT)')
+        if pair(0):
+            raise Refused(f'--cycmatch needs comparator 0: {pair(0)}')
         if 0 not in free:
             raise Refused('--cycmatch needs comparator 0, which is in use: --take-comparator 0 takes it')
+        if not able(0, 0):
+            raise Refused('--cycmatch: comparator 0 does not match the cycle counter (DWT_FUNCTION0.ID)')
         free.remove(0)
-        watches.append({'comparator': 0, 'addr': a.cycmatch, 'mask': 0, 'function': CYCMATCH | 0b0001,
-                        'cycmatch': a.cycmatch})
-    if len(free) < len(a.watch):
-        raise Refused(f'{len(a.watch)} watches, {len(free)} free data trace comparators (0-3 with FUNCTION 0, 0 '
-                      f'kept for --cycmatch); --take-comparator N takes one in use')
-    for w, n in zip(a.watch, free):
-        watches.append(dict(w, comparator=n))
+        watches.append({'comparator': 0, 'addr': a.cycmatch, 'mask': 0,
+                        'function': CYCMATCH_V8 if v8 else CYCMATCH | 0b0001, 'cycmatch': a.cycmatch})
+    planned = [(w, *watch_function(w, caps.get('architecture'))) for w in a.watch]
+    for w, function, id_bit in planned:
+        usable = [n for n in free if able(n, id_bit)]
+        if not usable:
+            raise Refused(f'{len(a.watch)} watches, not enough free data trace comparators (0-3 with FUNCTION 0, 0 '
+                          f'kept for --cycmatch, able to match a data address); --take-comparator N takes one in use')
+        free.remove(usable[0])
+        watches.append(dict(w, comparator=usable[0], function=function))
     return tcr, ter, steps, watches
 
 
-def read_before(b, numcomp):
-    regs = [DEMCR, ITM_TCR, ITM_TER, ITM_TPR, DWT_CTRL] + [DWT_COMP + 16 * n + k for n in range(min(numcomp, 4))
-                                                            for k in (0, 4, 8)]
+def read_before(b, numcomp, kind):
+    """The registers a capture may change, as found. Reading DWT_FUNCTIONn clears its MATCHED bit (ARMv7-M C1-894,
+    DDI0553 D1.2.64)."""
+    regs = [DEMCR, ITM_TCR, ITM_TER, ITM_TPR, DWT_CTRL] + [r for n in range(min(numcomp, 4))
+                                                            for r in comparator_regs(n, kind)]
+    if kind == 'armv8-m' and numcomp > 4:   # whether comparator 3 is the first of a linked pair
+        regs.append(DWT_COMP + 16 * 4 + 8)
     return {r: b.read32(r) for r in regs}
 
 
@@ -1037,6 +1132,13 @@ def caps_report(b):
                 'trace_packets': 'unsupported (NOTRCPKT)' if ctrl >> 27 & 1 else 'supported',
                 'cyccnt': 'unsupported (NOCYCCNT)' if ctrl >> 25 & 1 else 'supported',
                 'profiling_counters': 'unsupported (NOPRFCNT)' if ctrl >> 24 & 1 else 'supported'})
+    out['comparators'] = []
+    for n in range(ctrl >> 28):   # this read clears each MATCHED bit (read_before)
+        func = b.read32(DWT_COMP + 16 * n + 8)
+        c = {'n': n, 'function': f'0x{func:08x}'}
+        if kind == 'armv8-m':
+            c['matches'] = [name for i, name in enumerate(FUNCTION_IDS) if func >> FUNCTION_ID + i & 1]
+        out['comparators'].append(c)
     out['itm'] = 'present' if is_component(b, ITM_CIDR) else 'unknown: no component ID at 0xE0000FF0'
     out['itm_tcr'], out['itm_ter'] = f'0x{b.read32(ITM_TCR):08x}', f'0x{b.read32(ITM_TER):08x}'
     if b.gate and not b.gate_open():
@@ -1143,8 +1245,6 @@ def capture(a, b, out_dir):
     kind, part = core_kind(cpuid)
     if kind not in ('armv7-m', 'armv8-m'):
         raise Refused(f'CPUID 0x{cpuid:08x} ({part}): SWO trace needs an ARMv7-M or Armv8-M Mainline core with ITM')
-    if (a.watch or a.cycmatch is not None) and kind != 'armv7-m':
-        raise Refused(f'{part} is Armv8-M: its DWT_FUNCTION encoding is not supported by --watch or --cycmatch yet')
     if not b.read32(DEMCR) & DEMCR_TRCENA:
         raise Refused('DEMCR.TRCENA is 0: DWT and ITM read UNKNOWN; the probe tool normally sets it at connect')
     if b.gate and (not a.setup or a.setup['key'] != b.gate['entry']):
@@ -1154,9 +1254,9 @@ def capture(a, b, out_dir):
     if a.setup:
         check_setup(b, a.setup)
     ctrl_now = b.read32(DWT_CTRL)
-    caps = {'numcomp': ctrl_now >> 28, 'dwt_ctrl': ctrl_now}
+    caps = {'numcomp': ctrl_now >> 28, 'dwt_ctrl': ctrl_now, 'architecture': kind}
     cap.update(cpuid=f'0x{cpuid:08x}', core=part, architecture=kind, dhcsr_before=f'0x{b.read32(DHCSR):08x}')
-    before = read_before(b, caps['numcomp'])
+    before = read_before(b, caps['numcomp'], kind)
     tcr, ter, ctrl_steps, watches = plan_config(a, caps, before, b.attach_writes is not None)
     if a.observe_itm and b.start_itm_tcr is not None and not same(ITM_TCR, before[ITM_TCR], b.start_itm_tcr):
         raise Refused(f'--observe-itm: starting SWO over a {b.name} sets ITM_TCR to 0x{b.start_itm_tcr:08x}, and the '
@@ -1196,7 +1296,7 @@ def capture(a, b, out_dir):
     if a.profile or a.cyc_event:
         sources.append('evcnt')
     if watches:
-        sources += ['dpc', 'daddr', 'dval']
+        sources += ['dpc', 'daddr', 'dval'] + ['dmatch'] * (kind == 'armv8-m')
     cap['sources'] = None if a.observe_itm else sources   # what the firmware enables is not ours to list
     cap['before'] = {reg_name(r): f'0x{v:08x}' for r, v in before.items()}
     writes = [w for w in a.setup['writes'] if w.get('for') in (None, *features_on(a))] if a.setup else []
@@ -1212,7 +1312,7 @@ def capture(a, b, out_dir):
     journal = Journal(os.path.join(out_dir, 'journal.jsonl'),
                       {'identity': b.identity(), 'host': socket.gethostname(), 'cpuid': cpuid, 'image': image,
                        'started': time.time()})
-    s = Session(b, journal)
+    s = Session(b, journal, kind)
     stream = None
     failures = []
     try:
@@ -1241,12 +1341,13 @@ def capture(a, b, out_dir):
             s.write(ITM_TER, ter)
             s.write(ITM_TCR, tcr)
         for w in watches:   # disarmed while its address and mask change
-            base = DWT_COMP + 16 * w['comparator']
-            s.baseline([base, base + 4, base + 8])
-            s.write(base + 8, 0)
-            s.write(base, w['addr'])
-            s.write(base + 4, w['mask'])
-            s.write(base + 8, w['function'])
+            comp, *mask, func = regs = comparator_regs(w['comparator'], kind)
+            s.baseline(regs)
+            s.write(func, 0)
+            s.write(comp, w['addr'])
+            for r in mask:
+                s.write(r, w['mask'])
+            s.write(func, w['function'])
         for value in ctrl_steps:
             s.write(DWT_CTRL, value)
         cap['configured'] = time.time()
@@ -1351,7 +1452,8 @@ def restore_from(b, out_dir):
 
     report, problems = [], []
     for n, originals in comparators(first):
-        done, lines, trouble = restore_comparator(b, n, originals, {r: explained((r, None))[1] for r in originals})
+        done, lines, trouble = restore_comparator(b, n, originals, core_kind(cpuid)[0],
+                                                  {r: explained((r, None))[1] for r in originals})
         for addr, value in done.items():
             journal.restored(first[(addr, None)], value)
         report += lines
@@ -1511,7 +1613,8 @@ def parse_args(argv):
                    help='global timestamps (ITM_TCR.GTSFREQ) from the part\'s timestamp generator, which its --setup '
                         'entry enables')
     c.add_argument('--watch', action='append', default=[], help='addr=ADDR|SYMBOL,access=r|w|rw,'
-                   'emit=val|pc|pcval|offset|offval[,mask=BITS] (ARMv7-M, comparators 0-3)')
+                   'emit=val|pc|pcval|offset|offval[,mask=BITS][,size=1|2|4] (comparators 0-3; swo-dwt.md, '
+                   'Data trace)')
     c.add_argument('--cycmatch', type=lambda v: int(v, 0), metavar='CYCLES',
                    help='a PC packet each time DWT_CYCCNT equals CYCLES (comparator 0, once per 2^32 cycles)')
     c.add_argument('--elf', help='firmware ELF: symbols for --watch, and its hash in capture.json')
