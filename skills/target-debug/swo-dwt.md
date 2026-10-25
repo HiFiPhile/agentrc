@@ -94,7 +94,10 @@ A killed run leaves its journal: `--restore DIR` (same host and connection, boar
 firmware against the `--elf` segments the capture checked, then restores each register whose value the journal
 explains since that register's last restore, and reports any other value untouched, including one changed during an
 interrupted probe tool operation. Without an `--elf` at capture it refuses: restore by hand from the `original`
-values in `journal.jsonl`. On Linux the probe server dies with the script (`PR_SET_PDEATHSIG`).
+values in `journal.jsonl`. A register it cannot reach, a failed access or a trace-clock check that fails included, is
+reported and left alone, and the rest is still restored (exit 1). A gated TPIU entry left so stays out of reach once
+the gate register is back at its original: restore it by hand with the trace clock running. On Linux the probe server
+dies with the script (`PR_SET_PDEATHSIG`).
 
 What the probe tools do on their own, measured: J-Link's `SWO EnableTarget` sets DBGMCU_CR.TRACE_IOEN on an STM32F4,
 ITM_TCR to 0x1000D and ITM_TER to its port mask (it refuses mask 0), and the TPIU's ACPR, SPPR (2) and FFCR (0x100);
@@ -165,7 +168,7 @@ Cortex-M7.
 | DWT profiling counters, cycle-count events                | yes         | stm32f407disco                                      |
 | CYCMATCH                                                  | yes         | stm32h743nucleo                                     |
 | Global timestamps                                         | yes         | stm32h743nucleo (TSG behind AP2)                    |
-| Armv8-M SWO, trace clock gate                             | yes         | ra6m5_ek (`cdc_msc` exception trace, no fixture)    |
+| Armv8-M SWO, trace clock gate                             | yes         | ra6m5_ek (fixture: exc, ITM, failed gate check)     |
 | Armv8-M data trace (`--watch`, `--cycmatch`)              | no          | refused on Armv8-M                                  |
 | Manchester SWO, TPIU formatter, parallel trace, CMSIS-DAP | no          | deferred                                            |
 

@@ -1,9 +1,9 @@
 # SWO fixture
 
-Firmware on TinyUSB's board support (stm32f407disco, stm32h743nucleo) with a known trace workload, for checking SWO
-capture end to end on real hardware: bringing up a new board's SWO route, trace clock and rate, and re-checking
-`swo_capture.py` and its decoders after a change. Once the board's row in `skills/target-debug/swo-boards.md` cites
-the fixture, debug by capturing the real firmware.
+Firmware on TinyUSB's board support (stm32f407disco, stm32h743nucleo, ra6m5_ek) with a known trace workload, for
+checking SWO capture end to end on real hardware: bringing up a new board's SWO route, trace clock and rate, and
+re-checking `swo_capture.py` and its decoders after a change. Once the board's row in
+`skills/target-debug/swo-boards.md` cites the fixture, debug by capturing the real firmware.
 
 ## Workload
 
@@ -17,7 +17,8 @@ the fixture, debug by capturing the real firmware.
 | ITM port 2                     | once per phase                        | the phase (32-bit), `0xA55A` (16-bit), `0x7E` (8-bit) |
 | `swo_fixture_busy` / `_idle`   | 100 ms each, alternating              | PC samples split between the two                      |
 
-Bursts are spaced to fit a 1.5 MHz SWO (layout in `src/swo_fixture.c`); compare a capture with `swo_fixture_last`,
-the counts of the last 200 ms phase.
+TIM6 and TIM7 are the STM32 basic timers; on ra6m5_ek they are GPT0 and GPT1, in interrupt slots 7 and 8, the nested
+interrupt in slot 9, installed in the fixture's own vector table in flash. Bursts are spaced to fit a 1.5 MHz SWO (layout in
+`src/swo_fixture.c`); compare a capture with `swo_fixture_last`, the counts of the last 200 ms phase.
 
 Build recipe, board notes, and when to re-check the timing on hardware: `skills/target-debug/swo-boards.md` (Fixture).

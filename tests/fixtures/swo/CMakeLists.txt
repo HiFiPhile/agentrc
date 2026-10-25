@@ -13,8 +13,8 @@ project(swo_fixture C ASM)
 
 family_initialize_project(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR})
 
-if (NOT BOARD MATCHES "^(stm32f407disco|stm32h743nucleo)$")
-  message(FATAL_ERROR "the SWO fixture supports stm32f407disco and stm32h743nucleo only")
+if (NOT BOARD MATCHES "^(stm32f407disco|stm32h743nucleo|ra6m5_ek)$")
+  message(FATAL_ERROR "the SWO fixture supports stm32f407disco, stm32h743nucleo and ra6m5_ek only")
 endif ()
 
 add_executable(${PROJECT_NAME} src/swo_fixture.c)

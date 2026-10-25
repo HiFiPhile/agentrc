@@ -3,20 +3,19 @@
 Validated boards for `swo_capture.py` (`swo-dwt.md`). Read the row and its notes before capturing on a board; add both
 when a board is validated. A family's register requirements are its `--setup` entry in `scripts/swo_boards.json`,
 whose `ref` fields cite the documents; this file holds what was measured. Board names are TinyUSB BSP aliases. The
-firmware behind the stm32 rows is the fixture below, whose timers, nested interrupt, ITM marker and watched variable
-have known rates; ra6m5_ek ran unmodified `cdc_msc`, so its row has no fixture golden checks and no injected-failure
-cleanup.
+firmware behind each row is the fixture below, whose timers, nested interrupt, ITM marker and watched variable have
+known rates.
 
 | Board           | Probe, route                        | Setup   | Trace clock         | Exact SWO rates used | Verified                                                                |
 |-----------------|-------------------------------------|---------|---------------------|----------------------|-------------------------------------------------------------------------|
 | stm32f407disco  | on-board J-Link (ST-Link reflashed) | stm32f4 | HCLK 168 MHz        | 1.5 MHz (4.5 MHz/3)  | exc, LTS, ITM, data trace, PC sample, observe, comparator, PB3, restore |
 | stm32h743nucleo | STLINK-V3, OpenOCD `stlink-dap.cfg` | stm32h7 | 400 MHz (see notes) | 16 MHz               | exc, LTS, ITM, data trace, PC sample, PB3, restore                      |
-| ra6m5_ek        | on-board J-Link OB (S124)           | ra6m5   | TRCLK 100 MHz       | 500 kHz (3 MHz/6)    | exc, LTS, trace clock gate, restore                                     |
+| ra6m5_ek        | on-board J-Link OB (S124)           | ra6m5   | TRCLK 100 MHz       | 500 kHz (3 MHz/6)    | exc, LTS, ITM, trace clock gate, restore, failed gate check             |
 
 ## Fixture
 
-`tests/fixtures/swo` in this repository: one C file on TinyUSB's board support (clocks, LED), for stm32f407disco and
-stm32h743nucleo. Its README gives the workload, the source comments its timing layout; `swo_fixture_last` holds the
+`tests/fixtures/swo` in this repository: one C file on TinyUSB's board support (clocks, LED), for stm32f407disco,
+stm32h743nucleo and ra6m5_ek. Its README gives the workload, the source comments its timing layout; `swo_fixture_last` holds the
 counts of the last complete phase, the values a capture is checked against. Build it against a local TinyUSB
 checkout, named by `TINYUSB_PATH` as below or in the environment. Its rates rest on the BSP's clocks, measured with
 TinyUSB 13f9a36a: re-check them on hardware after a change to a board's clock setup.
@@ -77,8 +76,9 @@ on hardware before its row can cite the fixture.
   `etm-boards.md`), and firmware that writes TRCKCR without a debugger attached wedges a standalone boot until
   power-cycle (same notes): a different path to the same register.
 - On-board S124 J-Link OB: P109/TDO reaches it through J29 3-4 (schematic, book 1965, p7); `SWO GetSpeedInfo` gives
-  3 MHz base, MinDiv 6, so 500 kHz at most. Exception trace with local timestamps on unmodified `cdc_msc`: 2 overflows
-  and one packet decoded as a reserved exception function in 2 s, its cause unknown; PC sampling at its slowest
-  (`1:15`, about 12 k samples/s at 200 MHz) would not fit.
+  3 MHz base, MinDiv 6, so 500 kHz at most. The fixture's layout is spaced for 1.5 MHz: exception trace with local
+  timestamps overflows (423 in 4 s) and ITM alone is clean, so capture its sources apart. Exception trace without
+  timestamps gives the fixture's counts with no overflow, but about one packet a second decodes as a reserved exception
+  function or an unknown header, at 250 kHz as at 500 kHz: stream corruption on this route, its cause not located.
+  PC sampling at its slowest (`1:15`, about 12 k samples/s at 200 MHz) would not fit.
 - J-Link Commander halts the core: run it with `r` and `g` before a capture (DHCSR 0x00130003 gave a 1-byte stream).
-- The board's own USB never enumerated on ci.lan during this work, whatever image ran.
