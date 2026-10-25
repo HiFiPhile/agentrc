@@ -2,9 +2,9 @@
 
 Validated boards for `swo_capture.py` (`swo-dwt.md`). Read the row and its notes before capturing on a board; add both
 when a board is validated. A family's register requirements are its `--setup` entry in `scripts/swo_boards.json`,
-whose `ref` fields cite the documents; this file holds what was measured. Board names are TinyUSB BSP aliases. The
-firmware behind each row is the fixture below, whose timers, nested interrupt, ITM marker and watched variable have
-known rates.
+whose `ref` fields cite the documents; this file holds what was measured. Board names are TinyUSB BSP aliases. A row
+measured on the fixture below has its timers, nested interrupt, ITM marker and watched variable at known rates; a row
+that names other firmware (stm32f723disco: `cdc_msc`) has no such reference counts.
 
 | Board           | Probe, route                        | Setup   | Trace clock         | Exact SWO rates used | Verified                                                                |
 |-----------------|-------------------------------------|---------|---------------------|----------------------|-------------------------------------------------------------------------|
