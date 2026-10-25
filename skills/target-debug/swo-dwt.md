@@ -71,6 +71,13 @@ python3 $S/swo_decode.py /tmp/swo-run --elf fw.elf          # --jsonl events.jso
   whether byte 0 is a packet boundary, before and after register snapshots, byte count, teardown offset, the
   capture's `errors` and the `restore` outcome apart), `DIR/journal.jsonl` and `DIR/probe.log`. A refused run leaves
   only `probe.log`, and the same `--out` can be reused.
+- **`--formatter`** (J-Link, core TPIU) switches the TPIU formatter on, TPIU_FFCR.EnFCont written after the probe
+  tool's start, which bypasses it, and restored with the rest: the stream is then CoreSight formatter frames
+  (Architecture Specification IHI0029, book 6591, D4), and the decode takes the ITM's bytes by its trace bus ID
+  (ITM_TCR.TraceBusID, 1 in a configured capture) and counts frames, syncs, lost frames and other sources' bytes,
+  which it does not decode (an ETM's, say). The formatter took 21% more of the pin on stm32f407disco (126,248 bytes
+  for the fixture's 104,330 ITM bytes): besides the aux byte, the frames averaged 1.7 ID bytes. The STM32H7 SWO
+  unit has none (RM0433 60.5.7); OpenOCD's trace unit object owns the register and is refused.
 - **`--rtt`** (J-Link only) has the same GDB server serve RTT channel 0 (`-RTTTelnetPort`, SEGGER KB book 6586) and
   logs it to `DIR/rtt.log`, the server's banner removed by the `rtt` skill's filter: the firmware's text beside its
   trace over one probe connection. The log starts with what the target's ring held when the capture connected, so it
@@ -204,7 +211,13 @@ Cortex-M7.
 | Armv8-M SWO, trace clock gate                             | yes         | ra6m5_ek (fixture: exc, ITM, failed gate check)     |
 | Armv8-M data trace (`--watch`, `--cycmatch`)              | yes         | ra6m5_ek (`w,val`, `r,pc`, `rw,pcval`, CYCMATCH)    |
 | RTT beside SWO (`--rtt`, J-Link)                          | yes         | stm32f407disco                                      |
-| Manchester SWO, TPIU formatter, parallel trace, CMSIS-DAP | no          | deferred                                            |
+| TPIU formatter (`--formatter`), ITM through it            | yes         | stm32f407disco                                      |
+| Manchester SWO, parallel trace, CMSIS-DAP                 | no          | deferred: no farm probe captures them               |
+
+The deferred rows need a probe the farm lacks. J-Link software captures UART (NRZ) SWO only (SEGGER KB, book 6588), and
+OpenOCD's ST-LINK driver refuses any other mode; the farm's CMSIS-DAP probes are Raspberry Pi debugprobes, built with
+SWO_UART and SWO_MANCHESTER 0 in every release, and OpenOCD lists no SWO on them. The Cortex-M4 TPIU itself supports
+Manchester (TPIU_DEVID). A CMSIS-DAP probe with SWO support wired to a target's TRACESWO would cover both.
 
 ## Known faults
 

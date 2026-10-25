@@ -115,6 +115,92 @@ def source_packet(h, payload):
     return None
 
 
+FULL_SYNC = b'\xff\xff\xff\x7f'   # 0x7FFFFFFF, least significant byte first (CoreSight Architecture IHI0029 D4.2.2)
+SPECIAL_IDS = {0x00: 'null', 0x7B: 'flush', 0x7D: 'trigger'}   # D4.2.4
+
+
+def deformat(data, mark=None):
+    """({trace source ID: [bytearray, ...]}, counts) of a TPIU formatter stream (IHI0029 D4.2): 16-byte frames from
+    the first full sync on, whose even bytes are an ID when bit 0 is set, else data[7:1] completed by the aux byte 15,
+    and whose odd bytes are data. An ID byte's aux bit says whether the byte after it is still the old ID's. A halfword
+    starting 0xFF is a sync, ID 0x7F never being used: FF 7F a half sync, FF FF the start of a full one. A frame a sync
+    or ID 0x7F cuts short is lost, with any ID change it held: every source's bytes after it start a new segment, and
+    bytes stay unattributed until the next ID. counts['before_mark'] is each source's byte count before raw byte `mark`."""
+    counts = collections.Counter()
+    out, before = {}, collections.Counter()
+    start = data.find(FULL_SYNC)
+    i = counts['preamble_bytes'] = len(data) if start < 0 else start
+    cur, broken, frame, at = None, set(), bytearray(), []
+
+    def emit(byte, j):
+        if cur is None or cur in SPECIAL_IDS:
+            counts[f"{SPECIAL_IDS.get(cur, 'unattributed')}_bytes"] += 1
+            return
+        if mark is not None and at[j // 2] + j % 2 < mark:
+            before[cur] += 1
+        segs = out.setdefault(cur, [bytearray()])
+        if cur in broken:
+            broken.discard(cur)
+            segs.append(bytearray())
+        segs[-1].append(byte)
+
+    while i + 2 <= len(data):
+        if data[i] != 0xFF:
+            frame += data[i:i + 2]
+            at.append(i)
+            i += 2
+        elif data[i + 1] == 0x7F:
+            counts['half_syncs'] += 1
+            i += 2
+            continue
+        else:
+            full = data[i:i + 4] == FULL_SYNC
+            if frame or not full:   # a frame cut short, or an ID 0x7F: what it held is lost
+                counts['lost_frames'] += 1
+                cur, broken, frame, at = None, set(out), bytearray(), []
+            if not full:
+                i = data.find(FULL_SYNC, i + 1)
+                if i < 0:
+                    break
+            counts['full_syncs'] += 1
+            i += 4
+            continue
+        if len(frame) < 16:
+            continue
+        counts['frames'] += 1
+        aux = frame[15]
+        for k in range(8):
+            b, a = frame[2 * k], aux >> k & 1
+            if not b & 1:
+                emit(b & 0xFE | a, 2 * k)
+                if k < 7:
+                    emit(frame[2 * k + 1], 2 * k + 1)
+            elif k == 7:   # its aux bit is reserved: the new ID starts with the next frame
+                cur = b >> 1
+            elif a:
+                emit(frame[2 * k + 1], 2 * k + 1)
+                cur = b >> 1
+            else:
+                cur = b >> 1
+                emit(frame[2 * k + 1], 2 * k + 1)
+        frame, at = bytearray(), []
+    if mark is not None:
+        counts['before_mark'] = dict(before)
+    return out, counts
+
+
+def deformatted_packets(segments):
+    """packets() over one source's segments, each read from its first synchronization packet: the formatter was
+    switched on with the ITM running, and a lost frame leaves no packet boundary. Offsets count the source's bytes."""
+    base = 0
+    for n, seg in enumerate(segments):
+        if n:
+            yield {'off': base, 'kind': 'resync'}
+        for p in packets(bytes(seg), False):
+            yield dict(p, off=p['off'] + base)
+        base += len(seg)
+
+
 def packets(data, synced):
     """Packets of the stream in order, each a dict with 'off' and 'kind'. A stream that does not start
     synced is read from its first synchronization packet; an unknown header or a source packet with an
@@ -506,7 +592,17 @@ def global_report(evts, ticks_hz):
 
 
 def summarize(data, meta, syms, top):
-    evts, integ, unknown = events(packets(data, meta['synced']), meta.get('sources'), meta.get('teardown_byte'))
+    fmt = meta.get('formatter')
+    if fmt:
+        teardown = meta.get('teardown_byte')
+        streams, counts = deformat(data, teardown)
+        pkts = deformatted_packets(streams.get(fmt['itm_id'], []))
+        if teardown is not None:   # events() compares it with the ITM source's own offsets
+            teardown = counts.pop('before_mark').get(fmt['itm_id'], 0)
+        counts['other_ids'] = {i: sum(map(len, segs)) for i, segs in streams.items() if i != fmt['itm_id']}
+    else:
+        pkts, teardown = packets(data, meta['synced']), meta.get('teardown_byte')
+    evts, integ, unknown = events(pkts, meta.get('sources'), teardown)
     clock = meta.get('ts_clock_hz')
     ticks_hz = clock / meta['ts_prescale'] if clock else None
     timing = None
@@ -518,7 +614,7 @@ def summarize(data, meta, syms, top):
     if integ['lts'] and meta.get('periods'):
         integ['periodic_missed'] = periodic_missed(evts, meta['periods'], meta['ts_prescale'])
     summary = {
-        'integrity': dict(integ, bytes=len(data), unknown=unknown[:20]),
+        'integrity': dict(integ, bytes=len(data), unknown=unknown[:20], **({'formatter': dict(counts)} if fmt else {})),
         'timing': timing or f"local timestamps at {clock} Hz / {meta['ts_prescale']} ({meta.get('ts_clock_source')})",
         'exceptions': {(syms.exception(n) if syms else exception_name(n)) + f' ({n})': r for n, r in exc.items()},
         'exception_anomalies': anomalies,
@@ -543,6 +639,11 @@ def print_text(s, out=sys.stdout):
     w('INTEGRITY\n')
     w(f"  bytes {i['bytes']}  packets {i.get('packets', 0)}  syncs {i.get('sync', 0)}  overflows {i.get('overflow', 0)}"
       f"  segments {i['segments']}\n")
+    if 'formatter' in i:
+        f = i['formatter']
+        w(f"  formatter: frames {f.get('frames', 0)}  lost {f.get('lost_frames', 0)}  full syncs {f.get('full_syncs', 0)}"
+          f"  half syncs {f.get('half_syncs', 0)}  before the first sync {f['preamble_bytes']} bytes  other sources "
+          f"{f['other_ids'] or 'none'}\n")
     for k in ('unsynced_bytes', 'unknown_bytes', 'unexpected', 'truncated_bytes', 'untimed'):
         if i.get(k):
             w(f'  {k.replace("_", " ")} {i[k]}\n')
@@ -619,10 +720,11 @@ def load_input(a):
         meta = {'synced': cap['stream_start'] == 'synced', 'ts_clock_hz': ts.get('clock_hz'),
                 'ts_clock_source': ts.get('clock_source'), 'ts_prescale': ts.get('prescale', 1),
                 'sources': cap.get('sources'), 'teardown_byte': cap.get('teardown_byte'),
-                'periods': periods(cap.get('features') or {}),
+                'periods': periods(cap.get('features') or {}), 'formatter': cap.get('formatter'),
                 'comparators': {w['comparator']: w['addr'] for w in cap.get('watches') or []}}
-        if a.ts_clock_hz or a.ts_prescale:
-            raise Usage('a capture dir carries its timestamp clock; --ts-clock-hz is for a raw file')
+        if a.ts_clock_hz or a.ts_prescale or a.formatter_id is not None:
+            raise Usage('a capture dir carries its timestamp clock and formatter; --ts-clock-hz and --formatter-id are '
+                        'for a raw file')
     else:
         if not a.bin or not a.start:
             raise Usage('give a capture dir, or --bin with --start synced|unsynced')
@@ -630,7 +732,8 @@ def load_input(a):
             raise Usage('--ts-prescale needs --ts-clock-hz')
         path = a.bin
         meta = {'synced': a.start == 'synced', 'ts_clock_hz': a.ts_clock_hz,
-                'ts_clock_source': 'given with --ts-clock-hz', 'ts_prescale': a.ts_prescale or 1}
+                'ts_clock_source': 'given with --ts-clock-hz', 'ts_prescale': a.ts_prescale or 1,
+                'formatter': {'itm_id': a.formatter_id} if a.formatter_id is not None else None}
     if meta['ts_prescale'] not in (1, 4, 16, 64):
         raise Usage(f"timestamp prescale {meta['ts_prescale']} is not one of 1, 4, 16, 64 (ITM_TCR.TSPrescale)")
     with open(path, 'rb') as f:
@@ -645,6 +748,7 @@ def main(argv=None):
                    help='with --bin: synced when byte 0 is a packet boundary (capture began before any source)')
     p.add_argument('--ts-clock-hz', type=int, help='with --bin: the local timestamp clock')
     p.add_argument('--ts-prescale', type=int, help='with --bin: ITM_TCR.TSPrescale as a divisor (1, 4, 16, 64)')
+    p.add_argument('--formatter-id', type=int, help='with --bin: TPIU formatter frames, the ITM\'s trace ID in them')
     p.add_argument('--elf', help='firmware ELF for function and handler names')
     p.add_argument('--jsonl', help='write every event as one JSON line here')
     p.add_argument('--json', action='store_true', help='print the summary as JSON')

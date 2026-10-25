@@ -224,6 +224,71 @@ class ExceptionReport(unittest.TestCase):
         self.assertNotIn('dur_us', s['exceptions']['SysTick (15)'])
 
 
+def frames(source, data):
+    """TPIU formatter frames carrying `data` for trace ID `source`, 14 bytes a frame, each frame opening with the ID
+    (aux bit 0: the byte after it is the new ID's)."""
+    assert len(data) % 14 == 0
+    out = bytearray()
+    for n in range(0, len(data), 14):
+        d, aux = data[n:n + 14], 0
+        frame = bytearray([source << 1 | 1, d[0]])
+        for k in range(1, 8):
+            frame.append(d[2 * k - 1] & 0xFE)
+            aux |= (d[2 * k - 1] & 1) << k
+            frame += d[2 * k:2 * k + 1] if k < 7 else bytes([aux])
+        out += frame
+    return bytes(out)
+
+
+class Formatter(unittest.TestCase):
+    EXAMPLE = bytes.fromhex('07aaa6a72ba85452525407cac6c7c81c')   # IHI0029 Figure D4-2
+
+    def test_the_architecture_example_frame(self):
+        streams, counts = dec.deformat(dec.FULL_SYNC + self.EXAMPLE)
+        self.assertEqual({i: [bytes(b).hex() for b in segs] for i, segs in streams.items()},
+                         {0x03: ['aaa6a7a8cac6c7c8'], 0x15: ['55525354']})   # Table D4-2
+        self.assertEqual(counts['frames'], 1)
+
+    def test_syncs_are_dropped_and_a_cut_frame_breaks_each_source(self):
+        e = self.EXAMPLE
+        data = b'\x12' + dec.FULL_SYNC + e[:6] + b'\xff\x7f' + e[6:] + dec.FULL_SYNC + e[:4] + dec.FULL_SYNC + e
+        streams, counts = dec.deformat(data)
+        self.assertEqual([bytes(b).hex() for b in streams[0x03]], ['aaa6a7a8cac6c7c8', 'aaa6a7a8cac6c7c8'])
+        self.assertEqual((counts['preamble_bytes'], counts['half_syncs'], counts['lost_frames'], counts['frames']),
+                         (1, 1, 1, 2))
+        streams, counts = dec.deformat(dec.FULL_SYNC + e[:2] + b'\xff\x01' + e + dec.FULL_SYNC + e)   # ID 0x7F
+        self.assertEqual((counts['lost_frames'], counts['frames'], len(streams[0x03])), (1, 1, 1))
+
+    def test_an_id_in_byte_14_starts_with_the_next_frame(self):
+        last = bytearray(self.EXAMPLE)
+        last[14], last[15] = 0x15 << 1 | 1, last[15] & 0x7F   # its aux bit reserved, 0
+        data_only = bytes(range(2, 32, 2)) + b'\x00'   # 15 data bytes, bit 0 clear, aux byte 0
+        streams, _ = dec.deformat(dec.FULL_SYNC + bytes(last) + data_only)
+        self.assertEqual(bytes(streams[0x03][0])[-1:], b'\xc7')
+        self.assertEqual(bytes(streams[0x15][-1])[-15:], data_only[:15])
+
+    def test_bytes_after_a_lost_frame_wait_for_the_next_id(self):
+        data_only = bytes(range(2, 32, 2)) + b'\x00'
+        streams, counts = dec.deformat(dec.FULL_SYNC + frames(1, bytes(14)) + frames(2, bytes(14))[:6] +
+                                       dec.FULL_SYNC + data_only)
+        self.assertEqual(([len(b) for b in streams[1]], 2 in streams), ([14], False))
+        self.assertEqual(counts['unattributed_bytes'], 15)
+
+    def test_the_teardown_byte_is_translated_to_the_itm_source(self):
+        itm = SYNC + exc(15, 1) + OVERFLOW + exc(15, 2) + OVERFLOW   # overflows at source bytes 9 and 13
+        s, _ = decode(dec.FULL_SYNC + frames(1, itm), formatter={'itm_id': 1}, teardown_byte=15)   # source byte 10
+        self.assertEqual((s['integrity']['overflow'], s['integrity']['teardown_overflow']), (1, 1))
+
+    def test_the_itm_is_decoded_from_its_id_and_other_sources_counted(self):
+        itm = (SYNC + stim(1, ord('h')) + stim(1, ord('i')) + exc(15, 1)) * 2
+        itm += b'\x00' * (-len(itm) % 14)
+        data = b'\x05\x06' + dec.FULL_SYNC + frames(1, itm) + frames(2, bytes(14))
+        s, _ = decode(data, formatter={'itm_id': 1}, sources=['stim', 'exc'])
+        self.assertEqual(s['text'][1]['text'], 'hihi')
+        self.assertEqual(s['integrity']['formatter']['other_ids'], {2: 14})
+        self.assertEqual(s['integrity']['formatter']['preamble_bytes'], 2)
+
+
 class DecodeCli(unittest.TestCase):
     def test_a_capture_dir_carries_its_start_clock_sources_and_teardown(self):
         with tempfile.TemporaryDirectory() as d:
@@ -251,7 +316,7 @@ def args(**kw):
     a = dict(traceclk_hz=168_000_000, swo_hz=1_500_000, allow_approx_swo=False, clock_source='test',
              duration_ms=10, exc=True, pc_sample=None, cyc_event=None, profile=[], cycmatch=None, global_ts=None,
              itm_ports=None, timestamps=False, core_hz=None, ts_prescale=1, watch=[], setup=None, observe_itm=False,
-             take_itm=False, take_comparator=None, rtt=False,
+             take_itm=False, take_comparator=None, rtt=False, formatter=False,
              elf=None, elf_sha256=None, image_regions=None)
     a.update(kw)
     return argparse.Namespace(**a)
@@ -736,6 +801,16 @@ class Capture(unittest.TestCase):
         self.assertEqual((record['restore'], {k: t.mem.get(k, 0) for k in before}), ('complete', before))
         t.rtt.close()
 
+    def test_the_formatter_is_switched_on_after_the_probe_start_and_restored(self):
+        t = FakeTarget()
+        record, failures = self.run_capture(t, formatter=True)
+        self.assertEqual((failures, record['restore'], record['formatter']), ([], 'complete', {'itm_id': 1}))
+        self.assertIn((cap.TPIU_FFCR, 0x102), t.writes)
+        self.assertEqual(t.mem[cap.TPIU_FFCR], 0x102)   # as found
+        with self.assertRaisesRegex(cap.Refused, 'TraceBusID'):
+            self.run_capture(FakeTarget({cap.ITM_TCR: 0x9, cap.ITM_TER: 1}), formatter=True, observe_itm=True,
+                             exc=False)
+
     def test_the_elf_must_be_what_the_target_runs(self):
         t = FakeTarget()
         addr, image = FakeTarget.VECTORS
@@ -1201,6 +1276,7 @@ class CaptureCli(unittest.TestCase):
         self.assertEqual(b.name, 'openocd')
         self.assertIn('a jlink connect writes nothing', self.error(self.JLINK + ['--caps', '--accept-attach-writes']))
         self.assertIn('--rtt: only the J-Link route', self.error(oocd + ['--accept-attach-writes', '--rtt']))
+        self.assertIn('--formatter: an OpenOCD trace unit', self.error(oocd + ['--accept-attach-writes', '--formatter']))
         with tempfile.TemporaryDirectory() as d:
             out = self.error(oocd[:-1] + ['--accept-attach-writes', '--out', d + '/x', '--observe-itm'])
         self.assertIn("would not be the firmware's", out)

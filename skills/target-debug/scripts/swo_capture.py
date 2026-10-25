@@ -104,6 +104,7 @@ CTRL_NOTRCPKT = 1 << 27
 PROFILE_BITS = {'cpi': 1 << 17, 'exc': 1 << 18, 'sleep': 1 << 19, 'lsu': 1 << 20, 'fold': 1 << 21}   # ...EVTENA
 CTRL_TRACE_SOURCES = CTRL_PCSAMPLENA | CTRL_EXCTRCENA | (0x3F << 17)   # sampling, exception trace, event counters
 SPPR_NRZ = 2
+FFCR_ENFCONT = 1 << 1   # TPIU_FFCR.EnFCont: the formatter on in SWO mode (Cortex-M4 TRM 11.3.3)
 DBGMCU_CR_F4 = 0xE0042004
 JLINK_ITM_TCR = 0x0001000D   # what J-Link's SWO EnableTarget writes to ITM_TCR (measured)
 ACPR_MAX = 1 << 13   # Cortex-M4 TPIU_ACPR PRESCALER[12:0]; the architecture allows 16 bits (ARMv7-M C1-43)
@@ -1273,6 +1274,9 @@ def capture(a, b, out_dir):
     cap.update(cpuid=f'0x{cpuid:08x}', core=part, architecture=kind, dhcsr_before=f'0x{b.read32(DHCSR):08x}')
     before = read_before(b, caps['numcomp'], kind)
     tcr, ter, ctrl_steps, watches = plan_config(a, caps, before, b.attach_writes is not None)
+    if a.formatter and not tcr >> 16 & 0x7F:
+        raise Refused('--formatter: the ITM\'s trace bus ID (ITM_TCR.TraceBusID) is 0, the null source a formatter '
+                      'stream drops')
     if a.observe_itm and b.start_itm_tcr is not None and not same(ITM_TCR, before[ITM_TCR], b.start_itm_tcr):
         raise Refused(f'--observe-itm: starting SWO over a {b.name} sets ITM_TCR to 0x{b.start_itm_tcr:08x}, and the '
                       f'firmware runs 0x{before[ITM_TCR]:08x}: observing would change it; --take-itm reconfigures it '
@@ -1299,6 +1303,8 @@ def capture(a, b, out_dir):
     if tcr & TCR_TSENA:
         cap['timestamps'] = {'clock_hz': a.core_hz, 'clock_source': a.clock_source,
                              'prescale': (1, 4, 16, 64)[tcr >> 8 & 3]}
+    if a.formatter:
+        cap['formatter'] = {'itm_id': tcr >> 16 & 0x7F}
     cap.update(notes=notes, watches=watches, setup=a.setup and a.setup['key'],
                features={'exc': a.exc, 'pc_sample': a.pc_sample, 'cyc_event': a.cyc_event, 'profile': a.profile,
                          'global_ts': a.global_ts, 'cycmatch': a.cycmatch,
@@ -1348,6 +1354,8 @@ def capture(a, b, out_dir):
             if acpr + 1 != prescaler:
                 raise ToolError(f'the probe tool set the prescaler to {acpr + 1} (SWO {a.traceclk_hz / (acpr + 1):.0f} '
                                 f'Hz), not {prescaler}')
+        if a.formatter:   # after the probe tool's start, which bypasses it (FFCR 0x100)
+            s.write(unit_regs[3], unit_read(b, unit_regs[3]) | FFCR_ENFCONT)
         if a.observe_itm:
             for r in (ITM_TCR, ITM_TER):
                 if not same(r, b.read32(r), before[r]):
@@ -1585,6 +1593,8 @@ def make_backend(a, p):
         if a.swo_object or a.vid_pid:
             p.error('--swo-object and --vid-pid are OpenOCD flags')
         return JLinkBackend(a.probe, a.device, a.interface, a.speed, a.rtt)
+    if a.formatter:
+        p.error('--formatter: an OpenOCD trace unit object owns TPIU_FFCR (its -formatter); only the J-Link route sets it')
     if a.rtt:
         p.error('--rtt: only the J-Link route serves RTT beside SWO (its GDB server); use the rtt skill on OpenOCD')
     if a.interface or a.speed:
@@ -1647,6 +1657,8 @@ def parse_args(argv):
     c.add_argument('--elf', help='firmware ELF: symbols for --watch, and its hash in capture.json')
     c.add_argument('--setup', help='board setup entry in swo_boards.json, applied before the capture')
     c.add_argument('--rtt', action='store_true', help='also log RTT channel 0 to DIR/rtt.log (J-Link)')
+    c.add_argument('--formatter', action='store_true',
+                   help='TPIU formatter frames on SWO, the ITM by its trace bus ID in them (J-Link, core TPIU)')
     o = c.add_mutually_exclusive_group()
     o.add_argument('--observe-itm', action='store_true')
     o.add_argument('--take-itm', action='store_true')
@@ -1701,7 +1713,7 @@ def parse_args(argv):
             with open(a.elf, 'rb') as f:
                 a.elf_sha256 = hashlib.sha256(f.read()).hexdigest()
     elif any(getattr(a, f) for f in ('traceclk_hz', 'swo_hz', 'exc', 'pc_sample', 'cyc_event', 'profile', 'watch',
-                                     'itm_ports', 'timestamps', 'rtt')) or a.cycmatch is not None:
+                                     'itm_ports', 'timestamps', 'rtt', 'formatter')) or a.cycmatch is not None:
         p.error('capture flags need --out')
     return a, backend
 
