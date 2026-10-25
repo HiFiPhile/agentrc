@@ -9,6 +9,7 @@ known rates.
 | Board           | Probe, route                        | Setup   | Trace clock         | Exact SWO rates used | Verified                                                                |
 |-----------------|-------------------------------------|---------|---------------------|----------------------|-------------------------------------------------------------------------|
 | stm32f407disco  | on-board J-Link (ST-Link reflashed) | stm32f4 | HCLK 168 MHz        | 1.5 MHz (4.5 MHz/3)  | exc, LTS, ITM, data trace, PC sample, observe, comparator, PB3, restore |
+| stm32f723disco  | on-board J-Link (roster `jlink`)    | stm32f7 | HCLK 216 MHz        | 1.5 MHz (4.5 MHz/3)  | caps, exc, LTS, restore (`cdc_msc`, no fixture port)                    |
 | stm32h743nucleo | STLINK-V3, OpenOCD `stlink-dap.cfg` | stm32h7 | 400 MHz (see notes) | 16 MHz               | exc, LTS, ITM, data trace, PC sample, PB3, restore                      |
 | ra6m5_ek        | on-board J-Link OB (S124)           | ra6m5   | TRCLK 100 MHz       | 500 kHz (3 MHz/6)    | exc, LTS, ITM, data trace, CYCMATCH, comparator, gate, restore          |
 
@@ -51,6 +52,14 @@ on hardware before its row can cite the fixture.
   accesses the `pcval` one traced. Neither the ARMv7-M ARM nor the Cortex-M4 TRM in the library describes it.
 - `-device stm32f407vg` from the roster; GDB server memory access while running works over this probe.
 - DWT_MASKn reads back at most 15: `mask=31` fails the capture at its read-back (and is restored).
+
+## stm32f723disco
+
+- TinyUSB's `cdc_msc` (HSE 25 MHz / 25 x 432 / 2 = 216 MHz HCLK) at 1.5 MHz: 4081 SysTick entries in a 4.08 s span
+  of 216 MHz local timestamps, no overflow, one segment; restore complete.
+- PB3 reaches the on-board probe's T_SWO through SB13 (MB1260 schematic, book 2058, sheet 3); UM2140 has no
+  solder-bridge table, so SB13's default is read from the drawing. A J-Link connect left DBGMCU_CR at 0x7, trace clock
+  off, until the setup write.
 
 ## stm32h743nucleo
 

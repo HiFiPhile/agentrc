@@ -1324,7 +1324,7 @@ class CaptureCli(unittest.TestCase):
     def test_an_unknown_setup_lists_the_entries(self):
         with tempfile.TemporaryDirectory() as d:
             out = self.error(self.JLINK + ['--out', d + '/x', '--setup', 'nope'])
-        self.assertIn('stm32f4, stm32h7', out)
+        self.assertIn('stm32f4, stm32f7, stm32h7', out)
 
 
 class HilRoster(unittest.TestCase):
