@@ -1356,22 +1356,15 @@ def restore_from(b, out_dir):
             journal.restored(first[(addr, None)], value)
         report += lines
         problems += trouble
-    for key in reversed(list(first)):
-        if key[1] is None and comparator_of(key[0]) is not None:
-            continue
-        reg, name, original = key if key[1] else key[0], first[key]['name'], first[key]['original']
+    def restore_key(key, reg, name, original):
         owed, values = explained(key)
         if b.gate and in_tpiu(key[0]) and not b.gate_open():   # never touch a TPIU whose clock is stopped
             if owed:
                 problems.append(f'{name}: not read, {b.gate["name"]} stops the trace clock; left alone')
             else:
                 report.append(f'{name}: restored earlier; not read, the trace clock is stopped')
-            continue
-        try:
-            now = unit_read(b, reg)
-        except ToolError as err:
-            problems.append(f'{name}: {err}; left alone')
-            continue
+            return
+        now = unit_read(b, reg)
         if same(key[0], now, original):
             report.append(f'{name}: already 0x{now:08x}')
             journal.restored(first[key], now)
@@ -1380,7 +1373,7 @@ def restore_from(b, out_dir):
                                         entries)
             if conflict:
                 problems.append(conflict)
-                continue
+                return
             unit_write(b, reg, original)
             rb = unit_read(b, reg)
             if same(key[0], rb, original):
@@ -1393,6 +1386,15 @@ def restore_from(b, out_dir):
             why = f' (interrupted during {in_flight[-1]})' if in_flight else ''
             problems.append(f'{name}: 0x{now:08x} is neither the original 0x{original:08x} nor a value this capture '
                             f'left{why}; left alone')
+
+    for key in reversed(list(first)):
+        if key[1] is None and comparator_of(key[0]) is not None:
+            continue
+        name = first[key]['name']
+        try:   # a failed access, the gate check's included, leaves this register and goes on to the next
+            restore_key(key, key if key[1] else key[0], name, first[key]['original'])
+        except (ToolError, OSError) as err:
+            problems.append(f'{name}: {err}; left alone')
     return report, problems
 
 

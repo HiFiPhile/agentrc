@@ -699,6 +699,31 @@ class Capture(unittest.TestCase):
         self.assertEqual((problems, t.stalled), ([], []))
         self.assertIn('TPIU_ACPR: restored earlier; not read, the trace clock is stopped', report)
 
+    def test_ra_recovery_goes_on_past_a_failed_trace_clock_check(self):
+        for error in (cap.ToolError('memU8: no Data ='), OSError('connection reset')):
+            t = FakeRA()
+            self.setup('ra6m5')
+            s = self.session(t)
+            s.write(FakeRA.PRCR, 0x1)
+            s.write(FakeRA.TRCKCR, 0x81)
+            s.write(cap.TPIU_ACPR, 111)
+            s.write(cap.ITM_TCR, 0x1000D)
+
+            def gate_fails():
+                raise error
+            t.gate_open = gate_fails
+            tpiu, stall = [], t.stall
+
+            def record_tpiu(addr):   # before the fake's own gate check, which now raises
+                if cap.TPIU <= addr < cap.TPIU + 0x1000:
+                    tpiu.append(addr)
+                stall(addr)
+            t.stall = record_tpiu
+            report, problems = cap.restore_from(t, self.dir)
+            self.assertEqual(problems, [f'TPIU_ACPR: {error}; left alone'])
+            self.assertEqual((tpiu, t.mem[cap.ITM_TCR], t.mem[FakeRA.TRCKCR], t.mem[FakeRA.PRCR]), ([], 0, 0x01, 0))
+            self.assertEqual(t.mem[cap.TPIU_ACPR], 111)
+
     def test_ra_recovery_leaves_a_prerequisite_someone_else_changed(self):
         t = FakeRA()
         self.setup('ra6m5')
