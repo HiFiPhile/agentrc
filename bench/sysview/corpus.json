@@ -1,0 +1,428 @@
+{
+  "version": 1,
+  "archive": {
+    "tag": "test-data",
+    "asset": "sysview-corpus-v1.tar.xz",
+    "sha256": "473109ac30c30c07c8f9ecb4838525916f9349fffd6cbf608095e7e4f2448688",
+    "bytes": 18420264
+  },
+  "provenance": "TinyUSB cdc_msc and cdc_msc_freertos SystemView captures on STM32F407, STM32H743, RP2040, CH32V307, SAMD51 and MAX32666 (tinyusb#4294), 2026-10-22/23; GUI exports by SystemView 4.10b on Linux",
+  "missing_categories": [
+    "early-crash/no-Init"
+  ],
+  "files": {
+    "README.md": {
+      "sha256": "98936408cd5e2b9d2b9c845d979d85eb82374561af731e27702e1f24642568eb",
+      "bytes": 2180
+    },
+    "captures/ch32-wrapped/capture.SVDat": {
+      "sha256": "8ed57cc9af69c2c2bccfafac44db29558be9e6b6a1c3b90715d1a97c89a93f66",
+      "bytes": 4096
+    },
+    "captures/ch32-wrapped/gui/contexts.csv": {
+      "sha256": "b0e8a8d3936436ff9de1bfdc99e3594a078fdca29474f46f57ff3e10d6dda827",
+      "bytes": 630
+    },
+    "captures/ch32-wrapped/gui/events.txt": {
+      "sha256": "a2a16243b4239e3015e2610b887c3d1688f0ebfc20c8ce51d3aa5c95219a4957",
+      "bytes": 95256
+    },
+    "captures/ch32-wrapped/gui/record.json": {
+      "sha256": "7846bf4773337dd7aee5f263eb14771ef3627f2f7e157c2fd923a6096f5688e8",
+      "bytes": 34
+    },
+    "captures/cut2/capture.SVDat": {
+      "sha256": "8aed32c1dd55d87004b9d95ee0019e432d4e6c6696aec5acb895380a570895f1",
+      "bytes": 2264
+    },
+    "captures/cut2/gui/contexts.csv": {
+      "sha256": "27088b02bd917870deab9ffe8396789e9029b70778d4517f17dc157bdfeb9241",
+      "bytes": 1589
+    },
+    "captures/cut2/gui/events.txt": {
+      "sha256": "fd04a48a3b55959dfa0a838937e7b1e387fe9a3e21614f52e2d317f218a5d51c",
+      "bytes": 58301
+    },
+    "captures/cut2/gui/record.json": {
+      "sha256": "7846bf4773337dd7aee5f263eb14771ef3627f2f7e157c2fd923a6096f5688e8",
+      "bytes": 34
+    },
+    "captures/f407-baremetal/capture.SVDat": {
+      "sha256": "61de2daf5359d5e677c6ad63a51053e9c0b7246f41d97da7c4794df51f43b945",
+      "bytes": 879517
+    },
+    "captures/f407-baremetal/gui/contexts.csv": {
+      "sha256": "828cda66201901ad0841106f10003f4648d7385cfb18cfb9ca3328ac8e6696ef",
+      "bytes": 774
+    },
+    "captures/f407-baremetal/gui/events.txt": {
+      "sha256": "d066511862e877c9793121bd4b773c8dc75b4a41135e8cb707ef0227649fae06",
+      "bytes": 27544683
+    },
+    "captures/f407-baremetal/gui/record.json": {
+      "sha256": "7a2fd3934d1810996bddce783d05a032c039df2393c40972a46be8f1e916a836",
+      "bytes": 58
+    },
+    "captures/f407-live/capture.SVDat": {
+      "sha256": "6000344bb833f8170dea99af48d776976408fe59478bbd9a23039bdceb02ff98",
+      "bytes": 1263823
+    },
+    "captures/f407-live/gui/contexts.csv": {
+      "sha256": "d4e81a1b0aa9e9a8c290dfc21c258a24a9fb43fd6a024535c5e16f6996608201",
+      "bytes": 1971
+    },
+    "captures/f407-live/gui/events.txt": {
+      "sha256": "34ce69797a75516e6f86506738eaa475d1a46403d903b9cc326978868fdfe788",
+      "bytes": 30475029
+    },
+    "captures/f407-live/gui/record.json": {
+      "sha256": "7846bf4773337dd7aee5f263eb14771ef3627f2f7e157c2fd923a6096f5688e8",
+      "bytes": 34
+    },
+    "captures/f407-oocd/capture.SVDat": {
+      "sha256": "92ec10c83a9d65c13f449935ebbcfbad8c993a8515b2b68649a846f296485f85",
+      "bytes": 1001473
+    },
+    "captures/f407-oocd/gui/contexts.csv": {
+      "sha256": "66aded2b3a76c3979ca396846477018ecd294334d75c732044309f1a15e7811c",
+      "bytes": 1765
+    },
+    "captures/f407-oocd/gui/events.txt": {
+      "sha256": "ff8b930ba6768223738c5bad0ae06319189bad6baf75e480017b2c0805408139",
+      "bytes": 26764744
+    },
+    "captures/f407-oocd/gui/record.json": {
+      "sha256": "7846bf4773337dd7aee5f263eb14771ef3627f2f7e157c2fd923a6096f5688e8",
+      "bytes": 34
+    },
+    "captures/f407-wrapped-recheck/capture.SVDat": {
+      "sha256": "df407f1fa1e45d35690b5974d70962c78f50af10ab65f3b774df5cef55066f34",
+      "bytes": 65536
+    },
+    "captures/f407-wrapped-recheck/gui/contexts.csv": {
+      "sha256": "e913e4335ee605d2f615f4411370a7f5285a67c8644202adad244ea3447ace8d",
+      "bytes": 1594
+    },
+    "captures/f407-wrapped-recheck/gui/events.txt": {
+      "sha256": "e4dd5c1ad293c4bd184ac98369348bfd3237fc6fe8882e0dc71b4d2577a3c3e0",
+      "bytes": 1851385
+    },
+    "captures/f407-wrapped-recheck/gui/record.json": {
+      "sha256": "8a962eceef28cee74f21d5e996c6e718703b10698799ad5369e57b1908ef0fbb",
+      "bytes": 58
+    },
+    "captures/f407-wrapped-repeat/capture.SVDat": {
+      "sha256": "df407f1fa1e45d35690b5974d70962c78f50af10ab65f3b774df5cef55066f34",
+      "bytes": 65536
+    },
+    "captures/f407-wrapped-repeat/gui/contexts.csv": {
+      "sha256": "e913e4335ee605d2f615f4411370a7f5285a67c8644202adad244ea3447ace8d",
+      "bytes": 1594
+    },
+    "captures/f407-wrapped-repeat/gui/events.txt": {
+      "sha256": "e4dd5c1ad293c4bd184ac98369348bfd3237fc6fe8882e0dc71b4d2577a3c3e0",
+      "bytes": 1851385
+    },
+    "captures/f407-wrapped-repeat/gui/record.json": {
+      "sha256": "7846bf4773337dd7aee5f263eb14771ef3627f2f7e157c2fd923a6096f5688e8",
+      "bytes": 34
+    },
+    "captures/f407-wrapped/capture.SVDat": {
+      "sha256": "df407f1fa1e45d35690b5974d70962c78f50af10ab65f3b774df5cef55066f34",
+      "bytes": 65536
+    },
+    "captures/f407-wrapped/gui/contexts.csv": {
+      "sha256": "e913e4335ee605d2f615f4411370a7f5285a67c8644202adad244ea3447ace8d",
+      "bytes": 1594
+    },
+    "captures/f407-wrapped/gui/events.txt": {
+      "sha256": "e4dd5c1ad293c4bd184ac98369348bfd3237fc6fe8882e0dc71b4d2577a3c3e0",
+      "bytes": 1851385
+    },
+    "captures/f407-wrapped/gui/record.json": {
+      "sha256": "7846bf4773337dd7aee5f263eb14771ef3627f2f7e157c2fd923a6096f5688e8",
+      "bytes": 34
+    },
+    "captures/h743-oocd/capture.SVDat": {
+      "sha256": "f3c08f90ea5d43a6cf7a55ad6513f2bea96e923a9f825711f232ee2836eab00c",
+      "bytes": 2808358
+    },
+    "captures/h743-oocd/gui/contexts.csv": {
+      "sha256": "58635083b1854d413e2906263905e5db6b396c13c014819db10d8105f81b8e44",
+      "bytes": 1970
+    },
+    "captures/h743-oocd/gui/events.txt": {
+      "sha256": "30479beb2c171cdd6f1b75dd5a4ce2b0ce81944236a5953093aadee1ec7de49f",
+      "bytes": 68790205
+    },
+    "captures/h743-oocd/gui/record.json": {
+      "sha256": "7a2fd3934d1810996bddce783d05a032c039df2393c40972a46be8f1e916a836",
+      "bytes": 58
+    },
+    "captures/jl-wrapped/capture.SVDat": {
+      "sha256": "66cc0c945548650e95fcb4c299a40302a31e2458f632479dbd14671c3469e88c",
+      "bytes": 65536
+    },
+    "captures/jl-wrapped/gui/contexts.csv": {
+      "sha256": "e8d0ae4ad6423bd79e3d1acadc0ad53d637280bff7e697e40fed1d40cb1638f6",
+      "bytes": 1735
+    },
+    "captures/jl-wrapped/gui/events.txt": {
+      "sha256": "5a18b0f0d0b08f41799b4e57321ca3b6ad597e4cb22bb45c8268557c0a0f8782",
+      "bytes": 1559272
+    },
+    "captures/jl-wrapped/gui/record.json": {
+      "sha256": "8a962eceef28cee74f21d5e996c6e718703b10698799ad5369e57b1908ef0fbb",
+      "bytes": 58
+    },
+    "captures/max32666-corrupt/capture.SVDat": {
+      "sha256": "8f8948a12c67f10946d54bda0cde8ce5da5d1e5aa23b50dcb1c1772cc558ee1c",
+      "bytes": 101376
+    },
+    "captures/max32666-corrupt/gui/contexts.csv": {
+      "sha256": "746164dd3ce58dbd133a6ce5fcabe9ea3665acf7d853444012eaec66f48b1120",
+      "bytes": 2012
+    },
+    "captures/max32666-corrupt/gui/events.txt": {
+      "sha256": "336a781882d2858298499ebb6c8a40a67a622bd85d66fa95a3e3d796735b2de1",
+      "bytes": 2627903
+    },
+    "captures/max32666-corrupt/gui/record.json": {
+      "sha256": "b03d1c06694f2722d9b56b280b15570d0ecf60747109fb18f0e64b2ace4340bd",
+      "bytes": 58
+    },
+    "captures/metro-live/capture.SVDat": {
+      "sha256": "6c3642e5ba72ae3a3f7045b7dc2954a1e9efc4a77fc6e208d4fc880f41e855e5",
+      "bytes": 524424
+    },
+    "captures/metro-live/gui/contexts.csv": {
+      "sha256": "fdeaa0d2f1807703736a143b280474ec0e2574cd3d6a9b6be1b264b39388c025",
+      "bytes": 2028
+    },
+    "captures/metro-live/gui/events.txt": {
+      "sha256": "76e244c4cab0b1790fcca5e1fcaf460e1c0978ba3f9ed5004ecef40bfc02fb1c",
+      "bytes": 13861129
+    },
+    "captures/metro-live/gui/record.json": {
+      "sha256": "7846bf4773337dd7aee5f263eb14771ef3627f2f7e157c2fd923a6096f5688e8",
+      "bytes": 34
+    },
+    "captures/oc-wrapped/capture.SVDat": {
+      "sha256": "6c1a4d62066ca6fc02b11c50bb99d8fe58767964fe608aeca497e9430ecda93c",
+      "bytes": 65536
+    },
+    "captures/oc-wrapped/gui/contexts.csv": {
+      "sha256": "f1d1045d7e878acc841d312291a8604b5c998fbc9fce029c77852234fa4abcdf",
+      "bytes": 1724
+    },
+    "captures/oc-wrapped/gui/events.txt": {
+      "sha256": "bc2fb8967d8bcdb850713f4bccd30e5cd259474b41331273ab32da30c0a15463",
+      "bytes": 1701214
+    },
+    "captures/oc-wrapped/gui/record.json": {
+      "sha256": "8a962eceef28cee74f21d5e996c6e718703b10698799ad5369e57b1908ef0fbb",
+      "bytes": 58
+    },
+    "captures/pico-baremetal/capture.SVDat": {
+      "sha256": "a9b45580f4ccd1769d6983d72342e10a727523a5552bdbc24a9f9e25b1b3c6be",
+      "bytes": 850677
+    },
+    "captures/pico-baremetal/gui/contexts.csv": {
+      "sha256": "b998ed71bde4e063f449993de85a3240f2d58086614dc52c22ceb78df7d31fc2",
+      "bytes": 774
+    },
+    "captures/pico-baremetal/gui/events.txt": {
+      "sha256": "6ca19a1b16ba0bc91f443b9a52994e79b054db3683485bcf64d73f999aabcb8c",
+      "bytes": 30541203
+    },
+    "captures/pico-baremetal/gui/record.json": {
+      "sha256": "8a962eceef28cee74f21d5e996c6e718703b10698799ad5369e57b1908ef0fbb",
+      "bytes": 58
+    },
+    "captures/pico-oocd/capture.SVDat": {
+      "sha256": "3ace224a8c67b3193c1fac973f553c612be170fa48ab1662d30658a25ac4c861",
+      "bytes": 500889
+    },
+    "captures/pico-oocd/gui/contexts.csv": {
+      "sha256": "700bc7c11f7dd596afe7391aa15048f0fb7bc6a5608d43b9322d53a19badf79b",
+      "bytes": 773
+    },
+    "captures/pico-oocd/gui/events.txt": {
+      "sha256": "b2f6447bd7a29c6d52f4ef07663471bdefa212a421ea3d675ed146dbc1753678",
+      "bytes": 18361155
+    },
+    "captures/pico-oocd/gui/record.json": {
+      "sha256": "7846bf4773337dd7aee5f263eb14771ef3627f2f7e157c2fd923a6096f5688e8",
+      "bytes": 34
+    },
+    "unpaired/jl-check1.SVDat": {
+      "sha256": "d893e1974daade2e9350a876bf1f3126357bab971583584996b11e12796b97b4",
+      "bytes": 65536
+    },
+    "unpaired/jl-check2.SVDat": {
+      "sha256": "a763ce49981c86ac9f63c48fe701ead4948eb7ae4c8dc7a1fe2bae2c8c1d4d35",
+      "bytes": 65536
+    },
+    "unpaired/jl-check3.SVDat": {
+      "sha256": "1b11af2fd3493912dfb643317ba2bbd55cd3acd9fda172078d862463ac8ac5bf",
+      "bytes": 65536
+    },
+    "unpaired/oc-check1.SVDat": {
+      "sha256": "39e53ce790f1f9c823042c746a4ff4d7659ee10428165698c595766b2eb3f6f7",
+      "bytes": 65536
+    },
+    "unpaired/oc-check3.SVDat": {
+      "sha256": "e2120a81ecf6a546ddbe85dc2a6ed66ece53705eeb0535a6b8f3251fb4b47e35",
+      "bytes": 65536
+    },
+    "unpaired/oc-term2.SVDat": {
+      "sha256": "4cbb892a50685f00fbfdc4ed2c3f2c88c38178ab2863f992576cb7c923199f9c",
+      "bytes": 65536
+    }
+  },
+  "captures": [
+    {
+      "name": "f407-baremetal",
+      "raw": "captures/f407-baremetal/capture.SVDat",
+      "gui": "captures/f407-baremetal/gui",
+      "categories": [
+        "baremetal",
+        "clean"
+      ]
+    },
+    {
+      "name": "pico-baremetal",
+      "raw": "captures/pico-baremetal/capture.SVDat",
+      "gui": "captures/pico-baremetal/gui",
+      "categories": [
+        "baremetal",
+        "clean"
+      ]
+    },
+    {
+      "name": "ch32-wrapped",
+      "raw": "captures/ch32-wrapped/capture.SVDat",
+      "gui": "captures/ch32-wrapped/gui",
+      "categories": [
+        "wrapped"
+      ]
+    },
+    {
+      "name": "cut2",
+      "raw": "captures/cut2/capture.SVDat",
+      "gui": "captures/cut2/gui",
+      "categories": [
+        "truncated"
+      ]
+    },
+    {
+      "name": "f407-wrapped",
+      "raw": "captures/f407-wrapped/capture.SVDat",
+      "gui": "captures/f407-wrapped/gui",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "jl-wrapped",
+      "raw": "captures/jl-wrapped/capture.SVDat",
+      "gui": "captures/jl-wrapped/gui",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "oc-wrapped",
+      "raw": "captures/oc-wrapped/capture.SVDat",
+      "gui": "captures/oc-wrapped/gui",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "f407-live",
+      "raw": "captures/f407-live/capture.SVDat",
+      "gui": "captures/f407-live/gui",
+      "categories": [
+        "overflow",
+        "freertos"
+      ]
+    },
+    {
+      "name": "metro-live",
+      "raw": "captures/metro-live/capture.SVDat",
+      "gui": "captures/metro-live/gui",
+      "categories": [
+        "overflow",
+        "freertos"
+      ]
+    },
+    {
+      "name": "f407-oocd",
+      "raw": "captures/f407-oocd/capture.SVDat",
+      "gui": "captures/f407-oocd/gui",
+      "categories": [
+        "overflow",
+        "freertos"
+      ]
+    },
+    {
+      "name": "pico-oocd",
+      "raw": "captures/pico-oocd/capture.SVDat",
+      "gui": "captures/pico-oocd/gui",
+      "categories": [
+        "baremetal",
+        "clean"
+      ]
+    },
+    {
+      "name": "h743-oocd",
+      "raw": "captures/h743-oocd/capture.SVDat",
+      "gui": "captures/h743-oocd/gui",
+      "categories": [
+        "overflow",
+        "freertos",
+        "timer-wrap"
+      ]
+    },
+    {
+      "name": "f407-wrapped-repeat",
+      "raw": "captures/f407-wrapped-repeat/capture.SVDat",
+      "gui": "captures/f407-wrapped-repeat/gui",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "f407-wrapped-recheck",
+      "raw": "captures/f407-wrapped-recheck/capture.SVDat",
+      "gui": "captures/f407-wrapped-recheck/gui",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "max32666-corrupt",
+      "raw": "captures/max32666-corrupt/capture.SVDat",
+      "gui": "captures/max32666-corrupt/gui",
+      "categories": [
+        "corrupt-content",
+        "baremetal"
+      ],
+      "mode": "robustness"
+    }
+  ],
+  "unpaired": [
+    "unpaired/jl-check1.SVDat",
+    "unpaired/jl-check2.SVDat",
+    "unpaired/jl-check3.SVDat",
+    "unpaired/oc-check1.SVDat",
+    "unpaired/oc-check3.SVDat",
+    "unpaired/oc-term2.SVDat"
+  ]
+}
