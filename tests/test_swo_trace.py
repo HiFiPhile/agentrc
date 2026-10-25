@@ -363,6 +363,8 @@ class FakeTarget:
 
     def write32(self, addr, value, target=None):
         self.writes.append((addr, value))
+        if addr == cap.DWT_CTRL and self.mem[addr] & cap.CTRL_POSTCNT_ENABLES:   # POSTINIT ignored (ARMv7-M C1-883)
+            value = value & ~0x1E0 | self.mem[addr] & 0x1E0
         self.mem[(target, addr) if target else addr] = value
 
     def probe_rates(self):
@@ -690,6 +692,44 @@ class Capture(unittest.TestCase):
         self.assertEqual(record['sources'], ['stim', 'exc', 'dpc', 'daddr', 'dval'])
         names = [e['name'] for e in self.journal()[1]]
         self.assertIn('TPIU_ACPR', names)   # the probe tool's own change, journalled
+
+    def test_pc_sampling_is_stopped_before_postinit_is_restored(self):
+        t = FakeTarget()
+        record, failures = self.run_capture(t, pc_sample=(1, 8))
+        self.assertEqual((failures, record['restore'], t.mem[cap.DWT_CTRL]), ([], 'complete', 0x40000000))
+        t = FakeTarget({cap.DWT_CTRL: 0x40001061})   # the firmware samples, POSTINIT 3
+        record, failures = self.run_capture(t, pc_sample=(1, 8), take_itm=True)
+        self.assertEqual((failures, record['restore'], t.mem[cap.DWT_CTRL]), ([], 'complete', 0x40001061))
+
+    def sampling(self, t, ctrl=0x40001311):   # PC sampling 1:8 set up as a capture does
+        s = self.session(t)
+        for value in cap.write_steps(cap.DWT_CTRL, t.mem[cap.DWT_CTRL], ctrl):
+            s.write(cap.DWT_CTRL, value)
+        return s
+
+    def test_restore_from_a_killed_sampling_run_restores_postinit(self):
+        t = FakeTarget()
+        self.sampling(t)
+        report, problems = cap.restore_from(t, self.dir)
+        self.assertEqual((t.mem[cap.DWT_CTRL], problems), (0x40000000, []))
+
+    def test_a_restore_cut_short_between_its_steps_is_finished_by_the_next(self):
+        t = FakeTarget({cap.DWT_CTRL: 0x40001061})
+        s = self.sampling(t)
+        write = t.write32
+
+        def fail_last(addr, value, target=None):
+            if (addr, value) == (cap.DWT_CTRL, 0x40001061):
+                raise cap.ToolError('write: E31')
+            write(addr, value, target)
+        t.write32 = fail_last
+        self.assertRegex(s.restore()[0], 'E31')
+        self.assertEqual(t.mem[cap.DWT_CTRL], 0x40000061)
+        self.assertEqual({k: self.journal()[1][-1][k] for k in ('kind', 'intended')}, {'kind': 'restore',
+                                                                                     'intended': 0x40000061})
+        t.write32 = write
+        report, problems = cap.restore_from(t, self.dir)
+        self.assertEqual((t.mem[cap.DWT_CTRL], problems), (0x40001061, []))
 
     def test_teardown_stops_every_source_at_once_before_the_probe_stops(self):
         t = FakeTarget()

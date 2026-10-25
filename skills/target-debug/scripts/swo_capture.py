@@ -99,6 +99,8 @@ CTRL_CYCTAP = 1 << 9
 CTRL_PCSAMPLENA = 1 << 12
 CTRL_EXCTRCENA = 1 << 16
 CTRL_CYCEVTENA = 1 << 22
+CTRL_POSTCNT_ENABLES = CTRL_PCSAMPLENA | CTRL_CYCEVTENA
+CTRL_POSTCNT_CONFIG = CTRL_CYCTAP | 0x1FE   # CYCTAP, POSTINIT, POSTPRESET
 CTRL_NOPRFCNT = 1 << 24
 CTRL_NOTRCPKT = 1 << 27
 PROFILE_BITS = {'cpi': 1 << 17, 'exc': 1 << 18, 'sleep': 1 << 19, 'lsu': 1 << 20, 'fold': 1 << 21}   # ...EVTENA
@@ -922,13 +924,14 @@ class Session:
                 continue
             reg = (addr, target) if target else addr
             try:
-                if not same(addr, unit_read(self.b, reg), e['original']):
+                current = unit_read(self.b, reg)
+                if not same(addr, current, e['original']):
                     conflict = meet_requirement(self.b, e, self.j, self.values)
                     if conflict:
                         failures.append(conflict)
                         foreign.add((e['requires']['reg'], e['requires']['target']))
                         continue
-                    unit_write(self.b, reg, e['original'])
+                    restore_write(self.b, self.j, reg, current, e['original'])
                 rb = unit_read(self.b, reg)
             except (ToolError, OSError) as err:
                 failures.append(f"{e['name']}: {err}")
@@ -938,6 +941,26 @@ class Session:
             else:
                 failures.append(f"{e['name']}: restored 0x{e['original']:08x}, reads 0x{rb:08x}")
         return failures
+
+
+def write_steps(addr, current, value):
+    """The writes taking a register from `current` to `value`, the last one `value`: DWT_CTRL ignores a POSTINIT
+    write while the POSTCNT timer runs, and POSTINIT is written before the write that starts it (ARMv7-M C1-883)."""
+    if addr != DWT_CTRL or not (current ^ value) & CTRL_POSTCNT_CONFIG:
+        return [value]
+    steps = [current & ~CTRL_POSTCNT_ENABLES] if current & CTRL_POSTCNT_ENABLES else []
+    return steps + [value & ~CTRL_POSTCNT_ENABLES] + ([value] if value & CTRL_POSTCNT_ENABLES else [])
+
+
+def restore_write(b, journal, reg, current, original):
+    """Write `original` back, journalling each value write_steps passes through first, so a recovery after an
+    interruption finds it explained."""
+    *steps, _ = write_steps(reg[0] if isinstance(reg, tuple) else reg, current, original)
+    for value in steps:
+        journal.before(reg, current, value, 'restore')
+        unit_write(b, reg, value)
+        current = value
+    unit_write(b, reg, original)
 
 
 def comparator_regs(n, kind):
@@ -1066,7 +1089,6 @@ def plan_config(a, caps, before, itm_set_by_probe=False):
     ctrl = (ctrl_before & ~CTRL_TRACE_SOURCES if a.take_itm else ctrl_before) | CTRL_CYCCNTENA
     if not ctrl & CTRL_SYNCTAP:
         ctrl |= CTRL_SYNCTAP_24
-    steps = []
     if a.exc:
         ctrl |= CTRL_EXCTRCENA
     for name in a.profile:
@@ -1074,12 +1096,9 @@ def plan_config(a, caps, before, itm_set_by_probe=False):
     period, enable = (a.pc_sample, CTRL_PCSAMPLENA) if a.pc_sample else (a.cyc_event, CTRL_CYCEVTENA)
     if period:
         cyctap, postpreset = period
-        # POSTINIT, POSTPRESET and CYCTAP while the POSTCNT timer is off, then one enable bit (ARMv7-M C1-883)
-        base = ctrl & ~(CTRL_CYCTAP | 0x1FE | CTRL_PCSAMPLENA | CTRL_CYCEVTENA)
-        base |= (CTRL_CYCTAP if cyctap else 0) | postpreset << 5 | postpreset << 1
-        steps.append(base)
-        ctrl = base | enable
-    steps.append(ctrl)
+        ctrl = ctrl & ~(CTRL_POSTCNT_CONFIG | CTRL_POSTCNT_ENABLES) | enable | \
+            (CTRL_CYCTAP if cyctap else 0) | postpreset << 5 | postpreset << 1
+    steps = write_steps(DWT_CTRL, ctrl_before, ctrl)
     v8 = caps.get('architecture') == 'armv8-m'
 
     def found(n):
@@ -1509,7 +1528,7 @@ def restore_from(b, out_dir):
             if conflict:
                 problems.append(conflict)
                 return
-            unit_write(b, reg, original)
+            restore_write(b, journal, reg, now, original)
             rb = unit_read(b, reg)
             if same(key[0], rb, original):
                 report.append(f'{name}: 0x{now:08x} -> 0x{rb:08x}')
