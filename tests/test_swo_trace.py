@@ -246,7 +246,7 @@ def args(**kw):
     a = dict(traceclk_hz=168_000_000, swo_hz=1_500_000, allow_approx_swo=False, clock_source='test',
              duration_ms=10, exc=True, pc_sample=None, cyc_event=None, profile=[], cycmatch=None, global_ts=None,
              itm_ports=None, timestamps=False, core_hz=None, ts_prescale=1, watch=[], setup=None, observe_itm=False,
-             take_itm=False, take_comparator=None,
+             take_itm=False, take_comparator=None, rtt=False,
              elf=None, elf_sha256=None, image_regions=None)
     a.update(kw)
     return argparse.Namespace(**a)
@@ -319,6 +319,14 @@ class FakeTarget:
     def stop_swo(self, mask):
         self.mem[cap.ITM_TCR] = self.mem[cap.ITM_TER] = 0
         self.stream.close()
+
+    def start_rtt(self):   # the GDB server's banner, then the target's ring; `rtt_eof` closes it at once
+        ours, self.rtt = socket.socketpair()
+        self.rtt.sendall(b'SEGGER J-Link V9.78 - Real time terminal output\r\nSEGGER J-Link ST-LINK V1.0, SN=1\r\n'
+                         b'Process: JLinkGDBServerCLExe\r\nswo-fixture 7\n')
+        if getattr(self, 'rtt_eof', False):
+            self.rtt.close()
+        return ours
 
 
 class FakeRA(FakeTarget):
@@ -693,6 +701,35 @@ class Capture(unittest.TestCase):
         t.mem[f1] = FakeV8.ID   # the pair gone, the comparator is still owed
         report, problems = cap.restore_from(t, self.dir)
         self.assertEqual((problems, t.mem[cap.DWT_COMP], t.mem[f0] & 0xF), ([], 0, 0))
+
+    def test_rtt_is_logged_beside_the_swo_without_the_server_banner(self):
+        t = FakeTarget()
+        record, failures = self.run_capture(t, rtt=True, duration_ms=200)
+        self.assertEqual((failures, record['rtt']), ([], {'log': 'rtt.log', 'bytes': 13}))
+        self.assertEqual(Path(self.dir, 'rtt.log').read_bytes(), b'swo-fixture 7')
+        t.rtt.close()
+
+    def test_an_rtt_stream_the_server_closes_fails_the_capture_and_still_restores(self):
+        t = FakeTarget()
+        t.rtt_eof = True
+        record, failures = self.run_capture(t, rtt=True, duration_ms=200)
+        self.assertEqual(failures, ['rtt: the probe tool closed the RTT stream after 127 bytes'])
+        self.assertEqual(record['restore'], 'complete')
+
+    def test_an_rtt_log_that_fails_to_close_still_restores(self):
+        t = FakeTarget()
+        before = dict(t.mem)
+        close = cap.Stream.close
+
+        def fail_rtt(stream):
+            close(stream)
+            if stream.name == 'RTT':
+                raise OSError(28, 'No space left on device')
+        with mock.patch.object(cap.Stream, 'close', fail_rtt):
+            record, failures = self.run_capture(t, rtt=True, duration_ms=200)
+        self.assertEqual(failures, ['rtt: [Errno 28] No space left on device'])
+        self.assertEqual((record['restore'], {k: t.mem.get(k, 0) for k in before}), ('complete', before))
+        t.rtt.close()
 
     def test_the_elf_must_be_what_the_target_runs(self):
         t = FakeTarget()
@@ -1158,6 +1195,7 @@ class CaptureCli(unittest.TestCase):
         a, b = cap.parse_args(oocd + ['--accept-attach-writes'])
         self.assertEqual(b.name, 'openocd')
         self.assertIn('a jlink connect writes nothing', self.error(self.JLINK + ['--caps', '--accept-attach-writes']))
+        self.assertIn('--rtt: only the J-Link route', self.error(oocd + ['--accept-attach-writes', '--rtt']))
         with tempfile.TemporaryDirectory() as d:
             out = self.error(oocd[:-1] + ['--accept-attach-writes', '--out', d + '/x', '--observe-itm'])
         self.assertIn("would not be the firmware's", out)

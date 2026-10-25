@@ -7,7 +7,7 @@ target-debug skill's swo-dwt.md); decode the result with swo_decode.py.
                  --duration-ms N --out DIR [--exc] [--pc-sample CYCTAP:POSTPRESET] [--itm-ports SPEC] \
                  [--timestamps --core-hz HZ [--ts-prescale N]] [--watch addr=A|SYM,access=..,emit=..] \
                  [--elf FW.elf] [--setup ENTRY] [--observe-itm | --take-itm] [--take-comparator N] \
-                 [--allow-approx-swo]
+                 [--allow-approx-swo] [--rtt]
   swo_capture.py CONNECTION --restore DIR
 
 CONNECTION is --hil-config FILE --board NAME, or explicit flags: a J-Link by --probe SERIAL --device NAME
@@ -45,8 +45,9 @@ alone.
 
 DIR also gets swo.bin (the raw stream), probe.log (the probe tool's output) and capture.json (configuration, clocks
 with their source, identity, before and after register snapshots, byte count, host timing, the capture's errors and
-the restore's outcome). Exit 0 captured and restored, 1 a capture or restore that failed (the report says what is
-left), 2 bad usage or a refusal before any write.
+the restore's outcome); with --rtt (J-Link only) rtt.log, RTT channel 0 through the same GDB server, its banner
+removed, from what the target's ring held when the capture connected. Exit 0 captured and restored, 1 a capture or
+restore that failed (the report says what is left), 2 bad usage or a refusal before any write.
 """
 import argparse
 import contextlib
@@ -309,8 +310,8 @@ class JLinkBackend:
     attach_writes = None
     start_itm_tcr = JLINK_ITM_TCR
 
-    def __init__(self, probe, device, interface, speed):
-        self.probe, self.device, self.interface, self.speed = probe, device, interface, speed
+    def __init__(self, probe, device, interface, speed, rtt=False):
+        self.probe, self.device, self.interface, self.speed, self.rtt = probe, device, interface, speed, rtt
         self.family = 'stm32f4' if device.lower().startswith('stm32f4') else None
         self.gate = trace_gate(device)
         self.proc = self.rsp = None
@@ -322,11 +323,12 @@ class JLinkBackend:
         exe = os.environ.get('JLINK_GDBSERVER') or shutil.which('JLinkGDBServerCLExe')
         if not exe:
             raise ToolError('JLinkGDBServerCLExe not found (set JLINK_GDBSERVER)')
-        self.gdb_port, self.swo_port, telnet = free_ports(3)
+        self.gdb_port, self.swo_port, telnet, self.rtt_port = free_ports(4)
+        rtt = ['-RTTTelnetPort', str(self.rtt_port)] if self.rtt else []   # RTT channel 0 (SEGGER KB, GDB Server)
         self.proc = spawn(
             [exe, '-select', f'usb={self.probe}', '-device', self.device, '-if', self.interface, '-speed', self.speed,
              '-nohalt', '-noir', '-port', str(self.gdb_port), '-swoport', str(self.swo_port), '-telnetport',
-             str(telnet), '-singlerun', '-nogui'], log)
+             str(telnet), *rtt, '-singlerun', '-nogui'], log)
         self.rsp = Rsp(connect_when_up(self.gdb_port, self.proc, 20))
 
     def read32(self, addr):
@@ -380,6 +382,9 @@ class JLinkBackend:
         if 'success' not in reply:
             raise ToolError(f'SWO EnableTarget: {reply!r}')
         return connect_when_up(self.swo_port, self.proc, 10)
+
+    def start_rtt(self):
+        return connect_when_up(self.rtt_port, self.proc, 10)
 
     def stop_swo(self, port_mask):
         reply = self.rsp.monitor(f'SWO DisableTarget 0x{port_mask or 1:x}')
@@ -790,11 +795,11 @@ def check_rates(a, probe_rates):
 # ---------------------------------------------------------------------------------------------------
 
 class Stream:
-    """The SWO socket to a file. `error` says why it ended early: the probe tool closed it, or a read or write
-    failed, before `ending` was set."""
+    """A probe tool's socket (SWO, or RTT with --rtt) to a file. `error` says why it ended early: the probe tool
+    closed it, or a read or write failed, before `ending` was set."""
 
-    def __init__(self, sock, path):
-        self.sock, self.f = sock, open(path, 'wb')
+    def __init__(self, sock, path, name='SWO'):
+        self.sock, self.f, self.name = sock, open(path, 'wb'), name
         self.bytes, self.first, self.last, self.error = 0, None, None, None
         self.stop, self.ending = threading.Event(), threading.Event()
         self.sock.settimeout(0.2)
@@ -807,7 +812,7 @@ class Stream:
                 chunk = self.sock.recv(65536)
                 if not chunk:
                     if not self.ending.is_set():
-                        self.error = f'the probe tool closed the SWO stream after {self.bytes} bytes'
+                        self.error = f'the probe tool closed the {self.name} stream after {self.bytes} bytes'
                     return
                 now = time.time()
                 self.first = self.first or now
@@ -818,7 +823,7 @@ class Stream:
                 continue
             except OSError as e:
                 if not self.ending.is_set():
-                    self.error = f'SWO stream after {self.bytes} bytes: {e}'
+                    self.error = f'{self.name} stream after {self.bytes} bytes: {e}'
                 return
 
     def close(self):
@@ -828,6 +833,16 @@ class Stream:
         self.thread.join(5)
         self.f.close()
         self.sock.close()
+
+
+def strip_rtt_banner(path):
+    """Drop the J-Link server's banner from an RTT log, with the rtt skill's filter; the bytes left."""
+    sys.path.insert(0, os.path.join(HERE, '..', '..', 'rtt', 'scripts'))
+    with open(path, 'rb') as f:
+        data = __import__('rtt').strip_banner(f.read())
+    with open(path, 'wb') as f:
+        f.write(data)
+    return len(data)
 
 
 def snapshot(backend, regs):
@@ -1313,9 +1328,11 @@ def capture(a, b, out_dir):
                       {'identity': b.identity(), 'host': socket.gethostname(), 'cpuid': cpuid, 'image': image,
                        'started': time.time()})
     s = Session(b, journal, kind)
-    stream = None
+    stream = rtt = None
     failures = []
     try:
+        if a.rtt:   # from what the target's ring holds when it connects
+            rtt = Stream(b.start_rtt(), os.path.join(out_dir, 'rtt.log'), 'RTT')
         for w, reg in zip(writes, setup_writes):
             s.write(reg, unit_read(b, reg) & ~int(w['mask'], 0) | int(w['value'], 0),
                     requires=requirement(b, w, writes))
@@ -1380,6 +1397,14 @@ def capture(a, b, out_dir):
             if stream.error:
                 failures.append(f'capture: {stream.error}')
             cap.update(bytes=stream.bytes, stream_first=stream.first, stream_last=stream.last)
+        if rtt:
+            rtt.ending.set()
+            try:
+                rtt.close()
+                cap['rtt'] = {'log': 'rtt.log', 'bytes': strip_rtt_banner(os.path.join(out_dir, 'rtt.log'))}
+            except (ImportError, OSError) as e:
+                failures.append(f'rtt: {e}')
+            failures += [f'rtt: {rtt.error}'] if rtt.error else []
         restore_failures = s.restore()
         with contextlib.suppress(ToolError, OSError):
             cap['dhcsr_after'] = f'0x{b.read32(DHCSR):08x}'
@@ -1559,7 +1584,9 @@ def make_backend(a, p):
             p.error(f'--speed {a.speed!r}: kHz, auto or adaptive')
         if a.swo_object or a.vid_pid:
             p.error('--swo-object and --vid-pid are OpenOCD flags')
-        return JLinkBackend(a.probe, a.device, a.interface, a.speed)
+        return JLinkBackend(a.probe, a.device, a.interface, a.speed, a.rtt)
+    if a.rtt:
+        p.error('--rtt: only the J-Link route serves RTT beside SWO (its GDB server); use the rtt skill on OpenOCD')
     if a.interface or a.speed:
         p.error('--interface and --speed are J-Link flags; OpenOCD takes them from --cfg')
     if a.vid_pid and not re.fullmatch(r'0x[0-9a-fA-F]{1,4} 0x[0-9a-fA-F]{1,4}( 0x[0-9a-fA-F]{1,4} 0x[0-9a-fA-F]{1,4})*',
@@ -1619,6 +1646,7 @@ def parse_args(argv):
                    help='a PC packet each time DWT_CYCCNT equals CYCLES (comparator 0, once per 2^32 cycles)')
     c.add_argument('--elf', help='firmware ELF: symbols for --watch, and its hash in capture.json')
     c.add_argument('--setup', help='board setup entry in swo_boards.json, applied before the capture')
+    c.add_argument('--rtt', action='store_true', help='also log RTT channel 0 to DIR/rtt.log (J-Link)')
     o = c.add_mutually_exclusive_group()
     o.add_argument('--observe-itm', action='store_true')
     o.add_argument('--take-itm', action='store_true')
@@ -1673,7 +1701,7 @@ def parse_args(argv):
             with open(a.elf, 'rb') as f:
                 a.elf_sha256 = hashlib.sha256(f.read()).hexdigest()
     elif any(getattr(a, f) for f in ('traceclk_hz', 'swo_hz', 'exc', 'pc_sample', 'cyc_event', 'profile', 'watch',
-                                     'itm_ports', 'timestamps')) or a.cycmatch is not None:
+                                     'itm_ports', 'timestamps', 'rtt')) or a.cycmatch is not None:
         p.error('capture flags need --out')
     return a, backend
 

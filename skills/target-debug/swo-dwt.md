@@ -71,6 +71,11 @@ python3 $S/swo_decode.py /tmp/swo-run --elf fw.elf          # --jsonl events.jso
   whether byte 0 is a packet boundary, before and after register snapshots, byte count, teardown offset, the
   capture's `errors` and the `restore` outcome apart), `DIR/journal.jsonl` and `DIR/probe.log`. A refused run leaves
   only `probe.log`, and the same `--out` can be reused.
+- **`--rtt`** (J-Link only) has the same GDB server serve RTT channel 0 (`-RTTTelnetPort`, SEGGER KB book 6586) and
+  logs it to `DIR/rtt.log`, the server's banner removed by the `rtt` skill's filter: the firmware's text beside its
+  trace over one probe connection. The log starts with what the target's ring held when the capture connected, so it
+  may begin before the trace does: match its lines to ITM markers by content, not by time. A server that closes the
+  RTT socket early fails the capture, which still restores. On an OpenOCD probe use the `rtt` skill.
 
 ## Ownership and restore
 
@@ -198,6 +203,7 @@ Cortex-M7.
 | Global timestamps                                         | yes         | stm32h743nucleo (TSG behind AP2)                    |
 | Armv8-M SWO, trace clock gate                             | yes         | ra6m5_ek (fixture: exc, ITM, failed gate check)     |
 | Armv8-M data trace (`--watch`, `--cycmatch`)              | yes         | ra6m5_ek (`w,val`, `r,pc`, `rw,pcval`, CYCMATCH)    |
+| RTT beside SWO (`--rtt`, J-Link)                          | yes         | stm32f407disco                                      |
 | Manchester SWO, TPIU formatter, parallel trace, CMSIS-DAP | no          | deferred                                            |
 
 ## Known faults

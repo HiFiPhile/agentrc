@@ -15,10 +15,11 @@ known rates.
 ## Fixture
 
 `tests/fixtures/swo` in this repository: one C file on TinyUSB's board support (clocks, LED), for stm32f407disco,
-stm32h743nucleo and ra6m5_ek. Its README gives the workload, the source comments its timing layout; `swo_fixture_last` holds the
-counts of the last complete phase, the values a capture is checked against. Build it against a local TinyUSB
+stm32h743nucleo and ra6m5_ek. Its README gives the workload, the source comments its timing layout; `swo_fixture_last`
+holds the counts of the last complete phase, the values a capture is checked against. Build it against a local TinyUSB
 checkout, named by `TINYUSB_PATH` as below or in the environment. Its rates rest on the BSP's clocks, measured with
-TinyUSB 13f9a36a: re-check them on hardware after a change to a board's clock setup.
+TinyUSB 13f9a36a: re-check them on hardware after a change to a board's clock setup. A `-DLOGGER=rtt` build also prints
+each phase's marker on RTT, for `--rtt`.
 
 ```bash
 python3 <tinyusb>/tools/get_deps.py -b <board>

@@ -352,6 +352,9 @@ static void swo_fixture_task(void) {
   swo_fixture_busy(start + SWO_FIXTURE_BUSY_MS / 2);
   while (!marker_slot()) {}
   itm_phase_marker(swo_fixture_cur.phase);
+#ifdef LOGGER_RTT
+  printf("swo-fixture %lu\n", (unsigned long) swo_fixture_cur.phase); // the marker's text again, on RTT channel 0
+#endif
   swo_fixture_busy(start + SWO_FIXTURE_BUSY_MS);
   swo_fixture_idle(start + SWO_FIXTURE_BUSY_MS + SWO_FIXTURE_IDLE_MS);
 
