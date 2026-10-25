@@ -39,8 +39,16 @@ on hardware before its row can cite the fixture.
   holds whichever tool connects.
 - PB3 is TRACESWO from reset (MODER AF, AF0); the entry refuses when the firmware remapped it (checked with PB3 set
   to output, and to AF3).
-- J-Link Commander halts the core when it connects: the fixture's timers then lose their phase to SysTick and bursts
-  collide (22 overflows in 4 s against 0). Reset and run the board after any such session before a timing capture.
+- A J-Link connect rewrites DBGMCU_CR to 0x7 and DBGMCU_APB1_FZ to 0x1800 (read back through OpenOCD, whose handler
+  only sets bits): firmware's TRACE_IOEN and timer freezes are gone; `SWO EnableTarget` sets TRACE_IOEN again.
+- J-Link halts and restarts the core at every session close, and a halt stops SysTick: the fixture freezes TIM6 and
+  TIM7 in debug and sets the freeze again each phase, so consecutive captures keep the layout (8 in a row with 0 to 2
+  overflows in 4 s, all sources, with and without `--rtt`; without the freeze 1 to 4040). J-Link Commander halts as
+  it connects, after rewriting the freeze: the timers then lose their phase to SysTick and bursts collide. Reset and
+  run the board after any such session before a timing capture.
+- Two comparators matching one access send one PC or address-offset packet between them: beside an `offset` watch, a
+  `pcval` watch on the same variable got its values but no PC, and the other way round the offset watch lost the
+  accesses the `pcval` one traced. Neither the ARMv7-M ARM nor the Cortex-M4 TRM in the library describes it.
 - `-device stm32f407vg` from the roster; GDB server memory access while running works over this probe.
 - DWT_MASKn reads back at most 15: `mask=31` fails the capture at its read-back (and is restored).
 

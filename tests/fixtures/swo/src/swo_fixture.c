@@ -155,6 +155,14 @@ static void timers_init(void) {
   swo_fixture_timclk_hz = timer_clock_hz();
 }
 
+// A probe's halt stops SysTick (J-Link halts and restarts the core at every session close): the timers stop with it
+// and keep their place in its period (RM0090 DBGMCU_APB1_FZ, RM0433 DBGMCU_APB1LFZ1). Set each phase, since a J-Link
+// connect rewrites the register (measured 0x1800 on stm32f407disco).
+static void timers_freeze_in_debug(void) {
+  __HAL_DBGMCU_FREEZE_TIM6();
+  __HAL_DBGMCU_FREEZE_TIM7();
+}
+
 static void timers_start(void) {
   NVIC_SetPriority(NESTED_IRQn, 1);
   NVIC_EnableIRQ(NESTED_IRQn);
@@ -262,6 +270,8 @@ static void timers_init(void) {
   timer_setup(R_GPT1, TIM7_SLOT, ELC_EVENT_GPT1_COUNTER_OVERFLOW, SWO_FIXTURE_TIM7_HZ, SWO_FIXTURE_TIM7_AT_US, 3);
 }
 
+static void timers_freeze_in_debug(void) {}
+
 static void timers_start(void) {
   NVIC_SetPriority((IRQn_Type) NESTED_SLOT, 1);
   NVIC_EnableIRQ((IRQn_Type) NESTED_SLOT);
@@ -349,6 +359,7 @@ static bool marker_slot(void) {
 static void swo_fixture_task(void) {
   uint32_t const start = tusb_time_millis_api();
   board_led_write(swo_fixture_cur.phase & 1u);
+  timers_freeze_in_debug();
   swo_fixture_busy(start + SWO_FIXTURE_BUSY_MS / 2);
   while (!marker_slot()) {}
   itm_phase_marker(swo_fixture_cur.phase);
