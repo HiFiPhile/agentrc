@@ -7,7 +7,7 @@ target-debug skill's swo-dwt.md); decode the result with swo_decode.py.
                  --duration-ms N --out DIR [--exc] [--pc-sample CYCTAP:POSTPRESET] [--itm-ports SPEC] \
                  [--timestamps --core-hz HZ [--ts-prescale N]] [--watch addr=A|SYM,access=..,emit=..] \
                  [--elf FW.elf] [--setup ENTRY] [--observe-itm | --take-itm] [--take-comparator N] \
-                 [--allow-approx-swo]
+                 [--allow-approx-swo] [--rtt]
   swo_capture.py CONNECTION --restore DIR
 
 CONNECTION is --hil-config FILE --board NAME, or explicit flags: a J-Link by --probe SERIAL --device NAME
@@ -45,8 +45,9 @@ alone.
 
 DIR also gets swo.bin (the raw stream), probe.log (the probe tool's output) and capture.json (configuration, clocks
 with their source, identity, before and after register snapshots, byte count, host timing, the capture's errors and
-the restore's outcome). Exit 0 captured and restored, 1 a capture or restore that failed (the report says what is
-left), 2 bad usage or a refusal before any write.
+the restore's outcome); with --rtt (J-Link only) rtt.log, RTT channel 0 through the same GDB server, its banner
+removed, from what the target's ring held when the capture connected. Exit 0 captured and restored, 1 a capture or
+restore that failed (the report says what is left), 2 bad usage or a refusal before any write.
 """
 import argparse
 import contextlib
@@ -77,7 +78,7 @@ ITM_TPR = 0xE0000E40
 ITM_TCR = 0xE0000E80
 ITM_CIDR = 0xE0000FF0
 DWT_CTRL = 0xE0001000
-DWT_COMP = 0xE0001020   # + 16 n; MASK + 4, FUNCTION + 8
+DWT_COMP = 0xE0001020   # + 16 n; MASK + 4 (ARMv7-M only), FUNCTION + 8
 TPIU = 0xE0040000
 TPIU_CSPSR = TPIU + 0x004
 TPIU_ACPR = TPIU + 0x010
@@ -98,10 +99,14 @@ CTRL_CYCTAP = 1 << 9
 CTRL_PCSAMPLENA = 1 << 12
 CTRL_EXCTRCENA = 1 << 16
 CTRL_CYCEVTENA = 1 << 22
+CTRL_POSTCNT_ENABLES = CTRL_PCSAMPLENA | CTRL_CYCEVTENA
+CTRL_POSTCNT_CONFIG = CTRL_CYCTAP | 0x1FE   # CYCTAP, POSTINIT, POSTPRESET
 CTRL_NOPRFCNT = 1 << 24
+CTRL_NOTRCPKT = 1 << 27
 PROFILE_BITS = {'cpi': 1 << 17, 'exc': 1 << 18, 'sleep': 1 << 19, 'lsu': 1 << 20, 'fold': 1 << 21}   # ...EVTENA
 CTRL_TRACE_SOURCES = CTRL_PCSAMPLENA | CTRL_EXCTRCENA | (0x3F << 17)   # sampling, exception trace, event counters
 SPPR_NRZ = 2
+FFCR_ENFCONT = 1 << 1   # TPIU_FFCR.EnFCont: the formatter on in SWO mode (Cortex-M4 TRM 11.3.3)
 DBGMCU_CR_F4 = 0xE0042004
 JLINK_ITM_TCR = 0x0001000D   # what J-Link's SWO EnableTarget writes to ITM_TCR (measured)
 ACPR_MAX = 1 << 13   # Cortex-M4 TPIU_ACPR PRESCALER[12:0]; the architecture allows 16 bits (ARMv7-M C1-43)
@@ -115,17 +120,35 @@ WATCH_FUNCTION_V7 = {
     ('r', 'val'): 0b1100, ('r', 'offset'): 0b1100 | E, ('r', 'pcval'): 0b1110, ('r', 'offval'): 0b1110 | E,
     ('w', 'val'): 0b1101, ('w', 'offset'): 0b1101 | E, ('w', 'pcval'): 0b1111, ('w', 'offval'): 0b1111 | E,
 }
+# Armv8-M DWT_FUNCTIONn (DDI0553 D1.2.64, Tables RCNHN and RPSBJ): (access, emit) -> MATCH[3:0] | ACTION[5:4], on data
+# address (0b01xx) or Data Address With Value (0b11xx) comparators; ACTION 0b10 a Data Value packet, 0b11 a PC one
+DATA_PACKET, PC_PACKET = 0b10 << 4, 0b11 << 4
+WATCH_FUNCTION_V8 = {
+    ('rw', 'pc'): 0b0100 | PC_PACKET, ('w', 'pc'): 0b0101 | PC_PACKET, ('r', 'pc'): 0b0110 | PC_PACKET,
+    ('rw', 'val'): 0b1100 | DATA_PACKET, ('w', 'val'): 0b1101 | DATA_PACKET, ('r', 'val'): 0b1110 | DATA_PACKET,
+    ('rw', 'pcval'): 0b1100 | PC_PACKET, ('w', 'pcval'): 0b1101 | PC_PACKET, ('r', 'pcval'): 0b1110 | PC_PACKET,
+}
+CYCMATCH_V8 = 0b0001 | PC_PACKET
+LINKED_MATCH = {0b0011, 0b0111, 0b1011}   # limit and linked value comparators: n pairs with n - 1 (DDI0553 B14.2.5)
+DATAVSIZE = {1: 0, 2: 1, 4: 2}   # bytes -> DWT_FUNCTIONn.DATAVSIZE, bits [11:10]
+FUNCTION_ID = 27   # Armv8-M DWT_FUNCTIONn.ID[31:27], one bit per capability below (DDI0553 B14.2)
+FUNCTION_IDS = ('cycle counter', 'instruction address', 'data value', 'data address', 'linking')
+ID_CYCCNT, ID_DATA_ADDR = 0, 3   # bits of FUNCTION_IDS
 ARMV7M_PARTS = {0xC23: 'Cortex-M3', 0xC24: 'Cortex-M4', 0xC27: 'Cortex-M7'}
 ARMV8M_MAIN_PARTS = {0xD21: 'Cortex-M33', 0xD22: 'Cortex-M55', 0xD23: 'Cortex-M85', 0xD31: 'Cortex-M35P'}
 ARM_CHINA_ARMV8M_MAIN_PARTS = {0xD24: 'Cortex-M52'}   # implementer 0x63, Arm China
 NO_ITM_PARTS = {0xC20: 'Cortex-M0', 0xC60: 'Cortex-M0+', 0xC21: 'Cortex-M1', 0xD20: 'Cortex-M23'}
+
+def dwt_function(n):
+    return DWT_COMP + 16 * n + 8
+
 
 REG_NAMES = {DEMCR: 'DEMCR', DBGMCU_CR_F4: 'DBGMCU_CR', ITM_TER: 'ITM_TER0', ITM_TPR: 'ITM_TPR', ITM_TCR: 'ITM_TCR',
              DWT_CTRL: 'DWT_CTRL',
              TPIU_CSPSR: 'TPIU_CSPSR', TPIU_ACPR: 'TPIU_ACPR', TPIU_SPPR: 'TPIU_SPPR', TPIU_FFCR: 'TPIU_FFCR'}
 for _n in range(4):
     REG_NAMES.update({DWT_COMP + 16 * _n: f'DWT_COMP{_n}', DWT_COMP + 16 * _n + 4: f'DWT_MASK{_n}',
-                      DWT_COMP + 16 * _n + 8: f'DWT_FUNCTION{_n}'})
+                      dwt_function(_n): f'DWT_FUNCTION{_n}'})
 
 # registers a probe tool writes outside the trace registers when it starts SWO, by part: STM32F4 DBGMCU_CR.TRACE_IOEN
 # (J-Link EnableTarget, measured; openocd stm32f4x.cfg's tpiu pre-enable handler)
@@ -133,9 +156,10 @@ START_SIDE_EFFECTS = {'stm32f4': [DBGMCU_CR_F4]}
 DRAIN_S = 0.3
 CLEANING = threading.Event()   # set once a capture's teardown began
 READ_CHUNK = 1024
-# read-only bits a read-back ignores: ITM_TCR.BUSY; DWT_FUNCTIONn.MATCHED and LNK1ENA (ARMv7-M Table C1-39)
+# read-only bits a read-back ignores: ITM_TCR.BUSY; DWT_FUNCTIONn.MATCHED, LNK1ENA (ARMv7-M Table C1-39) and ID
+# (Armv8-M)
 VOLATILE_BITS = {ITM_TCR: 1 << 23}
-VOLATILE_BITS.update({DWT_COMP + 16 * n + 8: 1 << 24 | 1 << 9 for n in range(4)})
+VOLATILE_BITS.update({dwt_function(n): 0x1F << FUNCTION_ID | 1 << 24 | 1 << 9 for n in range(4)})
 SIZED = {}   # address -> (bits, key): a register narrower than a word, accessed at its width, `key` ORed into writes
 
 
@@ -155,8 +179,8 @@ def reg_name(addr):
     return REG_NAMES.get(addr, f'0x{addr:08x}')
 
 
-def sibling(name):
-    sys.path.insert(0, HERE)
+def sibling(name, where=HERE):
+    sys.path.insert(0, where)
     return __import__(name)
 
 
@@ -294,8 +318,8 @@ class JLinkBackend:
     attach_writes = None
     start_itm_tcr = JLINK_ITM_TCR
 
-    def __init__(self, probe, device, interface, speed):
-        self.probe, self.device, self.interface, self.speed = probe, device, interface, speed
+    def __init__(self, probe, device, interface, speed, rtt=False):
+        self.probe, self.device, self.interface, self.speed, self.rtt = probe, device, interface, speed, rtt
         self.family = 'stm32f4' if device.lower().startswith('stm32f4') else None
         self.gate = trace_gate(device)
         self.proc = self.rsp = None
@@ -307,11 +331,12 @@ class JLinkBackend:
         exe = os.environ.get('JLINK_GDBSERVER') or shutil.which('JLinkGDBServerCLExe')
         if not exe:
             raise ToolError('JLinkGDBServerCLExe not found (set JLINK_GDBSERVER)')
-        self.gdb_port, self.swo_port, telnet = free_ports(3)
+        self.gdb_port, self.swo_port, telnet, self.rtt_port = free_ports(4)
+        rtt = ['-RTTTelnetPort', str(self.rtt_port)] if self.rtt else []   # RTT channel 0 (SEGGER KB, GDB Server)
         self.proc = spawn(
             [exe, '-select', f'usb={self.probe}', '-device', self.device, '-if', self.interface, '-speed', self.speed,
              '-nohalt', '-noir', '-port', str(self.gdb_port), '-swoport', str(self.swo_port), '-telnetport',
-             str(telnet), '-singlerun', '-nogui'], log)
+             str(telnet), *rtt, '-singlerun', '-nogui'], log)
         self.rsp = Rsp(connect_when_up(self.gdb_port, self.proc, 20))
 
     def read32(self, addr):
@@ -365,6 +390,9 @@ class JLinkBackend:
         if 'success' not in reply:
             raise ToolError(f'SWO EnableTarget: {reply!r}')
         return connect_when_up(self.swo_port, self.proc, 10)
+
+    def start_rtt(self):
+        return connect_when_up(self.rtt_port, self.proc, 10)
 
     def stop_swo(self, port_mask):
         reply = self.rsp.monitor(f'SWO DisableTarget 0x{port_mask or 1:x}')
@@ -684,19 +712,19 @@ def parse_period(flag, text):
 
 
 def parse_watch(text, symbols):
+    """The watch `text` names; which encoding it takes waits for the core's architecture (watch_function)."""
     fields = {}
     for part in text.split(','):
         k, sep, v = part.partition('=')
-        if not sep or k not in ('addr', 'access', 'emit', 'mask'):
+        if not sep or k not in ('addr', 'access', 'emit', 'mask', 'size'):
             raise ValueError(f'--watch {text!r}: expected '
-                             f'addr=..,access=r|w|rw,emit=val|pc|pcval|offset|offval[,mask=N]')
+                             f'addr=..,access=r|w|rw,emit=val|pc|pcval|offset|offval[,mask=N][,size=1|2|4]')
         fields[k] = v.strip()
     if 'addr' not in fields or 'access' not in fields or 'emit' not in fields:
         raise ValueError(f'--watch {text!r}: addr, access and emit are required')
     key = (fields['access'], fields['emit'])
-    if key not in WATCH_FUNCTION_V7:
-        raise ValueError(f'--watch {text!r}: no ARMv7-M data trace encoding for access={key[0]} emit={key[1]} '
-                         f'(read-only and write-only comparators cannot emit the PC alone)')
+    if key not in WATCH_FUNCTION_V7 and key not in WATCH_FUNCTION_V8:
+        raise ValueError(f'--watch {text!r}: access is r, w or rw and emit val, pc, pcval, offset or offval')
     addr = fields['addr']
     if re.fullmatch(r'0x[0-9a-fA-F]+|\d+', addr):
         value, source = int(addr, 0), 'given'
@@ -710,8 +738,38 @@ def parse_watch(text, symbols):
     mask = int(fields.get('mask', '0'), 0)
     if not 0 <= mask <= 31 or value & ((1 << mask) - 1):
         raise ValueError(f'--watch {text!r}: mask {mask} must be 0-31 bits and the address aligned to it')
-    return {'addr': value, 'addr_source': source, 'mask': mask, 'access': key[0], 'emit': key[1],
-            'function': WATCH_FUNCTION_V7[key]}
+    w = {'addr': value, 'addr_source': source, 'mask': mask, 'access': key[0], 'emit': key[1]}
+    if 'size' in fields:
+        if fields['size'] not in ('1', '2', '4') or value % int(fields['size']):
+            raise ValueError(f'--watch {text!r}: size is 1, 2 or 4 bytes and the address aligned to it')
+        w['size'] = int(fields['size'])
+    elif source != 'given' and found[0][1] in DATAVSIZE and not value % found[0][1]:
+        w['object_size'] = found[0][1]
+    return w
+
+
+def watch_function(w, kind):
+    """(DWT_FUNCTIONn value, the capability ID bit it needs or None) for watch `w` on a core of `kind`; Refused
+    when that architecture has no single-comparator encoding for it."""
+    what = f"--watch access={w['access']},emit={w['emit']}"
+    if kind != 'armv8-m':
+        if (w['access'], w['emit']) not in WATCH_FUNCTION_V7:
+            raise Refused(f'{what}: no ARMv7-M data trace encoding (read-only and write-only comparators cannot '
+                          f'emit the PC alone); Armv8-M has one')
+        if 'size' in w:
+            raise Refused(f'{what}: size= is Armv8-M\'s; an ARMv7-M comparator matches by address and mask=')
+        return WATCH_FUNCTION_V7[w['access'], w['emit']], None
+    if w['emit'] in ('offset', 'offval'):
+        raise Refused(f'{what}: an Armv8-M address offset takes a linked comparator pair, which --watch does not '
+                      f'program')
+    if w['mask']:
+        raise Refused(f'{what}: Armv8-M has no DWT_MASKn; a range takes a linked comparator pair, which --watch '
+                      f'does not program')
+    size = w.get('size', w.get('object_size'))
+    if size is None:
+        raise Refused(f'{what}: an Armv8-M comparator matches size= bytes (1, 2 or 4) at its address: give size=, '
+                      f'or a symbol of that size')
+    return WATCH_FUNCTION_V8[w['access'], w['emit']] | DATAVSIZE[size] << 10, ID_DATA_ADDR
 
 
 def check_rates(a, probe_rates):
@@ -745,11 +803,11 @@ def check_rates(a, probe_rates):
 # ---------------------------------------------------------------------------------------------------
 
 class Stream:
-    """The SWO socket to a file. `error` says why it ended early: the probe tool closed it, or a read or write
-    failed, before `ending` was set."""
+    """A probe tool's socket (SWO, or RTT with --rtt) to a file. `error` says why it ended early: the probe tool
+    closed it, or a read or write failed, before `ending` was set."""
 
-    def __init__(self, sock, path):
-        self.sock, self.f = sock, open(path, 'wb')
+    def __init__(self, sock, path, name='SWO'):
+        self.sock, self.f, self.name = sock, open(path, 'wb'), name
         self.bytes, self.first, self.last, self.error = 0, None, None, None
         self.stop, self.ending = threading.Event(), threading.Event()
         self.sock.settimeout(0.2)
@@ -762,7 +820,7 @@ class Stream:
                 chunk = self.sock.recv(65536)
                 if not chunk:
                     if not self.ending.is_set():
-                        self.error = f'the probe tool closed the SWO stream after {self.bytes} bytes'
+                        self.error = f'the probe tool closed the {self.name} stream after {self.bytes} bytes'
                     return
                 now = time.time()
                 self.first = self.first or now
@@ -773,7 +831,7 @@ class Stream:
                 continue
             except OSError as e:
                 if not self.ending.is_set():
-                    self.error = f'SWO stream after {self.bytes} bytes: {e}'
+                    self.error = f'{self.name} stream after {self.bytes} bytes: {e}'
                 return
 
     def close(self):
@@ -783,6 +841,16 @@ class Stream:
         self.thread.join(5)
         self.f.close()
         self.sock.close()
+
+
+def strip_rtt_banner(path):
+    """Drop the J-Link server's banner from an RTT log, with the rtt skill's filter; the bytes left."""
+    rtt = sibling('rtt', os.path.join(HERE, '..', '..', 'rtt', 'scripts'))
+    with open(path, 'rb') as f:
+        data = rtt.strip_banner(f.read())
+    with open(path, 'wb') as f:
+        f.write(data)
+    return len(data)
 
 
 def snapshot(backend, regs):
@@ -795,17 +863,19 @@ def snapshot(backend, regs):
 
 
 class Session:
-    def __init__(self, backend, journal):
-        self.b, self.j = backend, journal
+    def __init__(self, backend, journal, kind):
+        self.b, self.j, self.kind = backend, journal, kind
 
     def write(self, reg, value, kind='write', requires=None):
-        original = unit_read(self.b, reg)
-        e = self.j.before(reg, original, value, kind, requires)
-        unit_write(self.b, reg, value)
-        rb = unit_read(self.b, reg)
-        self.j.after(e, rb)
-        if not same(e['reg'], rb, value):
-            raise ToolError(f'{e["name"]}: wrote 0x{value:08x}, read back 0x{rb:08x}')
+        """Write `value` through each step write_steps needs, each journalled before it and read back."""
+        original = current = unit_read(self.b, reg)
+        for step in write_steps(reg[0] if isinstance(reg, tuple) else reg, current, value):
+            e = self.j.before(reg, current, step, kind, requires)
+            unit_write(self.b, reg, step)
+            current = unit_read(self.b, reg)
+            self.j.after(e, current)
+            if not same(e['reg'], current, step):
+                raise ToolError(f'{e["name"]}: wrote 0x{step:08x}, read back 0x{current:08x}')
         return original
 
     def values(self, key):
@@ -849,7 +919,7 @@ class Session:
         failures = []
         for n, originals in comparators(firsts):
             try:
-                settled, _, problems = restore_comparator(self.b, n, originals)
+                settled, _, problems = restore_comparator(self.b, n, originals, self.kind)
             except (ToolError, OSError) as err:
                 settled, problems = {}, [f'comparator {n}: {err}']
             for addr, value in settled.items():
@@ -861,13 +931,14 @@ class Session:
                 continue
             reg = (addr, target) if target else addr
             try:
-                if not same(addr, unit_read(self.b, reg), e['original']):
+                current = unit_read(self.b, reg)
+                if not same(addr, current, e['original']):
                     conflict = meet_requirement(self.b, e, self.j, self.values)
                     if conflict:
                         failures.append(conflict)
                         foreign.add((e['requires']['reg'], e['requires']['target']))
                         continue
-                    unit_write(self.b, reg, e['original'])
+                    restore_write(self.b, self.j, reg, current, e['original'])
                 rb = unit_read(self.b, reg)
             except (ToolError, OSError) as err:
                 failures.append(f"{e['name']}: {err}")
@@ -877,6 +948,32 @@ class Session:
             else:
                 failures.append(f"{e['name']}: restored 0x{e['original']:08x}, reads 0x{rb:08x}")
         return failures
+
+
+def write_steps(addr, current, value):
+    """The writes taking a register from `current` to `value`, the last one `value`: DWT_CTRL ignores a POSTINIT
+    write while the POSTCNT timer runs, and POSTINIT is written before the write that starts it (ARMv7-M C1-883)."""
+    if addr != DWT_CTRL or not (current ^ value) & CTRL_POSTCNT_CONFIG:
+        return [value]
+    steps = [current & ~CTRL_POSTCNT_ENABLES] if current & CTRL_POSTCNT_ENABLES else []
+    return steps + [value & ~CTRL_POSTCNT_ENABLES] + ([value] if value & CTRL_POSTCNT_ENABLES else [])
+
+
+def restore_write(b, journal, reg, current, original):
+    """Write `original` back, journalling each value write_steps passes through first, so a recovery after an
+    interruption finds it explained."""
+    *steps, _ = write_steps(reg[0] if isinstance(reg, tuple) else reg, current, original)
+    for value in steps:
+        journal.before(reg, current, value, 'restore')
+        unit_write(b, reg, value)
+        current = value
+    unit_write(b, reg, original)
+
+
+def comparator_regs(n, kind):
+    """Comparator n's DWT_COMPn, DWT_MASKn and DWT_FUNCTIONn; Armv8-M has no DWT_MASKn (DDI0553 D1.2.64)."""
+    base = DWT_COMP + 16 * n
+    return (base, dwt_function(n)) if kind == 'armv8-m' else (base, base + 4, dwt_function(n))
 
 
 def comparator_of(addr):
@@ -894,25 +991,40 @@ def comparators(firsts):
     return sorted(out.items())
 
 
-def restore_comparator(b, n, originals, allowed=None):
+def linked_pair(n, function_of, numcomp):
+    """The Armv8-M linked pair comparator n belongs to, as text, or None: n a limit or linked value comparator, or the
+    one before such a comparator, which changing either changes what the other matches (DDI0553 B14.2.5)."""
+    for limit in (n, n + 1):
+        if limit < numcomp and function_of(limit) & 0xF in LINKED_MATCH:
+            return f'comparators {limit - 1} and {limit} are a linked pair (DWT_FUNCTION{limit} MATCH ' \
+                   f'0b{function_of(limit) & 0xF:04b})'
+    return None
+
+
+def restore_comparator(b, n, originals, kind, allowed=None):
     """(settled {addr: value}, report, problems): comparator n's journalled registers (`originals`, {addr: value})
-    back as found. With `allowed` ({addr: values the journal explains}) every register is checked first, and one
-    value that is neither original nor explained leaves the whole comparator alone. Its function is disarmed and
-    verified before its address or mask changes, and restored last."""
-    base = DWT_COMP + 16 * n
-    func = base + 8
-    now = {r: b.read32(r) for r in (base, base + 4, func)}
+    back as found, on a core of `kind`. With `allowed` ({addr: values the journal explains}) every register is
+    checked first, and one value that is neither original nor explained leaves the whole comparator alone. Its
+    function is disarmed and verified before its address or mask changes, and restored last. An Armv8-M comparator
+    found in a linked pair, formed since the capture, is left alone."""
+    *addrs, func = regs = comparator_regs(n, kind)
+    now = {r: b.read32(r) for r in regs}
+    if kind == 'armv8-m':
+        pair = linked_pair(n, lambda m: now[func] if m == n else b.read32(dwt_function(m)),
+                           b.read32(DWT_CTRL) >> 28)
+        if pair:
+            return {}, [], [f'comparator {n}: {pair}, which the capture never armed; the comparator is left alone']
     if allowed is not None:
         foreign = [r for r, v in originals.items()
                    if not same(r, now[r], v) and not any(same(r, now[r], x) for x in allowed[r])]
         if foreign:
             return {}, [], [f'comparator {n}: ' + ', '.join(f'{reg_name(r)} 0x{now[r]:08x}' for r in foreign) +
                             ' neither as found nor written by this capture; the comparator is left alone']
-    if func in originals and originals[func] & 0xF and not {base, base + 4} <= originals.keys():
+    if func in originals and originals[func] & 0xF and not set(addrs) <= originals.keys():
         return {}, [], [f'comparator {n}: its original address and mask were not journalled, so its function '
                         f'0x{originals[func]:08x} is not re-armed; FUNCTION left at 0x{now[func]:08x}']
     settled, report = {}, []
-    moves = [r for r in (base, base + 4) if r in originals and not same(r, now[r], originals[r])]
+    moves = [r for r in addrs if r in originals and not same(r, now[r], originals[r])]
     if moves and now[func] & 0xF:
         if func not in originals:
             return {}, [], [f'comparator {n}: armed by someone else (FUNCTION 0x{now[func]:08x}); its address and mask '
@@ -944,7 +1056,7 @@ def dwt_sources(a):
 
 
 def plan_config(a, caps, before, itm_set_by_probe=False):
-    """(itm_tcr, ter, dwt_ctrl_steps, watches) this capture writes; Refused on a conflict."""
+    """(itm_tcr, ter, dwt_ctrl, watches) this capture writes; Refused on a conflict."""
     tcr_before, ter_before, ctrl_before = before[ITM_TCR], before[ITM_TER], before[DWT_CTRL]
     itm_busy = (tcr_before & TCR_ITMENA) and ter_before and not itm_set_by_probe
     dwt_busy = ctrl_before & CTRL_TRACE_SOURCES
@@ -955,6 +1067,9 @@ def plan_config(a, caps, before, itm_set_by_probe=False):
     if a.observe_itm and dwt_busy and ctrl_sources(a):
         raise Refused('--observe-itm keeps DWT_CTRL as found, and it already has trace sources on; --exc, '
                       '--pc-sample, --cyc-event and --profile need --take-itm')
+    if dwt_sources(a) and caps.get('dwt_ctrl', 0) & CTRL_NOTRCPKT:
+        raise Refused('this DWT sends no trace packets (DWT_CTRL.NOTRCPKT): --exc, --pc-sample, --cyc-event, '
+                      '--profile, --watch and --cycmatch need them')
     if a.profile and caps.get('dwt_ctrl', 0) & CTRL_NOPRFCNT:
         raise Refused('--profile: this DWT has no profiling counters (DWT_CTRL.NOPRFCNT)')
     if a.observe_itm:
@@ -981,7 +1096,6 @@ def plan_config(a, caps, before, itm_set_by_probe=False):
     ctrl = (ctrl_before & ~CTRL_TRACE_SOURCES if a.take_itm else ctrl_before) | CTRL_CYCCNTENA
     if not ctrl & CTRL_SYNCTAP:
         ctrl |= CTRL_SYNCTAP_24
-    steps = []
     if a.exc:
         ctrl |= CTRL_EXCTRCENA
     for name in a.profile:
@@ -989,34 +1103,56 @@ def plan_config(a, caps, before, itm_set_by_probe=False):
     period, enable = (a.pc_sample, CTRL_PCSAMPLENA) if a.pc_sample else (a.cyc_event, CTRL_CYCEVTENA)
     if period:
         cyctap, postpreset = period
-        # POSTINIT, POSTPRESET and CYCTAP while the POSTCNT timer is off, then one enable bit (ARMv7-M C1-883)
-        base = ctrl & ~(CTRL_CYCTAP | 0x1FE | CTRL_PCSAMPLENA | CTRL_CYCEVTENA)
-        base |= (CTRL_CYCTAP if cyctap else 0) | postpreset << 5 | postpreset << 1
-        steps.append(base)
-        ctrl = base | enable
-    steps.append(ctrl)
+        ctrl = ctrl & ~(CTRL_POSTCNT_CONFIG | CTRL_POSTCNT_ENABLES) | enable | \
+            (CTRL_CYCTAP if cyctap else 0) | postpreset << 5 | postpreset << 1
+    v8 = caps.get('architecture') == 'armv8-m'
+
+    def found(n):
+        return before.get(dwt_function(n), 0)
+
+    def able(n, id_bit):   # an Armv8-M comparator names what it can match in FUNCTION.ID
+        return id_bit is None or not v8 or found(n) >> FUNCTION_ID + id_bit & 1
+
+    def pair(n):
+        return v8 and linked_pair(n, found, caps['numcomp'])
+
+    if a.take_comparator is not None and (taken := pair(a.take_comparator)):
+        raise Refused(f'--take-comparator {a.take_comparator}: {taken}; taking one would change '
+                      f'the other, so both are left alone')
     free = [n for n in range(min(caps['numcomp'], 4))
-            if not before[DWT_COMP + 16 * n + 8] & 0xF or n == a.take_comparator]
+            if not pair(n) and (not found(n) & 0xF or n == a.take_comparator)]
     watches = []
-    if a.cycmatch is not None:   # comparator 0 only (ARMv7-M C1-863): a Data trace PC packet when CYCCNT == COMP0
+    # --cycmatch: comparator 0 only, a Data trace PC packet when CYCCNT == COMP0 (ARMv7-M C1-863, DDI0553 D1.2.64)
+    if a.cycmatch is not None:
         if caps.get('dwt_ctrl', 0) & 1 << 25:
             raise Refused('--cycmatch: this DWT has no cycle counter (DWT_CTRL.NOCYCCNT)')
+        if linked := pair(0):
+            raise Refused(f'--cycmatch needs comparator 0: {linked}')
         if 0 not in free:
             raise Refused('--cycmatch needs comparator 0, which is in use: --take-comparator 0 takes it')
+        if not able(0, ID_CYCCNT):
+            raise Refused('--cycmatch: comparator 0 does not match the cycle counter (DWT_FUNCTION0.ID)')
         free.remove(0)
-        watches.append({'comparator': 0, 'addr': a.cycmatch, 'mask': 0, 'function': CYCMATCH | 0b0001,
-                        'cycmatch': a.cycmatch})
-    if len(free) < len(a.watch):
-        raise Refused(f'{len(a.watch)} watches, {len(free)} free data trace comparators (0-3 with FUNCTION 0, 0 '
-                      f'kept for --cycmatch); --take-comparator N takes one in use')
-    for w, n in zip(a.watch, free):
-        watches.append(dict(w, comparator=n))
-    return tcr, ter, steps, watches
+        watches.append({'comparator': 0, 'addr': a.cycmatch, 'mask': 0,
+                        'function': CYCMATCH_V8 if v8 else CYCMATCH | 0b0001, 'cycmatch': a.cycmatch})
+    planned = [(w, *watch_function(w, caps.get('architecture'))) for w in a.watch]
+    for w, function, id_bit in planned:
+        usable = [n for n in free if able(n, id_bit)]
+        if not usable:
+            raise Refused(f'{len(a.watch)} watches, not enough free data trace comparators (0-3 with FUNCTION 0, 0 '
+                          f'kept for --cycmatch, able to match a data address); --take-comparator N takes one in use')
+        free.remove(usable[0])
+        watches.append(dict(w, comparator=usable[0], function=function))
+    return tcr, ter, ctrl, watches
 
 
-def read_before(b, numcomp):
-    regs = [DEMCR, ITM_TCR, ITM_TER, ITM_TPR, DWT_CTRL] + [DWT_COMP + 16 * n + k for n in range(min(numcomp, 4))
-                                                            for k in (0, 4, 8)]
+def read_before(b, numcomp, kind):
+    """The registers a capture may change, as found. Reading DWT_FUNCTIONn clears its MATCHED bit (ARMv7-M C1-894,
+    DDI0553 D1.2.64)."""
+    regs = [DEMCR, ITM_TCR, ITM_TER, ITM_TPR, DWT_CTRL] + [r for n in range(min(numcomp, 4))
+                                                            for r in comparator_regs(n, kind)]
+    if kind == 'armv8-m' and numcomp > 4:   # whether comparator 3 is the first of a linked pair
+        regs.append(dwt_function(4))
     return {r: b.read32(r) for r in regs}
 
 
@@ -1037,6 +1173,13 @@ def caps_report(b):
                 'trace_packets': 'unsupported (NOTRCPKT)' if ctrl >> 27 & 1 else 'supported',
                 'cyccnt': 'unsupported (NOCYCCNT)' if ctrl >> 25 & 1 else 'supported',
                 'profiling_counters': 'unsupported (NOPRFCNT)' if ctrl >> 24 & 1 else 'supported'})
+    out['comparators'] = []
+    for n in range(ctrl >> 28):   # this read clears each MATCHED bit (read_before)
+        func = b.read32(dwt_function(n))
+        c = {'n': n, 'function': f'0x{func:08x}'}
+        if kind == 'armv8-m':
+            c['matches'] = [name for i, name in enumerate(FUNCTION_IDS) if func >> FUNCTION_ID + i & 1]
+        out['comparators'].append(c)
     out['itm'] = 'present' if is_component(b, ITM_CIDR) else 'unknown: no component ID at 0xE0000FF0'
     out['itm_tcr'], out['itm_ter'] = f'0x{b.read32(ITM_TCR):08x}', f'0x{b.read32(ITM_TER):08x}'
     if b.gate and not b.gate_open():
@@ -1143,8 +1286,6 @@ def capture(a, b, out_dir):
     kind, part = core_kind(cpuid)
     if kind not in ('armv7-m', 'armv8-m'):
         raise Refused(f'CPUID 0x{cpuid:08x} ({part}): SWO trace needs an ARMv7-M or Armv8-M Mainline core with ITM')
-    if (a.watch or a.cycmatch is not None) and kind != 'armv7-m':
-        raise Refused(f'{part} is Armv8-M: its DWT_FUNCTION encoding is not supported by --watch or --cycmatch yet')
     if not b.read32(DEMCR) & DEMCR_TRCENA:
         raise Refused('DEMCR.TRCENA is 0: DWT and ITM read UNKNOWN; the probe tool normally sets it at connect')
     if b.gate and (not a.setup or a.setup['key'] != b.gate['entry']):
@@ -1154,10 +1295,13 @@ def capture(a, b, out_dir):
     if a.setup:
         check_setup(b, a.setup)
     ctrl_now = b.read32(DWT_CTRL)
-    caps = {'numcomp': ctrl_now >> 28, 'dwt_ctrl': ctrl_now}
+    caps = {'numcomp': ctrl_now >> 28, 'dwt_ctrl': ctrl_now, 'architecture': kind}
     cap.update(cpuid=f'0x{cpuid:08x}', core=part, architecture=kind, dhcsr_before=f'0x{b.read32(DHCSR):08x}')
-    before = read_before(b, caps['numcomp'])
-    tcr, ter, ctrl_steps, watches = plan_config(a, caps, before, b.attach_writes is not None)
+    before = read_before(b, caps['numcomp'], kind)
+    tcr, ter, ctrl, watches = plan_config(a, caps, before, b.attach_writes is not None)
+    if a.formatter and not tcr >> 16 & 0x7F:
+        raise Refused('--formatter: the ITM\'s trace bus ID (ITM_TCR.TraceBusID) is 0, the null source a formatter '
+                      'stream drops')
     if a.observe_itm and b.start_itm_tcr is not None and not same(ITM_TCR, before[ITM_TCR], b.start_itm_tcr):
         raise Refused(f'--observe-itm: starting SWO over a {b.name} sets ITM_TCR to 0x{b.start_itm_tcr:08x}, and the '
                       f'firmware runs 0x{before[ITM_TCR]:08x}: observing would change it; --take-itm reconfigures it '
@@ -1184,6 +1328,8 @@ def capture(a, b, out_dir):
     if tcr & TCR_TSENA:
         cap['timestamps'] = {'clock_hz': a.core_hz, 'clock_source': a.clock_source,
                              'prescale': (1, 4, 16, 64)[tcr >> 8 & 3]}
+    if a.formatter:
+        cap['formatter'] = {'itm_id': tcr >> 16 & 0x7F}
     cap.update(notes=notes, watches=watches, setup=a.setup and a.setup['key'],
                features={'exc': a.exc, 'pc_sample': a.pc_sample, 'cyc_event': a.cyc_event, 'profile': a.profile,
                          'global_ts': a.global_ts, 'cycmatch': a.cycmatch,
@@ -1196,7 +1342,7 @@ def capture(a, b, out_dir):
     if a.profile or a.cyc_event:
         sources.append('evcnt')
     if watches:
-        sources += ['dpc', 'daddr', 'dval']
+        sources += ['dpc', 'daddr', 'dval'] + ['dmatch'] * (kind == 'armv8-m')
     cap['sources'] = None if a.observe_itm else sources   # what the firmware enables is not ours to list
     cap['before'] = {reg_name(r): f'0x{v:08x}' for r, v in before.items()}
     writes = [w for w in a.setup['writes'] if w.get('for') in (None, *features_on(a))] if a.setup else []
@@ -1212,10 +1358,12 @@ def capture(a, b, out_dir):
     journal = Journal(os.path.join(out_dir, 'journal.jsonl'),
                       {'identity': b.identity(), 'host': socket.gethostname(), 'cpuid': cpuid, 'image': image,
                        'started': time.time()})
-    s = Session(b, journal)
-    stream = None
+    s = Session(b, journal, kind)
+    stream = rtt = None
     failures = []
     try:
+        if a.rtt:   # from what the target's ring holds when it connects
+            rtt = Stream(b.start_rtt(), os.path.join(out_dir, 'rtt.log'), 'RTT')
         for w, reg in zip(writes, setup_writes):
             s.write(reg, unit_read(b, reg) & ~int(w['mask'], 0) | int(w['value'], 0),
                     requires=requirement(b, w, writes))
@@ -1231,6 +1379,8 @@ def capture(a, b, out_dir):
             if acpr + 1 != prescaler:
                 raise ToolError(f'the probe tool set the prescaler to {acpr + 1} (SWO {a.traceclk_hz / (acpr + 1):.0f} '
                                 f'Hz), not {prescaler}')
+        if a.formatter:   # after the probe tool's start, which bypasses it (FFCR 0x100)
+            s.write(unit_regs[3], unit_read(b, unit_regs[3]) | FFCR_ENFCONT)
         if a.observe_itm:
             for r in (ITM_TCR, ITM_TER):
                 if not same(r, b.read32(r), before[r]):
@@ -1241,14 +1391,14 @@ def capture(a, b, out_dir):
             s.write(ITM_TER, ter)
             s.write(ITM_TCR, tcr)
         for w in watches:   # disarmed while its address and mask change
-            base = DWT_COMP + 16 * w['comparator']
-            s.baseline([base, base + 4, base + 8])
-            s.write(base + 8, 0)
-            s.write(base, w['addr'])
-            s.write(base + 4, w['mask'])
-            s.write(base + 8, w['function'])
-        for value in ctrl_steps:
-            s.write(DWT_CTRL, value)
+            comp, *mask, func = regs = comparator_regs(w['comparator'], kind)
+            s.baseline(regs)
+            s.write(func, 0)
+            s.write(comp, w['addr'])
+            for r in mask:
+                s.write(r, w['mask'])
+            s.write(func, w['function'])
+        s.write(DWT_CTRL, ctrl)
         cap['configured'] = time.time()
         deadline = time.monotonic() + a.duration_ms / 1000
         while time.monotonic() < deadline and not stream.error:
@@ -1279,6 +1429,15 @@ def capture(a, b, out_dir):
             if stream.error:
                 failures.append(f'capture: {stream.error}')
             cap.update(bytes=stream.bytes, stream_first=stream.first, stream_last=stream.last)
+        if rtt:
+            rtt.ending.set()
+            try:
+                rtt.close()
+                cap['rtt'] = {'log': 'rtt.log', 'bytes': strip_rtt_banner(os.path.join(out_dir, 'rtt.log'))}
+            except (ImportError, OSError) as e:
+                failures.append(f'rtt: {e}')
+            if rtt.error:
+                failures.append(f'rtt: {rtt.error}')
         restore_failures = s.restore()
         with contextlib.suppress(ToolError, OSError):
             cap['dhcsr_after'] = f'0x{b.read32(DHCSR):08x}'
@@ -1303,7 +1462,7 @@ def quiesce(s, a, watches):
     elif s.journalled(DWT_CTRL):
         try_write(s, DWT_CTRL, lambda: s.original(DWT_CTRL), failures)
     for w in watches:
-        r = DWT_COMP + 16 * w['comparator'] + 8
+        r = dwt_function(w['comparator'])
         if s.journalled(r):
             try_write(s, r, lambda: 0, failures)
     return failures
@@ -1350,15 +1509,19 @@ def restore_from(b, out_dir):
             [e['readback'] for e in owed if 'readback' in e]
 
     report, problems = [], []
+    kind = core_kind(cpuid)[0]
     for n, originals in comparators(first):
-        done, lines, trouble = restore_comparator(b, n, originals, {r: explained((r, None))[1] for r in originals})
+        try:
+            done, lines, trouble = restore_comparator(b, n, originals, kind,
+                                                      {r: explained((r, None))[1] for r in originals})
+        except (ToolError, OSError) as err:
+            done, lines, trouble = {}, [], [f'comparator {n}: {err}; left alone']
         for addr, value in done.items():
             journal.restored(first[(addr, None)], value)
         report += lines
         problems += trouble
-    for key in reversed(list(first)):
-        if key[1] is None and comparator_of(key[0]) is not None:
-            continue
+
+    def restore_key(key):
         reg, name, original = key if key[1] else key[0], first[key]['name'], first[key]['original']
         owed, values = explained(key)
         if b.gate and in_tpiu(key[0]) and not b.gate_open():   # never touch a TPIU whose clock is stopped
@@ -1366,12 +1529,8 @@ def restore_from(b, out_dir):
                 problems.append(f'{name}: not read, {b.gate["name"]} stops the trace clock; left alone')
             else:
                 report.append(f'{name}: restored earlier; not read, the trace clock is stopped')
-            continue
-        try:
-            now = unit_read(b, reg)
-        except ToolError as err:
-            problems.append(f'{name}: {err}; left alone')
-            continue
+            return
+        now = unit_read(b, reg)
         if same(key[0], now, original):
             report.append(f'{name}: already 0x{now:08x}')
             journal.restored(first[key], now)
@@ -1380,8 +1539,8 @@ def restore_from(b, out_dir):
                                         entries)
             if conflict:
                 problems.append(conflict)
-                continue
-            unit_write(b, reg, original)
+                return
+            restore_write(b, journal, reg, now, original)
             rb = unit_read(b, reg)
             if same(key[0], rb, original):
                 report.append(f'{name}: 0x{now:08x} -> 0x{rb:08x}')
@@ -1393,6 +1552,14 @@ def restore_from(b, out_dir):
             why = f' (interrupted during {in_flight[-1]})' if in_flight else ''
             problems.append(f'{name}: 0x{now:08x} is neither the original 0x{original:08x} nor a value this capture '
                             f'left{why}; left alone')
+
+    for key in reversed(list(first)):
+        if key[1] is None and comparator_of(key[0]) is not None:
+            continue
+        try:   # a failed access, the gate check's included, leaves this register and goes on to the next
+            restore_key(key)
+        except (ToolError, OSError) as err:
+            problems.append(f"{first[key]['name']}: {err}; left alone")
     return report, problems
 
 
@@ -1455,7 +1622,12 @@ def make_backend(a, p):
             p.error(f'--speed {a.speed!r}: kHz, auto or adaptive')
         if a.swo_object or a.vid_pid:
             p.error('--swo-object and --vid-pid are OpenOCD flags')
-        return JLinkBackend(a.probe, a.device, a.interface, a.speed)
+        return JLinkBackend(a.probe, a.device, a.interface, a.speed, a.rtt)
+    if a.formatter:
+        p.error('--formatter: an OpenOCD trace unit object owns TPIU_FFCR (its -formatter); only the J-Link route '
+                'sets it')
+    if a.rtt:
+        p.error('--rtt: only the J-Link route serves RTT beside SWO (its GDB server); use the rtt skill on OpenOCD')
     if a.interface or a.speed:
         p.error('--interface and --speed are J-Link flags; OpenOCD takes them from --cfg')
     if a.vid_pid and not re.fullmatch(r'0x[0-9a-fA-F]{1,4} 0x[0-9a-fA-F]{1,4}( 0x[0-9a-fA-F]{1,4} 0x[0-9a-fA-F]{1,4})*',
@@ -1509,11 +1681,15 @@ def parse_args(argv):
                    help='global timestamps (ITM_TCR.GTSFREQ) from the part\'s timestamp generator, which its --setup '
                         'entry enables')
     c.add_argument('--watch', action='append', default=[], help='addr=ADDR|SYMBOL,access=r|w|rw,'
-                   'emit=val|pc|pcval|offset|offval[,mask=BITS] (ARMv7-M, comparators 0-3)')
+                   'emit=val|pc|pcval|offset|offval[,mask=BITS][,size=1|2|4] (comparators 0-3; swo-dwt.md, '
+                   'Data trace)')
     c.add_argument('--cycmatch', type=lambda v: int(v, 0), metavar='CYCLES',
                    help='a PC packet each time DWT_CYCCNT equals CYCLES (comparator 0, once per 2^32 cycles)')
     c.add_argument('--elf', help='firmware ELF: symbols for --watch, and its hash in capture.json')
     c.add_argument('--setup', help='board setup entry in swo_boards.json, applied before the capture')
+    c.add_argument('--rtt', action='store_true', help='also log RTT channel 0 to DIR/rtt.log (J-Link)')
+    c.add_argument('--formatter', action='store_true',
+                   help='TPIU formatter frames on SWO, the ITM by its trace bus ID in them (J-Link, core TPIU)')
     o = c.add_mutually_exclusive_group()
     o.add_argument('--observe-itm', action='store_true')
     o.add_argument('--take-itm', action='store_true')
@@ -1568,7 +1744,7 @@ def parse_args(argv):
             with open(a.elf, 'rb') as f:
                 a.elf_sha256 = hashlib.sha256(f.read()).hexdigest()
     elif any(getattr(a, f) for f in ('traceclk_hz', 'swo_hz', 'exc', 'pc_sample', 'cyc_event', 'profile', 'watch',
-                                     'itm_ports', 'timestamps')) or a.cycmatch is not None:
+                                     'itm_ports', 'timestamps', 'rtt', 'formatter')) or a.cycmatch is not None:
         p.error('capture flags need --out')
     return a, backend
 

@@ -71,6 +71,18 @@ python3 $S/swo_decode.py /tmp/swo-run --elf fw.elf          # --jsonl events.jso
   whether byte 0 is a packet boundary, before and after register snapshots, byte count, teardown offset, the
   capture's `errors` and the `restore` outcome apart), `DIR/journal.jsonl` and `DIR/probe.log`. A refused run leaves
   only `probe.log`, and the same `--out` can be reused.
+- **`--formatter`** (J-Link, core TPIU) switches the TPIU formatter on, TPIU_FFCR.EnFCont written after the probe
+  tool's start, which bypasses it, and restored with the rest: the stream is then CoreSight formatter frames
+  (Architecture Specification IHI0029, book 6591, D4), and the decode takes the ITM's bytes by its trace bus ID
+  (ITM_TCR.TraceBusID, 1 in a configured capture) and counts frames, syncs, lost frames and other sources' bytes,
+  which it does not decode (an ETM's, say). The formatter took 21% more of the pin on stm32f407disco (126,248 bytes
+  for the fixture's 104,330 ITM bytes): besides the aux byte, the frames averaged 1.7 ID bytes. The STM32H7 SWO
+  unit has none (RM0433 60.5.7); OpenOCD's trace unit object owns the register and is refused.
+- **`--rtt`** (J-Link only) has the same GDB server serve RTT channel 0 (`-RTTTelnetPort`, SEGGER KB book 6586) and
+  logs it to `DIR/rtt.log`, the server's banner removed by the `rtt` skill's filter: the firmware's text beside its
+  trace over one probe connection. The log starts with what the target's ring held when the capture connected, so it
+  may begin before the trace does: match its lines to ITM markers by content, not by time. A server that closes the
+  RTT socket early fails the capture, which still restores. On an OpenOCD probe use the `rtt` skill.
 
 ## Ownership and restore
 
@@ -94,7 +106,10 @@ A killed run leaves its journal: `--restore DIR` (same host and connection, boar
 firmware against the `--elf` segments the capture checked, then restores each register whose value the journal
 explains since that register's last restore, and reports any other value untouched, including one changed during an
 interrupted probe tool operation. Without an `--elf` at capture it refuses: restore by hand from the `original`
-values in `journal.jsonl`. On Linux the probe server dies with the script (`PR_SET_PDEATHSIG`).
+values in `journal.jsonl`. A register it cannot reach, a failed access or a trace-clock check that fails included, is
+reported and left alone, and the rest is still restored (exit 1). A gated TPIU entry left so stays out of reach once
+the gate register is back at its original: restore it by hand with the trace clock running. On Linux the probe server
+dies with the script (`PR_SET_PDEATHSIG`).
 
 What the probe tools do on their own, measured: J-Link's `SWO EnableTarget` sets DBGMCU_CR.TRACE_IOEN on an STM32F4,
 ITM_TCR to 0x1000D and ITM_TER to its port mask (it refuses mask 0), and the TPIU's ACPR, SPPR (2) and FFCR (0x100);
@@ -140,8 +155,36 @@ every encoding below verified through `swo_capture.py` on a Cortex-M4 (stm32f407
 
 Read-only and write-only comparators exist: a variable the main loop polls need not flood the pin. `mask=N` ignores
 the address's low N bits; a comparator implements fewer than 31 (an STM32F407 reads back at most 15), and a larger
-one fails the capture's read-back. The comparator stays disarmed after the capture. Armv8-M redesigns DWT_FUNCTION
-(MATCH/ACTION) and is not driven yet.
+one fails the capture's read-back. The comparator stays disarmed after the capture.
+
+## DWT data trace encodings (Armv8-M)
+
+Armv8-M redesigns DWT_FUNCTIONn as MATCH[3:0], ACTION[5:4] and DATAVSIZE[11:10] (Armv8-M ARM book 6539, D1.2.64,
+Tables RCNHN and RPSBJ). `--watch` takes a data address comparator for `pc` and a Data Address With Value one for
+`val` and `pcval`, matching `size=1|2|4` bytes at an address aligned to it, by default the size of a 1, 2 or 4-byte
+ELF symbol:
+
+| access | emit `val` | `pc` | `pcval` |
+|--------|------------|------|---------|
+| rw     | 0x2C       | 0x34 | 0x3C    |
+| r      | 0x2E       | 0x36 | 0x3E    |
+| w      | 0x2D       | 0x35 | 0x3D    |
+
+plus DATAVSIZE (0, 1, 2 for 1, 2, 4 bytes) at bit 10. A read-only or write-only `pc` exists here. There is no DWT_MASKn:
+`mask=`, `offset` and `offval` need a linked comparator pair, which the script does not program, and are refused.
+`--cycmatch` writes MATCH 0b0001 with ACTION 0b11 (0x31) on comparator 0. A comparator is used only when its
+DWT_FUNCTIONn.ID names the match (data address for a watch, cycle counter for `--cycmatch`); `--caps` lists each one's.
+A comparator in a linked pair, a limit or linked value comparator (MATCH 0b0011, 0b0111, 0b1011) and the one before it,
+is never used or taken, and a restore leaves alone one that has joined a pair since: changing one changes what the other
+matches (B14.2.5). A DWT whose DWT_CTRL.NOTRCPKT is set sends no trace packets, and every DWT source is refused there.
+
+Reading DWT_FUNCTIONn clears its MATCHED bit on both architectures, so `--caps` and a capture's first read consume a
+match the firmware or another debugger had not yet seen.
+
+The decode reads two packets ARMv7-M does not send: a Data Trace Match packet (`match` in DATA; it also stands in for a
+PC that Secure state does not let be traced, p359), and Short and Medium PC Value packets carrying PC bits [7:0] or
+[15:0], whose upper bits are DWT_COMP<CMPN>'s (F1.2.3, F1.2.4): it completes them from the comparator address in
+`capture.json`, and prints the bits alone for `--bin` input.
 
 ## Feature matrix
 
@@ -165,17 +208,27 @@ Cortex-M7.
 | DWT profiling counters, cycle-count events                | yes         | stm32f407disco                                      |
 | CYCMATCH                                                  | yes         | stm32h743nucleo                                     |
 | Global timestamps                                         | yes         | stm32h743nucleo (TSG behind AP2)                    |
-| Armv8-M SWO, trace clock gate                             | yes         | ra6m5_ek (`cdc_msc` exception trace, no fixture)    |
-| Armv8-M data trace (`--watch`, `--cycmatch`)              | no          | refused on Armv8-M                                  |
-| Manchester SWO, TPIU formatter, parallel trace, CMSIS-DAP | no          | deferred                                            |
+| Armv8-M SWO, trace clock gate                             | yes         | ra6m5_ek (fixture: exc, ITM, failed gate check)     |
+| Armv8-M data trace (`--watch`, `--cycmatch`)              | yes         | ra6m5_ek (`w,val`, `r,pc`, `rw,pcval`, CYCMATCH)    |
+| RTT beside SWO (`--rtt`, J-Link)                          | yes         | stm32f407disco                                      |
+| TPIU formatter (`--formatter`), ITM through it            | yes         | stm32f407disco                                      |
+| Manchester SWO, parallel trace, CMSIS-DAP                 | no          | deferred: no farm probe captures them               |
+
+The deferred rows need a probe the farm lacks. J-Link software captures UART (NRZ) SWO only (SEGGER KB, book 6588), and
+OpenOCD's ST-LINK driver refuses any other mode; the farm's CMSIS-DAP probes are Raspberry Pi debugprobes, built with
+SWO_UART and SWO_MANCHESTER 0 in every release, and OpenOCD lists no SWO on them. The Cortex-M4 TPIU itself supports
+Manchester (TPIU_DEVID). A CMSIS-DAP probe with SWO support wired to a target's TRACESWO would cover both.
 
 ## Known faults
 
-- STLINK-V3 (firmware J12M3) through OpenOCD occasionally drops or corrupts a byte at a 2 KiB-multiple stream offset;
-  the decode reports each as an unknown header or an unexpected source and resynchronizes.
-- Periodic DWT packets can go missing without an Overflow packet: on stm32f407disco `--cyc-event 1:15` with `--exc`
-  lost 365 Event counter packets that no Overflow marked (ARMv7-M D.2.3 says one is emitted). The decode compares
-  each periodic source against its period and reports `periodic_missed`.
+- STLINK-V3 (firmware J12M3) through OpenOCD on stm32h743nucleo loses a byte now and then: at 16 MHz near
+  2 KiB-multiple stream offsets (the decode breaks 0 to 5 bytes past one), and with exception trace and PC sampling
+  together at all three rates tried (4, 8 and 16 MHz). The decode reports each as an unknown header or an unexpected
+  source and resynchronizes; the counts and what was ruled out are in `swo-boards.md`.
+- A periodic DWT packet due while another is output comes out after it and can lose its own Local timestamp, taking
+  the next one (ARMv7-M D.2.4, p937): on stm32f407disco a Cyc event due at a TIM7 entry arrived one period late,
+  sharing the following event's timestamp. `periodic_missed` counts each source's packets over its run in a segment,
+  so a late packet is not counted lost; it flags packets lost without an Overflow packet.
 - The 8-bit profiling counters wrap fast: `sleep`, `cpi` and `lsu` on a busy core outrun a 1.5 MHz link (about 75
   thousand overflows in 4 s on stm32f407disco); enable one at a time, or use `exc` and `fold`, which wrap rarely.
 - Halting the core stops SysTick but not peripheral timers unless their DBGMCU freeze bit is set: phase relations the

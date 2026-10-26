@@ -19,6 +19,22 @@
    ],
    "openocd": {"swo_object": "stm32f4x.tpiu"}
   },
+  "stm32f7": {
+   "parts": "STM32F722/732, F723/733 (RM0431)",
+   "traceclk": "HCLK",
+   "writes": [
+    {"name": "DBGMCU_CR", "addr": "0xE0042004", "mask": "0x000000E0", "value": "0x00000020",
+     "why": "TRACE_CLKINEN=1, TRACE_MODE=00 asynchronous: TRACECLKIN is tied low until set",
+     "ref": "RM0431 (book 3659) DBGMCU_CR, p1393-1394; TRACECLKIN, Table 253 note p1399"}
+   ],
+   "watch": [
+    {"name": "GPIOB_MODER", "addr": "0x40020400", "mask": "0x000000C0", "value": "0x00000080",
+     "why": "PB3 (JTDO/TRACESWO) in alternate function mode, its reset state; firmware may have remapped it",
+     "ref": "RM0431 (book 3659) GPIOx_MODER reset values, p205; GPIOB at 0x40020400, p58"},
+    {"name": "GPIOB_AFRL", "addr": "0x40020420", "mask": "0x0000F000", "value": "0x00000000",
+     "why": "PB3 on AF0 (JTDO/TRACESWO)", "ref": "DS11853 (book 4947) alternate functions, Table 12 p85"}
+   ]
+  },
   "stm32h7": {
    "parts": "STM32H742, H743/753, H750 (RM0433)",
    "traceclk": "undocumented: 400 MHz worked on stm32h743nucleo, where rcc_c_ck and pll1_r_ck are both 400 MHz",

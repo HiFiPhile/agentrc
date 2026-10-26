@@ -14,7 +14,7 @@ Reports, each over the whole capture:
   INTEGRITY   always: bytes, packets, syncs, overflows, skipped and unknown bytes, segments
   EXCEPTIONS  per exception: entries, and with a timestamp clock, duration and self-time percentiles
   PC          periodic PC samples by function (--elf), sleep and prohibited samples
-  DATA        DWT data trace per comparator: PC, address offset, read and write values
+  DATA        DWT data trace per comparator: PC, address offset, read and write values, matches
   TEXT        ITM stimulus per port: byte count, and the bytes as text
   GLOBAL TIMESTAMPS  complete global timestamps, first and last, and their clock against local time
   EVENTS      DWT event counter packets per counter: wraps of each 8-bit counter, Cyc periods, and with
@@ -28,8 +28,10 @@ durations are withheld with the reason.
 Exit 0 decoded, 1 the input held no packet at all, 2 bad usage or an unreadable input.
 """
 import argparse
+import array
 import bisect
 import collections
+import itertools
 import json
 import os
 import sys
@@ -106,10 +108,96 @@ def source_packet(h, payload):
         if a < 16:
             if a & 1:
                 return {'kind': 'daddr', 'cmp': cmp, 'size': len(payload), 'value': value}
+            if len(payload) == 1 and value & 1:   # Armv8-M: a Match packet, not a Short PC (DDI0553 F1.2.3)
+                return {'kind': 'dmatch', 'cmp': cmp}
             return {'kind': 'dpc', 'cmp': cmp, 'size': len(payload), 'value': value}
         return {'kind': 'dval', 'cmp': cmp, 'access': 'write' if a & 1 else 'read', 'size': len(payload),
                 'value': value}
     return None
+
+
+FULL_SYNC = b'\xff\xff\xff\x7f'   # 0x7FFFFFFF, least significant byte first (CoreSight Architecture IHI0029 D4.2.2)
+SPECIAL_IDS = {0x00: 'null', 0x7B: 'flush', 0x7D: 'trigger'}   # D4.2.4
+
+
+def deformat(data):
+    """({trace source ID: [bytearray, ...]}, counts) of a TPIU formatter stream (IHI0029 D4.2): 16-byte frames from
+    the first full sync on, whose even bytes are an ID when bit 0 is set, else data[7:1] completed by the aux byte 15,
+    and whose odd bytes are data. An ID byte's aux bit says whether the byte after it is still the old ID's. A halfword
+    starting 0xFF is a sync, ID 0x7F never being used: FF 7F a half sync, FF FF the start of a full one. A frame a sync
+    or ID 0x7F cuts short is lost, with any ID change it held: every source's bytes after it start a new segment, and
+    bytes stay unattributed until the next ID. `raw` gives each segment byte's offset in `data`."""
+    counts = collections.Counter()
+    out, raw = {}, {}
+    start = data.find(FULL_SYNC)
+    i = counts['preamble_bytes'] = len(data) if start < 0 else start
+    cur, broken, frame, at = None, set(), bytearray(), []
+
+    def emit(byte, j):
+        if cur is None or cur in SPECIAL_IDS:
+            counts[f"{SPECIAL_IDS.get(cur, 'unattributed')}_bytes"] += 1
+            return
+        segs, offs = out.setdefault(cur, [bytearray()]), raw.setdefault(cur, [array.array('Q')])
+        if cur in broken:
+            broken.discard(cur)
+            segs.append(bytearray())
+            offs.append(array.array('Q'))
+        segs[-1].append(byte)
+        offs[-1].append(at[j // 2] + j % 2)
+
+    while i + 2 <= len(data):
+        if data[i] != 0xFF:
+            frame += data[i:i + 2]
+            at.append(i)
+            i += 2
+        elif data[i + 1] == 0x7F:
+            counts['half_syncs'] += 1
+            i += 2
+            continue
+        else:
+            full = data[i:i + 4] == FULL_SYNC
+            if frame or not full:   # a frame cut short, or an ID 0x7F: what it held is lost
+                counts['lost_frames'] += 1
+                cur, broken, frame, at = None, set(out), bytearray(), []
+            if not full:
+                i = data.find(FULL_SYNC, i + 1)
+                if i < 0:
+                    break
+            counts['full_syncs'] += 1
+            i += 4
+            continue
+        if len(frame) < 16:
+            continue
+        counts['frames'] += 1
+        aux = frame[15]
+        for k in range(8):
+            b, a = frame[2 * k], aux >> k & 1
+            if not b & 1:
+                emit(b & 0xFE | a, 2 * k)
+                if k < 7:
+                    emit(frame[2 * k + 1], 2 * k + 1)
+            elif k == 7:   # its aux bit is reserved: the new ID starts with the next frame
+                cur = b >> 1
+            elif a:
+                emit(frame[2 * k + 1], 2 * k + 1)
+                cur = b >> 1
+            else:
+                cur = b >> 1
+                emit(frame[2 * k + 1], 2 * k + 1)
+        frame, at = bytearray(), []
+    return out, raw, counts
+
+
+def deformatted_packets(segments, raw):
+    """packets() over one source's segments, each read from its first synchronization packet: the formatter was
+    switched on with the ITM running, and a lost frame leaves no packet boundary. Offsets are the raw stream's, of
+    each packet's first byte."""
+    for n, (seg, offs) in enumerate(zip(segments, raw)):
+        if n:
+            yield {'off': offs[0], 'kind': 'resync'}
+        for p in packets(bytes(seg), False):
+            p['off'] = offs[p['off']] if p['off'] < len(offs) else offs[-1] + 1
+            yield p
 
 
 def packets(data, synced):
@@ -397,19 +485,31 @@ def pc_report(evts, syms, top):
             'top': counts.most_common(top)}
 
 
-def data_report(evts, syms):
+def full_pc(e, comps):
+    """The PC of a dpc event, or None. An Armv8-M Short or Medium PC packet carries bits [7:0] or [15:0], the rest
+    being DWT_COMP<CMPN>'s (DDI0553 F1.2.4): `comps` gives what the capture programmed."""
+    if e['size'] == 4:
+        return e['value']
+    comp = comps.get(e['cmp'])
+    return None if comp is None else comp & -(1 << 8 * e['size']) | e['value']
+
+
+def data_report(evts, syms, comps=None):
     out = collections.defaultdict(lambda: collections.Counter())
     pcs = collections.defaultdict(collections.Counter)
     offsets = collections.defaultdict(collections.Counter)
     last = {}
     for e in evts:
-        if e['kind'] in ('dpc', 'daddr', 'dval'):
-            key = e['kind'] if e['kind'] != 'dval' else e['access']
+        if e['kind'] in ('dpc', 'daddr', 'dval', 'dmatch'):
+            key = {'dval': e.get('access'), 'dmatch': 'match'}.get(e['kind'], e['kind'])
             out[e['cmp']][key] += 1
             if e['kind'] == 'dpc':
-                pcs[e['cmp']][syms.function(e['value']) if syms else f"0x{e['value']:08x}"] += 1
-            if e['kind'] == 'daddr':   # data address bits [15:0]
-                offsets[e['cmp']][f"0x{e['value']:04x}"] += 1
+                pc = full_pc(e, comps or {})
+                name = f"PC[{8 * e['size'] - 1}:0] 0x{e['value']:0{2 * e['size']}x}" if pc is None else \
+                    syms.function(pc) if syms else f'0x{pc:08x}'
+                pcs[e['cmp']][name] += 1
+            if e['kind'] == 'daddr':   # data address bits [15:0] (ARMv7-M), or its low 1, 2 or 4 bytes (Armv8-M)
+                offsets[e['cmp']][f"0x{e['value']:0{2 * e['size']}x}"] += 1
             if e['kind'] == 'dval':
                 last[e['cmp']] = e['value']
     return {c: dict(out[c], last_value=last.get(c), pcs=pcs[c].most_common(5), offsets=offsets[c].most_common(8))
@@ -456,16 +556,22 @@ def event_shares(evts, ticks_hz, clock_hz):
 
 
 def periodic_missed(evts, periods, prescale):
-    """{source: packets missing}: a periodic source ('pc' samples, 'Cyc' events) whose consecutive packets, both
-    synchronously timestamped in one segment, lie k periods apart lost k - 1 between them. Measured on an STM32F407:
-    such packets go missing without an Overflow packet, which ARMv7-M Appendix D.2.3 would have the DWT emit."""
+    """{source: packets missing}: a periodic source ('pc' samples, 'Cyc' events) whose packets, between its first and
+    last synchronously timestamped one in a segment, number fewer than the periods they span. Counted over the run,
+    not between neighbours: a packet the ITM outputs late, behind another, can lose its own Local timestamp and take
+    the next one (ARMv7-M D.2.4), which neighbours would read as one lost and one early (measured on an STM32F407)."""
     out = {}
     for name, period in (periods or {}).items():
         mine = [e for e in evts if (e['kind'] == 'pc' if name == 'pc' else e['kind'] == 'evcnt' and e['bits'] >> 5 & 1)]
         missed = 0
-        for a, b in zip(mine, mine[1:]):   # neighbours as received: a delayed one between breaks the comparison
-            if a['seg'] == b['seg'] and a.get('tq') == b.get('tq') == 'sync':
-                missed += max(0, round((b['t'] - a['t']) * prescale / period) - 1)
+        for _, run in itertools.groupby(mine, key=lambda e: e['seg']):
+            run = list(run)
+            stamped = [k for k, e in enumerate(run) if e.get('tq') == 'sync']
+            if len(stamped) > 1:
+                first, last = stamped[0], stamped[-1]
+                while first < last and run[first + 1]['t'] == run[first]['t']:   # the late ones before it are earlier
+                    first += 1
+                missed += max(0, round((run[last]['t'] - run[first]['t']) * prescale / period) - (last - first))
         out[name] = missed
     return out
 
@@ -485,7 +591,14 @@ def global_report(evts, ticks_hz):
 
 
 def summarize(data, meta, syms, top):
-    evts, integ, unknown = events(packets(data, meta['synced']), meta.get('sources'), meta.get('teardown_byte'))
+    fmt = meta.get('formatter')
+    if fmt:
+        streams, raw, counts = deformat(data)
+        pkts = deformatted_packets(streams.get(fmt['itm_id'], []), raw.get(fmt['itm_id'], []))
+        counts['other_ids'] = {i: sum(map(len, segs)) for i, segs in streams.items() if i != fmt['itm_id']}
+    else:
+        pkts = packets(data, meta['synced'])
+    evts, integ, unknown = events(pkts, meta.get('sources'), meta.get('teardown_byte'))
     clock = meta.get('ts_clock_hz')
     ticks_hz = clock / meta['ts_prescale'] if clock else None
     timing = None
@@ -497,12 +610,12 @@ def summarize(data, meta, syms, top):
     if integ['lts'] and meta.get('periods'):
         integ['periodic_missed'] = periodic_missed(evts, meta['periods'], meta['ts_prescale'])
     summary = {
-        'integrity': dict(integ, bytes=len(data), unknown=unknown[:20]),
+        'integrity': dict(integ, bytes=len(data), unknown=unknown[:20], **({'formatter': dict(counts)} if fmt else {})),
         'timing': timing or f"local timestamps at {clock} Hz / {meta['ts_prescale']} ({meta.get('ts_clock_source')})",
         'exceptions': {(syms.exception(n) if syms else exception_name(n)) + f' ({n})': r for n, r in exc.items()},
         'exception_anomalies': anomalies,
         'pc': pc_report(evts, syms, top),
-        'data': data_report(evts, syms),
+        'data': data_report(evts, syms, meta.get('comparators')),
         'text': text_report(evts),
         'events': event_report(evts),
         'global_ts': global_report(evts, ticks_hz if not timing else None),
@@ -522,6 +635,11 @@ def print_text(s, out=sys.stdout):
     w('INTEGRITY\n')
     w(f"  bytes {i['bytes']}  packets {i.get('packets', 0)}  syncs {i.get('sync', 0)}  overflows {i.get('overflow', 0)}"
       f"  segments {i['segments']}\n")
+    if 'formatter' in i:
+        f = i['formatter']
+        w(f"  formatter: frames {f.get('frames', 0)}  lost {f.get('lost_frames', 0)}  "
+          f"full syncs {f.get('full_syncs', 0)}  half syncs {f.get('half_syncs', 0)}  "
+          f"before the first sync {f['preamble_bytes']} bytes  other sources {f['other_ids'] or 'none'}\n")
     for k in ('unsynced_bytes', 'unknown_bytes', 'unexpected', 'truncated_bytes', 'untimed'):
         if i.get(k):
             w(f'  {k.replace("_", " ")} {i[k]}\n')
@@ -532,7 +650,7 @@ def print_text(s, out=sys.stdout):
             w(f"  unknown header {u['header']} at {u['off']}, {u['bytes']} bytes skipped to the next sync\n")
     for name, n in i.get('periodic_missed', {}).items():
         if n:
-            w(f'  {n} {name} packet(s) missing between timestamped neighbours (no Overflow packet marks them)\n')
+            w(f'  {n} {name} packet(s) missing from their timestamped run (no Overflow packet marks them)\n')
     if i.get('teardown_overflow'):
         w(f"  {i['teardown_overflow']} overflow(s) after the capture began switching its sources off\n")
     if i.get('overflow'):
@@ -598,9 +716,11 @@ def load_input(a):
         meta = {'synced': cap['stream_start'] == 'synced', 'ts_clock_hz': ts.get('clock_hz'),
                 'ts_clock_source': ts.get('clock_source'), 'ts_prescale': ts.get('prescale', 1),
                 'sources': cap.get('sources'), 'teardown_byte': cap.get('teardown_byte'),
-                'periods': periods(cap.get('features') or {})}
-        if a.ts_clock_hz or a.ts_prescale:
-            raise Usage('a capture dir carries its timestamp clock; --ts-clock-hz is for a raw file')
+                'periods': periods(cap.get('features') or {}), 'formatter': cap.get('formatter'),
+                'comparators': {w['comparator']: w['addr'] for w in cap.get('watches') or []}}
+        if a.ts_clock_hz or a.ts_prescale or a.formatter_id is not None:
+            raise Usage('a capture dir carries its timestamp clock and formatter; --ts-clock-hz and --formatter-id are '
+                        'for a raw file')
     else:
         if not a.bin or not a.start:
             raise Usage('give a capture dir, or --bin with --start synced|unsynced')
@@ -608,7 +728,8 @@ def load_input(a):
             raise Usage('--ts-prescale needs --ts-clock-hz')
         path = a.bin
         meta = {'synced': a.start == 'synced', 'ts_clock_hz': a.ts_clock_hz,
-                'ts_clock_source': 'given with --ts-clock-hz', 'ts_prescale': a.ts_prescale or 1}
+                'ts_clock_source': 'given with --ts-clock-hz', 'ts_prescale': a.ts_prescale or 1,
+                'formatter': {'itm_id': a.formatter_id} if a.formatter_id is not None else None}
     if meta['ts_prescale'] not in (1, 4, 16, 64):
         raise Usage(f"timestamp prescale {meta['ts_prescale']} is not one of 1, 4, 16, 64 (ITM_TCR.TSPrescale)")
     with open(path, 'rb') as f:
@@ -623,6 +744,7 @@ def main(argv=None):
                    help='with --bin: synced when byte 0 is a packet boundary (capture began before any source)')
     p.add_argument('--ts-clock-hz', type=int, help='with --bin: the local timestamp clock')
     p.add_argument('--ts-prescale', type=int, help='with --bin: ITM_TCR.TSPrescale as a divisor (1, 4, 16, 64)')
+    p.add_argument('--formatter-id', type=int, help='with --bin: TPIU formatter frames, the ITM\'s trace ID in them')
     p.add_argument('--elf', help='firmware ELF for function and handler names')
     p.add_argument('--jsonl', help='write every event as one JSON line here')
     p.add_argument('--json', action='store_true', help='print the summary as JSON')
