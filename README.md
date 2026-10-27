@@ -108,11 +108,10 @@ and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
   symlink resolved, which reaches this checkout either way. `captain` is the
   exception (below).
 - `--claude-md` is opt-in: it links `instructions/user.md`, the owner's
-  personal rules (hosts, sudo, document library), as `<dir>/CLAUDE.local.md`,
-  Claude Code's per-user instructions for that project, so those rules and
-  the co-words hold in that work tree only. A link, because an
-  `@`-import of a file outside the project loads only once approved
-  interactively, never in a headless session.
+  personal rules, as `<dir>/CLAUDE.local.md`, Claude Code's per-user
+  instructions for that project, so those rules and the co-words hold in that
+  work tree only. A link, because an `@`-import of a file outside the project
+  loads only once approved interactively, never in a headless session.
 - Each link, and `settings.local.json` unless git already ignores it, gets a
   line in one marked block of the repository's `.git/info/exclude`, which its
   worktrees share; a line stays while any worktree has our link there, so `git
@@ -133,22 +132,21 @@ and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
   `.claude` itself included, which would carry them out of the work tree, and a
   `settings.local.json` that is tracked or a link, since they rewrite it.
 - Project mode is Claude Code only: `--bin`, `--statusline` and
-  `--herdr-plugin` are user-wide and refused with `--project`, and Codex has
-  no project install. A Codex coworker needs no `CLAUDE.local.md`: `cowork`
-  sends it its rules.
-- A project install leaves a user-wide one in place; removing that is its own
-  step, `install.py remove` with the user-wide flags and no `--project`.
-- Not supported with a project install:
+  `--herdr-plugin` are user-wide and refused with `--project`, and Codex's
+  own skills and agents have no project install. A Codex coworker needs no
+  `CLAUDE.local.md`: `cowork` sends it its rules.
+- A user-wide install on the same host is not supported beside a project
+  install: the hooks are registered twice and race, and the `headless-chief`
+  shadow check misjudges links into a different checkout. A project install
+  leaves a user-wide one in place; remove it as its own step, `install.py
+  remove` with the user-wide flags and no `--project`.
+- Not supported with a project install either:
   - `captain`, whose guard and scripts are user-wide only;
-  - a user-wide install on the same host as well: the hooks are registered
-    twice and race, and the `headless-chief` shadow check misjudges links
-    into a different checkout;
   - worktrees of one repository installed from different agentrc checkouts;
   - `install` or `remove` runs at the same time in worktrees of one
     repository;
   - `bench/finding-verify` replay fingerprints, which read the user-wide
-    install;
-  - Codex's own skills and agents, which have no project install.
+    install.
 
 ### Windows
 

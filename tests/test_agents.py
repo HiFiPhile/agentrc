@@ -38,7 +38,7 @@ class AgentFiles(unittest.TestCase):
     def test_chief_accepts_the_changed_criteria_hw_debugger_reports_on(self):
         """chief adjudicates a round from the hardware reference its Hardware section names, not from
         hw-debugger.md, so each carries the list of what counts as a changed round; the two copies must not drift."""
-        named = re.search(r'read `\$\{AGENTRC_DIR:-\$HOME/\.claude\}/skills/([^`]+)` in full', (AGENTS / 'chief.md').read_text())
+        named = re.search(r'read `"\$\{AGENTRC_DIR:-\$HOME/\.claude\}/skills/([^`"]+)"` in full', (AGENTS / 'chief.md').read_text())
         self.assertTrue(named, "chief.md no longer names its hardware reference")
         lists = [re.search(r'a valid first reproduction;[^.]*?demonstrated', path.read_text())
                  for path in (SKILLS / named[1], AGENTS / 'hw-debugger.md')]
@@ -235,8 +235,8 @@ class AgentFiles(unittest.TestCase):
 
     def test_hil_operator_refuses_hardware_work_without_the_project_contract(self):
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
-        self.assertIn('`${AGENTRC_DIR:-$HOME/.claude}/skills/hil/SKILL.md`', body)
-        self.assertIn('`${AGENTRC_DIR:-$HOME/.codex}/skills/hil/SKILL.md`', body)
+        self.assertIn('`"${AGENTRC_DIR:-$HOME/.claude}/skills/hil/SKILL.md"`', body)
+        self.assertIn('`"${AGENTRC_DIR:-$HOME/.codex}/skills/hil/SKILL.md"`', body)
         self.assertIn('perform no hardware action and return the blocker', body)
         self.assertIn('Never invent a command, choose another rig, bypass a lock, or report unexecuted work as passing.', body)
         page = ' '.join((SKILLS / 'hil' / 'SKILL.md').read_text().split())
