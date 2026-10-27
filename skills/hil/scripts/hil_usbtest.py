@@ -38,7 +38,7 @@ SYS_USB = Path('/sys/bus/usb/devices')
 SYS_DEV_CHAR = Path('/sys/dev/char')
 DRIVER = Path('/sys/bus/usb/drivers/usbtest')
 PATTERN_PARAM = Path('/sys/module/usbtest/parameters/pattern')
-HELPER_TIMEOUT = 30         # default bound for sudo helpers (dmesg/modprobe/setpci/tee)
+HELPER_TIMEOUT = 30         # default bound for the root helpers (hil_root.py verbs)
 CONNECT_TIMEOUT = 15        # the usbfs open, CONNECT and close each take the device lock
 # struct usbdevfs_ioctl and its requests (v6.12 include/uapi/linux/usbdevice_fs.h)
 _USBDEVFS_IOCTL_ARG = struct.Struct('@iiP')
@@ -51,7 +51,7 @@ RE_FAIL = re.compile(r'test (\d+) --> (\d+) \((.*)\)')
 _HEX4 = re.compile(r'[0-9a-f]{4}\Z')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py')
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 'skills/hil/scripts/hil_root.py')
 
 
 def _hil_load():
@@ -72,6 +72,8 @@ if __name__ != '__main__':      # the CONNECT child loads nothing but this file
     # find_device's walk and bounded reads: the process's one usb_observe (hil_load), so the
     # strand memo a harness's path_stranded checks read is the one find_device fed
     usb_observe = hil_load.load_file('skills/hil/scripts/usb_observe.py')
+    # every root operation: a rig's sudo grant covers its installed copy and nothing else
+    hil_root = hil_load.load_file('skills/hil/scripts/hil_root.py')
 
 SERIAL_GRACE = 1.0   # find_device's bound on one `serial` read, tighter than usb_observe's
                      # default on purpose: a runner calls it after every case and in its
@@ -81,20 +83,18 @@ _DEV_CACHE: dict = {}   # (vid, pid, serial lowercased) -> what find_device last
 
 def run(cmd, **kw):
     # NOT subprocess.run(timeout=): CPython's post-timeout path is an UNBOUNDED wait() that
-    # never returns on a D-state child -- the hang sysfs_write's timeout exists to catch.
+    # never returns on a D-state child -- a CONNECT or modprobe stuck on a device lock.
     timeout = kw.pop('timeout', None)
-    data = kw.pop('input', None)          # subprocess.run-only kwarg; Popen takes stdin
-    kw.pop('capture_output', None)        # ditto: expressed by the PIPEs below
+    kw.pop('capture_output', None)        # subprocess.run-only kwarg: expressed by the PIPEs below
     kw.setdefault('text', True)
     kw.setdefault('encoding', 'utf-8')
-    kw.setdefault('errors', 'replace')   # strict decode would raise out of _sudo_soft
-    # NO start_new_session: these helpers (dmesg, modprobe, setpci, tee) must stay in our
+    kw.setdefault('errors', 'replace')   # strict decode would raise out of _root_soft
+    # NO start_new_session: the root helpers must stay in our
     # process group so the caller's outer killpg reaps them with us.
     timeout = timeout if timeout is not None else HELPER_TIMEOUT
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if data is not None else None,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
     try:
-        out, err = proc.communicate(input=data, timeout=timeout)
+        out, err = proc.communicate(timeout=timeout)
         return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     except subprocess.TimeoutExpired:
         # Under sudo our child is only the wrapper; the root grandchild survives this and
@@ -107,7 +107,7 @@ def run(cmd, **kw):
         try:
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            for pipe in (proc.stdout, proc.stderr, proc.stdin):
+            for pipe in (proc.stdout, proc.stderr):
                 try:
                     if pipe is not None:
                         pipe.close()
@@ -116,49 +116,50 @@ def run(cmd, **kw):
         raise
 
 
-def sudo(cmd, **kw):
-    if os.geteuid() != 0:
-        cmd = ['sudo', '-n'] + cmd
+def root(verb, *args, **kw):
+    """One hil_root.py verb (hil_root.argv picks the copy and the sudo)."""
+    cmd = hil_root.argv(verb, *args)
     r = run(cmd, **kw)
     if r.returncode != 0 and 'password is required' in (r.stderr or ''):
         sys.exit(f'sudo needs a password for: {" ".join(cmd)}\n'
-                 'Run as root, or grant this user NOPASSWD sudo.')
+                 'Run as root, or grant this user NOPASSWD sudo on it.')
     return r
 
 
-def _sudo_soft(cmd, **kw):
-    """sudo() for calls whose failure must never abort the battery: run() re-raises
+def _root_soft(verb, *args, **kw):
+    """root() for calls whose failure must never abort the battery: run() re-raises
     TimeoutExpired, and two of these are evaluated inside run_case's own timeout handler
     -- a raise there loses the HUNG verdict, the recovery and the caller's report."""
     try:
-        return sudo(cmd, **kw)
+        return root(verb, *args, **kw)
     except (OSError, ValueError, subprocess.SubprocessError, SystemExit) as e:
-        # SystemExit too: sudo() sys.exit()s on 'a password is required', unwinding out of
+        # SystemExit too: root() sys.exit()s on 'a password is required', unwinding out of
         # run_case's timeout handler before the HUNG verdict is recorded
-        why = f'{cmd[0]}: {type(e).__name__}: {e}'
+        why = f'{verb}: {type(e).__name__}: {e}'
         print(why, file=sys.stderr)
-        return subprocess.CompletedProcess(cmd, 1, '', why)
+        return subprocess.CompletedProcess([verb, *args], 1, '', why)
 
 
-def sysfs_write(path, data):
+def sysfs_write(verb, *args):
+    """One hil_root.py write verb, bounded at 15 s."""
+    what = ' '.join(('hil_root', verb, *args))
     try:
-        r = sudo(['tee', str(path)], input=data, timeout=15)
+        r = root(verb, *args, timeout=15)
     except subprocess.TimeoutExpired:
-        sys.exit(f'write "{data}" > {path} blocked >15s. Check dmesg before any recovery '
+        sys.exit(f'{what} blocked >15s. Check dmesg before any recovery '
                  '(usb-kernel-recover skill).')
     if r.returncode != 0:
-        sys.exit(f'write "{data}" > {path} failed: {r.stderr.strip()}')
+        sys.exit(f'{what} failed: {r.stderr.strip()}')
 
 
 def dmesg_tail():
-    r = _sudo_soft(['dmesg'])
-    lines = [l for l in r.stdout.splitlines() if 'usbtest' in l]
-    return '\n'.join(lines[-8:])
+    r = _root_soft('dmesg')           # hil_root keeps only the lines naming usbtest
+    return '\n'.join(r.stdout.splitlines()[-8:])
 
 
-def needs_sudo(node):
-    """Device nodes are usually opened directly (udev rule); sudo only if not."""
-    return not os.access(node, os.W_OK) and os.geteuid() != 0
+def node_writable(node):
+    """The usbfs node opens for writing: root, or the project's udev rule."""
+    return os.geteuid() == 0 or os.access(node, os.W_OK)
 
 
 # speed_show's values (v6.12 drivers/usb/core/sysfs.c:145-177) less 'unknown', which names no speed
@@ -261,12 +262,12 @@ def find_device(vid, pid, serial=None, timeout=SERIAL_GRACE):
 def check_host_compat(node):
     """Refuse to run when the DUT's upstream host controller is known-incompatible:
     the MosChip MCS9990 (9710:9990) outright (buggy FRINDEX silicon: EHCI never
-    schedules int-OUT URBs and mangles unlinked reads - verified A/B 2026-07-09),
-    and the Renesas uPD720201/02 unless it runs firmware >= 2.0.2.6 (see below)."""
+    schedules int-OUT URBs and mangles unlinked reads - verified A/B 2026-07-09). A Renesas
+    uPD720201/02 needs firmware >= 2.0.2.6, or its command ring dies under unlink stress: a rig
+    setup prerequisite its owner checks after each reboot, not checked here."""
     for attempt in range(3):
         try:
             root = SYS_USB / f"usb{int(node.split('/')[-2])}"
-            drv = (root / '../driver').resolve().name
             pci = (root / '..').resolve()
             vid_did = ((pci / 'vendor').read_text().strip(), (pci / 'device').read_text().strip())
             break
@@ -283,38 +284,12 @@ def check_host_compat(node):
                  'incompatible with usbtest: broken FRINDEX silicon - int-OUT URBs are never '
                  'placed in the EHCI periodic schedule and unlinked reads complete as short '
                  'transfers (EREMOTEIO). Move the DUT to an xHCI port.')
-    if drv.startswith('xhci') and vid_did in (('0x1912', '0x0014'), ('0x1912', '0x0015')):
-        # The Renesas uPD720201/uPD720202 must run firmware >= 2.0.2.6 (K2026090.mem;
-        # RAM-uploaded, so it reverts to ROM on every power cycle): on ROM firmware its
-        # command ring dies under unlink stress and the hub worker deadlocks holding the
-        # device lock, needing a host power cycle (ch32v307 2026-07-10; ra6m5 test 24,
-        # mimxrt1015 2026-07-11). Both parts expose the FW version at PCI config 0x6c.
-        # Necessary, not sufficient -- batteries have killed the controller on current
-        # firmware too, which per-board skips in the rig config handle.
-        fw = None
-        try:
-            r = _sudo_soft(['setpci', '-s', pci.name, '0x6c.l'])
-            if r.returncode == 0:
-                fw = int(r.stdout.strip(), 16)
-        except (OSError, ValueError):
-            pass
-        if fw is None:
-            sys.exit(f'REFUSING to run: cannot read host xHCI Renesas ({pci.name}) firmware '
-                     'version (setpci missing or not permitted) - usbtest requires verified '
-                     'firmware >= 0x00202609 (2.0.2.6); on older firmware the command ring '
-                     'dies under unlink stress. Install pciutils / fix sudo, or load the '
-                     'firmware and re-check.')
-        if fw < 0x00202609:
-            sys.exit(f'REFUSING to run: host xHCI Renesas ({pci.name}) firmware 0x{fw:08x} '
-                     '< 0x00202609 (2.0.2.6) - its command ring dies under usbtest unlink '
-                     'stress. Load the latest firmware (K2026090.mem; it is RAM-uploaded and '
-                     'reverts to ROM on every power cycle).')
 
 
 def load_usbtest():
     """modprobe usbtest unless loaded: udev usually loads it on the device's modalias."""
     if not DRIVER.exists():
-        r = _sudo_soft(['modprobe', 'usbtest'])
+        r = _root_soft('modprobe')
         if r.returncode != 0 or not DRIVER.exists():
             sys.exit(f'cannot load usbtest module: {r.stderr.strip()}')
 
@@ -331,8 +306,12 @@ def ensure_usbtest_bound(interface, node):
     a usbfs CONNECT (device_attach, v6.12 devio.c proc_ioctl) rather than the driver's bind
     file, since any opener with write access may issue it, no root, and its fd pins one
     enumeration. Both take the device's and then the interface's lock, so it runs in a child
-    bounded at CONNECT_TIMEOUT. An interface held by another driver (a usbfs claim, a foreign
-    driver) is a named exit, never stolen."""
+    bounded at CONNECT_TIMEOUT. A node this user cannot write (testusb needs it too, so bound
+    or not) and an interface held by another driver (a usbfs claim, a foreign driver) are named
+    exits, never sudo or a steal."""
+    if not node_writable(node):
+        sys.exit(f"{node} is not writable: testusb and the usbfs CONNECT need write access to it "
+                 "(the project's udev rule)")
     load_usbtest()
     held = bound_driver(interface)
     if held is None:
@@ -341,7 +320,7 @@ def ensure_usbtest_bound(interface, node):
                      f'({platform.system()} {platform.machine()})')
         cmd = [sys.executable, '-I', os.path.abspath(__file__), 'connect', node, interface]
         try:
-            r = (sudo if needs_sudo(node) else run)(cmd, timeout=CONNECT_TIMEOUT)
+            r = run(cmd, timeout=CONNECT_TIMEOUT)
         except subprocess.TimeoutExpired:
             sys.exit(f'usbfs CONNECT on {interface} blocked >{CONNECT_TIMEOUT}s: its device lock is '
                      'held -- a peer case or a wedged device. Check dmesg before any recovery '
@@ -380,33 +359,30 @@ def _usbfs_connect(node, interface):
 def set_pattern(value):
     try:
         if PATTERN_PARAM.read_text().strip() != str(value):
-            sysfs_write(PATTERN_PARAM, str(value))
+            sysfs_write('pattern', str(value))
     except OSError as e:  # FileNotFoundError (no param), PermissionError (root-only), ...
         sys.exit(f'{PATTERN_PARAM} not usable ({e.strerror}): this usbtest module build may lack '
                  'the "pattern" param, or it is not readable')
 
 
-def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidden):
+def run_case(testusb, node, num, params, timeout, *, wedge_confirm):
     """Run testusb case `num` with options `params` (argv list) on usbfs `node`, bounded by
     `timeout` s. Returns the verdict fields: status PASS (secs), FAIL (detail; dmesg, stderr
     or late_cleared where they apply), NOTRUN or HUNG.
 
     HUNG means the killed child was not reaped within 5 s and then not within `wedge_confirm`
-    s more; it carries `_proc`, the surviving child for the caller's recovery to watch, or
-    None under sudo, whose wrapper's reaping proves nothing. `sudo_forbidden` refuses a
-    sudo-wrapped testusb (a caller that must confirm a recovery)."""
+    s more; it carries `_proc`, the surviving child for the caller's recovery to watch. A node
+    this user cannot write fails without running testusb: never under sudo, whose wrapper's
+    reaping proves nothing."""
     # -A <node> confines testusb's ftw() device scan to the DUT: with -D alone it opens every
     # usbfs node, blocking on any peer's held device lock (hathach/tinyusb#4047). -A must
     # precede -D, it clears it.
     cmd = [testusb, '-A', node, '-D', node, '-t', str(num), *params]
     result = {}
-    if needs_sudo(node):
-        if sudo_forbidden:
-            # a re-enumeration after the caller's check can hand back a node only root may open
-            result.update(status='FAIL', detail=f'{node} is not writable: refusing a '
-                          'sudo-wrapped testusb under a recovery request')
-            return result
-        cmd = ['sudo', '-n'] + cmd
+    if not node_writable(node):
+        # a re-enumeration after the caller's check can hand back a node only root may open
+        result.update(status='FAIL', detail=f'{node} is not writable: install the project\'s udev rule')
+        return result
 
     # NO start_new_session: testusb must stay in OUR process group so the caller's outer
     # killpg still reaps it.
@@ -417,11 +393,6 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
     try:
         out, _ = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        # Under sudo we only kill the wrapper; its root-owned testusb keeps the inherited
-        # stdout pipe, so the reap below times out and the overrun is reported as HUNG.
-        # Accepted rather than escalated: the rig's udev rules make the device node
-        # writable, so sudo is the exception, and the harness must never sudo-kill a pid
-        # it cannot prove is its own.
         try:
             p.kill()
         except OSError:
@@ -432,24 +403,22 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
             # SIGKILL had no effect: the child is in uninterruptible sleep on the DUT's
             # device lock or an in-kernel usbfs ioctl. A finite hold is reaped once it ends,
             # so watch the child for `wedge_confirm` before calling it a wedge
-            # (hathach/tinyusb#3944). Under sudo the child is the wrapper and reaps at once,
-            # which proves nothing.
-            if cmd[0] != 'sudo':
-                t0 = time.monotonic()
-                try:
-                    p.wait(timeout=wedge_confirm)
-                    waited = time.monotonic() - t0
-                    result.update(status='FAIL', dmesg=dmesg_tail(), late_cleared=True,
-                                  detail=f'timeout after {timeout}s (the kill landed '
-                                         f'{waited:.0f}s late; testusb reaped during the '
-                                         f'confirmation watch)')
-                    return result
-                except subprocess.TimeoutExpired:
-                    pass
+            # (hathach/tinyusb#3944).
+            t0 = time.monotonic()
+            try:
+                p.wait(timeout=wedge_confirm)
+                waited = time.monotonic() - t0
+                result.update(status='FAIL', dmesg=dmesg_tail(), late_cleared=True,
+                              detail=f'timeout after {timeout}s (the kill landed '
+                                     f'{waited:.0f}s late; testusb reaped during the '
+                                     f'confirmation watch)')
+                return result
+            except subprocess.TimeoutExpired:
+                pass
             result.update(status='HUNG', detail=f'testusb stuck in D state after {timeout}s',
                           dmesg=dmesg_tail())
-            # not JSON: the caller watches the child after its recovery step (sudo: cannot)
-            result['_proc'] = None if cmd[0] == 'sudo' else p
+            # not JSON: the caller watches the child after its recovery step
+            result['_proc'] = p
             return result
         result.update(status='FAIL', detail=f'timeout after {timeout}s', dmesg=dmesg_tail())
         return result
@@ -463,11 +432,6 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
     if m and int(m.group(1)) == num:
         result.update(status='FAIL', detail=f'errno {m.group(2)} ({m.group(3)})',
                       dmesg=dmesg_tail())
-        return result
-
-    if cmd[0] == 'sudo' and ('password is required' in out or 'a terminal is required' in out):
-        result.update(status='FAIL', detail='sudo needs a password to run testusb: the device node '
-                      'is not writable')
         return result
 
     # testusb prints '<speed> speed\t<node>\t<ifnum>' once it has opened the node
