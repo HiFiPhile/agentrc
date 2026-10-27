@@ -57,7 +57,6 @@ and a settings.local.json that is tracked or a link, refuse both actions;
 pruning leaves a tracked link alone.
 """
 import argparse
-import functools
 import json
 import os
 import re
@@ -74,6 +73,7 @@ KINDS = ('skill', 'agent', 'hook', 'workflow', 'bin')
 FLAGS = ('skill', 'agent', 'workflow', 'bin')  # hooks come with the skill of the same name
 STATUSLINE = {'type': 'command', 'command': 'bash "$HOME/.claude/statusline.sh"'}
 PROJECT = None  # --project: the work tree whose .claude takes the Claude entries
+ICASE = False  # --project: git matches PROJECT's names case-insensitively, as on a Windows or macOS file system
 SETTINGS_LOCAL = '.claude/settings.local.json'
 BLOCK = ('# >>> agentrc install.py --project: managed by its install and remove',
          '# <<< agentrc install.py --project')
@@ -375,7 +375,6 @@ def relative(dst):
     return dst.relative_to(PROJECT).as_posix()
 
 
-@functools.cache
 def ignorecase(top):
     """Whether git treats the work tree's names case-insensitively, as on a Windows or macOS file system."""
     return git(top, 'config', '--bool', 'core.ignorecase', check=False).stdout.strip() == b'true'
@@ -385,13 +384,13 @@ def tracked(rels):
     """The paths the repository tracks among rels and below them, matched as git matches names."""
     if not rels:
         return set()
-    magic = 'literal,icase' if ignorecase(PROJECT) else 'literal'
+    magic = 'literal,icase' if ICASE else 'literal'
     listed = git(PROJECT, 'ls-files', '-z', '--', *(f':({magic}){rel}' for rel in rels)).stdout
     return set(os.fsdecode(listed).split('\0')) - {''}
 
 
 def is_tracked(rel, listed):
-    if ignorecase(PROJECT):
+    if ICASE:
         rel, listed = rel.casefold(), {t.casefold() for t in listed}
     return any(t == rel or t.startswith(rel + '/') for t in listed)
 
@@ -461,22 +460,22 @@ def read_block(exclude):
         range(start + 2, end + 1)  # git's 1-based numbers of the lines between the markers
 
 
-def ignored_elsewhere(exclude, rel):
-    """Whether a pattern outside our block already ignores rel."""
+def ignored_elsewhere(exclude, block, rel):
+    """Whether a pattern outside our block, as read_block parsed it, already ignores rel."""
     done = git(PROJECT, 'check-ignore', '-v', '-z', '--no-index', '--stdin', check=False, stdin=os.fsencode(rel) + b'\0')
     if done.returncode:
         return False
     source, line, rule = os.fsdecode(done.stdout).split('\0')[:3]  # -z: no quoting of the source's path
     if rule.startswith('!'):
         return False
-    ours = canonical(PROJECT / source) == canonical(exclude) and int(line) in read_block(exclude)[2]
+    ours = canonical(PROJECT / source) == canonical(exclude) and int(line) in block[2]
     return not ours
 
 
-def write_exclude(exclude, trees, added):
+def write_exclude(exclude, block, trees, added):
     """Our block: its entries and the added ones, each kept while a work tree of the repository has our link there,
     not a link or file of the project's own."""
-    rest, entries, _ = read_block(exclude)
+    rest, entries, _ = block
     paths = {rel: pattern(rel) for rel in added}
     paths.update({re.sub(r'\\(.)', r'\1', e[1:]): e for e in entries})
     keep = [entry for rel, entry in sorted(paths.items())
@@ -575,9 +574,8 @@ def project_clashes(args, pairs):
 
 
 def main(argv=None):
-    global PROJECT
-    PROJECT = None
-    ignorecase.cache_clear()
+    global PROJECT, ICASE
+    PROJECT, ICASE = None, False
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('action', choices=('install', 'remove'))
     for kind in FLAGS:
@@ -599,7 +597,8 @@ def main(argv=None):
     chosen = selection(parser, args)
     if args.project:
         PROJECT, exclude, trees = work_tree(args.project)
-        read_block(exclude)  # a broken block refuses before any change
+        ICASE = ignorecase(PROJECT)
+        block = read_block(exclude)  # a broken block refuses before any change
     pairs = [(kind, pair) for kind, name in chosen for pair in links(kind, name)]
     orphaned = []
     if PROJECT:
@@ -631,7 +630,7 @@ def main(argv=None):
         if planned:
             write_settings(*planned)
         if PROJECT:
-            write_exclude(exclude, trees, [])
+            write_exclude(exclude, block, trees, [])
         return
 
     preflight([pair for _, pair in pairs])
@@ -648,8 +647,8 @@ def main(argv=None):
     if planned:
         write_settings(*planned)
     if PROJECT:
-        local = [] if ignored_elsewhere(exclude, SETTINGS_LOCAL) else [SETTINGS_LOCAL]
-        write_exclude(exclude, trees, [relative(dst) for _, (_, dst) in pairs] + local)
+        local = [] if ignored_elsewhere(exclude, block, SETTINGS_LOCAL) else [SETTINGS_LOCAL]
+        write_exclude(exclude, block, trees, [relative(dst) for _, (_, dst) in pairs] + local)
 
 
 if __name__ == '__main__':

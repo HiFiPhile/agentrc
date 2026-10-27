@@ -104,12 +104,6 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.claude / 'agents').exists())
         self.assertEqual(self.ok('install', '--skill'), '', 'a rerun is silent')
 
-    def test_each_run_reads_core_ignorecase_afresh(self):
-        install.ignorecase(ROOT)
-        with mock.patch.object(Path, 'home', return_value=self.home), contextlib.redirect_stdout(io.StringIO()):
-            install.main(['remove', '--workflow'])
-        self.assertEqual(install.ignorecase.cache_info().currsize, 0)
-
     def test_each_flag_covers_its_kind_and_a_skill_brings_its_hook(self):
         self.ok('install', '--skill', '--agent', '--workflow', '--bin', '--claude-md')
         self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), SKILLS)
@@ -435,10 +429,10 @@ class ProjectInstallTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def git(self, *args, cwd=None):
+    def git(self, *args, cwd=None, input=None):
         done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'user.name=t', '-c', 'user.email=t@t',
                                '-c', 'core.autocrlf=false', *args], cwd=cwd or self.repo, capture_output=True, text=True,
-                              env=self.env)
+                              env=self.env, input=input)
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout
 
@@ -766,6 +760,18 @@ class ProjectInstallTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn('tracked or a link', done.stderr)
 
+    def test_each_run_in_one_process_reads_core_ignorecase_afresh(self):
+        blob = self.git('hash-object', '-w', '--stdin', input='{"model": "team"}').strip()
+        self.git('update-index', '--add', '--cacheinfo', f'100644,{blob},.CLAUDE/settings.local.json')
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            self.git('config', 'core.ignorecase', 'false')
+            install.main(['install', '--project', str(self.repo), '--workflow'])  # another name to git
+            self.git('config', 'core.ignorecase', 'true')
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                install.main(['install', '--project', str(self.repo), '--workflow'])
+        self.assertIn('tracked or a link', err.getvalue())
+
     def test_a_tracked_or_linked_settings_local_file_refuses_before_any_change(self):
         def tracked(local, _):
             local.write_text('{"model": "team"}')
@@ -866,10 +872,8 @@ class ProjectInstallTest(unittest.TestCase):
                              (self.repo / '.claude' / 'hooks' / 'headless-chief' / 'shadow_guard.py').as_posix())
         payload = json.dumps({'tool_name': 'Workflow', 'cwd': str(self.repo)})
         bash = shutil.which('bash') if os.name == 'nt' else '/bin/sh'
-        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_') or k.startswith('GIT_CONFIG')}
         done = subprocess.run([bash, '-c', command], input=payload, capture_output=True, text=True,
-                              env={**env, 'CLAUDE_PROJECT_DIR': str(self.repo), 'HOME': str(self.home),
-                                   'USERPROFILE': str(self.home)})
+                              env={**self.env, 'CLAUDE_PROJECT_DIR': str(self.repo)})
         self.assertEqual(done.returncode, 0, done.stderr)
 
 
