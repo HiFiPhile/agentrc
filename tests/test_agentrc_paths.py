@@ -15,12 +15,13 @@ SCANNED = ('agents', 'skills', 'workflows', 'instructions', 'hooks', 'README.md'
 # A literal user-wide path to agentrc content misses a project install. Claude state (~/.claude/projects,
 # settings.json, transcripts) is no agentrc content and is not matched.
 USER_WIDE = re.compile(r'(?<!:-)(?:~|\$HOME)/\.(?:claude|codex)/(?:skills|agents|workflows|hooks)/[^\s`\'")]*')
+# allowed path -> the file prefixes it is allowed in ('' is every file)
 ALLOWED = {
     # captain is user-wide only (README, Per project): captain_guard.py allows these literal paths and rejects any
     # `$` form, and captain.md's hook, its SKILL.md recipes and user.md's captain rule run them
-    '/.claude/skills/captain/',
+    '/.claude/skills/captain/': ('',),
     # captain_guard.py's PUBLISHERS: the one followup-issue script captain runs, by the same literal-path rule
-    '/.claude/skills/followup-issue/scripts/publish.py',
+    '/.claude/skills/followup-issue/scripts/publish.py': ('skills/captain/', 'agents/captain.md'),
 }
 
 BASE = r'\$\{AGENTRC_DIR:-\$HOME/\.(?:claude|codex)\}'
@@ -58,7 +59,7 @@ class AgentrcPaths(unittest.TestCase):
     def test_content_is_named_through_agentrc_dir(self):
         bad = [f'{name}:{line_of(text, m.start())}: {m[0]}'
                for name, text in scanned() for m in USER_WIDE.finditer(text)
-               if not any(allowed in m[0] for allowed in ALLOWED)]
+               if not any(allowed in m[0] and name.startswith(files) for allowed, files in ALLOWED.items())]
         self.assertEqual(bad, [], 'name agentrc content as "${AGENTRC_DIR:-$HOME/.claude}/..." or allow it here')
 
     def test_every_expansion_is_quoted(self):
