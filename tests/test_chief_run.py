@@ -197,6 +197,16 @@ class ChiefRun(unittest.TestCase):
         self.assertFalse(lead.keys() & env.keys(), 'none of the lead session\'s identity reaches chief')
         self.assertEqual(env['CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS'], '0')
 
+    def test_chief_gets_the_shared_lead_session_filter_and_keeps_configuration(self):
+        # A chief launched from a Codex session or a coworker relay's command too.
+        self.stream(init(), result())
+        lead = {'CODEX_TOOL_CALL_ID': 'lead', 'COWORK_READ_ONLY': '1'}
+        kept = {'CLAUDE_CONFIG_DIR': str(self.root / 'config')}
+        self.assertEqual(self.run_it(**lead, **kept).returncode, 0)
+        env = json.loads((self.fake / 'env.json').read_text())
+        self.assertFalse(lead.keys() & env.keys())
+        self.assertEqual({k: env.get(k) for k in kept}, kept)
+
     def test_only_the_first_line_of_a_message_is_a_status_line(self):
         self.stream(
             init(),
