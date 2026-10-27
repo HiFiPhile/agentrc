@@ -104,6 +104,12 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.claude / 'agents').exists())
         self.assertEqual(self.ok('install', '--skill'), '', 'a rerun is silent')
 
+    def test_each_run_reads_core_ignorecase_afresh(self):
+        install.ignorecase(ROOT)
+        with mock.patch.object(Path, 'home', return_value=self.home), contextlib.redirect_stdout(io.StringIO()):
+            install.main(['remove', '--workflow'])
+        self.assertEqual(install.ignorecase.cache_info().currsize, 0)
+
     def test_each_flag_covers_its_kind_and_a_skill_brings_its_hook(self):
         self.ok('install', '--skill', '--agent', '--workflow', '--bin', '--claude-md')
         self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), SKILLS)
@@ -411,6 +417,10 @@ class ProjectInstallTest(unittest.TestCase):
         self.home, self.repo, self.wt = top / 'home', top / 'repo', top / 'wt'
         self.home.mkdir()
         self.repo.mkdir()
+        # git here and in install.py reads no user or system config: a global ignore would hide what a test commits
+        self.env = {**{k: v for k, v in os.environ.items() if not k.startswith('GIT_') and k != 'XDG_CONFIG_HOME'},
+                    'HOME': str(self.home), 'USERPROFILE': str(self.home), 'GIT_CONFIG_GLOBAL': os.devnull,
+                    'GIT_CONFIG_NOSYSTEM': '1'}
         self.git('init', '-q')
         own = self.repo / '.claude' / 'skills' / 'own-skill'
         own.mkdir(parents=True)
@@ -427,13 +437,13 @@ class ProjectInstallTest(unittest.TestCase):
 
     def git(self, *args, cwd=None):
         done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'user.name=t', '-c', 'user.email=t@t',
-                               '-c', 'core.autocrlf=false', *args], cwd=cwd or self.repo, capture_output=True, text=True)
+                               '-c', 'core.autocrlf=false', *args], cwd=cwd or self.repo, capture_output=True, text=True,
+                              env=self.env)
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout
 
     def run_cli(self, *argv):
-        return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True,
-                              env={**os.environ, 'HOME': str(self.home), 'USERPROFILE': str(self.home)})
+        return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, env=self.env)
 
     def ok(self, *argv):
         done = self.run_cli(*argv)
@@ -444,7 +454,7 @@ class ProjectInstallTest(unittest.TestCase):
         return json.loads(((tree or self.repo) / '.claude' / 'settings.local.json').read_text(encoding='utf-8'))
 
     def block(self):
-        lines = self.exclude.read_text().splitlines()
+        lines = self.exclude.read_bytes().decode('utf-8', 'surrogateescape').split('\n')
         if install.BLOCK[0] not in lines:
             return None
         return lines[lines.index(install.BLOCK[0]) + 1:lines.index(install.BLOCK[1])]
@@ -453,7 +463,7 @@ class ProjectInstallTest(unittest.TestCase):
         return self.git('status', '--short', '--untracked-files=all', cwd=tree)
 
     def snapshot(self):
-        return sorted(str(p) for p in Path(self.tmp.name).rglob('*') if '.git' not in p.parts), self.exclude.read_text()
+        return sorted(str(p) for p in Path(self.tmp.name).rglob('*') if '.git' not in p.parts), self.exclude.read_bytes()
 
     def test_entries_link_into_the_work_tree_and_nothing_user_wide(self):
         out = self.ok('install', '--project', str(self.repo), '--skill', '--agent', '--workflow')
@@ -580,9 +590,13 @@ class ProjectInstallTest(unittest.TestCase):
             cache.mkdir(parents=True)
             (cache / 'x.cpython-312.pyc').write_bytes(b'')
 
+        def empty_directories_only():
+            (self.repo / '.claude' / 'skills' / SKILL / 'scripts' / '__pycache__').mkdir(parents=True)
+
         cases = {'a tracked skill': (tracked_skill, 'is tracked'), 'a tracked symlink': (tracked_link, 'is tracked'),
                  'an untracked real file': (untracked_workflow, 'real file'),
-                 'a leftover bytecode cache': (bytecode_only, 'bytecode caches')}
+                 'a leftover bytecode cache': (bytecode_only, 'bytecode caches'),
+                 'empty directories only': (empty_directories_only, 'real file or directory')}
         for case, (arrange, why) in cases.items():
             with self.subTest(case):
                 self.tearDown()
@@ -645,6 +659,91 @@ class ProjectInstallTest(unittest.TestCase):
         self.assertTrue(os.path.samefile(hook, own_hook), 'the project\'s hook link untouched')
         self.assertIn(command, TestCommands.of(self.local())['PreToolUse'], 'and its registration')
 
+    def test_an_install_that_skips_every_entry_writes_nothing(self):
+        for case in ('no settings yet', 'settings from an earlier install'):
+            with self.subTest(case):
+                self.tearDown()
+                self.setUp()
+                local = self.repo / 'CLAUDE.local.md'
+                if case == 'settings from an earlier install':
+                    self.ok('install', '--project', str(self.repo), '--claude-md')
+                    local.unlink()
+                local.write_text('the user\'s own')
+                settings = self.repo / '.claude' / 'settings.local.json'
+                before = self.snapshot(), settings.read_bytes() if settings.exists() else None
+                self.assertIn('skipped', self.ok('install', '--project', str(self.repo), '--claude-md', '--skip-clashes'))
+                self.assertEqual((self.snapshot(), settings.read_bytes() if settings.exists() else None), before,
+                                 'no settings.local.json or exclude change')
+
+    @unittest.skipIf(os.name == 'nt' or os.geteuid() == 0, 'needs a directory the user cannot write into')
+    def test_an_exclude_file_in_a_read_only_info_directory_is_rewritten_in_place(self):
+        info = self.exclude.parent
+        info.chmod(0o555)
+        try:
+            self.ok('install', '--project', str(self.repo), '--workflow')
+        finally:
+            info.chmod(0o755)
+        self.assertIn('/.claude/workflows/pr-babysit.js', self.block())
+        self.assertEqual(self.status(), '')
+
+    def test_a_malformed_block_refuses_before_any_change(self):
+        start, end = install.BLOCK
+        cases = {'a start without an end': [start, '/x'], 'an end without a start': ['/x', end],
+                 'a repeated start': [start, start, '/x', end], 'an end before its start': [end, '/x', start],
+                 'two blocks': [start, '/x', end, start, '/y', end]}
+        for case, block in cases.items():
+            with self.subTest(case):
+                self.exclude.write_text('# the user\'s own\n' + ''.join(f'{line}\n' for line in block) + '*.after\n')
+                before = self.snapshot()
+                for action in ('install', 'remove'):
+                    done = self.run_cli(action, '--project', str(self.repo), '--workflow')
+                    self.assertEqual(done.returncode, 1, action)
+                    self.assertIn(os.path.join('info', 'exclude'), done.stderr)
+                self.assertEqual(self.snapshot(), before, 'no link made, no line lost')
+
+    def test_the_exclude_file_is_read_as_git_numbers_its_lines(self):
+        start, end = install.BLOCK
+        rule = b'.claude/settings.local.json\n'  # the user's, after our block
+        cases = {'characters str.splitlines also splits on': b'# own\nv\x0bt\x0cf\n',  # 2 lines more would make it ours
+                 'bytes that are not UTF-8': b'# caf\xe9\n'}
+        for case, own in cases.items():
+            with self.subTest(case):
+                self.tearDown()
+                self.setUp()
+                self.exclude.write_bytes(own + f'{start}\n/.claude/workflows/pr-babysit.js\n{end}\n'.encode() + rule)
+                self.ok('install', '--project', str(self.repo), '--workflow')
+                data = self.exclude.read_bytes()
+                self.assertTrue(data.startswith(own) and rule[:-1] in data.split(b'\n'),
+                                'the user\'s lines kept byte for byte')
+                self.assertNotIn('/.claude/settings.local.json', self.block(), 'the user\'s rule already ignores it')
+                self.assertEqual(self.status(), '')
+
+    def test_an_entry_goes_once_no_work_tree_has_our_link_there(self):
+        self.ok('install', '--project', str(self.repo), '--workflow')
+        workflow = self.repo / '.claude' / 'workflows' / 'pr-babysit.js'
+        workflow.unlink()
+        os.symlink(Path(self.tmp.name) / 'own.js', workflow)  # the project's own link now
+        self.ok('install', '--project', str(self.repo), '--skill')
+        self.assertNotIn('/.claude/workflows/pr-babysit.js', self.block())
+        self.assertIn('.claude/workflows/pr-babysit.js', self.status(), 'the project\'s own link shows')
+
+    def test_a_project_install_changes_nothing_outside_the_work_tree_and_its_git_dir(self):
+        other = Path(self.tmp.name) / 'other'
+        other.mkdir()
+        self.git('init', '-q', cwd=other)
+        (other / 'file').write_text('x')
+
+        def outside():
+            return {str(p): p.read_bytes() if p.is_file() else None for p in Path(self.tmp.name).rglob('*')
+                    if not p.is_relative_to(self.repo)}
+
+        before = outside()
+        self.ok('install', '--project', str(self.repo), '--skill', '--agent', '--workflow', '--claude-md')
+        self.assertEqual(outside(), before)
+        self.ok('remove', '--project', str(self.repo), '--skill', '--agent', '--workflow', '--claude-md')
+        self.assertEqual(outside(), before)
+        self.assertEqual(os.listdir(self.home), [])
+
     @unittest.skipUnless(os.name == 'nt', 'a junction is Windows\' own link')
     def test_a_junction_on_the_way_refuses_before_any_change(self):
         elsewhere = Path(self.tmp.name) / 'elsewhere'
@@ -660,7 +759,7 @@ class ProjectInstallTest(unittest.TestCase):
         if self.git('config', '--bool', '--default', 'false', 'core.ignorecase').strip() != 'true':
             self.skipTest('git matches names case-sensitively here')
         blob = subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=self.repo, input='{"model": "team"}',
-                              capture_output=True, text=True, check=True).stdout.strip()
+                              capture_output=True, text=True, check=True, env=self.env).stdout.strip()
         self.git('update-index', '--add', '--cacheinfo', f'100644,{blob},.CLAUDE/settings.local.json')  # tracked in other case
         (self.repo / '.claude' / 'settings.local.json').write_text('{"model": "team"}')
         done = self.run_cli('install', '--project', str(self.repo), '--workflow')

@@ -47,7 +47,8 @@ herdr are user-wide, so --project refuses their flags. Each link, and
 settings.local.json unless git already ignores it, is an entry of one marked
 block in the repository's exclude file (`git rev-parse --git-common-dir`/info/
 exclude), which every worktree shares: an entry stays while any worktree of
-the repository has it, so `git status` stays clean. A destination the
+the repository has our link there, so `git status` stays clean, and a broken
+block (a marker missing, repeated or out of order) refuses. A destination the
 repository tracks, or a real file or nonempty directory there such as the
 project's own skill of that name, refuses before any change; --skip-clashes
 leaves it and skips that entry, and its hook's registration with it, and a
@@ -425,7 +426,8 @@ def clashes(pairs):
             found[dst] = 'is tracked by the repository'
         elif dst.is_symlink() or not dst.exists() or (dst.is_dir() and not any(dst.iterdir())):
             continue
-        elif dst.is_dir() and all('__pycache__' in p.relative_to(dst).parts for p in dst.rglob('*') if p.is_file()):
+        elif dst.is_dir() and (files := [p for p in dst.rglob('*') if p.is_file()]) and \
+                all('__pycache__' in p.relative_to(dst).parts for p in files):
             found[dst] = 'holds only Python bytecode caches, left by an earlier copy of the project; delete it'
         else:
             found[dst] = 'is a real file or directory'
@@ -437,14 +439,25 @@ def pattern(rel):
     return '/' + re.sub(r'([][*?\\])', r'\\\1', rel)
 
 
+def read_exclude(exclude):
+    """The exclude file's lines as git numbers them, split on \\n only; bytes that are not UTF-8 survive a rewrite."""
+    text = exclude.read_bytes().decode('utf-8', 'surrogateescape') if exclude.exists() else ''
+    lines = text.split('\n')
+    return lines[:-1] if lines[-1] == '' else lines
+
+
 def read_block(exclude):
-    """(the exclude file's lines outside our block, the block's entries, the block's line range)."""
-    lines = exclude.read_text(encoding='utf-8').splitlines() if exclude.exists() else []
-    if BLOCK[0] not in lines:
+    """(the exclude file's lines outside our block, the block's entries, the block's line range); refuses a block
+    whose markers are missing, repeated or out of order, which a rewrite would lose the user's lines to."""
+    lines = read_exclude(exclude)
+    bare = [line.removesuffix('\r') for line in lines]
+    starts, ends = ([i for i, line in enumerate(bare) if line == mark] for mark in BLOCK)
+    if not starts and not ends:
         return lines, [], range(0)
-    start = lines.index(BLOCK[0])
-    end = lines.index(BLOCK[1], start) if BLOCK[1] in lines[start:] else len(lines)
-    return lines[:start] + lines[end + 1:], [line for line in lines[start + 1:end] if line.startswith('/')], \
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        refuse(f'{exclude} has a broken agentrc block: each marker line must appear once, in order; fix it first')
+    start, end = starts[0], ends[0]
+    return lines[:start] + lines[end + 1:], [line for line in bare[start + 1:end] if line.startswith('/')], \
         range(start + 2, end + 1)  # git's 1-based numbers of the lines between the markers
 
 
@@ -461,18 +474,19 @@ def ignored_elsewhere(exclude, rel):
 
 
 def write_exclude(exclude, trees, added):
-    """Our block: its entries and the added ones, each kept while a work tree of the repository has it."""
+    """Our block: its entries and the added ones, each kept while a work tree of the repository has our link there,
+    not a link or file of the project's own."""
     rest, entries, _ = read_block(exclude)
     paths = {rel: pattern(rel) for rel in added}
     paths.update({re.sub(r'\\(.)', r'\1', e[1:]): e for e in entries})
     keep = [entry for rel, entry in sorted(paths.items())
-            if any((tree / rel).is_file() if rel == SETTINGS_LOCAL else (tree / rel).is_symlink() for tree in trees)]
+            if any((tree / rel).is_file() if rel == SETTINGS_LOCAL else ours(tree / rel) for tree in trees)]
     lines = rest + ([BLOCK[0], *keep, BLOCK[1]] if keep else [])
-    after = '\n'.join(lines) + '\n' if lines else ''
-    if after == (exclude.read_text(encoding='utf-8') if exclude.exists() else ''):
+    after = ('\n'.join(lines) + '\n' if lines else '').encode('utf-8', 'surrogateescape')
+    if after == (exclude.read_bytes() if exclude.exists() else b''):
         return
     exclude.parent.mkdir(parents=True, exist_ok=True)
-    exclude.write_text(after, encoding='utf-8', newline='\n')
+    exclude.write_bytes(after)
     print(f'updated {exclude}')
 
 
@@ -563,6 +577,7 @@ def project_clashes(args, pairs):
 def main(argv=None):
     global PROJECT
     PROJECT = None
+    ignorecase.cache_clear()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('action', choices=('install', 'remove'))
     for kind in FLAGS:
@@ -584,11 +599,14 @@ def main(argv=None):
     chosen = selection(parser, args)
     if args.project:
         PROJECT, exclude, trees = work_tree(args.project)
+        read_block(exclude)  # a broken block refuses before any change
     pairs = [(kind, pair) for kind, name in chosen for pair in links(kind, name)]
     orphaned = []
     if PROJECT:
         contained([dst for _, (_, dst) in pairs] + [settings()])
         pairs, orphaned = project_clashes(args, pairs)
+        if args.action == 'install' and not pairs:  # every entry skipped: no AGENTRC_DIR or exclude entry for none
+            return
     herdr_steps = plan_herdr(args.action == 'install') if args.herdr_plugin else []
     hooks = [dst.name for kind, (_, dst) in pairs if kind == 'hook']  # a skipped hook's link is not registered
     planned = None
