@@ -1,7 +1,7 @@
 export const meta = {
   name: 'pr-babysit',
   description: 'Drive a PR to green: validate bot review findings, fix, verify, push and reply, overlapped with a CI watch-and-judge lane',
-  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true, or yieldOnChange: true to pause only after a cycle that needs it, and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: ${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/ARGUMENTS.md.',
+  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true, or yieldOnChange: true to pause only after a cycle that needs it, and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: ${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/ARGUMENTS.md, expanded in the shell before reading.',
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 

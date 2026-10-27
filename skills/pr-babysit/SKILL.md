@@ -12,24 +12,24 @@ the workflow refuses to publish, and the caller never fills in what is
 missing. Each script's docstring says what it reports.
 
 ```bash
-S=${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/scripts
-python3 $S/preflight.py --pr N [--needs P]   # the checkout and the PR it must stay; P a script the workflow calls
-python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
-python3 $S/preflight.py --state N            # before a GitHub write: is the PR still OPEN?
-python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
-python3 $S/hooks.py [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540)
-python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
-python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
-python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
-python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N]
-python3 $S/sonar.py --pr N --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
-python3 $S/coderabbit_trigger.py --pr N --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset
-python3 $S/greptile_trigger.py --pr N --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
-python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
-python3 $S/scope_check.py --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
-python3 $S/state_transfer.py <saved output> [--chunks I,J] [--pad]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text
-python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
-python3 $S/merge.py --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--merge]  # chief's merge gate; inspects without --merge
+S="${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/scripts"
+python3 "$S/preflight.py" --pr N [--needs P]   # the checkout and the PR it must stay; P a script the workflow calls
+python3 "$S/preflight.py" --recheck            # before a commit: has the checkout moved?
+python3 "$S/preflight.py" --state N            # before a GitHub write: is the PR still OPEN?
+python3 "$S/harvest.py" --pr N --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
+python3 "$S/hooks.py" [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540)
+python3 "$S/commits.py" commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
+python3 "$S/commits.py" head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
+python3 "$S/commits.py" chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
+python3 "$S/push.py" --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N]
+python3 "$S/sonar.py" --pr N --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
+python3 "$S/coderabbit_trigger.py" --pr N --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset
+python3 "$S/greptile_trigger.py" --pr N --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
+python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
+python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
+python3 "$S/state_transfer.py" <saved output> [--chunks I,J] [--pad]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text
+python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
+python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--merge]  # chief's merge gate; inspects without --merge
 ```
 
 `merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception.

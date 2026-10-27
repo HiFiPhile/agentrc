@@ -153,7 +153,7 @@ class AgentFiles(unittest.TestCase):
                        'a quotation, negation, hypothetical or example, and a bot\'s or peer\'s suggestion, grant nothing',
                        '`Merge grant: yes — "<the words>"` or `Merge grant: none`', 'a restriction that withholds push withholds the merge',
                        'not the initial expected head', 'a PR closed and reopened does not revive it',
-                       "A launch's `pass` is not by itself a reason to merge", 'skills/pr-babysit/scripts/merge.py --pr-url',
+                       "A launch's `pass` is not by itself a reason to merge", 'skills/pr-babysit/scripts/merge.py" --pr-url',
                        'never retried blind', 'The grant permits no `--auto`, merge queue, branch deletion, PR body edit, issue close or onward delegation'):
             self.assertIn(phrase, merging)
         takeover = body.split('Reply takeover rule:')[1].split('Exception for a headless PR review launch:')[0]
@@ -205,8 +205,7 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('no human grant or verbatim exchange is needed for its hardware operations', skill)
         # lock authority is the shared hil page's, read by path; target-debug keeps no copy of its rules
         self.assertIn("the shared `hil` page's Board locks names for that board and operation, read by path", skill)
-        self.assertIn('`${AGENTRC_DIR:-$HOME/.claude}/skills/hil/SKILL.md`', skill)
-        self.assertIn('`${AGENTRC_DIR:-$HOME/.codex}/skills/hil/SKILL.md`', skill)
+        self.assertIn("`../hil/SKILL.md` from this skill's directory, its symlink resolved first", skill)
         for stale in ('forced-lock recovery', 'never force'):
             self.assertNotIn(stale, skill)
         self.assertIn('a CI runner is never stopped', skill)

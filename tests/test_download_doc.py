@@ -718,7 +718,7 @@ class AddOne(unittest.TestCase):
             'identifiers': {'nordic': 'PS1234'}, 'publisher': 'Nordic Semiconductor',
             'comments': f'\n\nDocument ID: PS1234\nRevision: 1.4\nSource: {self.URL}'}])
         self.assertIn('IMPORTED #1 nordic:PS1234', out)
-        self.assertIn('locate.py build --all', out)
+        self.assertIn('locate.py" build --all', out)
 
     def test_an_identifier_already_filed_is_refused_before_any_download(self):
         self.library = FakeCalibre({'id': 7, 'title': 'PS1234 old', 'authors': 'Nordic Semiconductor',

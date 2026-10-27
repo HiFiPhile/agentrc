@@ -11,8 +11,8 @@ with a status line (the rule in `agents/chief.md`); the script copies those
 first lines to `progress.log`, so the caller tails a file.
 
 ```bash
-R=${AGENTRC_DIR:-$HOME/.claude}/skills/headless-chief/scripts/chief_run.py
-python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
+R="${AGENTRC_DIR:-$HOME/.claude}/skills/headless-chief/scripts/chief_run.py"
+python3 "$R" --out <new dir> --worktree <task worktree> --task-file <task.md> \
   --permission-mode bypassPermissions
 ```
 
