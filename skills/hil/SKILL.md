@@ -205,9 +205,10 @@ recovery stay the contract's. Linux only.
   A J-Link session can exit 0 with every command failed: `jlink_problem(op)`
   judges its last attempt, each command from its own output chunk against the
   command file it ran (`jlink_judgment`, from recorded transcripts; an
-  unknown command or output shape fails). `esptool_problem(op)` does the same
-  for `flash_esptool` against the offsets its last attempt wrote (each written
-  once, verified, then the hard reset), `esptool_runtime()` the esptool the flash and its helper sessions run (one
+  unknown command or output shape fails). `esptool_problem(op)` judges a
+  `flash_esptool` by its last attempt's exit status and the known failures
+  esptool exits 0 on (a refused reset, a skipped empty image),
+  `esptool_runtime()` the esptool the flash and its helper sessions run (one
   package, the one `scripts/esptool_session.py` imports too, its version), and `esptool_port(uid)` the one tty for
   a probe serial, refusing an ambiguous or missing one.
 - A flash or reset returns an `Operation`: the last run's `CompletedProcess`
@@ -320,6 +321,7 @@ recovery stay the contract's.
 | `hil_report_core.py` | the report document: `_hil` metadata and roster identity, attempt archive, withdrawal and publish recovery, adopting a fetched report, the Markdown view, run and sequence verdicts |
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
 | `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
+| `hil_root.py` | every root operation of the usbtest and TT scripts, one checked verb each; a rig grants its CI user sudo on its installed copy (`/usr/local/sbin/hil_root`), and separately on `/usr/local/sbin/usb_recover` for `hil_reserve.py run` recovery |
 | `hil_usbtest.py` | usbtest binding, the device under test by serial (`find_device`), and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 

@@ -403,6 +403,77 @@ class CoworkTest(unittest.TestCase):
         code, out, _ = self.run_cli('reset', 'codex', 'review', '--read-only')  # a hint followed twice
         self.assertEqual((code, out.strip()), (0, 'codex/review: no session'))
 
+    def test_the_relays_marker_holds_send_and_reset_to_read_only_lanes_whatever_the_flags(self):
+        # The coworker agent's hook exports it: a relay that leaves out --read-only, or follows a prompt
+        # naming a writable lane, still reaches only read-only lanes.
+        self.commit('a.txt', 'a')
+        self.send('--task', 'a')
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
+        ran = len(self.calls())
+        with mock.patch.dict('os.environ', {cowork.READ_ONLY: '1'}):
+            for argv, why in ((('--task', 'b'), 'main is this checkout and writable'),
+                              (('--lane', 'impl', '--task', 'y'), 'codex/impl is a worktree lane'),
+                              (('--lane', 'new', '--worktree', '--task', 'z'), f'{cowork.READ_ONLY} is set')):
+                code, _, _, err = self.send(*argv)
+                self.assertEqual(code, cowork.BUSY, argv)
+                self.assertIn(why, err)
+            self.assertEqual(len(self.calls()), ran)
+            self.assertFalse(self.box(lane='new').exists())
+            for lane, what in (('main', 'main'), ('impl', 'worktree')):
+                code, _, err = self.run_cli('reset', 'codex', lane)
+                self.assertEqual(code, cowork.BUSY, lane)
+                self.assertIn(f'codex/{lane} is {what}, not read-only', err)
+                self.assertTrue((self.box(lane=lane) / 'session').exists(), lane)
+            code, _, err = self.run_cli('reset', 'codex', 'all')
+            self.assertEqual(code, cowork.FAILED)
+            self.assertIn('not all', err)
+            code, _, _, err = self.send('--lane', 'review', '--task', 'q')
+            self.assertEqual(code, 0, err)
+            self.assertIn('Scope: do not edit anything', self.calls()[-1]['stdin'])
+            code, out, _ = self.run_cli('reset', 'codex', 'review')
+            self.assertEqual((code, out.strip()), (0, 'codex/review: session forgotten'))
+        self.assertTrue((self.root / '.worktrees' / 'cowork-codex-impl').exists())
+
+    def test_an_empty_relay_marker_is_still_the_marker(self):
+        with mock.patch.dict('os.environ', {cowork.READ_ONLY: ''}):
+            code, _, _, err = self.send('--task', 'b')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('main is this checkout and writable', err)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_relays_marker_kills_only_a_read_only_lanes_request_checked_under_its_lock(self):
+        main_proc, writable = self.send_gated('--task', 'slow')
+        review_proc, request = self.send_gated('--lane', 'review', '--task', 'slow')
+        review = self.box(lane='review')
+        self.started(writable)
+        until(lambda: cowork.cli_pid(review / f'{request}.lock') != '')
+        real = cowork.admission
+
+        @contextlib.contextmanager
+        def replaced(box):  # the lane remade as a worktree lane between the request's lookup and the lock
+            (box / 'read-only').unlink()
+            (box / 'base').write_text('0' * 40 + '\n')
+            with real(box):
+                yield
+
+        with mock.patch.dict('os.environ', {cowork.READ_ONLY: '1'}):
+            code, _, err = self.run_cli('kill', writable)
+            self.assertEqual(code, cowork.BUSY)
+            self.assertIn(f'codex/main is main, not read-only; not killing {writable}', err)
+            with mock.patch.object(cowork, 'admission', replaced):
+                code, _, err = self.run_cli('kill', request)
+            self.assertEqual(code, cowork.BUSY)
+            self.assertIn('codex/review is worktree, not read-only', err)
+            self.assertEqual(cowork.state(self.box(), writable), 'running')
+            self.assertEqual(cowork.state(review, request), 'running')
+            (review / 'base').unlink()
+            (review / 'read-only').touch()
+            code, out, _ = self.run_cli('kill', request)
+            self.assertEqual((code, out.strip()), (0, f'{request}: killed'))
+        review_proc.wait(timeout=30)
+        self.gate.touch()
+        main_proc.wait(timeout=30)
+
     # --- model and effort ---------------------------------------------------------
 
     def test_a_new_lane_starts_at_its_sides_default_whatever_drives_it(self):
@@ -656,6 +727,18 @@ class CoworkTest(unittest.TestCase):
         call = self.calls()[0]
         self.assertEqual(call['cwd'], str(self.root))
         self.assertEqual(set(call['env']), {'COWORK_TURN'}, 'no HERDR_* and no CLAUDECODE reach the coworker')
+
+    def test_the_coworker_gets_the_shared_lead_session_filter_and_keeps_configuration(self):
+        seen = Path(self.tmp.name) / 'env.json'
+        self.codex_does(f"open({str(seen)!r}, 'w').write(json.dumps(dict(os.environ)))")
+        lead = {'CLAUDE_PID': 'lead', cowork.READ_ONLY: '1'}
+        kept = {'CLAUDE_CONFIG_DIR': str(Path(self.tmp.name) / 'config')}
+        code, request, _, err = self.send('--lane', 'review', '--task', 'x', **lead, **kept)
+        self.assertEqual(code, 0, err)
+        env = json.loads(seen.read_text())
+        self.assertFalse(lead.keys() & env.keys(), 'the relay\'s marker included')
+        self.assertEqual({k: env.get(k) for k in kept}, kept)
+        self.assertEqual((env['COWORK_TURN'], env['CODEX_HOME']), (request, os.environ['CODEX_HOME']))
 
     def test_task_sources(self):
         task = self.root / 'task.md'
@@ -1879,6 +1962,25 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, cowork.BUSY)
         self.assertIn('has no record of its base', err)
         self.assertEqual(len(self.calls()), ran)
+        code, _, err = self.run_cli('reset', 'codex', 'impl', '--read-only')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('codex/impl is kindless, not read-only', err)
+        self.assertTrue((self.root / '.worktrees' / 'cowork-codex-impl').exists())
+
+    def test_a_read_only_reset_refuses_a_kindless_lane_holding_a_session_or_a_request(self):
+        self.commit('a.txt', 'a')
+        self.send('--lane', 'review', '--task', 'x')
+        request = self.send('--lane', 'pending', '--detach', '--task', 'y')[1]
+        until(lambda: not cowork.held(self.box(lane='pending') / f'{request}.lock'))
+        (self.box(lane='pending') / 'session').unlink()
+        for lane, kept in (('review', 'session'), ('pending', f'{request}.lock')):
+            box = self.box(lane=lane)
+            (box / 'read-only').unlink()
+            self.assertEqual(sorted(p.name for p in box.iterdir() if p.name in ('session', f'{request}.lock')), [kept])
+            code, _, err = self.run_cli('reset', 'codex', lane, '--read-only')
+            self.assertEqual(code, cowork.BUSY, lane)
+            self.assertIn(f'codex/{lane} is kindless, not read-only', err)
+            self.assertTrue((box / kept).exists(), lane)
 
     def test_the_recorded_base_is_the_commit_the_worktree_was_made_from(self):
         base = self.commit('a.txt', 'a')

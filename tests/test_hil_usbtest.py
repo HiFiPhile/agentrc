@@ -1,6 +1,6 @@
 """skills/hil/scripts/hil_usbtest.py is the usbtest/testusb mechanism the HIL harnesses share,
 moved from tinyusb's test/hil/usbtest.py with its mechanism tests (test_hil_usbtest_id.py,
-test_hil_usbtest_verdict.py, and test_hil_bounded.py's run/sudo/sysfs_write/reap classes):
+test_hil_usbtest_verdict.py, and test_hil_bounded.py's run/sysfs_write/reap classes):
 loading and binding, the exact testusb argv, timeout and reap, result
 parsing and the host check. A fake testusb prints kernel tools/usb/testusb.c's own strings;
 sysfs is a temp tree. The kernel side is proved by a rig run."""
@@ -73,8 +73,8 @@ class Binding(unittest.TestCase):
         patch(self, hu, 'SYS_USB', self.sys_usb)
         patch(self, hu, 'DRIVER', self.driver)
         patch(self, hu, 'run', self.run_child)
-        patch(self, hu, '_sudo_soft', self.sudo_soft)
-        patch(self, hu, 'needs_sudo', lambda node: False)
+        patch(self, hu, '_root_soft', self.root_soft)
+        patch(self, hu, 'node_writable', lambda node: True)
         patch(self, hu, 'dmesg_tail', lambda: 'usbtest dmesg')
         patch(self, hu.platform, 'system', lambda: 'Linux')
         patch(self, hu.platform, 'machine', lambda: 'x86_64')
@@ -90,11 +90,11 @@ class Binding(unittest.TestCase):
             self.bind(self.attach)
         return subprocess.CompletedProcess(cmd, self.rc, '', errno.errorcode.get(self.rc, '') if self.rc else '')
 
-    def sudo_soft(self, cmd, **kw):
-        self.helpers.append(cmd)
-        if cmd == ['modprobe', 'usbtest']:
+    def root_soft(self, *cmd, **kw):
+        self.helpers.append(list(cmd))
+        if cmd == ('modprobe',):
             self.driver.mkdir(parents=True, exist_ok=True)
-        return subprocess.CompletedProcess(cmd, 0, '', '')
+        return subprocess.CompletedProcess(list(cmd), 0, '', '')
 
     def exit_of(self):
         with self.assertRaises(SystemExit) as cm:
@@ -112,12 +112,14 @@ class Binding(unittest.TestCase):
         self.assertEqual(self.runs, [([sys.executable, '-I', script, 'connect', self.NODE, '1-1:1.0'],
                                       hu.CONNECT_TIMEOUT)])
 
-    def test_an_unwritable_node_runs_the_child_through_sudo(self):
-        patch(self, hu, 'needs_sudo', lambda node: True)
-        sudoed = []
-        patch(self, hu, 'sudo', lambda cmd, **kw: sudoed.append(cmd) or self.run_child(cmd, **kw))
-        hu.ensure_usbtest_bound('1-1:1.0', self.NODE)
-        self.assertEqual(sudoed, [self.runs[0][0]])
+    def test_an_unwritable_node_is_a_named_exit_before_any_load_or_connect(self):
+        patch(self, hu, 'node_writable', lambda node: False)
+        for bound in (False, True):
+            with self.subTest(bound=bound):
+                if bound:
+                    self.bind('usbtest')
+                self.assertIn(f'{self.NODE} is not writable', self.exit_of())
+                self.assertEqual((self.runs, self.helpers), ([], []))
 
     def test_an_unknown_ioctl_abi_is_refused_before_any_child(self):
         patch(self, hu.platform, 'machine', lambda: 'ppc64le')
@@ -157,11 +159,11 @@ class Binding(unittest.TestCase):
     def test_loads_the_module_when_missing(self):
         shutil.rmtree(self.driver)
         hu.ensure_usbtest_bound('1-1:1.0', self.NODE)
-        self.assertEqual(self.helpers, [['modprobe', 'usbtest']])
+        self.assertEqual(self.helpers, [['modprobe']])
 
     def test_a_module_that_will_not_load_is_a_named_exit(self):
         shutil.rmtree(self.driver)
-        patch(self, hu, '_sudo_soft', lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, '', 'not found'))
+        patch(self, hu, '_root_soft', lambda *cmd, **kw: subprocess.CompletedProcess(list(cmd), 1, '', 'not found'))
         self.assertIn('cannot load usbtest module: not found', self.exit_of())
         self.assertEqual(self.runs, [])
 
@@ -221,7 +223,7 @@ class UsbfsConnect(unittest.TestCase):
         self.assertIn('usage: hil_usbtest.py connect NODE INTERFACE', r.stderr)
 
     def test_the_child_runs_from_this_file_alone(self):
-        # stdlib only, as under sudo: no hil_load bootstrap, no sibling module (setUp's fstat
+        # stdlib only: no hil_load bootstrap, no sibling module (setUp's fstat
         # patch is process-wide, so the copy is a plain read and write)
         alone = self.root / 'alone'
         alone.mkdir()
@@ -238,10 +240,10 @@ class Pattern(unittest.TestCase):
         self.param = Path(td.name) / 'pattern'
         self.writes = []
         patch(self, hu, 'PATTERN_PARAM', self.param)
-        patch(self, hu, 'sysfs_write', lambda path, data: self.writes.append((path, data)))
+        patch(self, hu, 'sysfs_write', lambda verb, *args: self.writes.append((verb, *args)))
 
     def test_written_only_when_it_differs(self):
-        for current, writes in (('0\n', []), ('1\n', [(self.param, '0')])):
+        for current, writes in (('0\n', []), ('1\n', [('pattern', '0')])):
             self.writes.clear()
             self.param.write_text(current)
             hu.set_pattern(0)
@@ -276,13 +278,13 @@ class RunCase(unittest.TestCase):
             f.write(FAKE_TESTUSB)
         os.chmod(self.testusb, stat.S_IRWXU)
         patch(self, hu, 'dmesg_tail', lambda: 'dmesg')
-        patch(self, hu, 'needs_sudo', lambda node: False)
+        patch(self, hu, 'node_writable', lambda node: True)
         for name in ('FAKE_OUT', 'FAKE_RC', 'FAKE_SLEEP'):
             self.addCleanup(os.environ.pop, name, None)
 
     def case(self, out, num=1, rc=0, timeout=30, sleep=0):
         os.environ['FAKE_OUT'], os.environ['FAKE_RC'], os.environ['FAKE_SLEEP'] = out, str(rc), str(sleep)
-        return hu.run_case(self.testusb, NODE, num, ['-c', '1'], timeout, wedge_confirm=30, sudo_forbidden=False)
+        return hu.run_case(self.testusb, NODE, num, ['-c', '1'], timeout, wedge_confirm=30)
 
     def test_pass_line(self):
         r = self.case(SPEED + '%s test %d,    3.004567 secs\n')   # "%s test %d, %4d.%.06d secs"
@@ -325,7 +327,7 @@ class ScanScope(unittest.TestCase):
     """testusb -D alone still ftw()s and opens every usbfs node; -A <node> scans only the DUT
     (#4047). -A falls through to -a and clears -D, so it must come first."""
 
-    def argv(self, node, sudo, params=('-c', '1')):
+    def argv(self, node, params=('-c', '1')):
         cmds = []
 
         class Popen:
@@ -337,44 +339,41 @@ class ScanScope(unittest.TestCase):
                 return '', None
 
         with mock.patch.object(hu.subprocess, 'Popen', Popen), \
-                mock.patch.object(hu.os, 'access', lambda p, m: not sudo), \
-                mock.patch.object(hu.os, 'geteuid', lambda: 1000):
-            hu.run_case('/x/testusb', node, 0, list(params), 30, wedge_confirm=30, sudo_forbidden=False)
+                mock.patch.object(hu, 'node_writable', lambda node: True):
+            hu.run_case('/x/testusb', node, 0, list(params), 30, wedge_confirm=30)
         return cmds[0]
 
     def test_scan_is_confined_to_the_node_before_it_is_selected(self):
-        for sudo, prefix in ((False, []), (True, ['sudo', '-n'])):
-            for node in ('/dev/bus/usb/001/005', '/dev/bus/usb/003/017'):
-                self.assertEqual(self.argv(node, sudo),
-                                 prefix + ['/x/testusb', '-A', node, '-D', node, '-t', '0', '-c', '1'])
+        for node in ('/dev/bus/usb/001/005', '/dev/bus/usb/003/017'):
+            self.assertEqual(self.argv(node), ['/x/testusb', '-A', node, '-D', node, '-t', '0', '-c', '1'])
 
     def test_the_options_follow_verbatim(self):
-        self.assertEqual(self.argv(NODE, False, ('-c', '64', '-s', '1024', '-g', '8'))[7:],
+        self.assertEqual(self.argv(NODE, ('-c', '64', '-s', '1024', '-g', '8'))[7:],
                          ['-c', '64', '-s', '1024', '-g', '8'])
 
 
-class SudoAfterAdmission(unittest.TestCase):
-    """A node that turns root-only after the caller's check (a re-enumeration between cases)
-    must still not get a sudo-wrapped testusb under a recovery request."""
+class UnwritableNode(unittest.TestCase):
+    """A node this user cannot write (no udev rule, or a re-enumeration between cases) fails
+    the case without running testusb, never under sudo."""
 
-    def test_run_case_refuses_sudo_when_forbidden(self):
-        patch(self, hu, 'needs_sudo', lambda node: True)
+    def test_run_case_fails_without_launching(self):
+        patch(self, hu, 'node_writable', lambda node: False)
         launched = []
         patch(self, hu.subprocess, 'Popen',
               lambda *a, **k: launched.append(a) or (_ for _ in ()).throw(AssertionError))
-        r = hu.run_case('/bin/true', NODE, 1, [], 5, wedge_confirm=30, sudo_forbidden=True)
+        r = hu.run_case('/bin/true', NODE, 1, [], 5, wedge_confirm=30)
         self.assertEqual((r['status'], launched), ('FAIL', []))
-        self.assertIn('refusing a sudo-wrapped testusb', r['detail'])
+        self.assertIn('udev rule', r['detail'])
         self.assertIn(NODE, r['detail'])
 
 
 class RunCaseConfirmsByReap(unittest.TestCase):
     """HUNG is 'SIGKILL not reaped in 5 s', which a finite hold on the DUT's device lock also
     produces. Watching our child for `wedge_confirm` tells the two apart: reaped late is a
-    timeout, not a wedge. Under sudo the child is the wrapper, so its reaping proves nothing.
+    timeout, not a wedge.
     A stub Popen: no real child outlives SIGKILL without a held kernel lock."""
 
-    def _run_case(self, sudo: bool, reaps_late: bool):
+    def _run_case(self, reaps_late: bool):
         class Popen:
             def __init__(self, cmd, **kw):
                 self.cmd = cmd
@@ -394,35 +393,25 @@ class RunCaseConfirmsByReap(unittest.TestCase):
 
         patch(self, hu.subprocess, 'Popen', Popen)
         patch(self, hu, 'dmesg_tail', lambda: '')
-        patch(self, hu.os, 'access', lambda p, m: not sudo)
-        patch(self, hu.os, 'geteuid', lambda: 1000)
-        return hu.run_case('/bin/true', NODE, 1, [], 7, wedge_confirm=13, sudo_forbidden=False)
+        patch(self, hu, 'node_writable', lambda node: True)
+        return hu.run_case('/bin/true', NODE, 1, [], 7, wedge_confirm=13)
 
     def test_a_child_reaped_within_the_window_is_a_late_timeout(self):
-        r = self._run_case(sudo=False, reaps_late=True)
+        r = self._run_case(reaps_late=True)
         self.assertEqual(r['status'], 'FAIL')
         self.assertTrue(r['late_cleared'])
         self.assertIn('landed', r['detail'])
         self.assertNotIn('_proc', r)
 
     def test_a_child_still_stuck_after_the_window_is_hung_with_its_handle(self):
-        r = self._run_case(sudo=False, reaps_late=False)
+        r = self._run_case(reaps_late=False)
         self.assertEqual(r['status'], 'HUNG')
         self.assertEqual(r['_proc'].waited, 13)
         self.assertEqual(r['_proc'].communicates, [7, 5])
 
-    def test_under_sudo_the_wrapper_reaping_proves_nothing(self):
-        r = self._run_case(sudo=True, reaps_late=True)
-        self.assertEqual(r['status'], 'HUNG')
-        self.assertIsNone(r['_proc'], 'the wrapper is not the child to watch')
-
 
 class RunHelper(unittest.TestCase):
-    """run() is the bounded replacement for subprocess.run: sysfs_write feeds it input=."""
-
-    def test_input_kwarg_is_honoured(self):
-        r = hu.run(['cat'], input='payload', timeout=10)
-        self.assertEqual((r.returncode, r.stdout), (0, 'payload'))
+    """run() is the bounded replacement for subprocess.run the root helpers go through."""
 
     def test_capture_output_kwarg_is_accepted(self):
         r = hu.run(['printf', 'x'], capture_output=True, timeout=10)
@@ -460,32 +449,34 @@ class RunHelper(unittest.TestCase):
         self.assertEqual(seen['timeout'], hu.HELPER_TIMEOUT)
 
 
-class Sudo(unittest.TestCase):
+class Root(unittest.TestCase):
+    """root() runs a hil_root.py verb through hil_root.argv (test_hil_root.py has the argv)."""
+
     def test_a_password_prompt_is_a_named_exit(self):
         patch(self, hu, 'run', lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, '', 'a password is required'))
-        patch(self, hu.os, 'geteuid', lambda: 1000)
+        patch(self, hu.hil_root, 'argv', lambda *a: ['sudo', '-n', '/x/hil_root.py', *a])
         with self.assertRaises(SystemExit) as cm:
-            hu.sudo(['dmesg'])
-        self.assertIn('sudo needs a password for: sudo -n dmesg', str(cm.exception))
+            hu.root('dmesg')
+        self.assertIn('sudo needs a password for: sudo -n /x/hil_root.py dmesg', str(cm.exception))
 
-    def test_root_runs_it_bare(self):
+    def test_the_verb_goes_through_argv_with_the_callers_bound(self):
         seen = []
-        patch(self, hu, 'run', lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''))
-        patch(self, hu.os, 'geteuid', lambda: 0)
-        hu.sudo(['dmesg'])
-        self.assertEqual(seen, [['dmesg']])
+        patch(self, hu, 'run', lambda cmd, **kw: seen.append((cmd, kw)) or subprocess.CompletedProcess(cmd, 0, '', ''))
+        patch(self, hu.hil_root, 'argv', lambda *a: ['H', *a])
+        hu.root('pattern', '1', timeout=4)
+        self.assertEqual(seen, [(['H', 'pattern', '1'], {'timeout': 4})])
 
 
-class SudoSoftNeverRaises(unittest.TestCase):
+class RootSoftNeverRaises(unittest.TestCase):
     """Two of its call sites are inside run_case's timeout handler, where ANY raise costs the
-    HUNG verdict -- and sudo() sys.exit()s on 'a password is required'."""
+    HUNG verdict -- and root() sys.exit()s on 'a password is required'."""
 
     def check(self, exc):
         def boom(*a, **k):
             raise exc
-        patch(self, hu, 'sudo', boom)
+        patch(self, hu, 'root', boom)
         with redirect_stderr(io.StringIO()):
-            r = hu._sudo_soft(['dmesg'])            # must not propagate
+            r = hu._root_soft('dmesg')            # must not propagate
         self.assertEqual(r.returncode, 1)
         self.assertIn(f'dmesg: {type(exc).__name__}: {exc}', r.stderr)   # callers quote it
 
@@ -503,30 +494,29 @@ class SysfsWrite(unittest.TestCase):
     def test_a_blocked_write_is_a_bounded_named_exit(self):
         seen = {}
 
-        def blocked(cmd, **kw):
+        def blocked(*cmd, **kw):
             seen.update(kw)
             raise subprocess.TimeoutExpired(cmd, kw.get('timeout'))
-        patch(self, hu, 'sudo', blocked)
+        patch(self, hu, 'root', blocked)
         with self.assertRaises(SystemExit) as cm:
-            hu.sysfs_write('/sys/module/usbtest/parameters/pattern', '0')
+            hu.sysfs_write('pattern', '0')
         self.assertEqual(seen.get('timeout'), 15)
         self.assertIn('blocked >15s', str(cm.exception))
 
-    def test_tee_gets_the_data_and_a_failure_is_a_named_exit(self):
+    def test_the_verb_passes_through_and_a_failure_is_a_named_exit(self):
         calls = []
-        patch(self, hu, 'sudo', lambda cmd, **kw: calls.append((cmd, kw['input']))
-              or subprocess.CompletedProcess(cmd, 1, '', 'denied\n'))
+        patch(self, hu, 'root', lambda *cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 1, '', 'denied\n'))
         with self.assertRaises(SystemExit) as cm:
-            hu.sysfs_write('/p', 'x')
-        self.assertEqual(calls[0], (['tee', '/p'], 'x'))
-        self.assertIn('write "x" > /p failed: denied', str(cm.exception))
+            hu.sysfs_write('pattern', '1')
+        self.assertEqual(calls, [('pattern', '1')])
+        self.assertIn('hil_root pattern 1 failed: denied', str(cm.exception))
 
 
 class DmesgTail(unittest.TestCase):
-    def test_the_last_eight_usbtest_lines(self):
-        lines = [f'usbtest {i}' if i % 2 else f'other {i}' for i in range(30)]
-        patch(self, hu, '_sudo_soft', lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, '\n'.join(lines), ''))
-        self.assertEqual(hu.dmesg_tail().splitlines(), [f'usbtest {i}' for i in range(15, 30, 2)])
+    def test_the_last_eight_lines_of_the_helpers_usbtest_log(self):
+        lines = [f'usbtest {i}' for i in range(30)]
+        patch(self, hu, '_root_soft', lambda *cmd, **kw: subprocess.CompletedProcess(cmd, 0, '\n'.join(lines), ''))
+        self.assertEqual(hu.dmesg_tail().splitlines(), lines[-8:])
 
 
 class FindDevice(unittest.TestCase):
@@ -713,7 +703,7 @@ class FindDevice(unittest.TestCase):
 class HostCompat(unittest.TestCase):
     """The upstream controller of the node's bus, from a fake sysfs: usbN -> its PCI function."""
 
-    def host(self, vendor, device, driver='xhci_hcd', fw=None):
+    def host(self, vendor, device):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         root = Path(td.name)
@@ -721,39 +711,27 @@ class HostCompat(unittest.TestCase):
         (pci / 'usb5').mkdir(parents=True)
         (pci / 'vendor').write_text(vendor + '\n')
         (pci / 'device').write_text(device + '\n')
-        (root / 'drivers' / driver).mkdir(parents=True)
-        (pci / 'driver').symlink_to(root / 'drivers' / driver)
         (root / 'devices').mkdir()
         (root / 'devices' / 'usb5').symlink_to(pci / 'usb5')
         patch(self, hu, 'SYS_USB', root / 'devices')
-        self.setpci = []
-        patch(self, hu, '_sudo_soft', lambda cmd, **kw: self.setpci.append(cmd) or (
-            subprocess.CompletedProcess(cmd, 0, fw, '') if fw else subprocess.CompletedProcess(cmd, 1, '', 'no')))
+        self.rooted = []
+        patch(self, hu, '_root_soft', lambda *cmd, **kw: self.rooted.append(list(cmd)))
 
     def check(self):
         hu.check_host_compat('/dev/bus/usb/005/007')
 
     def test_moschip_is_refused(self):
-        self.host('0x9710', '0x9990', driver='ehci-pci')
+        self.host('0x9710', '0x9990')
         with self.assertRaises(SystemExit) as cm:
             self.check()
         self.assertIn('MosChip MCS9990 (0000:03:00.0)', str(cm.exception))
 
-    def test_renesas_needs_current_firmware(self):
-        self.host('0x1912', '0x0014', fw='00202609\n')
-        self.check()
-        self.assertEqual(self.setpci, [['setpci', '-s', '0000:03:00.0', '0x6c.l']])
-        for fw, says in (('00202500\n', 'firmware 0x00202500 < 0x00202609'), (None, 'cannot read')):
-            with self.subTest(fw=fw):
-                self.host('0x1912', '0x0015', fw=fw)
-                with self.assertRaises(SystemExit) as cm:
-                    self.check()
-                self.assertIn(says, str(cm.exception))
-
-    def test_other_hosts_pass_without_setpci(self):
-        self.host('0x8086', '0xa36d')
-        self.check()
-        self.assertEqual(self.setpci, [])
+    def test_other_hosts_pass_without_a_root_call(self):
+        for vendor, device in (('0x8086', '0xa36d'), ('0x1912', '0x0014'), ('0x1912', '0x0015')):
+            with self.subTest(host=(vendor, device)):
+                self.host(vendor, device)
+                self.check()
+                self.assertEqual(self.rooted, [])
 
     def test_an_unprobeable_host_warns_and_passes(self):
         td = tempfile.TemporaryDirectory()
