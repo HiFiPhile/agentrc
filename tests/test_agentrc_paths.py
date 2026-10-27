@@ -19,6 +19,8 @@ ALLOWED = {
     # captain is user-wide only (README, Per project): captain_guard.py allows these literal paths and rejects any
     # `$` form, and captain.md's hook, its SKILL.md recipes and user.md's captain rule run them
     '/.claude/skills/captain/',
+    # captain_guard.py's PUBLISHERS: the one followup-issue script captain runs, by the same literal-path rule
+    '/.claude/skills/followup-issue/scripts/publish.py',
 }
 
 BASE = r'\$\{AGENTRC_DIR:-\$HOME/\.(?:claude|codex)\}'
