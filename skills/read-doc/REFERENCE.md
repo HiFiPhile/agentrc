@@ -54,9 +54,12 @@ python3 <skill dir>/scripts/locate.py build --book 2125    # one book
 It reuses current indexes and extracts PDFs whose indexes are missing or
 stale, including retrying PDFs with no text layer, and prunes index entries
 for books that no longer have a PDF in the library metadata. Run it after
-importing documents, or nightly:
+importing documents, or nightly. Cron does not see the `AGENTRC_DIR` a project
+install sets, so set it in the crontab to the agentrc checkout's absolute path
+(cron does not expand variables there); a user-wide install can omit it:
 
 ```cron
+AGENTRC_DIR=/absolute/path/to/agentrc
 17 3 * * * python3 "${AGENTRC_DIR:-$HOME/.claude}/skills/read-doc/scripts/locate.py" build --all >/dev/null
 ```
 

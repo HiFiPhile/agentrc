@@ -243,7 +243,8 @@ def show(heading: str, doc, pdf: Path, why: str) -> None:
           f"  comments    " + doc.comments().strip().replace("\n", "\n              "))
 
 
-REINDEX = 'reindex so read-doc finds it: python3 "${AGENTRC_DIR:-$HOME/.claude}/skills/read-doc/scripts/locate.py" build --all'
+LOCATE = Path(__file__).resolve().parents[2] / 'read-doc' / 'scripts' / 'locate.py'
+REINDEX = f'reindex so read-doc finds it: python3 "{LOCATE}" build --all'
 
 
 def add_main(argv: list) -> int:
