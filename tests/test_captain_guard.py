@@ -1,10 +1,12 @@
 import importlib.util
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -16,9 +18,17 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'scripts' 
 spec = importlib.util.spec_from_file_location('captain_guard', SCRIPT)
 guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
+PUBLISHER = Path(__file__).resolve().parents[1] / 'skills' / 'followup-issue' / 'scripts' / 'publish.py'
+spec = importlib.util.spec_from_file_location('followup_publish', PUBLISHER)
+publish = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(publish)
 
 RUN = 'python3 ~/.claude/skills/captain/scripts/captain.py'
 READ = 'python3 ~/.claude/skills/captain/scripts/captain_read.py'
+PUBLISH = 'python3 ~/.claude/skills/followup-issue/scripts/publish.py'
+REPO = '--repo hathach/agentrc --allow-repo hathach/agentrc'
+# a command spells paths with forward slashes: the guard refuses a backslash, an escape in the Bash tool's shell
+DRAFTS, MEMORY = guard.DRAFTS.replace(os.sep, '/'), guard.MEMORY.replace(os.sep, '/')
 
 
 def setUpModule():
@@ -139,7 +149,8 @@ class VerdictTest(unittest.TestCase):
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
         sample = {'<checkout>': '~/code/repo', '<N>': '12', '<owner>/<repo>': 'o/r', '<fields>': 'number,title',
                   '-n N': '-n 5', 'oneline|dated': 'dated', '<range>': 'main..topic', '<ref>': 'main',
-                  '<directory>': '~/.cache/chief-runs', '<prefix>': 'tinyusb-4165'}
+                  '<directory>': '~/.cache/chief-runs', '<prefix>': 'tinyusb-4165', '<word>': 'captain',
+                  '--limit N': '--limit 500'}
         found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain_read\.py [^`#\n]*)', text)
         self.assertGreaterEqual(len(found), 7)
         for cmd in found:
@@ -148,6 +159,81 @@ class VerdictTest(unittest.TestCase):
             cmd = re.sub(r'\[([^\]]*)\]', r'\1', cmd.strip())
             with self.subTest(cmd):
                 self.assertIsNone(self.verdict('Bash', command=cmd))
+
+    def test_a_follow_up_issue_publishes_only_as_drafted_for_hathach_agentrc(self):
+        title, body = f'{DRAFTS}/herdr-timeout-title.md', f'{DRAFTS}/herdr.md'
+        tilde = body.replace(Path.home().as_posix(), '~', 1)
+        home = (Path.home() / '.claude/skills/followup-issue/scripts/publish.py').as_posix()
+        create = f'create {REPO} --title-file {title} --body-file {body} --label follow-up'
+        for cmd in [f'{PUBLISH} {create}', f'python3 {home} {create}',
+                    f'{PUBLISH} create --label follow-up --body-file {tilde} --title-file {title} {REPO}',
+                    f'{PUBLISH} comment {REPO} --issue 313 --body-file {body}']:
+            with self.subTest(cmd):
+                self.assertIsNone(self.verdict('Bash', command=cmd))
+                self.assertIsNotNone(self.verdict('Monitor', command=cmd, timeout_ms=1800000))
+        for cmd in [f'{PUBLISH}', f'{PUBLISH} edit {REPO} --issue 1 --body-file {body}',
+                    f'{PUBLISH} {create} --label bug', f'{PUBLISH} {create} --repo hathach/agentrc',
+                    f'{PUBLISH} {create.replace("--label follow-up", "")}',
+                    f'{PUBLISH} {create.replace("--label follow-up", "--label bug")}',
+                    f'{PUBLISH} {create.replace("--repo hathach/agentrc", "--repo hathach/tinyusb")}',
+                    f'{PUBLISH} {create} --allow-repo hathach/tinyusb',
+                    f'{PUBLISH} {create.replace("--title-file", "--title")}',
+                    f'{PUBLISH} {create.replace("--title-file", "--title-f")}',
+                    f'{PUBLISH} {create.replace("--title-file " + title, "--title-file=" + title)}',
+                    f'{PUBLISH} {create.replace(title, DRAFTS + "/x.txt")}',
+                    f'{PUBLISH} {create.replace(title, DRAFTS + "/../x.md")}',
+                    f'{PUBLISH} {create.replace(title, DRAFTS + "-other/x.md")}',
+                    f'{PUBLISH} {create.replace(title, MEMORY + "/x.md")}',
+                    f'{PUBLISH} {create.replace(title, "x.md")}', f'{PUBLISH} {create.replace(title, "~root/x.md")}',
+                    f'{PUBLISH} {create} extra', f'{PUBLISH} comment {REPO} --issue 0 --body-file {body}',
+                    f'{PUBLISH} comment {REPO} --issue x --body-file {body}',
+                    f'{PUBLISH} comment {REPO} --issue 3 --body-file {body} --label follow-up',
+                    f'{PUBLISH} comment {REPO} --issue 3 --issue 4 --body-file {body}',
+                    f'{PUBLISH} {create}; git push', f'{PUBLISH} {create} > /tmp/x',
+                    f'python3 skills/followup-issue/scripts/publish.py {create}',
+                    f'python3 /tmp/publish.py {create}']:
+            with self.subTest(cmd):
+                self.assertIsNotNone(self.verdict('Bash', command=cmd))
+
+    def test_every_admitted_publication_is_one_publish_py_parses(self):
+        """The guard keeps its own copy of publish.py's options: each shape it admits must reach publish.py's checks,
+        here its refusal of a draft that does not exist, never an argparse usage error."""
+        drafts = tmpdir(self)
+        missing = str(drafts / 'never-written.md')
+        for action, values in guard.PUBLISH.items():
+            argv = [action] + [w for name, value in values.items()
+                               for w in (name, value or ('3' if name == '--issue' else missing))]
+            with self.subTest(action), mock.patch.object(guard, 'DRAFTS', str(drafts)):
+                self.assertIsNone(guard.publication(argv))
+                out = io.StringIO()
+                with redirect_stdout(out), mock.patch.object(publish, 'gh', side_effect=AssertionError('no call')):
+                    code = publish.main(argv)
+                receipt = json.loads(out.getvalue().splitlines()[-1])
+                self.assertEqual((code, receipt['outcome']), (2, 'refused'))
+                self.assertIn('cannot read', receipt['error'])
+
+    def test_a_draft_symlinked_out_of_the_drafts_is_refused(self):
+        drafts = tmpdir(self)
+        (drafts / 'x.md').symlink_to(Path(os.path.expanduser('~')) / 'code' / 'x.md')
+        (drafts / 'y.md').write_text('y', encoding='utf-8')
+        with mock.patch.object(guard, 'DRAFTS', str(drafts)):
+            ok = f'{PUBLISH} comment {REPO} --issue 3 --body-file {(drafts / "y.md").as_posix()}'
+            self.assertIsNone(self.verdict('Bash', command=ok))
+            self.assertIsNotNone(self.verdict('Bash', command=ok.replace('y.md', 'x.md')))
+            self.assertIsNone(self.verdict('Write', file_path=str(drafts / 'y.md'), content='x'))
+            self.assertIsNotNone(self.verdict('Write', file_path=str(drafts / 'x.md'), content='x'))
+
+    def test_the_skill_s_documented_publications_pass(self):
+        text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
+        sample = {'<title.md>': '~/.cache/agentrc/captain/drafts/herdr-title.md',
+                  '<body.md>': f'{DRAFTS}/herdr.md', '<N>': '313'}
+        found = re.findall(r'(python3 ~/\.claude/skills/followup-issue/scripts/publish\.py [^`#\n]*)', text)
+        self.assertEqual(len(found), 2)
+        for cmd in found:
+            for k, v in sample.items():
+                cmd = cmd.replace(k, v)
+            with self.subTest(cmd):
+                self.assertIsNone(self.verdict('Bash', command=cmd.strip()))
 
     def test_monitor_only_watches_a_command(self):
         self.assertIsNotNone(self.verdict('Monitor', ws={'url': 'wss://x'}))
@@ -158,7 +244,8 @@ class VerdictTest(unittest.TestCase):
                      f'{home}/code/agentrc/README.md', f'{home}/.herdr/worktrees/tinyusb/x/src/tusb.c',
                      f'{home}/.cache/chief-runs/tinyusb-4165-babysit-1/progress.log',
                      f'{home}/.claude/projects/-home-u-code-agentrc/memory/MEMORY.md',
-                     os.path.join(guard.MEMORY, 'MEMORY.md')]:
+                     os.path.join(guard.MEMORY, 'MEMORY.md'),
+                     f'{home}/.claude/skills/followup-issue/SKILL.md']:
             with self.subTest(path):
                 self.assertIsNone(self.verdict('Read', file_path=path))
         for path in ['/etc/passwd', os.path.join(guard.STATE, '..', 'x'), 'relative.md', guard.STATE + '-other/x',
@@ -175,11 +262,13 @@ class VerdictTest(unittest.TestCase):
             self.assertIsNone(self.verdict('Read', file_path=str(root / 'in.log')))
             self.assertIsNotNone(self.verdict('Read', file_path=str(root / 'out' / 'passwd')))
 
-    def test_writes_only_markdown_in_its_memory(self):
-        note = os.path.join(guard.MEMORY, 'MEMORY.md')
-        self.assertIsNone(self.verdict('Write', file_path=note, content='x'))
-        self.assertIsNone(self.verdict('Edit', file_path=note, old_string='a', new_string='b'))
+    def test_writes_only_markdown_in_its_memory_and_drafts(self):
+        for note in (os.path.join(guard.MEMORY, 'MEMORY.md'), os.path.join(guard.DRAFTS, 'herdr-title.md')):
+            self.assertIsNone(self.verdict('Write', file_path=note, content='x'))
+            self.assertIsNone(self.verdict('Edit', file_path=note, old_string='a', new_string='b'))
         for path in [os.path.join(guard.MEMORY, 'run.sh'), guard.MEMORY + '-other/x.md',
+                     os.path.join(guard.DRAFTS, 'x.json'), os.path.join(guard.DRAFTS, '..', 'ledger.md'),
+                     guard.DRAFTS + '-other/x.md',
                      os.path.join(guard.MEMORY, '..', 'chief', 'x.md'),
                      os.path.expanduser('~/.claude/projects/-home-u-code-agentrc/memory/MEMORY.md'),
                      os.path.expanduser('~/code/agentrc/README.md'), 'MEMORY.md', None]:
@@ -198,6 +287,7 @@ class VerdictTest(unittest.TestCase):
 
     def test_other_tools(self):
         self.assertIsNone(self.verdict('Skill', skill='captain'))
+        self.assertIsNone(self.verdict('Skill', skill='followup-issue'))
         self.assertIsNotNone(self.verdict('Skill', skill='pr-babysit'))
         self.assertIsNone(self.verdict('ToolSearch', query='select:Monitor'))
         self.assertIsNotNone(self.verdict('ToolSearch', query='select:WebFetch'))
