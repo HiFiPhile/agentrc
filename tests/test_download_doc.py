@@ -853,6 +853,20 @@ class ReindexPath(unittest.TestCase):
         self.assertEqual(linked['LOCATE'], skills / 'read-doc' / 'scripts' / 'locate.py')
         self.assertTrue(linked['LOCATE'].is_file())
 
+    def test_the_reindex_command_keeps_a_path_with_shell_characters_one_argument(self):
+        skills = tmpdir(self) / 'a b$c`d"e'
+        scripts = skills / 'download-doc' / 'scripts'
+        try:
+            scripts.mkdir(parents=True)
+        except OSError as e:
+            self.skipTest(f'no such directory name: {e}')
+        shutil.copy(Path(sync.__file__), scripts / 'sync.py')
+        with unittest.mock.patch.object(sys, 'path', list(sys.path)):
+            copied = runpy.run_path(str(scripts / 'sync.py'))
+        locate = skills / 'read-doc' / 'scripts' / 'locate.py'
+        self.assertEqual(shlex.split(copied['REINDEX'].partition(': ')[2]),
+                         ['python3', str(locate), 'build', '--all'])
+
 
 @unittest.skipUnless(shutil.which('pdftotext'), 'identity checks read the PDF with pdftotext')
 class AddOne(unittest.TestCase):
