@@ -93,7 +93,8 @@ class VerdictTest(unittest.TestCase):
                     f'{RUN} ask w2:p1 w3:p4', f'{RUN} ask pr:12 pr:hathach:agentrc:12 issue:7 ws:w54 ws:my-label',
                     f'{RUN} relay pr:12 w2:p1', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
                     f'{RUN} cancel m-0a1b', f'{RUN} relay w2:p1 w3:p4',
-                    f'{RUN} relay w2:p1 --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff', f'{RUN} withdraw a-0a1b',
+                    f'{RUN} relay w2:p1 --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff --digest 3f9a0c1d2e4b5a67',
+                    f'{RUN} withdraw a-0a1b',
                     f'{RUN} open --checkout /home/u/code/repo --account ada --name repo',
                     f'{RUN} open --checkout ~/code/repo --account main',
                     f'python3 {home_script} list']:
@@ -120,7 +121,8 @@ class VerdictTest(unittest.TestCase):
         """The captain runs what SKILL.md shows; a recipe the guard denies would strand it."""
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
         sample = {'<pane>...': 'w2:p1', '<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
-                  '<uuid>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<action>': 'a-1', '<target>...': 'pr:12',
+                  '<uuid>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<hex>': '3f9a0c1d2e4b5a67', '<action>': 'a-1',
+                  '<target>...': 'pr:12',
                   '<dir>': '/home/u/code/repo', '<main|ada>': 'ada', '<name>': 'repo'}
         found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain\.py [^`#\n]*)', text)
         self.assertGreaterEqual(len(found), 10)
@@ -284,6 +286,18 @@ class VerdictTest(unittest.TestCase):
             for tool in ('Write', 'Edit'):
                 with self.subTest(tool):
                     self.assertIsNotNone(self.verdict(tool, file_path=str(memory / 'x.md')))
+
+    def test_a_parent_step_is_refused_before_links_resolve(self):
+        base = tmpdir(self)
+        memory, out = base / 'memory', base / 'out'
+        (memory / 'sub').mkdir(parents=True)
+        out.mkdir()
+        (out / 'link').symlink_to(memory / 'sub')   # resolved, link/../x.md is memory/x.md; as written, out/x.md
+        with mock.patch.object(guard, 'MEMORY', str(memory)):
+            self.assertIsNone(self.verdict('Write', file_path=str(memory / 'sub' / 'x.md'), content='x'))
+            for path in (os.path.join(out, 'link', '..', 'x.md'), os.path.join(memory, 'sub', '..', 'x.md')):
+                with self.subTest(path):
+                    self.assertIsNotNone(self.verdict('Write', file_path=path, content='x'))
 
     def test_other_tools(self):
         self.assertIsNone(self.verdict('Skill', skill='captain'))

@@ -76,6 +76,19 @@ class CommitsTest(unittest.TestCase):
         rest = {k: v for k, v in out.items() if k != 'seal'}
         self.assertEqual(out['seal'], sys.modules['facts'].sealed(rest)['seal'], 'the line is sealed over what it says')
 
+    def test_status_names_each_untracked_file_a_renames_source_and_takes_paths_literally(self):
+        status = sys.modules['facts'].status
+        self.write('new/x.c', 'x\n')
+        self.write('new/y.c', 'y\n')
+        self.write('[ab].c', 'glob\n')
+        self.git('mv', 'a.c', 'b.c')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.repo)
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}, clear=True):
+            self.assertEqual(status(), ['R  b.c', 'a.c', '?? [ab].c', '?? new/x.c', '?? new/y.c'])
+            self.assertEqual(status('[ab].c'), ['?? [ab].c'], 'a pathspec is literal, never a glob over b.c')
+            self.assertEqual(status('new'), ['?? new/x.c', '?? new/y.c'])
+
     def test_the_seal_leaves_null_members_out_and_ignores_key_order(self):
         sealed = sys.modules['facts'].sealed
         self.assertEqual(sealed({'a': 1, 'b': None, 'c': [{'d': None, 'e': 'é'}]})['seal'], sealed({'c': [{'e': 'é'}], 'a': 1})['seal'])
@@ -96,6 +109,8 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c'), 'the commit carries unowned path(s): b.c')
         self.write('c.c', 'c\n')
         self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c', 'b.c', 'c.c'), 'the commit left owned change(s) behind: ?? c.c')
+        self.write('new/d.c', 'd\n')
+        self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c', 'b.c', 'new/d.c'), 'the commit left owned change(s) behind: ?? new/d.c')
         self.git('commit', '-q', '--amend', '--allow-empty-message', '-m', '')
         self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c', 'b.c'), 'the commit has no message')
         # A merge whose first parent is right still brings history nothing audited.
@@ -448,6 +463,48 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual((code, out['committed']), (0, False))
         self.assertIn('blank', out['detail'])
         self.assertEqual(self.git('status', '--porcelain'), ' M a.c\n', 'nothing was staged')
+
+    def test_hook_output_is_bounded_and_rid_of_escapes_and_control_characters(self):
+        # #266: a long or escaped hook detail is what a relay mis-copies.
+        self.hook('printf "\\033[31mFailed\\033[0m\\ttab\\a \\"q\\"\\n" >&2\nhead -c 4000 /dev/zero | tr "\\0" x >&2\nexit 1')
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin='Fix\n')
+        self.assertEqual((code, out['committed']), (0, False), out)
+        self.assertEqual(len(out['detail']), commits.DETAIL_MAX)
+        self.assertTrue(out['detail'].startswith('Failed tab  "q" / xxx'), out['detail'][:40])
+        self.assertTrue(out['detail'].endswith('x…'))
+        self.assertTrue(out['detail'].isprintable())
+
+    def test_a_receipt_keeps_the_line_for_its_request_parent_and_scope_only(self):
+        receipt = str(self.repo.parent / f'{self.repo.name}-commit#1-review.json')
+        self.addCleanup(lambda: Path(receipt).unlink(missing_ok=True))
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', '--receipt', receipt, '--request', 'commit#1-review', 'a.c', stdin='Fix\n')
+        self.assertEqual((code, out['committed']), (0, True), out)
+        sha = self.git('rev-parse', 'HEAD').strip()
+        read = ['receipt', receipt, '--request', 'commit#1-review', '--parent', self.base, 'a.c']
+        code, back = self.run_script(*read)
+        self.assertEqual(code, 0, back)
+        self.assertEqual({k: v for k, v in back.items() if k != 'seal'},
+                         {'request': 'commit#1-review', 'parent': self.base, 'scope': ['a.c'], 'committed': True, 'detail': out['detail'], 'sha': sha})
+        self.assertEqual(self.git('rev-parse', 'HEAD').strip(), sha, 'reading commits nothing')
+        for i, want in ((3, 'another request'), (5, 'another parent'), (6, 'another scope')):
+            argv = list(read)
+            argv[i] = {3: 'commit#2-review', 5: sha, 6: 'b.c'}[i]
+            code, stale = self.run_script(*argv)
+            self.assertEqual(code, 2)
+            self.assertIn(want, stale['error'])
+        self.write('a.c', 'again\n')
+        code, out = self.run_script('commit', '--receipt', receipt, '--request', 'commit#1-review', 'a.c', stdin='Fix\n')
+        self.assertEqual(code, 2)
+        self.assertIn('already exists', out['error'])
+        self.assertEqual(self.git('rev-parse', 'HEAD').strip(), sha, 'a stale receipt stops the commit before it starts')
+        saved = json.loads(Path(receipt).read_text(encoding='utf-8'))
+        saved['line']['detail'] = 'edited'
+        Path(receipt).write_text(json.dumps(saved), encoding='utf-8')
+        self.assertIn('does not match its seal', self.run_script(*read)[1]['error'])
+        Path(receipt).unlink()
+        self.assertIn('no receipt at', self.run_script(*read)[1]['error'])
 
     def test_a_full_sha_is_exactly_forty_lowercase_hex(self):
         self.assertTrue(commits.FULL_SHA.match('a' * 40))

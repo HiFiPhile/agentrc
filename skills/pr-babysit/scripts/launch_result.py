@@ -65,8 +65,9 @@ REFUSED = {
     'stale-head': "HEAD moved off the state's head since the last launch: commits on top of it rejoin by adoptHead; "
                   'a rewritten history (rebase, force-push) rejoins by rebasedHead naming the PR head, only on the user\'s word; '
                   'report anything else, never reset the state',
-    'wrong-head': 'the checkout HEAD is not the PR head: check out the PR head, or name the local chain that holds it '
-                  'as adoptHead; report anything else, never reset the state',
+    'wrong-head': 'the checkout HEAD is not the PR head: check out the PR head, or, when HEAD is a chain of local commits '
+                  "on the PR head (on the state's head, once a launch pinned one), relaunch with adoptHead naming HEAD and "
+                  'the same stateRef, if any; report anything else, never reset the state',
     'deferral-refused': 'a deferral was refused: it needs a new decision before it is passed again',
     'pr-conflicting': 'the PR conflicts with its base, so passing checks establish nothing: resolve the conflict in a merge from the base, '
                       "then relaunch with adoptHead naming that merge; rebasedHead is only for a rewrite on the user's word",
@@ -101,10 +102,18 @@ STALLED = {
     'github-rate-limited': 'GitHub refused a call for a rate limit (`rateLimit`): relaunch from the stateRef after its resetAt, '
                            'or after a few minutes for a secondary limit',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
+    'pending-review': 'the posting account holds a pending review on the PR (`review`, by `login`), and GitHub refuses its replies '
+                      'while it does: report it for the human to submit or delete, never submit or delete it yourself, and relaunch '
+                      'from the stateRef once it is gone',
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
-                      'python3 on PATH lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared',
+                      "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
-                         'expired gh login or a module the python3 on PATH lacks, or relaunch once a passing cause (a GitHub outage) cleared',
+                         "expired gh login or a module the launch's interpreter lacks, or relaunch once a passing cause (a GitHub outage) cleared",
+    'collector-skew': "collect.py prints another output contract than the launch's workflow script reads (`detail`): the session "
+                      'ran a workflow copy older or newer than the installed scripts; relaunch from the installed file (Workflow '
+                      'scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first), never the same copy again',
+    'python-unusable': "the interpreter the launch runs its scripts under cannot import a module its lanes need (`detail`): "
+                       'install it for that interpreter, or relaunch with python naming one that has it',
     'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "
                      '(an artifact harvest.py does not know, a tie, a failed read) and relaunch once it changed or harvest.py reads it',
 }
@@ -118,6 +127,9 @@ def relaunch_ask(ask):
     already spent)."""
     if ask.get('relaunchAsks') == 'tick':
         return 'it skipped the head for a manual review and this run never ticked its box on it: a relaunch with coderabbitTrigger ticks it once'
+    if ask.get('relaunchAsks') == 'request' and ask.get('retryAt') is None:
+        return ('it skipped the head for a manual review and no tick asked for its review: a relaunch with coderabbitTrigger '
+                'comments `@coderabbitai review` once')
     if ask.get('relaunchAsks') == 'request':
         return (f"it is rate-limited until {ask.get('retryAt')} and this run never asked on the head: a relaunch with "
                 'coderabbitTrigger after that comments `@coderabbitai review` once')

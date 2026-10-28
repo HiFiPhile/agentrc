@@ -19,13 +19,18 @@ import doclib  # noqa: E402
 import retitle  # noqa: E402
 import sync  # noqa: E402
 import titles  # noqa: E402
+import vendor_allwinner  # noqa: E402
 import vendor_arm  # noqa: E402
+import vendor_espressif  # noqa: E402
+import vendor_geehy  # noqa: E402
 import vendor_hpmicro  # noqa: E402
 import vendor_microchip  # noqa: E402
 import vendor_nxp  # noqa: E402
 import vendor_renesas  # noqa: E402
+import vendor_silabs  # noqa: E402
 import vendor_st  # noqa: E402
 import vendor_ti  # noqa: E402
+import vendor_wch  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors, tmpdir  # noqa: E402
 
@@ -231,6 +236,7 @@ class RetitlePlan(unittest.TestCase):
         err = io.StringIO()
         with unittest.mock.patch.dict(os.environ, {'DOWNLOAD_DOC_SECRET': str(secret)}), \
                 unittest.mock.patch.object(doclib.Library, '_cmdlines', gui), \
+                unittest.mock.patch.object(doclib.Library, '_gui_library', staticmethod(lambda: str(doclib.DEFAULT_LIBRARY))), \
                 unittest.mock.patch.object(doclib.subprocess, 'run', run), \
                 unittest.mock.patch.object(retitle, 'build_plan', lambda use_pdf: plan), \
                 unittest.mock.patch.object(sys, 'argv', ['retitle.py', '--apply']), \
@@ -239,6 +245,111 @@ class RetitlePlan(unittest.TestCase):
             self.assertEqual(retitle.main(), 2)
         self.assertIn('GUI is open', err.getvalue())
         self.assertEqual(calls, [])
+
+
+    def rollback_tsv(self, *rows):
+        tsv = self.lib / 'retitle.tsv'
+        tsv.write_text(''.join(f'{row}\n' for row in rows), encoding='utf-8')
+        return tsv
+
+    def test_a_rollback_restores_only_books_still_titled_as_the_rename_left_them(self):
+        self.book(1, 'UM10503 LPC43xx manual')
+        self.book(2, 'LPC43xx guide (UM10503)')
+        self.book(3, 'UM10503 LPC43xx notes, edited')
+        self.book(4, 'UM10503 LPC43xx sheet', folder=False)
+        self.book(5, 'UM10503 LPC43xx book', formats={'PDF': True, 'EPUB': False})
+        tsv = self.rollback_tsv(*(f'{n}\tLPC43xx {kind} (UM10503)\tUM10503 LPC43xx {kind}' for n, kind in
+                                  ((1, 'manual'), (2, 'guide'), (3, 'notes'), (4, 'sheet'), (5, 'book'), (9, 'card'))))
+        plan, withheld, restored = retitle.rollback_plan(tsv)
+        self.assertEqual(plan, [(1, 'UM10503 LPC43xx manual', 'LPC43xx manual (UM10503)')])
+        self.assertEqual(withheld, [(3, "retitled since: 'UM10503 LPC43xx notes, edited'"),
+                                    (4, 'the database names files that are not on disk'),
+                                    (5, 'the database names files that are not on disk'), (9, 'no such book')])
+        self.assertEqual(restored, 1)
+
+    def test_a_title_is_split_from_the_next_row_by_a_newline_alone(self):
+        self.book(1, 'UM10503 LPC43xx\u2028manual')
+        tsv = self.rollback_tsv('1\tLPC43xx\u2028manual (UM10503)\tUM10503 LPC43xx\u2028manual')
+        self.assertEqual(retitle.rollback_plan(tsv)[0], [(1, 'UM10503 LPC43xx\u2028manual', 'LPC43xx\u2028manual (UM10503)')])
+        tsv.write_text('', encoding='utf-8')
+        self.assertEqual(retitle.rollback_plan(tsv), ([], [], 0))
+
+    def test_a_file_that_is_not_an_apply_tsv_is_refused_whole(self):
+        self.book(1, 'UM10503 LPC43xx manual')
+        row = '1\tLPC43xx manual (UM10503)\tUM10503 LPC43xx manual'
+        for bad in ('x\told\tnew', '2\tonly two', row, '2\t\tnew', '2\told\tnew\textra'):
+            with self.subTest(bad):
+                with self.assertRaisesRegex(ValueError, 'not a row of a retitle --apply TSV'):
+                    retitle.rollback_plan(self.rollback_tsv(row, bad))
+                err = io.StringIO()
+                with unittest.mock.patch.object(retitle.doclib, 'Library', lambda path: self.fail('touched calibre')), \
+                        unittest.mock.patch.object(sys, 'argv', ['retitle.py', '--rollback', str(self.lib / 'retitle.tsv'),
+                                                                 '--apply']), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(retitle.main(), 2)
+                self.assertIn('REFUSED', err.getvalue())
+
+
+@unittest.skipUnless(shutil.which('calibredb'), 'renames go through calibredb')
+class RetitleRollbackInCalibre(unittest.TestCase):
+    """--rollback renames back through calibredb in a real library, and each book's PDF moves with it."""
+
+    def setUp(self):
+        if doclib.Library._gui_running():
+            self.skipTest("the Calibre GUI's lock refuses calibredb on every library")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.lib = self.root / 'library'
+        env = {k: v for k, v in os.environ.items() if k != 'DOWNLOAD_DOC_SECRET'}
+        for patch in (unittest.mock.patch.dict(os.environ, dict(env, CALIBRE_CONFIG_DIRECTORY=str(self.root / 'config')),
+                                               clear=True),
+                      unittest.mock.patch.object(retitle, 'LIB', self.lib),
+                      unittest.mock.patch.object(Path, 'home', lambda: self.root)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        pdf = self.root / 'manual.pdf'
+        pdf.write_bytes(pdf_with('UM10503 LPC43xx manual'))
+        for title in ('LPC43xx manual (UM10503)', 'LPC43xx guide (UM10503)'):
+            self.calibredb('add', '-t', title, '-a', 'NXP Semiconductors', '-I', 'nxp:UM10503', str(pdf))
+
+    def calibredb(self, *args):
+        return subprocess.run(['calibredb', '--with-library', str(self.lib), *args], check=True,
+                              capture_output=True, text=True).stdout
+
+    def titles(self):
+        return {b['id']: b['title'] for b in json.loads(self.calibredb('list', '--for-machine', '-f', 'title'))}
+
+    def assert_pdfs_on_disk(self):
+        _, files, books = retitle.read_library()
+        for book, _, folder in books:
+            self.assertEqual([f.suffix for f in files[book]], ['.pdf'])
+            self.assertTrue(retitle.on_disk(folder, files[book]), folder)
+
+    def retitle(self, *argv):
+        out = io.StringIO()
+        with unittest.mock.patch.object(sys, 'argv', ['retitle.py', *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            return retitle.main(), out.getvalue()
+
+    def test_a_rollback_restores_the_titles_and_a_second_one_changes_nothing(self):
+        code, out = self.retitle('--no-pdf', '--apply')
+        self.assertEqual(code, 0, out)
+        tsv = out.split('rollback: ')[1].split()[0]
+        self.assertEqual(self.titles(), {1: 'UM10503 LPC43xx manual', 2: 'UM10503 LPC43xx guide'})
+        self.assert_pdfs_on_disk()
+        self.calibredb('set_metadata', '--field', 'title:UM10503 LPC43xx guide v2', '2')
+        code, out = self.retitle('--rollback', tsv, '--apply')
+        self.assertEqual(code, 1, out)
+        self.assertIn('#2 withheld: retitled since', out)
+        restored = {1: 'LPC43xx manual (UM10503)', 2: 'UM10503 LPC43xx guide v2'}
+        self.assertEqual(self.titles(), restored)
+        self.assert_pdfs_on_disk()
+        code, out = self.retitle('--rollback', tsv, '--apply')
+        self.assertIn('0 titles to restore, 1 already restored', out)
+        self.assertNotIn('rollback: ', out)
+        self.assertEqual(self.titles(), restored)
+        self.assert_pdfs_on_disk()
 
 
 class GuiDetection(unittest.TestCase):
@@ -312,21 +423,30 @@ class GuiDetection(unittest.TestCase):
         self.running(['/usr/bin/FreeFileSync_x86_64', '/home/u/calibre-library.ffs_batch'])
         self.assertIn('FreeFileSync', lib.blockers()[0])
 
-    def lock_then(self, results, server=None):
-        """A Library whose calibredb answers each call from `results` (a lock error or output)."""
+    def lock_then(self, results, server=None, path=Path('/lib')):
+        """A Library whose calibredb answers each call from `results` (a lock error, a
+        ('fail', stderr) or output)."""
         calls = []
 
         def run(argv, capture_output, text):
             calls.append(argv)
             out = results.pop(0)
+            if isinstance(out, tuple):
+                return subprocess.CompletedProcess(argv, 1, '', out[1])
             return subprocess.CompletedProcess(argv, 1 if out == 'lock' else 0, out, 'Another calibre program is running' if out == 'lock' else '')
         saved = (doclib.subprocess.run, doclib.time.sleep)
         self.addCleanup(lambda: (setattr(doclib.subprocess, 'run', saved[0]), setattr(doclib.time, 'sleep', saved[1])))
         doclib.subprocess.run = run
         doclib.time.sleep = lambda s: None
         lib = doclib.Library.__new__(doclib.Library)
-        lib.path, lib.server = Path('/lib'), server
+        lib.path, lib.server, lib._url = path, server, None
         return lib, calls
+
+    def gui_on(self, library):
+        """The GUI has `library` open, as calibre's prefs record it."""
+        patch = unittest.mock.patch.object(doclib.Library, '_gui_library', staticmethod(lambda: str(library)))
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def test_a_lock_with_only_a_worker_running_is_retried(self):
         self.running(*self.WORKER)
@@ -337,6 +457,7 @@ class GuiDetection(unittest.TestCase):
 
     def test_a_lock_with_the_gui_open_is_not_retried(self):
         self.running(*self.GUI)
+        self.gui_on('/lib')
         lib, calls = self.lock_then(['lock'])
         with self.assertRaisesRegex(RuntimeError, 'GUI is open'):
             lib._run('list')
@@ -344,43 +465,60 @@ class GuiDetection(unittest.TestCase):
         self.assertEqual(lib._run('list'), 'via server')
         self.assertEqual(calls[1][2], 'http://localhost:8080/#lib')
 
-    def secret(self, serves_scratch=False):
-        """Content-server credentials in a secret.yml -> a scratch library, which the server
-        serves only when serves_scratch says so; otherwise it serves the default library."""
+    def secret(self, server_url=None):
+        """Content-server credentials in a secret.yml -> a scratch library path."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        scratch = Path(tmp.name) / 'scratch library'
-        served = f'  library: {scratch}\n' if serves_scratch else ''
-        (Path(tmp.name) / 'secret.yml').write_text(f'calibre:\n  username: u\n  password: pw\n{served}',
+        url = f'  server_url: {server_url}\n' if server_url else ''
+        (Path(tmp.name) / 'secret.yml').write_text(f'calibre:\n  username: u\n  password: pw\n{url}',
                                                    encoding='utf-8')
         env = unittest.mock.patch.dict(os.environ, {'DOWNLOAD_DOC_SECRET': str(Path(tmp.name) / 'secret.yml')})
         env.start()
         self.addCleanup(env.stop)
-        return scratch
+        return Path(tmp.name) / 'My Library'
 
-    def test_the_content_server_is_used_only_for_the_library_it_serves(self):
+    def test_the_content_server_is_used_only_for_the_library_the_gui_has_open(self):
         # The GUI's lock refuses calibredb on every library, so a scratch library run
         # with the GUI open must stop, not read and write the GUI's library instead.
         self.running(*self.GUI)
         scratch = self.secret()
-        self.assertIsNotNone(doclib.Library(doclib.DEFAULT_LIBRARY).server)
+        self.gui_on(doclib.DEFAULT_LIBRARY)
         lib = doclib.Library(scratch)
-        self.assertIsNone(lib.server)
-        self.assertIn('GUI is open', lib.blockers()[0])
-        _, calls = self.lock_then(['lock'])
+        self.assertIn(f'GUI is open on {doclib.DEFAULT_LIBRARY}, not {scratch}', lib.blockers()[0])
+        lib, calls = self.lock_then(['lock'], server=lib.server, path=scratch)
         with self.assertRaisesRegex(RuntimeError, 'GUI is open'):
             lib._run('add', 'x.pdf')
         self.assertEqual([argv[2] for argv in calls], [str(scratch)])
 
-    def test_a_library_key_names_the_library_the_server_serves(self):
+    def test_a_server_url_without_a_library_id_is_refused_whatever_the_server_lists(self):
+        # calibre 8.5 lists only the ids an account may see: GUI library /gui/My Library is
+        # My_Library, /other/My_Library is My_Library1, and an account allowed only the
+        # latter sees a lone My_Library1, which is not the GUI's library.
         self.running(*self.GUI)
-        scratch = self.secret(serves_scratch=True)
-        self.assertIsNone(doclib.Library(doclib.DEFAULT_LIBRARY).server)
-        lib = doclib.Library(scratch)
-        self.assertEqual(lib.blockers(), [])
-        _, calls = self.lock_then(['lock', 'via server'])
-        self.assertEqual(lib._run('list'), 'via server')
-        self.assertEqual(calls[1][2], 'http://localhost:8080')
+        target = self.secret()
+        self.gui_on(target)
+        for ids in ('My_Library1\n', 'My_Library\n', 'My_Library\nMy_Library1\n', ''):
+            with self.subTest(ids):
+                lib, calls = self.lock_then(['lock', ids, ids], server=doclib.Library(target).server, path=target)
+                with self.assertRaisesRegex(RuntimeError, r"server_url names no library id; set it to "
+                                                          r"http://localhost:8080/#<id> .*ids it shows this account: "
+                                                          + (', '.join(ids.split()) or 'none')):
+                    lib._run('add', 'x.pdf')
+                self.assertEqual([argv[2] for argv in calls], [str(target), 'http://localhost:8080/#-'])
+                self.assertIn('server_url names no library id', lib.blockers()[0])
+        self.secret(server_url='http://localhost:8080/#My_Library1')
+        lib, calls = self.lock_then(['lock', 'via server'], server=doclib.Library(target).server, path=target)
+        self.assertEqual(lib._run('add', 'x.pdf'), 'via server')
+        self.assertEqual(calls[1][2], 'http://localhost:8080/#My_Library1')
+
+    def test_an_id_the_server_does_not_serve_is_refused_not_retried_without_it(self):
+        self.running(*self.GUI)
+        self.gui_on('/lib')
+        lib, calls = self.lock_then(['lock', ('fail', 'Not Found')], server=('http://localhost:8080/#lib', 'u', 'pw'))
+        with self.assertRaisesRegex(RuntimeError, r"http://localhost:8080/#lib serves no library by that id; "
+                                                  r".*'http://localhost:8080/#-' list"):
+            lib._run('add', 'x.pdf')
+        self.assertEqual([argv[2] for argv in calls], [str(Path('/lib')), 'http://localhost:8080/#lib'])
 
 
 class LibraryCalls(unittest.TestCase):
@@ -444,7 +582,7 @@ class LastModified(unittest.TestCase):
         def run(argv, **kw):
             if argv[0] == 'wget':
                 raise FileNotFoundError(2, 'No such file', 'wget')
-            return subprocess.CompletedProcess(argv, 0, b'{"ok": 1}', b'')
+            return subprocess.CompletedProcess(argv, 0, b'{"ok": 1}\n200', b'')
         with unittest.mock.patch.object(doclib.subprocess, 'run', run):
             self.assertEqual(doclib.get_json('https://example.com/x.json'), {'ok': 1})
 
@@ -458,6 +596,35 @@ class LastModified(unittest.TestCase):
                 version, err = self.head(lambda argv, **kw: subprocess.CompletedProcess(argv, code, out, ''))
                 self.assertIsNone(version)
                 self.assertIn(f'no Last-Modified from https://example.com/x.pdf ({why})', err)
+
+
+class HttpGet(unittest.TestCase):
+    """Only the server's 404 or 410 says a document is missing; any other failure proves nothing."""
+
+    def get(self, curl_out, curl_exit=0):
+        """http_get for a PDF with wget failing and curl printing `curl_out` (body, then its -w status)."""
+        def run(argv, **kw):
+            if argv[0] == 'wget':
+                return subprocess.CompletedProcess(argv, 8, b'', b'')
+            return subprocess.CompletedProcess(argv, curl_exit, curl_out, b'')
+        with unittest.mock.patch.object(doclib.subprocess, 'run', run):
+            return doclib.http_get('https://example.com/x.pdf', validate=lambda b: b.startswith(b'%PDF'))
+
+    def test_a_pdf_comes_back_without_the_status(self):
+        self.assertEqual(self.get(b'%PDF-1.7\nbody\n200'), b'%PDF-1.7\nbody')
+
+    def test_only_a_completed_404_or_410_is_a_missing_document(self):
+        for out, code, missing in ((b'<html>gone</html>\n404', 0, True),
+                                   (b'<html>gone</html>\n410', 0, True),
+                                   (b'%PDF-1.7 not the document\n404', 0, True),
+                                   (b'\n301', 0, False),
+                                   (b'<html>busy</html>\n503', 0, False),
+                                   (b'<html>login</html>\n200', 0, False),
+                                   (b'\n000', 28, False),
+                                   (b'<html>gone</html>\n404', 56, False)):
+            with self.subTest(out=out, code=code), self.assertRaises(RuntimeError) as raised:
+                self.get(out, code)
+            self.assertEqual(isinstance(raised.exception, doclib.NotFound), missing, out)
 
 
 class MicrochipNumber(unittest.TestCase):
@@ -497,7 +664,7 @@ class TiParts(unittest.TestCase):
     def serve(self, *present):
         def http_get(url, **kw):
             if not any(url.endswith(f'/{p}.pdf') for p in present):
-                raise RuntimeError('404')
+                raise doclib.NotFound('404')
             return b'%PDF'
         vendor_ti.http_get = http_get
 
@@ -602,7 +769,7 @@ def patch_library(test):
     test.addCleanup(restore)
     doclib.Library._run = lambda lib, *a, **k: test.library.run(*a, **k)
     doclib.Library.blockers = lambda lib: []
-    doclib.Library._server_creds = staticmethod(lambda path: None)
+    doclib.Library._server_creds = staticmethod(lambda: None)
 
 
 class FakeCalibre:
@@ -1158,7 +1325,7 @@ class VendorSync(unittest.TestCase):
             def resolve(self, vendor, fam, cands, tmp, complete):
                 if resolved is None:
                     return None
-                (tmp / f'peek-{fam}.pdf').write_bytes(b'%PDF')
+                (tmp / f'{fam}.pdf').write_bytes(b'%PDF')
                 resolved.append(tmp)
                 verdicts[fam] = True
         doclib.UsbIndex = Usb
@@ -1215,7 +1382,7 @@ class VendorSync(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(resolved), 1)
         self.assertFalse(resolved[0].exists())
-        self.assertEqual(list(self.root.rglob('peek-*')), [])
+        self.assertEqual(list(self.root.rglob('*.pdf')), [])
 
     def adapter(self, vendor):
         """Dispatch through sync's own enumerate_vendor to `vendor`'s adapter, answering self.docs."""
@@ -1226,6 +1393,21 @@ class VendorSync(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     enumerate_vendor = staticmethod(sync.enumerate_vendor)
+
+    def test_a_vendor_that_never_reports_is_not_partial_after_one_that_did(self):
+        self.docs = [st_doc('AN1', [])]
+
+        def enumerate_vendor(vendor, args):
+            if vendor == 'st':
+                doclib.partial_enumeration('SS1: fetch failed')
+            return list(self.docs)
+        sync.enumerate_vendor = enumerate_vendor
+        code, _, err = run_sync('st')
+        self.assertEqual(code, 0, err)
+        self.assertIn('enumeration incomplete', err)
+        code, _, err = run_sync('rpi')
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('enumeration incomplete', err)
 
     def test_any_vendor_plans_at_most_the_limit(self):
         self.docs = [st_doc(f'DS{n}', []) for n in range(5)]
@@ -1274,7 +1456,8 @@ class VendorSync(unittest.TestCase):
     def test_a_recorded_negative_is_honoured(self):
         cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
         cache.parent.mkdir(parents=True)
-        cache.write_text(json.dumps({'st:STM32X0': {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'old'}}))
+        cache.write_text(json.dumps({'st:STM32X0': {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'old',
+                                                    'complete': True}}))
         self.docs = [st_doc(f'DS{n}', ['STM32X0']) for n in range(1, 4)]
         self.adapter('st')
         self.peek_usb_in('DS1')
@@ -1282,6 +1465,88 @@ class VendorSync(unittest.TestCase):
         self.assertEqual(code, 1, err)
         self.assertIn('left out: 3 document(s)', err)
         self.assertEqual(json.loads(cache.read_text())['st:STM32X0']['source'], 'pdf:3 docs')
+
+    def test_a_negative_recorded_before_adapters_reported_partial_lists_is_read_again(self):
+        cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
+        cache.parent.mkdir(parents=True)
+        stale = {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'old'}
+        self.docs = [st_doc(f'DS{n}', ['STM32X0']) for n in range(1, 5)]
+        self.adapter('st')
+        self.peek_usb_in('none')
+        cache.write_text(json.dumps({'st:STM32X0': stale}))
+        code, out, err = run_sync('st', '--types', 'datasheet')
+        self.assertEqual((code, out.count('NEW       ')), (0, 4), err)
+        self.assertEqual(json.loads(cache.read_text())['st:STM32X0'], stale)
+        self.peek_usb_in('DS4')
+        code, out, err = run_sync('st')
+        self.assertEqual((code, out.count('NEW       ')), (0, 4), err)
+        self.assertIs(json.loads(cache.read_text())['st:STM32X0']['usb'], True)
+
+    def st_grids(self, grids, failing=()):
+        """vendor_st over `grids` {grid id: (family, [doc ids])}, its cache under self.root, `failing` unreachable."""
+        def http_get(url, *a, **k):
+            gid = url.rsplit('/', 1)[1].split('.')[0]
+            if gid in failing:
+                raise RuntimeError('fetch failed')
+            return json.dumps({'rows': [{'resourceType': 'Datasheet', 'title': d, 'version': '1.0',
+                                         'localizedLinks': {'en': f'/{d}.pdf'}} for d in grids[gid][1]]}).encode()
+        shutil.rmtree(self.root / 'st', ignore_errors=True)
+        for name, value in (('SERIES', {g: fam for g, (fam, _) in grids.items()}), ('CACHE', self.root / 'st'),
+                            ('http_get', http_get)):
+            patch = unittest.mock.patch.object(vendor_st, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        sync.enumerate_vendor = self.enumerate_vendor
+
+    def test_a_grid_st_could_not_fetch_records_no_negative(self):
+        cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
+        self.peek_usb_in('none')
+        grids = {'SS1': ('STM32X0', ['DS1', 'DS2', 'DS3']), 'SS2': ('STM32Y0', ['DS9'])}
+        with unittest.mock.patch.object(vendor_st.time, 'sleep', lambda s: None):
+            self.st_grids(grids, failing={'SS2'})
+            code, out, err = run_sync('st')
+            self.assertEqual((code, out.count('NEW       ')), (0, 3), err)
+            self.assertIn('enumeration incomplete', err)
+            self.assertFalse(cache.exists())
+            self.st_grids(grids, failing={'SS1', 'SS2'})
+            code, _, err = run_sync('st')
+            self.assertEqual(code, 1)
+            self.assertIn('st: enumeration failed (see above) — nothing to plan', err)
+            # The default types are the default scope; the same list named explicitly narrows the run.
+            self.st_grids(grids)
+            code, _, err = run_sync('st', '--types', ','.join(sorted(doclib.TECHNICAL_TYPES)))
+            self.assertEqual(code, 0, err)
+            self.assertFalse(cache.exists())
+            code, _, err = run_sync('st')
+            self.assertEqual(code, 0, err)
+            self.assertNotIn('enumeration incomplete', err)
+        verdicts = json.loads(cache.read_text())
+        self.assertEqual((verdicts['st:STM32X0']['usb'], verdicts['st:STM32X0']['complete']), (False, True))
+
+    def test_a_failed_page_recovers_on_the_next_run(self):
+        # Page two holds the one document showing USB; a run without it must not settle the family.
+        cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
+
+        def nxp_run(fail):
+            def page(tax, device_tax, start):
+                if tax != vendor_nxp.TYPE_TAX['datasheet']:
+                    return {'totalcount': 0, 'results': []}
+                if start and fail:
+                    raise RuntimeError('HTTP 503')
+                codes = ['LPC99DS0', 'LPC99DS1', 'LPC99DS2'] if not start else ['LPC99DS3']
+                return {'totalcount': 4, 'results': [
+                    {'metaData': {'code': c}, 'url': f'https://nxp.com/{c}.pdf', 'title': c} for c in codes]}
+            with unittest.mock.patch.object(vendor_nxp, '_page', page), \
+                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None):
+                return run_sync('nxp')
+        sync.enumerate_vendor = self.enumerate_vendor
+        self.peek_usb_in('LPC99DS3')
+        code, out, err = nxp_run(fail=True)
+        self.assertEqual((code, out.count('NEW       ')), (0, 3), err)
+        self.assertFalse(cache.exists())
+        code, out, err = nxp_run(fail=False)
+        self.assertEqual((code, out.count('NEW       ')), (0, 4), err)
+        self.assertIs(json.loads(cache.read_text())['nxp:LPC99']['usb'], True)
 
     def test_a_failed_index_page_does_not_exclude_a_family_from_later_runs(self):
         # Three readable datasheets without USB settle "no USB", unless a page went missing.
@@ -1297,8 +1562,7 @@ class VendorSync(unittest.TestCase):
             cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
             cache.unlink(missing_ok=True)
             with unittest.mock.patch.object(vendor_nxp, '_page', page), \
-                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None), \
-                    unittest.mock.patch.object(vendor_nxp, 'ENUMERATION_COMPLETE', True):
+                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None):
                 code, _, err = run_sync('nxp')
             return code, err, json.loads(cache.read_text()) if cache.exists() else {}
         sync.enumerate_vendor = self.enumerate_vendor
@@ -1333,11 +1597,28 @@ class UsbResolution(unittest.TestCase):
         self.assertEqual(index.get('st', 'STM32X0')['usb'], None)
         self.assertEqual(index.get('st', 'STM32X0')['source'], 'pdf:sampled 6/8')
 
+    def test_only_a_negative_set_complete_is_kept_as_a_verdict(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / 'usb.json'
+        index = doclib.UsbIndex(path)
+        index.set('st', 'STM32X0', False, 'pdf:3 docs', 'no USB peripheral found', complete=True)
+        index.set('st', 'STM32Y0', False, 'pdf:3 docs', 'no USB peripheral found')
+        index.set('st', 'STM32Z0', True, 'vendor index', 'USB OTG')
+        self.assertEqual(json.loads(path.read_text()), {
+            'st:STM32X0': {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'no USB peripheral found',
+                           'complete': True},
+            'st:STM32Y0': {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'no USB peripheral found'},
+            'st:STM32Z0': {'usb': True, 'source': 'vendor index', 'evidence': 'USB OTG'}})
+        index = doclib.UsbIndex(path)
+        self.assertEqual([index.get('st', f) is not None for f in ('STM32X0', 'STM32Y0', 'STM32Z0')],
+                         [True, False, True])
+
     def test_a_manual_whose_text_cannot_be_extracted_is_unread_not_usb_less(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         rm = st_doc('RM1', ['STM32X0'], 'reference-manual')
-        (Path(tmp.name) / 'peek-RM1.pdf').write_bytes(b'%PDF' + b' ' * 2048)   # already downloaded
+        (Path(tmp.name) / 'RM1.pdf').write_bytes(b'%PDF' + b' ' * 2048)   # already downloaded
         no_usb = 'STM32X0 reference manual: GPIO, SPI, I2C'
         cases = {'no pdftotext': (None, no_usb, 0), 'pdftotext fails': ('pdftotext', no_usb, 1),
                  'no text layer': ('pdftotext', ' \n\f ', 0)}
@@ -1350,6 +1631,168 @@ class UsbResolution(unittest.TestCase):
                 self.assertIsNone(index.peek(rm, Path(tmp.name)))
                 self.assertIsNone(index.resolve('st', 'STM32X0', [rm], Path(tmp.name), complete=True))
                 self.assertFalse((Path(tmp.name) / f'{name}.json').exists())
+
+
+@unittest.skipUnless(shutil.which('pdftotext'), 'the USB peek and the identity check read the PDF with pdftotext')
+class RunDownloads(unittest.TestCase):
+    """A document the USB peek downloaded is imported from the run's one download dir,
+    once it passes the checks a fresh download would; the dir goes with the run."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        (self.root / 'tmp').mkdir()
+        self.library = FakeCalibre()
+        patch_library(self)
+        self.good = pdf_with('DS1234 Rev 1 STM32X0 MCU with USB OTG full speed')
+        self.fetched = []
+        doc = st_doc('DS1234', ['STM32X0'])
+        for target, name, value in ((sync, 'enumerate_vendor', lambda vendor, args: [doc]),
+                                    (doclib, 'http_get', self.http_get), (Path, 'home', lambda: self.root),
+                                    (tempfile, 'tempdir', str(self.root / 'tmp'))):
+            patch = unittest.mock.patch.object(target, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def http_get(self, url, *a, **k):
+        self.fetched.append(url)
+        return self.good
+
+    def peeked(self, data):
+        """UsbIndex.peek leaving `data` where a peek's download lands, and finding USB."""
+        def peek(index, doc, tmp):
+            (tmp / f'{doc.doc_id}.pdf').write_bytes(data)
+            index.last_evidence = 'USB OTG'
+            return True
+        patch = unittest.mock.patch.object(doclib.UsbIndex, 'peek', peek)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_peeked_document_is_downloaded_once(self):
+        code, out, err = run_sync('st', '--apply')
+        self.assertEqual(code, 0, err)
+        self.assertIn('IMPORTED  1 new', out)
+        self.assertEqual(self.fetched, ['https://st.com/DS1234.pdf'])
+        self.assertEqual(self.library.added, [self.good])
+
+    def test_a_peeked_copy_that_fails_the_import_checks_is_downloaded_again(self):
+        for name, data in (('not a pdf', b'<html>' + b'x' * 2048), ('too short', b'%PDF-1.4'),
+                           ('another document', pdf_with('DS9999 Rev 2 STM32X0 USB OTG'))):
+            with self.subTest(name):
+                self.fetched.clear()
+                self.library = FakeCalibre()
+                self.peeked(data)
+                code, out, err = run_sync('st', '--apply')
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fetched, ['https://st.com/DS1234.pdf'])
+                self.assertEqual(self.library.added, [self.good])
+
+    def test_the_download_dir_goes_with_the_run(self):
+        self.peeked(self.good)
+        for argv in (('st',), ('st', '--apply')):
+            with self.subTest(argv):
+                code, _, err = run_sync(*argv)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(list((self.root / 'tmp').iterdir()), [])
+        self.library.fail['list'] = 'database read failed'
+        code, _, err = run_sync('st', '--apply')
+        self.assertEqual(code, 2, err)
+        self.assertEqual(list((self.root / 'tmp').iterdir()), [])
+
+
+class EnumerationComplete(unittest.TestCase):
+    """An adapter whose fetch failed says its list is partial; a 404 or an empty answer is the vendor's own."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def patch(self, mod, **attrs):
+        for name, value in attrs.items():
+            patch = unittest.mock.patch.object(mod, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def complete(self, mod, http_get, **kw):
+        """mod.enumerate_docs(**kw) with http_get answering -> whether it reported its list complete."""
+        with unittest.mock.patch.object(mod, 'http_get', http_get), \
+                contextlib.redirect_stderr(io.StringIO()):
+            mod.enumerate_docs(**kw)
+        return doclib.enumeration_complete
+
+    @staticmethod
+    def fails(*a, **k):
+        raise RuntimeError('fetch failed')
+
+    def test_an_adapter_with_one_index_page_reports_its_failure(self):
+        cases = {vendor_allwinner: lambda *a, **k: b'<html>' + b' ' * 3000,
+                 vendor_wch: lambda *a, **k: b'{"code": 0, "message": null, "data": null}',
+                 vendor_st: lambda *a, **k: b'{"rows": []}'}
+        self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')
+        sleep = unittest.mock.patch.object(vendor_st.time, 'sleep', lambda s: None)
+        sleep.start()
+        self.addCleanup(sleep.stop)
+        for mod, answers in cases.items():
+            with self.subTest(mod.__name__):
+                self.assertFalse(self.complete(mod, self.fails, refresh=True))
+                self.assertTrue(self.complete(mod, answers, refresh=True))
+
+    def test_each_enumeration_reports_only_its_own_fetches(self):
+        page = lambda *a, **k: b'<html>' + b' ' * 3000
+        self.assertEqual([self.complete(vendor_allwinner, get) for get in (self.fails, page, self.fails, page)],
+                         [False, True, False, True])
+
+    def test_a_partial_enumeration_does_not_carry_over_to_another_vendor(self):
+        self.assertFalse(self.complete(vendor_allwinner, self.fails))
+        self.assertTrue(self.complete(vendor_wch, lambda *a, **k: b'{"code": 0, "message": null, "data": null}'))
+
+    def test_wch_reports_an_unsuccessful_answer_from_a_related_page(self):
+        # The seed answers; the page it links to answers with an error code instead.
+        def http_get(url, *a, **k):
+            if 'CH32V307DS0_PDF' in url:
+                return json.dumps({'code': 0, 'data': {
+                    'id': 1, 'name': 'CH32V307DS0.PDF', 'content': 'CH32V307 datasheet',
+                    'relationFileList': [{'name': 'CH32FV2x_V3xRM.PDF'}]}}).encode()
+            return b'{"code": 500, "message": "busy", "data": null}' if 'V3XRM' in url.upper() else \
+                b'{"code": 0, "message": null, "data": null}'
+        self.patch(vendor_wch, SEEDS=['CH32V307DS0_PDF.html'])
+        self.assertFalse(self.complete(vendor_wch, http_get))
+
+    def test_st_falls_back_to_its_cached_grid(self):
+        self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')
+        (self.root / 'st').mkdir()
+        (self.root / 'st' / 'SS1.json').write_text('{"rows": []}')
+        self.assertTrue(self.complete(vendor_st, self.fails, refresh=True))
+
+    def test_espressif_reports_a_document_page_it_could_not_fetch(self):
+        row = ('<tr><td class="views-field-title">ESP32-S3 Datasheet</td>'
+               '<a href="https://docs.espressif.com/esp32-s3/ds.html">x</a></tr>')
+        self.patch(vendor_espressif, _index_html=lambda refresh: row)
+        self.assertFalse(self.complete(vendor_espressif, self.fails))
+        self.assertTrue(self.complete(vendor_espressif, lambda *a, **k: b'<html><a href="ds.pdf"></a></html>'))
+
+    def test_a_probing_adapter_tells_a_missing_document_from_a_failed_fetch(self):
+        cases = {vendor_silabs: dict(_families_from_bsp=lambda: {'efm32gg12'}),
+                 vendor_ti: dict(_parts_from_bsp=lambda: {'tm4c123gh6pm': 'TM4C'}),
+                 vendor_geehy: dict(VERSIONS=['V1.0'])}
+        for mod, attrs in cases.items():
+            with self.subTest(mod.__name__):
+                self.patch(mod, **attrs)
+                for error, missing in ((doclib.NotFound, True), (RuntimeError, False)):
+                    def http_get(*a, **k):
+                        raise error('fetch failed')
+                    self.assertEqual(self.complete(mod, http_get), missing)
+
+    def test_nxp_reports_an_empty_page_short_of_its_total(self):
+        self.patch(vendor_nxp, PACE_SECONDS=0)
+        for total, complete in ((5, False), (0, True)):
+            with self.subTest(total), \
+                    unittest.mock.patch.object(vendor_nxp, '_page', lambda *a: {'totalcount': total, 'results': []}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                vendor_nxp.enumerate_docs(types=['errata'])
+                self.assertIs(doclib.enumeration_complete, complete)
 
 
 class DocumentLimit(unittest.TestCase):

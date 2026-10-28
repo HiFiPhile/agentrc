@@ -13,7 +13,7 @@ observedAt}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error), and
 `rateLimit` {observedAt, resetAt, secondary} beside an error from a gh call GitHub
 refused for a rate limit, as pr-babysit's facts.py reports it; every
-line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
+line but an error one also carries `contract`, CONTRACT, and `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
 again). The PR is read again on every poll; once --stop-file PATH exists (the
 caller met a GitHub rate limit elsewhere) it ends as an error before its next
@@ -70,8 +70,10 @@ one file per call, and prints {head, detail, gates, bases, error}, `bases` each
 command prints {head, bases, error}, the same tokens, reading no log. Each
 check's entry holds its saved `log` and the diagnostic lines of every step that reported an error.
 The log is the job's whole log without ANSI codes, NULs and timestamps for an
-Actions job, but only tails for the others: the last 150 lines of each failed
-CircleCI step and Read the Docs' notes with 40-line tails of failed commands.
+Actions job, and the whole output of each failed CircleCI step, cleaned alike;
+`wholeLog` is true only when CircleCI marked none of them truncated and none was
+cut at circleci.MAX_LINES. For Read the Docs it is its notes with 40-line tails
+of failed commands, `wholeLog` false.
 For an Actions job the entry also holds `workflow`, the inventory's name for
 it, `runAttempt`, the attempt that
 executed it, and `executedBefore`, whether an earlier attempt executed the same
@@ -195,6 +197,9 @@ DIAGNOSTIC = re.compile(r'\b(?:error|Error|ERROR|FAIL|FAILED|Failed|failed|[Aa]s
 DURATION = re.compile(r'\s+in \d+(?:\.\d+)?s\b')
 FILES = re.compile(r'[\w./-]+\.(?:c|h|cc|cpp|hpp|py|S|s|ld|cmake|mk|ya?ml|json)\b')
 KEEP = 20
+# The members every command's line holds, as pr-babysit's relay schema reads them: bump it, and the workflow's COLLECT_CONTRACT
+# with it, on any change to them, so a workflow copy older or newer than this file is told apart from a mis-copied line (#293).
+CONTRACT = 1
 RECALL_BYTES = 8192  # unmeasured: a relay copied 3.5 KB whole and failed at 28 KB and 51 KB (agentrc#9, #23, #20)
 SHA = re.compile(r'[0-9a-f]{40}')
 HIL_ROW = re.compile(r'^(?:\d+\.\d{3} )?(\S+)\s+(\S+)\s+\.\.\.\s+(\S.*)$')  # HIL_PROFILE=1 prefixes epoch seconds
@@ -613,8 +618,12 @@ def line(head, verdicts=(), left=()):
     return {'head': head, 'verdicts': list(verdicts), 'left': list(left)}
 
 
+def finished(out):
+    return sealed({**out, 'contract': CONTRACT})
+
+
 def fits_line(out):
-    return len(json.dumps(sealed(out))) + 1 <= RECALL_BYTES
+    return len(json.dumps(finished(out))) + 1 <= RECALL_BYTES
 
 
 def page(entry, start, end):
@@ -959,7 +968,7 @@ def readthedocs(link, folder, cache):
     for code, command, tail in failed:
         lines += [f'command exited {code}: {command}', *tail.splitlines()]
     first = (failed[0][2].splitlines() or [''])[-1] if failed else record.get('error') or (notes[0][1] if notes else '')
-    return {'name': f'build {build}', 'log': save(folder, f'readthedocs-{build}.log', lines), 'base': None,
+    return {'name': f'build {build}', 'log': save(folder, f'readthedocs-{build}.log', lines), 'base': None, 'wholeLog': False,
             'firstError': first, 'signature': signature(first), 'files': [], 'diagnostics': lines[:KEEP]}
 
 
@@ -1064,11 +1073,12 @@ def greptile_gate(repo, head, check):
 
 
 def circle(repo, number, folder):
-    lines = []
-    for name, tail in circleci.failed_steps(repo, number, 150):
-        lines += [f'== {name}', *clean(tail)]
+    lines, whole = [], True
+    for name, text, complete in circleci.failed_steps(repo, number):
+        lines += [f'== {name}', *clean(text)]
+        whole = whole and complete
     entry = evidence(lines, None)
-    return {'name': f'job {number}', 'log': save(folder, f'circleci-{number}.log', lines), 'base': None, **entry}
+    return {'name': f'job {number}', 'log': save(folder, f'circleci-{number}.log', lines), 'base': None, 'wholeLog': whole, **entry}
 
 
 def prior_verdicts(repo, pr, head, entries):
@@ -1246,7 +1256,7 @@ def main(argv=None):
             out = remember(a.repo, a.pr, a.head, sys.stdin.buffer.read())
         else:
             out = recall(a.repo, a.pr, a.head, a.check, a.offset)
-        out, rc = sealed(out), 0
+        out, rc = finished(out), 0
     except Failed as e:
         out, rc = {'head': a.head, 'error': str(e), **({'rateLimit': e.limit} if e.limit else {})}, 1
     print(json.dumps(out))

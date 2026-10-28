@@ -53,21 +53,35 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
 # been observed to differ between processes on the same host at the same moment.
 # So: retry with the other client, then back off — and don't hard-code a winner.
 
-def _wget(url: str, timeout: int, accept: str) -> bytes:
+GONE = ("404", "410")
+
+
+class NotFound(RuntimeError):
+    """The server answered 404 or 410: no document there, as opposed to a fetch that
+    failed and proves nothing."""
+
+
+def _wget(url: str, timeout: int, accept: str) -> tuple:
+    """-> (payload, ""): wget reports no status, so curl's decides absence."""
     try:
         p = subprocess.run(["wget", "-q", "-O", "-", "-T", str(timeout), "-t", "2",
                             f"--user-agent={UA}", f"--header=Accept: {accept}", url],
                            capture_output=True)
     except FileNotFoundError:  # no wget, as on stock Windows: curl alone
-        return b""
-    return p.stdout if p.returncode == 0 else b""
+        return b"", ""
+    return (p.stdout if p.returncode == 0 else b""), ""
 
 
-def _curl(url: str, timeout: int, accept: str) -> bytes:
-    # -g is mandatory: NXP's brace-wrapped query is a literal path segment.
-    p = subprocess.run(["curl", "-sg", "--compressed", "-m", str(timeout),
-                        "-A", UA, "-H", f"Accept: {accept}", url], capture_output=True)
-    return p.stdout if p.returncode == 0 else b""
+def _curl(url: str, timeout: int, accept: str) -> tuple:
+    """-> (payload, final HTTP status), both empty when no response completed."""
+    # -g is mandatory: NXP's brace-wrapped query is a literal path segment. No -L: a
+    # redirect is not followed, so it never reads as a missing document.
+    p = subprocess.run(["curl", "-sg", "--compressed", "-m", str(timeout), "-A", UA,
+                        "-H", f"Accept: {accept}", "-w", "\n%{http_code}", url], capture_output=True)
+    if p.returncode:
+        return b"", ""
+    body, _, status = p.stdout.rpartition(b"\n")
+    return body, status.decode("ascii", "replace")
 
 
 def last_modified(url: str) -> str | None:
@@ -88,19 +102,24 @@ def last_modified(url: str) -> str | None:
 
 def http_get(url: str, timeout: int = 60, accept: str = "application/json",
              validate=None) -> bytes:
-    """GET a URL, returning validated bytes. Raises RuntimeError if no client
-    produced a payload that passes `validate`."""
+    """GET a URL, returning validated bytes. Raises NotFound if the server answered 404
+    or 410, RuntimeError if no client produced a payload that passes `validate`."""
     problems = []
     for name, client in (("wget", _wget), ("curl", _curl)):
-        data = client(url, timeout, accept)
+        data, status = client(url, timeout, accept)
+        if status in GONE:   # the server's own answer, whatever page it sent with it
+            problems.append(f"{name}: HTTP {status}")
+            continue
+        why = f"HTTP {status}, " if status else ""
         if not data:
-            problems.append(f"{name}: no payload")
+            problems.append(f"{name}: {why}no payload")
             continue
         if validate and not validate(data):
-            problems.append(f"{name}: {len(data)} bytes but failed validation")
+            problems.append(f"{name}: {why}{len(data)} bytes but failed validation")
             continue
         return data
-    raise RuntimeError(f"fetch failed [{'; '.join(problems)}]: {url}")
+    # curl runs last, so `status` is its answer.
+    raise (NotFound if status in GONE else RuntimeError)(f"fetch failed [{'; '.join(problems)}]: {url}")
 
 
 def _is_json(b: bytes) -> bool:
@@ -317,6 +336,24 @@ DOCID_IN_PDF = re.compile(r"\b(DS|RM|ES|PM|UM|AN|TN)\s?(\d{3,5})\b\s*[-–]?\s*R
 
 # ---------------------------------------------------------------- documents
 
+# Whether the latest enumeration listed its whole scope. An adapter that carries on past
+# a failed fetch reports it here; sync.py then records no family as USB-less from the list.
+enumeration_complete = True
+
+
+def begin_enumeration() -> None:
+    """Called first by every enumerate_docs(), so one failed run does not mark the next."""
+    global enumeration_complete
+    enumeration_complete = True
+
+
+def partial_enumeration(why: str) -> None:
+    """Report a fetch the enumeration carried on without: its list is now partial."""
+    global enumeration_complete
+    print(f"  {why}", file=sys.stderr)
+    enumeration_complete = False
+
+
 # The default document scope. "Technical" here means the documents you consult to
 # actually program a part — not product briefs, presentations, packaging or
 # certification paperwork, which are the bulk of a vendor catalogue and noise in a
@@ -402,30 +439,29 @@ class Library:
     """calibredb wrapper.
 
     The GUI takes an exclusive write lock, so imports need it closed unless
-    content-server credentials are configured for this library (see _server_creds),
-    in which case writes go through the running GUI's server instead.
+    content-server credentials are configured (see _server_creds) and this is the
+    library the GUI has open, in which case writes go through its server instead.
     """
 
     def __init__(self, path: Path = LIBRARY):
         self.path = path
-        self.server = self._server_creds(path)
+        self.server = self._server_creds()
+        self._url = None
 
     @staticmethod
-    def _server_creds(path: Path):
+    def _server_creds():
         """Optional write-through-the-GUI credentials, read from the gitignored
         `secret.yml` beside SKILL.md (or `$DOWNLOAD_DOC_SECRET`) so they are never
         typed into a command by hand:
 
             calibre:
-              server_url: http://localhost:8080
+              server_url: http://localhost:8080/#calibre-library
               username: <name>
               password: <secret>
-              library: ~/Documents/calibre-library
 
-        `library` is the library the server serves, unquoted, defaulting to
-        DEFAULT_LIBRARY; for any other `path` this returns None. The GUI's lock refuses
-        calibredb on every library, so without that check a run aimed at a scratch
-        library would read and write the served one.
+        `#<id>` is calibre's id for the library the GUI has open; writes go through the
+        server only for that library and only with that id (served_url). A `library`
+        key, which used to declare the library, is no longer read.
 
         Calibre's content server accepts reads unauthenticated but answers writes with
         "Forbidden" until a user exists (Preferences -> Sharing over the net -> Require
@@ -447,10 +483,82 @@ class Library:
         g = dict(re.findall(r"^\s+(\w+):[ \t]*(\S.*?)[ \t]*$", blk.group(1), re.M))
         if not (g.get("username") and g.get("password")):
             return None
-        served = Path(g.get("library") or DEFAULT_LIBRARY).expanduser()
-        if served.resolve() != Path(path).expanduser().resolve():
-            return None
         return (g.get("server_url", "http://localhost:8080"), g["username"], g["password"])
+
+    @staticmethod
+    def _gui_library() -> str | None:
+        """The library the GUI has open, as calibre records it: prefs['library_path'],
+        saved at start and on every switch. None when calibre-debug cannot say."""
+        code = ("import sys; from calibre.utils.config import prefs; "
+                "sys.stdout.buffer.write((prefs['library_path'] or '').encode('utf-8'))")
+        try:
+            p = subprocess.run(["calibre-debug", "-c", code], capture_output=True)
+        except OSError:
+            return None
+        out = p.stdout.decode("utf-8", "replace").strip()
+        return out if p.returncode == 0 and out else None
+
+    def served_url(self) -> str:
+        """`server_url#<library id>` addressing this library through the GUI's content
+        server, or RuntimeError why it cannot be.
+
+        Only the GUI's own library qualifies: the GUI's lock refuses calibredb on every
+        library, so a scratch library's run would otherwise write the served one. Its id
+        must be named in `server_url`: nothing the server answers proves which library an
+        id is. calibre names a library by its folder name, spaces as `_`, numbering a
+        repeat (`My_Library`, `My_Library1`) in the order it met them; it refuses an id
+        it does not serve, but not a same-named library of another path; and its list of
+        ids shows only what the account may see, so a lone `My_Library1` there can be
+        another library while the GUI's is hidden. Without any id the server writes its
+        default library, the first it lists and not necessarily the GUI's.
+        """
+        if self._url:
+            return self._url
+        gui = self._gui_library()
+        if gui is None or os.path.normcase(str(Path(gui).resolve())) != \
+                os.path.normcase(str(Path(self.path).expanduser().resolve())):
+            raise RuntimeError(f"The Calibre GUI is open on {gui or 'a library calibre-debug cannot name'}, "
+                               f"not {self.path}, and holds the write lock — close it before importing.")
+        url, _, given = self.server[0].partition("#")
+        url = url.rstrip("/")
+        if not given:
+            p = self._server_call(f"{url}/#-", "list")
+            shown = (", ".join(p.stdout.split()) or "none") if p.returncode == 0 else \
+                f"unlisted: {(p.stderr or p.stdout or '').strip()[:120]}"
+            raise RuntimeError(f"secret.yml's server_url names no library id; set it to {url}/#<id> "
+                               f"with the id {url} gives the GUI's library {gui} (ids it shows "
+                               f"this account: {shown})")
+        self._url = f"{url}/#{given}"
+        return self._url
+
+    def _server_call(self, url: str, *args) -> subprocess.CompletedProcess:
+        """calibredb against the content server at url, with the stored credentials."""
+        _, user, pw = self.server
+        # Never put the password in argv: /proc/<pid>/cmdline is world
+        # readable, so `ps` would show it for the life of every call —
+        # which would defeat keeping it in a gitignored file at all.
+        # calibredb takes `<f:PATH>`, decodes it as UTF-8 and rstrip()s it,
+        # so hand it a private file (0600 in $XDG_RUNTIME_DIR or /tmp; the
+        # user's temp dir on Windows) and delete it immediately. Its
+        # other option, `<stdin>`, routes through
+        # getpass() and needs a TTY we do not have here.
+        rt = Path(os.environ.get("XDG_RUNTIME_DIR",
+                                 tempfile.gettempdir() if os.name == "nt" else "/tmp"))
+        fd, tmp_pw = tempfile.mkstemp(dir=str(rt), prefix=".calpw-")
+        try:
+            if hasattr(os, "fchmod"):  # mkstemp already made it 0600; Windows has no modes
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(pw)
+            return subprocess.run(
+                ["calibredb", "--with-library", url, "--username", user,
+                 "--password", f"<f:{tmp_pw}>", *args],
+                capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(tmp_pw)
+            except OSError:
+                pass
 
     # calibredb reports "Another calibre program ... is running" even when Calibre is
     # closed, if a FreeFileSync mirror is touching the library directory at that moment.
@@ -471,41 +579,19 @@ class Library:
                     if self.server:
                         # Write through the running GUI's own content server rather than
                         # wait for a lock that cannot clear while the GUI is open.
-                        url, user, pw = self.server
-                        # Never put the password in argv: /proc/<pid>/cmdline is world
-                        # readable, so `ps` would show it for the life of every call —
-                        # which would defeat keeping it in a gitignored file at all.
-                        # calibredb takes `<f:PATH>`, decodes it as UTF-8 and rstrip()s it,
-                        # so hand it a private file (0600 in $XDG_RUNTIME_DIR or /tmp; the
-                        # user's temp dir on Windows) and delete it immediately. Its
-                        # other option, `<stdin>`, routes through
-                        # getpass() and needs a TTY we do not have here.
-                        rt = Path(os.environ.get("XDG_RUNTIME_DIR",
-                                                 tempfile.gettempdir() if os.name == "nt" else "/tmp"))
-                        fd, tmp_pw = tempfile.mkstemp(dir=str(rt), prefix=".calpw-")
-                        try:
-                            if hasattr(os, "fchmod"):  # mkstemp already made it 0600; Windows has no modes
-                                os.fchmod(fd, 0o600)
-                            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                                fh.write(pw)
-                            p2 = subprocess.run(
-                                ["calibredb", "--with-library", url, "--username", user,
-                                 "--password", f"<f:{tmp_pw}>", *args],
-                                capture_output=True, text=True)
-                        finally:
-                            try:
-                                os.unlink(tmp_pw)
-                            except OSError:
-                                pass
+                        url = self.served_url()
+                        p2 = self._server_call(url, *args)
                         if p2.returncode == 0:
                             return p2.stdout
-                        raise RuntimeError("content-server write failed: "
-                                           + (p2.stderr or p2.stdout or "").strip()[:160])
+                        why = (p2.stderr or p2.stdout or "").strip()[:160]
+                        if why == "Not Found":
+                            why = (f"{url} serves no library by that id; `calibredb --with-library "
+                                   f"'{url.partition('#')[0]}#-' list` lists the ids it serves")
+                        raise RuntimeError("content-server write failed: " + why)
                     raise RuntimeError(
                         "the Calibre GUI is open and holds the library's write lock. "
                         "Close it, or define a content-server user and put the credentials "
-                        "and this library's path in secret.yml under `calibre:` "
-                        "(see Library._server_creds).")
+                        "in secret.yml under `calibre:` (see Library._server_creds).")
                 if attempt < tries - 1:
                     print(f"  calibredb reported a lock (attempt {attempt + 1}/{tries}); "
                           f"retrying — a sync is probably touching the library",
@@ -585,9 +671,14 @@ class Library:
         if gui and not self.server:
             out.append("The Calibre GUI is open and holds the library's write lock — "
                        "close it before importing.")
-        # With content-server credentials configured, an open GUI is not a blocker:
-        # _run writes through its server instead of competing for the lock. Reporting
-        # it anyway made sync.py refuse imports that would have succeeded.
+        elif gui:
+            # With content-server credentials, an open GUI is not a blocker for its own
+            # library: _run writes through its server instead of competing for the lock.
+            # Reporting it anyway made sync.py refuse imports that would have succeeded.
+            try:
+                self.served_url()
+            except RuntimeError as e:
+                out.append(str(e))
         # Linux only: it needs the program's arguments to find the calibre-library batch.
         # On Windows _cmdlines() has image names alone (FreeFileSync_x64.exe,
         # RealTimeSync.exe), and blocking on the name would let a resident RealTimeSync
@@ -825,11 +916,20 @@ class UsbIndex:
         self.data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
     def get(self, vendor: str, family: str):
-        return self.data.get(f"{vendor}:{family}")
+        v = self.data.get(f"{vendor}:{family}")
+        # A negative without `complete` predates adapters reporting a partial enumeration,
+        # so it may come from one: treat it as unresolved until a complete run re-reads it.
+        if v and v["usb"] is False and not v.get("complete"):
+            return None
+        return v
 
-    def set(self, vendor: str, family: str, usb, source: str, evidence: str = ""):
-        self.data[f"{vendor}:{family}"] = {"usb": usb, "source": source,
-                                           "evidence": evidence[:120]}
+    def set(self, vendor: str, family: str, usb, source: str, evidence: str = "",
+            complete: bool = False):
+        """`complete`: read from a whole default scope that enumerated in full (see get)."""
+        entry = {"usb": usb, "source": source, "evidence": evidence[:120]}
+        if complete:
+            entry["complete"] = True
+        self.data[f"{vendor}:{family}"] = entry
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True), encoding="utf-8")
 
@@ -907,12 +1007,12 @@ class UsbIndex:
             return None
         self.set(vendor, family, False, f"pdf:{len(cands[:budget])} docs"
                  + (" incl. reference manual" if seen_rm else ""),
-                 "no USB peripheral found")
+                 "no USB peripheral found", complete=True)
         return False
 
     def peek(self, doc: "Doc", tmp: Path) -> bool | None:
         """Settle a family by reading one of its documents. Returns the verdict."""
-        pdf = tmp / f"peek-{doc.doc_id}.pdf"
+        pdf = tmp / f"{doc.doc_id}.pdf"     # where the import looks for it (sync.fetch)
         got = pdf if pdf.exists() and pdf.stat().st_size > 1024 else download(doc.url, pdf)
         if got is None:
             return None

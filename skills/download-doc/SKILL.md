@@ -15,7 +15,7 @@ the web for a manual, so its value depends on being complete and *not stale*.
 | `scripts/sync.py` | CLI: sync a vendor (enumerate → plan → `--apply` imports/replaces), or `add`, `refresh` or `remove` one document. Dry run by default. |
 | `scripts/vendor_<name>.py` | One adapter per vendor; `sync.py --help` lists them, each docstring gives its scope. Renesas, Microchip and HPMicro only read a hand-harvested cache; their docstrings say how to build it |
 | `scripts/doclib.py` | Shared core: transport, revisions, Calibre I/O, planning |
-| `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry run by default. |
+| `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry run by default; `--rollback <tsv>` restores the titles an `--apply` saved. |
 | `references/st.md`, `references/nxp.md` | Per-vendor endpoints, quirks, the NXP gated-download flow |
 | `references/maintaining.md` | Why the conventions, the failure modes, adding a vendor |
 
@@ -103,10 +103,12 @@ Dedup depends on matching these exactly; `maintaining.md` gives the reasons.
 - `--apply` refuses while something holds the library. **The Calibre GUI's write lock**:
   ask the user to close it, never kill it — or configure a content-server user in the
   gitignored `secret.yml` beside this file (`calibre:` block; `Library._server_creds`
-  documents it). The server is used only for the library it serves; with the GUI open,
-  no other library (a scratch copy included) can be written. **A FreeFileSync
-  `calibre-library.ffs_batch` mirror** to omv: let it finish. On Windows the mirror
-  check cannot see command lines; pause the mirror yourself before `--apply`.
+  documents it), its `server_url` ending in `#<id>`, calibre's id for the GUI's library
+  (`calibre-library` for `~/Documents/calibre-library`). The server is used only for the
+  library the GUI has open; with the GUI open, no other library (a scratch copy included)
+  can be written. **A FreeFileSync `calibre-library.ffs_batch` mirror** to omv: let it
+  finish. On Windows the mirror check cannot see command lines; pause the mirror yourself
+  before `--apply`.
 - Replacing or removing a book moves the old one to Calibre's Recycle Bin (kept 14
   days by default; restore it there); remove through `refresh` or `sync.py remove`,
   never `calibredb remove` by hand.

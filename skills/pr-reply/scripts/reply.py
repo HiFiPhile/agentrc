@@ -41,7 +41,14 @@ written by hand. Exit 0 when every reply is verified and, for a review
 reply, resolved; 1 otherwise, a failed comment lookup (an inaccessible --repo or a
 rate limit included) being a receipt's error; 2 on a usage or manifest error, or
 when finding the repo (gh repo view) or our login (gh api user) fails, with
-{"error": ...} as the last stdout line. A null resolved or
+{"error": ...} as the last stdout line. A manifest posts nothing while our login
+holds a PENDING review on the PR, which GitHub refuses review replies beside:
+exit 2 with the error "pending review <id> of <login> on PR #<N> blocks
+replies: ..." and the member "pendingReview": {"id", "login"} beside it, for a
+human to submit or delete; this script never does either.
+A failed listing of the reviews is exit 2 too, nothing posted.
+A failed call's error is gh's diagnostic plus the message and errors GitHub
+answered with, at most BODY_MAX characters of them. A null resolved or
 error is left out of the line: a model relaying it drops a trailing null. An
 entry whose error names a GitHub rate limit ends the batch: every later entry
 gets a receipt that nothing was tried, with no further GitHub call.
@@ -99,6 +106,7 @@ THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owne
                  'pullRequest(number:$p){reviewThreads(first:100,after:$c){pageInfo{hasNextPage endCursor}'
                  'nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}')
 RESOLVE_MUTATION = 'mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}'
+BODY_MAX = 300
 
 
 class ApiError(Exception):
@@ -109,6 +117,21 @@ def gh(args, stdin=None):
     # replace: a stray byte must reach the error and read-back paths, not raise past them
     r = subprocess.run(['gh', *args], input=stdin, capture_output=True, encoding='utf-8', errors='replace')
     return r.returncode, r.stdout, r.stderr
+
+
+def failure(out, err):
+    """gh prints `gh: Validation Failed (HTTP 422)` on stderr and GitHub's own message and errors on stdout (#321)."""
+    try:
+        answer = json.loads(out)
+    except ValueError:
+        answer = None
+    said = ''
+    if isinstance(answer, dict) and (answer.get('message') or answer.get('errors')):
+        said = '; '.join(filter(None, (str(answer.get('message') or ''), json.dumps(answer['errors']) if answer.get('errors') else '')))
+    elif not err.strip():
+        said = out.strip()
+    said = said if len(said) <= BODY_MAX else said[:BODY_MAX - 1] + '…'
+    return ': '.join(filter(None, (err.strip(), said)))
 
 
 def api(method, path, body=None, paginate=False):
@@ -122,7 +145,7 @@ def api(method, path, body=None, paginate=False):
         stdin = json.dumps(body)
     rc, out, err = gh(args, stdin)
     if rc != 0:
-        raise ApiError(err.strip() or out.strip())
+        raise ApiError(failure(out, err))
     if paginate:
         try:
             data = json.loads(out)
@@ -145,7 +168,7 @@ def graphql(query, variables):
         args += ['-F' if isinstance(v, int) else '-f', f'{k}={v}']
     rc, out, err = gh(args)
     if rc != 0:
-        raise ApiError(err.strip() or out.strip())
+        raise ApiError(failure(out, err))
     return json.loads(out)
 
 
@@ -171,6 +194,10 @@ class Poster:
         if self._reviews is None:
             self._reviews = api('GET', f'repos/{self.repo}/pulls/{self.pr}/reviews?per_page=100', paginate=True)
         return self._reviews
+
+    def pending_review(self):
+        """Our PENDING review on the PR, None when there is none; ApiError when the reviews could not be listed."""
+        return next((r for r in self.reviews() if r.get('state') == 'PENDING' and (r.get('user') or {}).get('login') == self.me), None)
 
     def kind_of(self, comment_id):
         """('review', comment) for an inline review comment on this PR, ('issue',
@@ -517,10 +544,10 @@ def saved_receipt(path, request):
     return line, saved['code']
 
 
-def failed(message):
+def failed(message, **members):
     """Exit 2 before anything is posted: a relay copies the last stdout line, and with none it improvises (#115)."""
     print(f'reply.py: {message}', file=sys.stderr)
-    print(json.dumps({'error': message}))
+    print(json.dumps({'error': message, **members}))
     return 2
 
 
@@ -575,6 +602,15 @@ def main(argv=None):
         inspected = [inspect(poster, c, r) for c, r in a.inspect]
         print(json.dumps(sealed({'inspected': inspected})))
         return 0 if all(i['error'] is None for i in inspected) else 1
+    try:
+        pending = poster.pending_review() if replies else None
+    except ApiError as e:
+        # A later listing that succeeds could still hold one: nothing is posted unchecked.
+        return failed(f'the reviews on PR #{a.pr} could not be listed to check for a pending review of ours: {e}')
+    if pending:
+        return failed(f"pending review {pending['id']} of {poster.me} on PR #{a.pr} blocks replies: GitHub refuses a review reply "
+                      'while its author holds a pending review; a human submits or deletes it',
+                      pendingReview={'id': pending['id'], 'login': poster.me})
     if reuses:
         receipts = settle_all(reuses, lambda i: reuse(poster, i), lambda i: receipt(i['commentId'], i['replyId'], i['bodyDigest']))
     elif edits:

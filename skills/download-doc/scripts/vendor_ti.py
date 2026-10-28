@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, http_get, last_modified   # noqa: E402
+from doclib import Doc, NotFound, begin_enumeration, http_get, last_modified, partial_enumeration   # noqa: E402
 
 AUTHOR = "Texas Instruments"
 BSP = Path.home() / "code" / "tinyusb" / "hw" / "bsp"
@@ -62,6 +62,7 @@ def _parts_from_bsp() -> dict:
 
 
 def enumerate_docs(families=None, types=None, refresh=False, parts=None) -> list:
+    begin_enumeration()
     if types and "datasheet" not in types:
         return []
     want = {f.upper() for f in families} if families else None
@@ -74,8 +75,11 @@ def enumerate_docs(families=None, types=None, refresh=False, parts=None) -> list
         try:                       # probe: only real PDFs become documents
             http_get(url, timeout=30, accept="application/pdf",
                      validate=lambda b: b.startswith(b"%PDF"))
-        except RuntimeError:
-            print(f"  no datasheet at ti.com/lit/ds/symlink/{part}", file=sys.stderr)
+        except RuntimeError as e:
+            if isinstance(e, NotFound):
+                print(f"  no datasheet at ti.com/lit/ds/symlink/{part}", file=sys.stderr)
+            else:
+                partial_enumeration(f"{url}: fetch failed")
             missing.append(part)
             continue
         docs.append(Doc(

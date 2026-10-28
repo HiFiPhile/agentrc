@@ -1,8 +1,22 @@
 # pr-babysit arguments
 
 The `args` object `workflows/pr-babysit.js` takes (installed as `"${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js"`).
+A key not listed here throws before anything runs.
 
 - `pr` (number, required).
+- `repo`: `OWNER/NAME`, the repository `pr` belongs to (a fork PR's base
+  repository); every script's gh call names it. Omitted, a resumed launch takes
+  its state's, and a first launch the one the checkout's remotes name alone:
+  the remote marked `gh-resolved` (`gh repo set-default`), else the only GitHub
+  repository any remote names; with several and none marked, preflight stops
+  rather than guess. A state continues only its own repository: another refuses
+  the launch. Per launch.
+- `python`: the interpreter every script runs under, a path or command name,
+  the `stateRef` load included. Omitted, the load and preflight run `python3`,
+  and every later script the absolute path that interpreter reports; nothing
+  searches for another. Preflight checks it imports what the lanes need (PyYAML
+  while a bot is waited on) and stops `python-unusable` naming what is missing.
+  Per launch.
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default
@@ -21,13 +35,18 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `"${AGENTRC_DIR:
   repository below its open-source threshold). Once per head, ticks
   the "Trigger review" box of CodeRabbit's summary comment when the head was
   skipped that way, then waits for the review up to the silent-bot cap. Once
-  per head too, when CodeRabbit is rate-limited with a reset time under an
-  hour away, naps until the reset and comments `@coderabbitai review` (a limit
-  notice has no box), then waits the same way. The first launch with the
-  switch latches the run, as `greptileTrigger` does: every later head needs
+  per head too, it comments `@coderabbitai review` instead: when that tick
+  failed (a summary with no box to tick, a failed edit), unless the box reads
+  ticked or such a comment follows the head event, or when CodeRabbit is
+  rate-limited with a reset time under an hour away, after napping until the
+  reset (a limit notice has no box); then it waits the same way. A request that
+  failed before its post, so posted nothing, is tried once more, one that may
+  have posted is not. A tick that failed before this fallback existed, recorded
+  in a state, still gets its one comment from a relaunch. The first launch with
+  the switch latches the run, as `greptileTrigger` does: every later head needs
   CodeRabbit's review, a launch without the switch waits on an earlier ask and
-  asks nothing, and a head left unreviewed (a failed tick, no review within
-  the cap, a skip or limit with nothing more to ask) stops
+  asks nothing, and a head left unreviewed (a failed tick and request, no review
+  within the cap, a skip or limit with nothing more to ask) stops
   `coderabbit-unreviewed`, never a pass. That stop, and any other with
   CodeRabbit's last reading of the head no review, returns `coderabbitAsk`:
   the asks made on the head and the one a relaunch would still make, if any.
@@ -57,8 +76,11 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `"${AGENTRC_DIR:
   that the repository hooks validate it.
 - `build`: verify command, `<BUILD>` for a fresh build directory, carrying any
   environment setup it needs; default the repository's build contract, its
-  setup and the tools it requires resolved with it, a missing one stopping
-  `build-unverifiable` rather than failing the batch; per launch.
+  setup and the tools it requires resolved with it, every built target's or
+  board family's included, a missing one stopping `build-unverifiable` rather
+  than failing the batch; per launch. Only a tool the resolver names is checked
+  before the build: one only a build wrapper invokes and the contract never
+  names still fails the build as unverified.
 - `ciWait`: minutes to wait on pending checks, default 30. CodeRabbit's own
   check is left out when coderabbit is in `autoRun` and the review lane runs:
   the review lane waits on it. A head with no other check registered settles
@@ -106,7 +128,9 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `"${AGENTRC_DIR:
 - `adoptHead`: full SHA of audited commits on top of the state's
   `expectedHead` (a caller's repair, or a push made outside the workflow):
   the chain is audited, published under `autoPush`, and the run continues
-  from it; per launch. A merge from the PR's base branch is one link, its
+  from it; per launch. Without a pinned state (a first launch, or the state
+  of one that stopped before its pin, such as `wrong-head`), the chain's base
+  is the live PR head. A merge from the PR's base branch is one link, its
   paths those it leaves unlike both parents; it is from the base when the
   branch's live tip or the base GitHub recorded holds its second parent. That
   record is stale until the head is pushed, so a merge newer than it needs the

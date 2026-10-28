@@ -1075,7 +1075,21 @@ class BuildOutput(ProfileCase):
 
 
     def test_a_timeout_returns_124_and_keeps_the_output_as_text(self):
-        ret = sd.run(['sh', '-c', 'printf err >&2; echo out; exec sleep 30'], timeout=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp, 'ready')
+            cmd = ['sh', '-c', 'printf err >&2; echo out; : > "$0"; exec sleep 30', ready.as_posix()]
+            communicate = subprocess.Popen.communicate
+
+            def after_the_output(proc, *args, **kwargs):
+                # the 1 s starts once the output is written, not with sh's start-up (over 1 s on Windows CI, #267)
+                deadline = time.monotonic() + 30
+                while proc.args is cmd and not ready.exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                return communicate(proc, *args, **kwargs)
+
+            with mock.patch.object(subprocess.Popen, 'communicate', after_the_output):
+                ret = sd.run(cmd, timeout=1)
         self.assertEqual(ret.returncode, 124)
         self.assertEqual(ret.stdout, 'out\n')
         self.assertTrue(ret.stderr.startswith('err\nCommand timed out after 1s'))
@@ -1890,9 +1904,12 @@ class MainFailure(ProfileCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(sd.shutil, 'which', return_value='/usr/bin/bloaty'):
             code, out = self._run_main(tmp, ['-b', 'b', '--bloaty'], build, lambda *_a, **_k: sizes, run)
         self.assertEqual(code, 0)
-        self.assertEqual([c[-3:] for c in bloaty_cmds[::2]],
-                         [[os.path.join(tmp, 'b', 'build', d, e), '--', os.path.join(tmp, 'b', 'base', d, e)]
-                          for d, e in (('a', 'a.elf'), ('b', 'b.elf'))])
+        # the trees' unit paths differ, so no compile-unit level (and no source filter on it)
+        self.assertEqual(bloaty_cmds,
+                         [['bloaty', '--domain=vm'] + options
+                          + [os.path.join(tmp, 'b', 'build', d, e), '--', os.path.join(tmp, 'b', 'base', d, e)]
+                          for d, e in (('a', 'a.elf'), ('b', 'b.elf'))
+                          for options in (['-d', 'sections'], ['-d', 'symbols', '-s', 'vm'])])
         self.assertIn('--- bloaty sections a/a.elf ---', out)
 
     def test_a_failed_base_setup_still_removes_the_worktree(self):

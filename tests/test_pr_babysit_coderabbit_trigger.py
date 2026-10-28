@@ -21,6 +21,10 @@ BOX = '> - [ ] <!-- {"checkboxId":"e9bb8d72-00e8-4f67-9cb2-caf3b22574fe"} --> ðŸ
 BOT = 'coderabbitai[bot]'
 SKIP = {'context': 'CodeRabbit', 'state': 'success', 'updated_at': '2026-10-12T11:41:10Z',
         'description': 'Review skipped: manual review required for this OSS repository'}
+# #324: hathach/agentrc#323's head, which CodeRabbit skipped through a check run and no status.
+SKIP_RUN = {'id': 12, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-10-12T11:41:09Z',
+            'completed_at': '2026-10-12T11:41:10Z', 'output': {'title': 'Review skipped', 'summary': 'Result: Skipped - Review skipped'}}
+NO_AUTO = 'This repository does not receive automatic reviews because it has fewer than 10 stars.'
 
 
 def setUpModule():
@@ -28,10 +32,11 @@ def setUpModule():
 
 
 class Rig:
-    """A fake `gh api`: the PR, the head's statuses and the PR's comments as GET pages (run), recording each PATCH (attempt)."""
+    """A fake `gh api`: the PR, the head's statuses and check runs and the PR's comments as GET pages (run), recording each
+    PATCH (attempt)."""
 
-    def __init__(self, statuses=(SKIP,), comments=None, head=HEAD, readback=None):
-        self.head, self.statuses, self.patches, self.readback = head, list(statuses), [], readback
+    def __init__(self, statuses=(SKIP,), comments=None, head=HEAD, readback=None, checks=()):
+        self.head, self.statuses, self.checks, self.patches, self.readback = head, list(statuses), list(checks), [], readback
         self.comments = comments if comments is not None else [{'id': 5, 'user': {'login': BOT}, 'body': f'summary\n{BOX}\nend'}]
 
     def attempt(self, *argv, input=None):
@@ -46,13 +51,15 @@ class Rig:
             return 0, json.dumps({'head': {'sha': self.head}})
         if '/statuses?' in path:
             return 0, json.dumps([self.statuses])
+        if '/check-runs?' in path:
+            return 0, json.dumps([{'check_runs': self.checks}])
         if '/comments?' in path:
             return 0, json.dumps([self.comments])
         raise trigger.Unusable(f'unexpected {path}')
 
 
 class Trigger(unittest.TestCase):
-    def run_with(self, rig, argv=('--pr', '7', '--head', HEAD)):
+    def run_with(self, rig, argv=('--pr', '7', '--head', HEAD, '--repo', 'o/r')):
         out = io.StringIO()
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), redirect_stdout(out):
             code = trigger.report(trigger.collect, list(argv), seal=True)
@@ -84,6 +91,27 @@ class Trigger(unittest.TestCase):
                 self.assertNotIn('commentId', out)
                 self.assertEqual(rig.patches, [])
 
+    def test_a_check_run_skip_is_ticked_only_when_the_summary_says_manual_review(self):
+        rig = Rig(statuses=(), checks=(SKIP_RUN,))
+        self.assertEqual(self.run_with(rig)[1]['outcome'], 'ticked', 'its unticked box says it')
+        self.assertEqual(len(rig.patches), 1)
+        words = Rig(statuses=(), checks=(SKIP_RUN,), comments=[{'id': 5, 'user': {'login': BOT}, 'body': f'summary\n> {NO_AUTO}'}])
+        code, out = self.run_with(words)
+        self.assertEqual((out['outcome'], out['detail']), ('failed', '0 CodeRabbit comments hold one Trigger review box, not 1'),
+                         'its words say it, and no box is left to tick')
+        cases = {'another skip': Rig(statuses=(), checks=(SKIP_RUN,), comments=[{'id': 5, 'user': {'login': BOT}, 'body': 'summary'}]),
+                 'a newer status': Rig(statuses=(dict(SKIP, description='Review completed', updated_at='2026-10-12T11:45:00Z'),), checks=(SKIP_RUN,)),
+                 'a status that reads otherwise at its second': Rig(statuses=(dict(SKIP, state='pending', description='Review in progress'),),
+                                                                    checks=(SKIP_RUN,)),
+                 'a newer run in progress': Rig(statuses=(), checks=(SKIP_RUN, dict(SKIP_RUN, id=13, status='in_progress', conclusion=None,
+                                                                                     started_at='2026-10-12T11:50:00Z', completed_at=None)))}
+        for what, rig in cases.items():
+            with self.subTest(what):
+                out = self.run_with(rig)[1]
+                self.assertEqual(out['outcome'], 'notSkipped', out)
+                self.assertEqual(rig.patches, [])
+        self.assertIn('check run skipped: Review skipped', self.run_with(cases['another skip'])[1]['detail'])
+
     def test_failures(self):
         other = {'id': 6, 'user': {'login': 'someone'}, 'body': BOX}
         cases = {'no box': Rig(comments=[other]),
@@ -104,7 +132,7 @@ class Trigger(unittest.TestCase):
         self.assertEqual(rig.patches, [])
 
     def test_a_short_sha_is_refused(self):
-        code, out = self.run_with(Rig(), ('--pr', '7', '--head', 'abc'))
+        code, out = self.run_with(Rig(), ('--pr', '7', '--head', 'abc', '--repo', 'o/r'))
         self.assertEqual(code, 2)
         self.assertIn('full SHA', out['error'])
 
@@ -118,14 +146,15 @@ NOW = '2026-10-13T11:00:00Z'
 class RequestRig:
     """A fake `gh api` for --request: the PR, harvest.observe's reading, the PR's comments, and each POST with its read-back."""
 
-    def __init__(self, cr=LIMITED, observed=NOW, comments=(), state='open', head=HEAD, readback=trigger.REQUEST, post_code=0, later=None):
-        self.cr, self.observed, self.comments, self.state, self.head = dict(cr), observed, list(comments), state, head
+    def __init__(self, cr=LIMITED, observed=NOW, comments=(), state='open', head=HEAD, readback=trigger.REQUEST, post_code=0, later=None,
+                 event_at='2026-10-13T09:00:00Z'):
+        self.cr, self.observed, self.comments, self.state, self.head, self.event_at = dict(cr), observed, list(comments), state, head, event_at
         self.later, self.pulls = later, 0  # later: the PR's (state, head) on the read just before posting
         self.readback, self.post_code, self.posts = readback, post_code, []
 
     def observe(self, repo, n, reviewers, auto):
         assert (repo, n, reviewers, auto) == ('o/r', 7, ['coderabbit'], ['coderabbit'])
-        return {'headSha': self.head, 'observedAt': self.observed, 'bots': [self.cr], 'comments': []}
+        return {'headSha': self.head, 'observedAt': self.observed, 'headEventAt': self.event_at, 'bots': [self.cr], 'comments': []}
 
     def attempt(self, *argv, input=None):
         assert argv[2:5] == ('-X', 'POST', 'repos/{owner}/{repo}/issues/7/comments') and argv[5:] == ('-f', f'body={trigger.REQUEST}'), argv
@@ -152,7 +181,7 @@ class Request(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
                 mock.patch.object(trigger, 'observe', rig.observe), redirect_stdout(out):
-            code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--request'], seal=True)
+            code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--repo', 'o/r', '--request'], seal=True)
         return code, json.loads(out.getvalue())
 
     def test_a_reset_limit_is_asked_once_and_read_back(self):
@@ -198,13 +227,55 @@ class Request(unittest.TestCase):
                 self.assertEqual((code, out['outcome']), (0, 'notLimited'))
                 self.assertEqual(rig.posts, [])
 
+    def test_a_manual_review_skip_no_tick_asked_for_is_asked_once_by_comment(self):
+        # #274: hathach/agentrc#300's head, whose refreshed summary held no Trigger review box.
+        skip = dict(LIMITED, kind='skipped', reason=SKIP['description'], retryAt=None)
+        cases = {'no box': [], 'an unticked box, its tick failed': [{'id': 5, 'user': {'login': BOT}, 'body': BOX, 'updated_at': NOW}],
+                 "an older head's request": [{'id': 50, 'body': '@coderabbitai review', 'created_at': '2026-10-13T08:00:00Z'}]}
+        for what, comments in cases.items():
+            with self.subTest(what):
+                code, out = self.run_with(rig := RequestRig(cr=skip, comments=comments))
+                self.assertEqual((code, out['outcome'], out['commentId'], out['retryAt']), (0, 'requested', 99, None))
+                self.assertEqual(len(rig.posts), 1)
+        ticked = {'id': 5, 'user': {'login': BOT}, 'body': BOX.replace('[ ]', '[x]'), 'updated_at': '2026-10-13T10:00:00Z'}
+        mine = {'id': 51, 'body': '@coderabbitai review', 'created_at': '2026-10-13T09:30:00Z'}
+        at_event = dict(mine, id=52, created_at='2026-10-13T09:00:00Z')
+        for what, comments, want in (('a ticked box', [ticked], (5, '2026-10-13T10:00:00Z')), ('a request after the head event', [mine], (51, mine['created_at'])),
+                                     ("a request at the head event's second", [at_event], (52, at_event['created_at']))):
+            with self.subTest(what):
+                code, out = self.run_with(rig := RequestRig(cr=skip, comments=comments))
+                self.assertEqual((out['outcome'], out['commentId'], out['at']), ('already', *want), 'never a second ask on the head')
+                self.assertEqual(rig.posts, [])
+        code, out = self.run_with(rig := RequestRig(cr=skip, comments=[mine], event_at=None))
+        self.assertEqual((out['outcome'], out['phase']), ('failed', 'read'), 'a request it cannot place')
+        self.assertEqual(rig.posts, [])
+        self.assertEqual(self.run_with(RequestRig(cr=skip, event_at=None))[1]['outcome'], 'requested', 'none to place')
+        other = dict(skip, reason='check run skipped: Review skipped')
+        self.assertEqual(self.run_with(rig := RequestRig(cr=other))[1]['outcome'], 'notLimited', 'another skip is not asked about')
+        self.assertEqual(rig.posts, [])
+
     def test_a_failed_or_unconfirmed_post_is_failed_with_its_limit(self):
         for what, rig in (('post failed', RequestRig(post_code=1)), ('read back differs', RequestRig(readback='something else'))):
             with self.subTest(what):
                 code, out = self.run_with(rig)
-                self.assertEqual((code, out['outcome'], out['retryAt']), (0, 'failed', None))
+                self.assertEqual((code, out['outcome'], out['retryAt'], out['phase']), (0, 'failed', None, 'post'), 'it may have posted')
                 self.assertNotIn('commentId', out)
                 self.assertIsInstance(out['detail'], str)
+
+    def test_a_read_that_fails_before_the_post_says_nothing_was_posted(self):
+        # #276: a 503 on the pull read, which comes before the POST.
+        rig = RequestRig()
+
+        def unavailable(*argv, ok=(0,)):
+            raise trigger.Unusable('gh api repos/{owner}/{repo}/pulls/7: gh: HTTP 503')
+        rig.run = unavailable
+        code, out = self.run_with(rig)
+        self.assertEqual((code, out['outcome'], out['phase'], out['detail']), (0, 'failed', 'read', 'gh api repos/{owner}/{repo}/pulls/7: gh: HTTP 503'))
+        self.assertEqual(rig.posts, [])
+        mine = {'id': 50, 'body': '@coderabbitai review', 'created_at': '2026-10-13T10:56:00Z'}
+        self.assertEqual(self.run_with(retry := RequestRig(comments=[mine]))[1]['outcome'], 'already', 'a retry still finds a standing request first')
+        self.assertEqual(retry.posts, [])
+        self.assertNotIn('phase', self.run_with(RequestRig())[1], 'only a failed line has a phase')
 
 
 if __name__ == '__main__':
