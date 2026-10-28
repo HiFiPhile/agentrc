@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, http_get, rev_newer   # noqa: E402
+from doclib import Doc, NotFound, begin_enumeration, http_get, partial_enumeration, rev_newer   # noqa: E402
 
 AUTHOR = "Geehy Semiconductor"
 BASE = "https://www.geehy.com/uploads/tool/"
@@ -42,6 +42,7 @@ VERSIONS = [f"V{a}.{b}" for a in (1, 2) for b in range(0, 8)]
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
+    begin_enumeration()
     want = {f.upper() for f in families} if families else None
     best: dict = {}
     for part in PARTS:
@@ -57,7 +58,10 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
                     try:
                         http_get(url, timeout=20, accept="application/pdf",
                                  validate=lambda b: b.startswith(b"%PDF"))
-                    except RuntimeError:
+                    except NotFound:   # most of the grid by design
+                        continue
+                    except RuntimeError:   # may hide a document
+                        partial_enumeration(f"{url}: fetch failed")
                         continue
                     key = (part, kind)
                     v = ver.lstrip("Vv")

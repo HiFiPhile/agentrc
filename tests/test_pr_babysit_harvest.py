@@ -88,6 +88,36 @@ class SettleRules(unittest.TestCase):
             r = harvest.coderabbit(HEAD, statuses, checks, [], EVENT)
             self.assertEqual((r['state'], r['kind']), want, (statuses, checks))
 
+    def test_a_skipped_coderabbit_check_run_is_a_manual_review_skip_only_when_its_summary_says_so(self):
+        # #324: hathach/agentrc#323's head, which CodeRabbit skipped through a check run and no status.
+        run_ = {'id': 12, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-09-25T09:00:00Z',
+                'completed_at': '2026-09-25T09:00:01Z', 'output': {'title': 'Review skipped', 'summary': 'Result: Skipped - Review skipped'}}
+        box = '> - [ ] <!-- {"checkboxId":"e9bb8d72"} --> 🔍 Trigger review'
+        words = 'This repository does not receive automatic reviews because it has fewer than 10 stars.'
+        bot = 'coderabbitai[bot]'
+        for what, issue, want in (
+                ('an unticked box', [comment(bot, f'summary\n{box}', id_=5)], 'comment 5 holds a Trigger review box'),
+                ('a box ticked since, by the ask', [comment(bot, box.replace('[ ]', '[x]'), id_=5)], 'comment 5 holds a Trigger review box'),
+                ('its words', [comment(bot, f'summary\n> {words}', id_=6)], 'comment 6 says the repository gets no automatic reviews')):
+            with self.subTest(what):
+                r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
+                self.assertEqual((r['state'], r['kind'], r['sha']), ('settled', 'skipped', HEAD))
+                self.assertEqual(r['reason'], f'Review skipped: manual review required (check run; {want})')
+        for what, issue in (('no summary', []),
+                            ("someone else's words", [comment('hathach', f'{box}\n{words}', id_=7)])):
+            with self.subTest(what):
+                r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
+                self.assertEqual((r['state'], r['kind'], r['reason']), ('settled', 'skipped', 'check run skipped: Review skipped'), 'another skip')
+        manual = [comment(bot, box, id_=5)]
+        other = dict(run_, output={'title': 'Something else'})
+        self.assertEqual(harvest.coderabbit(HEAD, [], [other], manual, EVENT)['state'], 'unknown', 'a skip it does not know')
+        self.assertEqual(harvest.coderabbit(HEAD, [status('success', 'Review completed', '2026-09-25T09:05:00Z')], [run_], manual, EVENT)['state'],
+                         'reviewed', 'a newer status wins')
+        self.assertEqual(harvest.coderabbit(HEAD, [status('pending', 'Review in progress', '2026-09-25T09:00:01Z')], [run_], manual, EVENT)['state'],
+                         'unknown', 'a status that reads otherwise at its second')
+        agrees = status('success', 'Review skipped: manual review required for this OSS repository', '2026-09-25T09:00:01Z')
+        self.assertEqual(harvest.coderabbit(HEAD, [agrees], [run_], manual, EVENT)['kind'], 'skipped', 'one that agrees')
+
     def test_coderabbit_pause_and_rate_limit(self):
         bot = 'coderabbitai[bot]'
         paused = comment(bot, 'x ' + harvest.CR_PAUSED, at='2026-09-25T07:00:00Z', updated='2026-09-25T09:30:00Z')
@@ -356,7 +386,10 @@ class FailClosed(unittest.TestCase):
         overview = '<!-- ccr-overview-v2 -->\n### Approval recommended'
         excluded = harvest.COPILOT_NO_FILES + ' Check if the **Files changed** are included in default exclusions.'
         cases = [
-            ([v(harvest.COPILOT_QUOTA)], ('settled', 'limited', HEAD)),
+            ([v(harvest.COPILOT_QUOTA[0])], ('settled', 'limited', HEAD)),
+            ([v('Copilot was unable to review this pull request because the user who requested the review has insufficient remaining quota.')],
+             ('settled', 'limited', HEAD)),
+            ([v('Copilot was unable to review this pull request because the user who requested the review has no seat.')], ('unknown', None, None)),
             ([v(excluded)], ('settled', 'skipped', HEAD)),
             ([v(overview)], ('reviewed', None, HEAD)),
             ([v('## Pull request overview\nx')], ('reviewed', None, HEAD)),
@@ -367,9 +400,9 @@ class FailClosed(unittest.TestCase):
             ([v(overview, state='DISMISSED')], ('absent', None, None)),
             ([review('coderabbitai[bot]', HEAD, overview)], ('absent', None, None)),
             ([], ('absent', None, None)),
-            ([v(overview, at='2026-09-25T09:00:00Z', id_=1), v(harvest.COPILOT_QUOTA, at='2026-09-25T10:00:00Z', id_=2)], ('settled', 'limited', HEAD)),
-            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA, id_=2)], ('unknown', None, None)),
-            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA, at=None, id_=2)], ('unknown', None, None)),
+            ([v(overview, at='2026-09-25T09:00:00Z', id_=1), v(harvest.COPILOT_QUOTA[0], at='2026-09-25T10:00:00Z', id_=2)], ('settled', 'limited', HEAD)),
+            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA[0], id_=2)], ('unknown', None, None)),
+            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA[0], at=None, id_=2)], ('unknown', None, None)),
         ]
         for reviews, want in cases:
             r = harvest.copilot(HEAD, reviews)
@@ -486,8 +519,7 @@ class EndToEnd(unittest.TestCase):
         view = lambda h: {'headRefOid': h, 'headRefName': 'fix', 'headRepository': {'name': 'r', 'nameWithOwner': 'o/r'}}
         run = lambda id_, event, path, at, h=HEAD: {'id': id_, 'event': event, 'path': path, 'created_at': at, 'head_sha': h,
                                                     'head_branch': 'fix', 'head_repository': {'full_name': 'o/r'}}
-        a = {'repo view --json nameWithOwner': [{'nameWithOwner': R}],
-             f'pr view {N} -R {R} --json headRefOid,headRefName,headRepository': [view(h) for h in heads],
+        a = {f'pr view {N} -R {R} --json headRefOid,headRefName,headRepository': [view(h) for h in heads],
              f'pr view {N} -R {R} --json headRefOid': [{'headRefOid': h} for h in heads[1:] + heads[-1:]]}
         for h in set(heads):
             a[f'api --paginate --slurp repos/{R}/actions/runs?head_sha={h}&per_page=100'] = [[{'workflow_runs': [
@@ -511,7 +543,8 @@ class EndToEnd(unittest.TestCase):
         gh = FakeGh(self.root, answers)
         out = io.StringIO()
         with run_gh_as(gh.stub), redirect_stdout(out):
-            code = harvest.report(harvest.collect, list(argv) or ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit'], limits=True)
+            argv = list(argv) or ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit']
+            code = harvest.report(harvest.collect, argv if '--repo' in argv else [*argv, '--repo', 'o/r'], limits=True)
         return code, json.loads(out.getvalue().splitlines()[-1])
 
     def test_one_read(self):
@@ -528,7 +561,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.harvest(self.answers([HEAD]))[1]['fingerprint'], got['fingerprint'], 'a second read of the same evidence')
 
     def test_the_repo_named_is_read_instead_of_the_checkouts(self):
-        answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items() if not k.startswith('repo view')}
+        answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items()}
         code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--repo', 'up/r')
         self.assertEqual((code, got['headSha']), (0, HEAD), got)
 
@@ -583,18 +616,18 @@ class EndToEnd(unittest.TestCase):
     def test_a_copilot_refusal_has_no_body_and_reads_settled(self):
         answers = self.answers([HEAD])
         answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].append(
-            review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA, id_=33) | {'state': 'COMMENTED'})
+            review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA[0], id_=33) | {'state': 'COMMENTED'})
         code, got = self.harvest(answers)
         self.assertEqual(code, 0, got)
         mine = [c for c in got['comments'] if c['source'] == 'copilot']
         self.assertEqual([(c['commentId'], c['body'], c['bodyOmitted'], c['digest']) for c in mine],
-                         [(33, None, 'copilot-refusal', harvest.digest(harvest.COPILOT_QUOTA))])
+                         [(33, None, 'copilot-refusal', harvest.digest(harvest.COPILOT_QUOTA[0]))])
         self.assertEqual([(b['state'], b['kind'], b['evidence']) for b in got['bots'] if b['bot'] == 'copilot'],
                          [('settled', 'limited', [f'review 33 on {HEAD[:8]}'])])
 
     def test_each_comment_endpoint_is_read_once(self):
         answers = self.answers([HEAD])
-        quota = review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA, id_=33) | {'state': 'COMMENTED'}
+        quota = review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA[0], id_=33) | {'state': 'COMMENTED'}
         # A second read would get the second page set, with no Copilot review in it.
         answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'] = [[[quota]], [[]]]
         answers['api --paginate --slurp repos/o/r/issues/7/comments?per_page=100'].append([[]])
@@ -641,6 +674,23 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(code, 2, got)
         self.assertIn('secondary rate limit', got['error'])
         self.assertEqual((got['rateLimit']['resetAt'], got['rateLimit']['secondary']), (None, True))
+
+    def test_a_workflow_read_that_fails_twice_leaves_the_head_undated_and_says_so(self):
+        """#242: the runs date the head, but a failed read of the workflow that would date it is not "nothing dates the head"."""
+        path = f'api repos/o/r/contents/.github/workflows/build.yml?ref={HEAD}'
+        answers = self.answers([HEAD])
+        answers[path] = [{'stderr': 'HTTP 503'}, workflow('on: [push, pull_request]\n')]
+        with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
+            code, got = self.harvest(answers)
+        self.assertEqual((code, got['headEventAt']), (0, '2026-09-25T08:00:00Z'), 'one failed read is read again')
+        harvest.pr_types.cache_clear()
+        answers[path] = [{'stderr': 'HTTP 503'}]
+        with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
+            code, got = self.harvest(answers)
+        self.assertEqual((code, got['headEventAt']), (0, None), got)
+        self.assertIn('workflow .github/workflows/build.yml at aaaaaaaaa could not be read', got['headEventEvidence'])
+        self.assertIn('HTTP 503', got['headEventEvidence'])
+        self.assertNotIn('no push or head-activity', got['headEventEvidence'])
 
     def test_a_malformed_answer_is_an_error(self):
         answers = self.answers([HEAD])

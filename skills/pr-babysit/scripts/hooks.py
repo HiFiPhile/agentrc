@@ -9,7 +9,7 @@ when .pre-commit-config.yaml exists (once more if it failed after a hook
 modified files), then the status and snapshot again. Both runs together get N
 seconds (default 540, inside the 600 a relay's Bash call allows); past that
 the pre-commit process tree is killed and the result is an error. Status lines are `git status --porcelain -z`
-records; snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
+records, each untracked file its own; snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
 
 stdout ends with one JSON line {ran, passed, modifiedBy, before, after,
 snapshotBefore, snapshotAfter, seal} (seal: facts.sealed): passed is the last run's exit status,
@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Unusable, checkout_top, git, report  # noqa: E402
+from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
 
@@ -39,10 +39,6 @@ MODIFIED = '- files were modified by this hook'
 # pre-commit pads a hook's name with dots to its result, then prints the
 # hook's `- ` block only when it failed or runs verbose (commands/run.py).
 RESULT = re.compile(r'\.(Passed|Failed)$')
-
-
-def status():
-    return [r for r in git('status', '--porcelain', '-z').split('\0') if r]
 
 
 def status_paths(records):

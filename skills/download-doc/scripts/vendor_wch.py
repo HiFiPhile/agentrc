@@ -26,7 +26,7 @@ from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, http_get   # noqa: E402
+from doclib import Doc, begin_enumeration, http_get, partial_enumeration   # noqa: E402
 
 AUTHOR = "Nanjing Qinheng Microelectronics (WCH)"
 API = "https://www.wch-ic.com/api/official/website/common/relationFiles?fileName={}"
@@ -59,12 +59,20 @@ def _fetch(file_name: str) -> dict | None:
         d = http_get(API.format(file_name), timeout=30, accept="application/json",
                      validate=lambda b: b.lstrip()[:1] == b"{")
     except RuntimeError:
+        # Its relatives are reached only through this page, so the crawl is now partial.
+        partial_enumeration(f"{file_name}: fetch failed")
         return None
     j = json.loads(d)
-    return j.get("data") if j.get("code") == 0 else None
+    # An unknown name is {"code": 0, "data": null} (seen 2026-10-27); any other code is a
+    # failure that proves nothing about the page.
+    if j.get("code") != 0:
+        partial_enumeration(f"{file_name}: API answered code {j.get('code')!r}: {j.get('message')}")
+        return None
+    return j.get("data")
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
+    begin_enumeration()
     want = {f.upper() for f in families} if families else None
     seen, docs, queue, have = set(), [], deque(SEEDS), set()
     while queue:

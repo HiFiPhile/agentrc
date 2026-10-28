@@ -65,6 +65,8 @@ const keyOf = (f) => {
   for (const ch of JSON.stringify([f.workflow === '' ? '' : 'ci', f.check, f.signature])) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
   return h.toString(16).padStart(16, '0')
 }
+// collect.py's output contract, as the workflow reads it.
+const COLLECT_CONTRACT = Number(body.match(/^const COLLECT_CONTRACT = (\d+)$/m)[1])
 // The checks a CI judge prompt asks about.
 // The values a relay prompt passes a script, each shell-quoted as --flag='value'.
 const flagValues = (prompt, flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
@@ -81,7 +83,7 @@ const BASE = 'ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e'
 const TIP = '7e57e57e57e57e57e57e57e57e57e57e57e57e57'
 // What the preflight pins, and what the pre-publish recheck must still find.
 const PIN = {
-  branch: 'claude/foo', prBranch: 'claude/foo',
+  python: '/usr/bin/python3', missing: [], repo: 'hathach/tinyusb', branch: 'claude/foo', prBranch: 'claude/foo',
   prHead: HEAD, prBase: BASE, prBaseBranch: 'master', prBaseTip: TIP, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888', prState: 'OPEN',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
@@ -160,7 +162,7 @@ const quotedAfter = (prefix) => (prompt) => {
   const m = String(prompt).match(new RegExp(`${prefix.source} ((?:${SHQ.source} ?)+)`))
   return m ? [...m[1].matchAll(SHQ)].map(t => t[0].slice(1, -1).replaceAll(`'\\''`, `'`)) : []
 }
-const pathLine = quotedAfter(/commits\.py commit/)
+const pathLine = quotedAfter(/commits\.py commit --receipt '[^']*' --request '[^']*'/)
 const auditScope = quotedAfter(/commits\.py head --parent [0-9a-f]{40}/)
 // A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
@@ -210,6 +212,7 @@ async function run(opts = {}) {
   const receiptFiles = new Map() // reply.py or sonar.py --receipt path -> the line its first run saved there
   const sonarMarked = new Set() // comments whose SonarCloud issue a sonar.py run marked
   const replied = new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
+  const commitReceipts = new Map() // commits.py --receipt path -> the line it saved, with its bindings
 
   const agent = async (prompt, options) => {
     const label = options.label
@@ -231,7 +234,8 @@ async function run(opts = {}) {
       return patch({ ...PIN, head, prHead }, opts.preflight)
     }
     if (label === 'adopt:audit' || label === 'adopt:audit.retry') {
-      const fallback = chainAudit([opts.args?.adoptHead], undefined, { from: opts.args?.state?.expectedHead ?? HEAD })
+      // commits.py echoes the FROM it was given: the state's expectedHead, or the live PR head without a pinned state.
+      const fallback = chainAudit([opts.args?.adoptHead], undefined, { from: String(prompt).match(/commits\.py chain ([0-9a-f]{40}) /)[1] })
       const answer = typeof opts.adoptAudit === 'function' ? await opts.adoptAudit(label)
         : opts.adoptAudit === undefined ? fallback : opts.adoptAudit
       if (answer instanceof Error) throw answer
@@ -318,8 +322,11 @@ async function run(opts = {}) {
         answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', gates, bases: links.map(link => ({ link, base: baseOf(link) })) }
         if (opts.gates) answer = opts.gates(answer)
       }
-      // collect.py prints every member, a null one too, but no null error.
-      return answer === null ? null : conforms(options.schema, answer, label)
+      // collect.py prints every member, a null one too, but no null error, and the output contract this workflow reads;
+      // opts.collector(line, label) is another collect.py's line, held to no schema.
+      if (answer === null) return null
+      const line = conforms(options.schema, { contract: COLLECT_CONTRACT, ...answer }, label)
+      return opts.collector ? opts.collector(line, label) : line
     }
     if (label.startsWith('ci:judge#')) {
       const ci = ciOf(label)
@@ -395,7 +402,7 @@ async function run(opts = {}) {
       const entries = JSON.parse(String(prompt).match(/Manifest: (\{.*\})$/)[1]).replies
       // reply.py's error line before anything is posted (replyError), as the relay is told to return it.
       const scriptError = opts.replyError && opts.replyError(label)
-      if (scriptError) return conforms(options.schema, { error: scriptError, receipts: [] }, label)
+      if (scriptError) return conforms(options.schema, { ...(typeof scriptError === 'string' ? { error: scriptError } : scriptError), receipts: [] }, label)
       const failed = opts.dropDoneIds && opts.dropDoneIds(label)
       const receipt = ({ commentId, digest }) => failed
         ? { commentId, kind: 'review', replyId: null, digest, sent: false, posted: false, verified: false, resolved: null, error: 'posting failed' }
@@ -439,7 +446,19 @@ async function run(opts = {}) {
       // commit whose SHA equals its parent, so reusing one would fail in cycle 2.
       staged = pathLine(prompt)
       made = shaFor(++commits)
-      return { committed: true, detail: 'committed', ...opts.commit }
+      const line = { committed: true, detail: 'committed', ...opts.commit }
+      // commits.py's --receipt file: the line, bound to the request, the parent and the scope.
+      const [, file, request] = String(prompt).match(/ --receipt '([^']*)' --request '([^']*)' /)
+      if (!line.error) commitReceipts.set(file, { request, parent: head, scope: staged, ...line, sha: line.committed ? made : '' })
+      return line
+    }
+    if (label.startsWith('receipt:commit#')) {
+      if (opts.commitReceipt === null) return null
+      const [, file, request, parent] = String(prompt).match(/commits\.py receipt '([^']*)' --request '([^']*)' --parent ([0-9a-f]{40}) /)
+      const saved = commitReceipts.get(file)
+      if (!saved) return { error: `no receipt at ${file}: the commit script saved none` }
+      if (saved.request !== request || saved.parent !== parent) return { error: `receipt ${file} is for another request` }
+      return { ...saved, ...opts.commitReceipt }
     }
     if (label.startsWith('audit#')) {
       if (opts.audit === null) return null // a dead read-back agent
@@ -765,9 +784,109 @@ test('the preflight pins the checkout without touching it', async () => {
   const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'receipts', 'remote', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'head', 'missing', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'python', 'receipts', 'remote', 'repo', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
+})
+
+// #311: a fork-of-a-fork checkout made gh read PR 9 in the wrong repository, and a `repo` argument was ignored.
+const PICO = 'adafruit/Pico-PIO-USB'
+const picoPin = { repo: PICO, prUrl: `https://github.com/${PICO}/pull/3888` }
+// The scripts that call gh, as a prompt runs them: each must name the PR's repository.
+const GH_SCRIPT = /(?:harvest|push|sonar|coderabbit_trigger|greptile_trigger|reply|collect)\.py|preflight\.py --(?:pr|state)/
+
+test('an unknown or malformed argument throws before any agent runs (#311)', async () => {
+  for (const [args, expected] of [
+    [{ repository: PICO }, /unknown argument\(s\) \["repository"\]: pr-babysit takes only pr, repo, python, reviewers/],
+    [{ repo: 'adafruit' }, /repo must be OWNER\/NAME/], [{ repo: `${PICO}/x` }, /repo must be OWNER\/NAME/], [{ repo: 7 }, /repo must be OWNER\/NAME/],
+  ]) {
+    const trace = []
+    await assert.rejects(run({ args, trace }), expected, JSON.stringify(args))
+    assert.deepEqual(trace, [], JSON.stringify(args))
+  }
+})
+
+test('the repo named is the one every gh-calling script is run against (#311)', async () => {
+  const reviews = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
+  const named = await run({ reviews, scope: ['src/a.c'], args: { repo: PICO, autoPush: true, maxCycles: 2 }, preflight: picoPin })
+  assert.ok(named.calls[0].prompt.includes(`--repo '${PICO}'\``), named.calls[0].prompt)
+  const gh = named.calls.filter(c => GH_SCRIPT.test(c.prompt))
+  assert.ok(['reviews#1', 'replies#1', 'push#1-review', 'ci:collect#1.1', 'prstate#1-replies'].every(l => gh.some(c => c.label === l)), gh.map(c => c.label).join(', '))
+  for (const c of gh) assert.ok(c.prompt.includes(`--repo '${PICO}'`), `${c.label}: ${c.prompt}`)
+  // Omitted, the repository preflight found the checkout naming is the one every later call names.
+  const found = await run({ reviews, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 2 }, preflight: picoPin })
+  assert.doesNotMatch(found.calls[0].prompt, /--repo/)
+  for (const c of found.calls.filter(c => GH_SCRIPT.test(c.prompt)).slice(1)) assert.ok(c.prompt.includes(`--repo '${PICO}'`), `${c.label}: ${c.prompt}`)
+  const judged = await run({ ...redWith({ check: 'build', firstError: 'error: x', files: [] }), args: { repo: PICO }, preflight: picoPin })
+  assert.match(judged.calls.find(c => c.label === 'ci:judge#1').prompt, /Judge the failing CI checks of PR #3888 of adafruit\/Pico-PIO-USB at head/)
+})
+
+test('a pin of another repository than the one named or read stops at preflight (#311)', async () => {
+  for (const [args, preflight, detail] of [
+    // The same PR number in another repository: what an unpinned gh read in a fork-of-a-fork checkout.
+    [{ repo: PICO }, { repo: PICO, prUrl: 'https://github.com/sekigon-gonnoc/Pico-PIO-USB/pull/3888' },
+      'adafruit/Pico-PIO-USB read PR #3888 as https://github.com/sekigon-gonnoc/Pico-PIO-USB/pull/3888'],
+    [{ repo: PICO }, { repo: 'sekigon-gonnoc/Pico-PIO-USB', prUrl: 'https://github.com/sekigon-gonnoc/Pico-PIO-USB/pull/3888' },
+      'the pin is of sekigon-gonnoc/Pico-PIO-USB, not adafruit/Pico-PIO-USB'],
+    [{}, { prUrl: `https://github.com/${PICO}/pull/3888` }, `hathach/tinyusb read PR #3888 as https://github.com/${PICO}/pull/3888`],
+    [{}, { ...picoPin, prUrl: `https://github.com/${PICO}/pull/38` }, `${PICO} read PR #3888 as https://github.com/${PICO}/pull/38`],
+    [{}, { repo: '' }, 'the pin names no repository OWNER/NAME ("")'],
+  ]) {
+    const { result, labels } = await run({ reviews: oneValid, args, preflight })
+    assert.deepEqual([result.reason, result.detail], ['preflight-failed', detail])
+    assert.deepEqual(labels, ['preflight'])
+  }
+  // Case is no other repository.
+  const cased = await run({ args: { repo: 'ADAFRUIT/pico-pio-usb' }, preflight: picoPin })
+  assert.equal(cased.result.pass, true, cased.result.reason)
+})
+
+test('a resumed launch names its state\'s repository, and refuses another (#311)', async () => {
+  const state = adoptionState()
+  const trace = []
+  await assert.rejects(run({ args: adoptionArgs(state, { adoptHead: undefined, repo: PICO }), trace }),
+    /repo adafruit\/Pico-PIO-USB is not the state's hathach\/tinyusb: a state continues only the PR it pinned/)
+  assert.deepEqual(trace, [])
+  const resumed = await run({ args: adoptionArgs(state, { adoptHead: undefined }) })
+  assert.ok(resumed.calls[0].prompt.includes("--repo 'hathach/tinyusb'`"), resumed.calls[0].prompt)
+  const cased = await run({ args: adoptionArgs(state, { adoptHead: undefined, repo: 'HATHACH/TinyUSB' }) })
+  assert.ok(cased.calls[0].prompt.includes("--repo 'HATHACH/TinyUSB'`"), cased.calls[0].prompt)
+})
+
+// #234: a bare python3 that resolved to an interpreter without PyYAML failed every harvest on an MSYS2 host.
+const SCRIPT_RUN = /[\s`]('[^']*'(?:\\''[^']*')*|[^\s`']+) ~\/\.claude\/skills\/[\w./-]+\.py/
+const interpreters = (calls) => [...new Set(calls.map(c => SCRIPT_RUN.exec(c.prompt)?.[1]).filter(Boolean))]
+
+test('every script runs under the interpreter preflight reports, quoted, or the one python names (#234)', async () => {
+  const reviews = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
+  const spaced = '/c/Program Files/Python 3/python.exe'
+  const reported = await run({ reviews, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 2 }, preflight: { python: spaced } })
+  assert.equal(SCRIPT_RUN.exec(reported.calls[0].prompt)[1], 'python3', 'preflight runs under python3, no search')
+  assert.deepEqual(interpreters(reported.calls.slice(1)), [`'${spaced}'`], 'then every script under the path it reported')
+  assert.ok(reported.calls.filter(c => SCRIPT_RUN.test(c.prompt)).length > 8, reported.labels.join(', '))
+  const judged = await run({ ...redWith({ check: 'build', firstError: 'error: x', files: [] }), preflight: { python: spaced } })
+  assert.ok(judged.calls.find(c => c.label === 'ci:judge#1').prompt.includes(`Run any ci-rerun script under '${spaced}'.`))
+  const named = await run({ reviews, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 2, python: "/opt/it's py/python3" } })
+  assert.deepEqual(interpreters(named.calls), ["'/opt/it'\\''s py/python3'"], 'the one python names, preflight included, whatever preflight reports')
+  await assert.rejects(run({ args: { python: '' } }), /python must be the interpreter/)
+  await assert.rejects(run({ args: { python: 'py\n3' } }), /python must be the interpreter/)
+})
+
+test('an interpreter missing a module the lanes need stops at preflight, naming it (#234)', async () => {
+  const { result, labels, calls } = await run({ reviews: oneValid, preflight: { missing: ["yaml: ModuleNotFoundError: No module named 'yaml'"] } })
+  assert.match(calls[0].prompt, / --module yaml[ `]/, 'auto-run bots are dated from workflow files')
+  assert.equal(result.reason, 'python-unusable')
+  assert.equal(result.detail, "/usr/bin/python3 cannot import yaml: ModuleNotFoundError: No module named 'yaml' (PyYAML), which this launch's lanes need: " +
+    'install it for that interpreter, or launch with python naming one that has it')
+  assert.deepEqual(labels, ['preflight'])
+  const unnamed = await run({ reviews: oneValid, preflight: { python: ' ' } })
+  assert.deepEqual([unnamed.result.reason, unnamed.result.detail], ['python-unusable', 'preflight names no interpreter'])
+  // A CI-only launch, or one waiting on no bot, imports nothing beyond the standard library.
+  for (const args of [{ reviewers: [] }, { lane: 'ci', yieldAfterCycle: true }, { reviewers: ['copilot'] }]) {
+    const ci = await run({ args })
+    assert.doesNotMatch(ci.calls[0].prompt, /--module/, JSON.stringify(args))
+    assert.equal(ci.result.reason === 'python-unusable', false)
+  }
 })
 
 test('a dirty start refuses before any writer runs', async () => {
@@ -1135,7 +1254,7 @@ test('the committer gets the claims without their hints, and the message on stdi
   const commit = calls.find(c => c.label === 'commit#1-review').prompt
   assert.doesNotMatch(commit, /hint:|rewrite it all/)
   assert.match(commit, /The fixes: \["src\/a\.c:\d+ /)
-  assert.match(commit, /commits\.py commit 'src\/a\.c' < '<that file>'; rm -f '<that file>'`/)
+  assert.match(commit, /commits\.py commit --receipt '\/tmp\/pr-babysit-receipts-x\/commit#1-review\.json' --request 'commit#1-review' 'src\/a\.c' < '<that file>'; rm -f '<that file>'`/)
   const quoted = calls.filter(c => c.prompt.includes("'<that file>'"))
   assert.ok(quoted.some(c => c.label.startsWith('reply')) || quoted.length > 1, 'more than the commit quotes its file')
   for (const c of quoted) assert.match(c.prompt, /a new temporary file[^:]*, a name without quotes/, c.label)
@@ -1190,6 +1309,20 @@ test('a contract setup and its tools go to build.py, and a shell that stopped be
   const unknown = await run({ reviews: oneValid, buildPlan, candidate: { stage: 'elsewhere' } })
   assert.equal(unknown.result.reason, 'build-unverifiable')
   assert.match(unknown.result.detail, /the build did not count: the receipt names no step it stopped in \("elsewhere"\)/)
+})
+
+test('the resolver is asked for every built family\'s setup and wrapper tools, and a family\'s absent tool is unverifiable (#309)', async () => {
+  const buildPlan = {
+    command: 'python3 tools/check_build.py --scope hw/bsp/ch32v30x/family.c', setup: '. "$IDF_PATH/export.sh"',
+    requires: ['python3', 'riscv-none-elf-gcc', 'idf.py'],
+  }
+  const { result, calls } = await run({ reviews: oneValid, buildPlan, candidate: { stage: 'prerequisite', exit: 127 } })
+  const resolve = calls.find(c => c.label === 'build:resolve#1-review').prompt
+  assert.match(resolve, /several targets or board families, a wrapper script's included, setup and requires hold every one's/)
+  assert.match(resolve, /each tool its build invokes, through the wrapper too \(such as idf\.py\)/)
+  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /--setup='\. "\$IDF_PATH\/export\.sh"' --require='python3' --require='riscv-none-elf-gcc' --require='idf\.py'`/)
+  assert.equal(result.reason, 'build-unverifiable', 'not fix-verification-failed')
+  assert.match(result.detail, /its prerequisite step stopped the shell \(exit 127\)/)
 })
 
 test('a batch no build applies to is published with the reason logged', async () => {
@@ -1511,7 +1644,7 @@ test('the publisher stages exactly the owned paths, never a protected one', asyn
   const push = calls.find(c => c.label === 'push#1-review')
   // The exact refspec is the point: pushing the branch would publish whatever
   // HEAD became after the audit, not the commit that was audited.
-  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888\``), push.prompt)
+  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888 --repo 'hathach/tinyusb'\``), push.prompt)
   assert.match(push.prompt, /Committing, amending and forcing nothing/)
   // The stage cannot commit and already knows the SHA, so it is asked for neither.
   assert.deepEqual(push.schema.required, ['pushed', 'detail', 'heads', 'prState'])
@@ -2408,7 +2541,7 @@ test('a collector that dies gets one fresh agent; a second death leaves the cycl
 
 test('a collector failing the same way on two cycles running stops ci-collect-failed; a passing failure re-arms after a backoff', async () => {
   const failing = (error, when = () => true) => (l, a) => l.startsWith('ci:collect#') && when(cycleOf(l))
-    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', baseRef: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], requiredChecks: [], observedAt: '', seal: '' }
+    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', baseRef: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], requiredChecks: [], observedAt: '', contract: 0, seal: '' }
     : a
   const auth = await run({ args: { maxCycles: 4 }, garble: failing('gh: authentication expired') })
   assert.deepEqual([auth.result.reason, auth.result.detail, auth.result.cycles], ['ci-collect-failed', 'gh: authentication expired', 2], auth.logs.join('\n'))
@@ -2435,6 +2568,56 @@ test('a collector failing the same way on two cycles running stops ci-collect-fa
   assert.equal(pushed.result.state.last.ciCollectFailed.head, HEAD)
   const onPushed = await run({ preflight: { head: moved, prHead: moved }, args: { maxCycles: 3, yieldAfterCycle: true, state: pushed.result.state }, garble: failing('gh: HTTP 502') })
   assert.notEqual(onPushed.result.reason, 'ci-collect-failed', 'one failure on each of two heads')
+})
+
+test('a collector of another output contract stops collector-skew at once; a mis-copied line is a dead relay (#293)', async () => {
+  const relayed = (over) => (l, a) => l.startsWith('ci:collect#') && !a.error ? over(a) : a
+  const SKEW = (got) => new RegExp(`^collect\\.py prints output contract ${got}, and this launch's workflow script reads ${COLLECT_CONTRACT}: ` +
+    '.*Relaunch from the installed file \\(Workflow scriptPath ~/\\.claude/workflows/pr-babysit\\.js\\)')
+  for (const [name, collector, garble, got] of [
+    // An older collect.py: no contract, nor a member added since, which the relay fills in to meet its schema.
+    ['older', ({ contract, requiredChecks, ...line }) => line, relayed(a => ({ contract: 0, requiredChecks: [], ...a })), 0],
+    // A newer one: a member this copy's schema lacks, which the relay leaves out.
+    ['newer', (line) => ({ ...line, contract: COLLECT_CONTRACT + 1, added: [] }), relayed(({ added, ...a }) => a), COLLECT_CONTRACT + 1],
+  ]) {
+    const { result, labels, logs } = await run({ args: { maxCycles: 4 }, collector, garble })
+    assert.equal(result.reason, 'collector-skew', name)
+    assert.match(result.detail, SKEW(got), name)
+    assert.equal(result.cycles, 1, `${name}: stopped at once, not after two cycles`)
+    assert.deepEqual(labels.filter(l => l.startsWith('ci:collect#')), ['ci:collect#1.1'], `${name}: no retry, no further read`)
+    assert.ok(logs.some(l => SKEW(got).test(l.replace(/^cycle 1: /, ''))), logs.join('\n'))
+    assert.equal(logs.some(l => /collector died|does not match its seal/.test(l)), false, name)
+  }
+  // The same contract, a member altered in the copy: the seal catches it, as before.
+  const altered = await run({ args: { maxCycles: 1 }, garble: relayed(a => ({ ...a, observedAt: '2026-01-01T00:00:00Z' })) })
+  assert.notEqual(altered.result.reason, 'collector-skew')
+  assert.ok(altered.logs.includes('ci:collect#1.1: the relayed copy does not match its seal'), altered.logs.join('\n'))
+  assert.ok(altered.logs.some(l => l === 'cycle 1: CI inventory failed — the collector died'), altered.logs.join('\n'))
+})
+
+test('a resumed launch collects and judges once more a stored CircleCI verdict judged incomplete (#319)', async () => {
+  const RAM = { check: 'ci/circleci: build', link: 'https://circleci.com/gh/hathach/tinyusb/508184', signature: "ld: region `RAM' overflowed by 744 bytes",
+    firstError: "ld: region `RAM' overflowed by 744 bytes", files: [], verdict: 'rig-side' }
+  const accepted = { key: keyOf(RAM), reason: 'master overflows RAM on this board', scope: 'until master fixes it' }
+  const tail = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: c.failures.map(f => ({ ...f, complete: false })) })) })
+  const store = new Map()
+  const args = { ...YIELD, acceptedFailures: [accepted] }
+  const first = await run({ store, args, reviews: WAITING, ci: redWith(RAM).ci, judge: tail })
+  assert.ok(first.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), first.logs.join('\n'))
+  const again = await run({ store, args: { ...args, state: first.result.state }, reviews: WAITING, ci: redWith(RAM).ci })
+  assert.deepEqual(ciLabels(again.labels).slice(0, 4), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.f', 'ci:judge#2'])
+  assert.ok(again.logs.some(l => l.endsWith('collected and judged again for ci/circleci: build')), again.logs.join('\n'))
+  assert.equal(again.logs.some(l => /not accepted/.test(l)), false, 'the whole log made the listing complete, so the acceptance applies')
+  // Still incomplete after its refresh, it stands as judged: one more judge per launch, never one per cycle.
+  const still = await run({ store, args: { ...args, state: first.result.state, maxCycles: 4, yieldAfterCycle: undefined, yieldOnChange: true }, reviews: WAITING, ci: redWith(RAM).ci, judge: tail })
+  assert.equal(still.labels.filter(l => l.startsWith('ci:judge#')).length, 1, still.labels.join('\n'))
+  assert.ok(still.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)))
+  // An Actions job's log was always whole: its stored verdict is reused as before.
+  const actions = { ...RAM, check: 'build / arm', link: undefined }
+  const kept = new Map()
+  const judged = await run({ store: kept, args: YIELD, reviews: WAITING, ci: redWith(actions).ci, judge: tail })
+  const resumed = await run({ store: kept, args: { ...YIELD, state: judged.result.state }, reviews: WAITING, ci: redWith(actions).ci })
+  assert.equal(resumed.labels.some(l => l.startsWith('ci:judge#')), false)
 })
 
 test('a verdict the store lost or garbled is reused by its launch, then judged again', async () => {
@@ -2722,7 +2905,7 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
   assert.deepEqual(writes(watched.labels), ['prstate#1-replies', 'replies#1'])
   const unread = await run({ reviews: refuting, prState: null, args: { autoPush: true, maxCycles: 3 } })
   assert.ok(unread.logs.some(l => l === 'prstate#1-replies: PR #3888 state unread — the relay died'), unread.logs.join('\n'))
-  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `python3 ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888` /)
+  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `'\/usr\/bin\/python3' ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888 --repo 'hathach\/tinyusb'` /)
   // A copy that turns MERGED into OPEN fails the script's seal: it is no answer, and nothing is posted.
   const miscopied = await run({ reviews: refuting, prState: 'MERGED', garble: (l, a) => l.startsWith('prstate#') && a ? { ...a, state: 'OPEN' } : a, args: { autoPush: true, maxCycles: 3 } })
   assert.equal(miscopied.result.reason, 'pr-state-unread')
@@ -2790,7 +2973,7 @@ test('a push refused because the PR is no longer open stops the launch, its comm
   assert.equal(result.reason, 'pr-merged')
   assert.equal(result.history[0].reviewPushFailed.prState, 'merged')
   assert.equal(result.state.pending.stage, 'push-failed')
-  assert.match(calls.find(c => c.label === 'push#1-review').prompt, / --open-pr 3888`/)
+  assert.match(calls.find(c => c.label === 'push#1-review').prompt, / --open-pr 3888 --repo 'hathach\/tinyusb'`/)
 })
 
 test('a PR conflicting with its base stops, judging nothing, whatever its checks say (#51)', async () => {
@@ -2944,6 +3127,17 @@ test('an acceptance needs a complete listing of the job', async () => {
   assert.ok(logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), logs.join('\n'))
 })
 
+test('an accepted CircleCI failure passes only on a complete listing, which a whole log lets the watcher give (#319)', async () => {
+  const RAM = { check: 'ci/circleci: build---one-random-make-apm32f10x-large-arm-gcc', workflow: 'ci', job: 'build', cell: 'apm32f103_dev_board device/net_lwip_webserver',
+    signature: "ld: region `RAM' overflowed by 744 bytes", firstError: "ld: region `RAM' overflowed by 744 bytes", files: [], verdict: 'rig-side' }
+  const accepted = { key: keyOf(RAM), reason: 'master overflows RAM on this board', scope: 'until master fixes it' }
+  const whole = await run({ ...redWith({ ...RAM, complete: true }), args: { acceptedFailures: [accepted] } })
+  assert.equal(whole.result.pass, true, whole.logs.join('\n'))
+  const tail = await run({ ...redWith({ ...RAM, complete: false }), args: { acceptedFailures: [accepted] } })
+  assert.notEqual(tail.result.pass, true)
+  assert.ok(tail.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), tail.logs.join('\n'))
+})
+
 test('an acceptance not renewed on a resumed launch no longer applies, and says so', async () => {
   const first = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()], maxCycles: 3, yieldAfterCycle: true } })
   const { result, logs } = await run({ ...redWith(PVS), args: { maxCycles: 3, state: first.result.state } })
@@ -2979,6 +3173,21 @@ test('a report carrying both a rate limit and a harvest error takes the rate-lim
   assert.equal(result.reason, 'github-rate-limited')
   assert.deepEqual(result.rateLimit, LIMITED_REVIEWS.rateLimit)
   assert.equal(result.state.cyclesUsed, 0)
+})
+
+test('a harvest that printed no JSON line is retried and reported by its last stderr line, a rate limit first (#240)', async () => {
+  const validator = readFileSync(new URL('../agents/pr-review-validator.md', import.meta.url), 'utf8')
+  assert.ok(validator.includes('or no JSON line at all (a traceback, or nothing), run it once more'), 'the same single retry')
+  assert.ok(validator.includes('the last non-empty line of its stderr verbatim, else `harvest.py printed nothing (exit <its exit code>)`'))
+  const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', fingerprint: '', bots: [], botsWhole: true, findings: [], replies: [] }
+  for (const error of ["PermissionError: [Errno 13] Permission denied: 'gh'", 'harvest.py printed nothing (exit 1)']) {
+    const { result, labels } = await run({ reviews: { ...failed, harvestError: error }, args: { maxCycles: 4 } })
+    assert.deepEqual([result.reason, result.detail], ['harvest-failed', error])
+    assert.deepEqual(labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], 'stopped, no cycle spent re-reading it')
+  }
+  // A traceback, then a rate-limited retry: the limit decides.
+  const limited = await run({ reviews: { ...LIMITED_REVIEWS, harvestError: 'ModuleNotFoundError: No module named greptile' }, args: { maxCycles: 4 } })
+  assert.equal(limited.result.reason, 'github-rate-limited')
 })
 
 test('a dead review validator still settles the CI lane', async () => {
@@ -3226,6 +3435,46 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
   assert.ok(commit.logs.some(l => l.startsWith('commit#') && l.endsWith('the relayed copy does not match its seal')))
   assert.ok(commit.labels.some(l => l.startsWith('push#')), 'the push went ahead')
   assert.equal(commit.result.history[0].reviewPushFailed, undefined)
+})
+
+test("a commit copy that fails its seal is recovered from the script's receipt, never by a second commit (#266)", async () => {
+  const garbled = (l, a) => l === 'commit#1-review' ? { ...a, detail: `${a.detail}.` } : a
+  const { result, labels, logs } = await run({ reviews: oneValid, garble: garbled })
+  assert.equal(labels.filter(l => l.startsWith('commit#')).length, 1, 'the committing script runs once')
+  assert.ok(labels.includes('receipt:commit#1-review'))
+  assert.ok(logs.includes('commit#1-review: the relayed copy does not match its seal'), logs.join('\n'))
+  assert.ok(logs.some(l => l.startsWith('commit#1-review: the rejected copy: {') && l.includes('"detail":"committed."')), logs.join('\n'))
+  assert.ok(logs.includes(`commit#1-review: recovered from the commit script's receipt: committed ${shaFor(1).slice(0, 7)} — committed`), logs.join('\n'))
+  assert.equal(logs.some(l => l.includes('commit agent died')), false)
+  assert.ok(labels.some(l => l.startsWith('push#')), 'the recovered commit is audited and pushed')
+  assert.equal(result.history[0].reviewPushFailed, undefined)
+
+  const long = await run({ reviews: oneValid, garble: (l, a) => l === 'commit#1-review' ? { ...a, detail: 'x'.repeat(5000) } : a })
+  const rejected = long.logs.find(l => l.startsWith('commit#1-review: the rejected copy: '))
+  assert.ok(rejected.length < 800 && /… \(\d+ characters\)$/.test(rejected), rejected.slice(-80))
+
+  const refused = await run({ reviews: oneValid, commit: { committed: false, detail: 'trailing-whitespace....Failed' }, garble: garbled })
+  assert.deepEqual([refused.result.history[0].reviewPushFailed.committed, refused.result.history[0].reviewPushFailed.detail], [false, 'trailing-whitespace....Failed'])
+  assert.equal(refused.labels.some(l => l.startsWith('audit#')), false, 'no commit to audit')
+
+  // A relay that lost the script's line returns an error line; the receipt the script saved still settles it.
+  const lostLine = await run({ reviews: oneValid, commit: { committed: false, detail: 'hook failed' },
+    garble: (l, a) => l === 'commit#1-review' ? { error: 'no output line', committed: false, detail: '', seal: '' } : a })
+  assert.ok(lostLine.labels.includes('receipt:commit#1-review'))
+  assert.ok(lostLine.logs.includes("commit#1-review: recovered from the commit script's receipt: no commit — hook failed"), lostLine.logs.join('\n'))
+  assert.deepEqual([lostLine.result.history[0].reviewPushFailed.committed, lostLine.result.history[0].reviewPushFailed.detail], [false, 'hook failed'])
+
+  // A receipt the script did not save, or one for another commit, is no receipt: the HEAD read-back settles it as before.
+  for (const commitReceipt of [{ error: 'no receipt at /tmp/x: the commit script saved none' }, { parent: FOREIGN }, { scope: ['src/z.c'] }]) {
+    const fallback = await run({ reviews: oneValid, commitReceipt, garble: garbled })
+    assert.ok(fallback.logs.some(l => l.startsWith('commit#1-review: no commit receipt read back: ')), JSON.stringify(commitReceipt))
+    assert.ok(fallback.logs.some(l => /commit#1-review.*HEAD moved to|HEAD moved to .*auditing it/.test(l)), JSON.stringify(commitReceipt))
+    assert.ok(fallback.labels.some(l => l.startsWith('push#')), JSON.stringify(commitReceipt))
+  }
+  // A receipt naming another commit than HEAD is never published.
+  const other = await run({ reviews: oneValid, commitReceipt: { sha: FOREIGN }, garble: garbled })
+  assert.match(other.result.history[0].reviewPushFailed.detail, /receipt names c0ffee1/)
+  assert.equal(other.labels.some(l => l.startsWith('push#')), false)
 })
 
 test("a relay that fills in error: '' on a sealed line still matches its seal", async () => {
@@ -4128,7 +4377,7 @@ test('a reply is published by the script from a workflow-built manifest', async 
   for (const label of ['replies#1', 'resolve#1']) {
     const c = calls.find(x => x.label === label)
     assert.ok(c, `${label} ran`)
-    assert.match(c.prompt, /skills\/pr-reply\/scripts\/reply\.py --pr 3888 --manifest/, `${label} runs the script`)
+    assert.match(c.prompt, /skills\/pr-reply\/scripts\/reply\.py --pr 3888 --repo 'hathach\/tinyusb' --manifest/, `${label} runs the script`)
     assert.doesNotMatch(c.prompt, /gh api/, `${label} types no gh call`)
     assert.equal(c.schema.properties.receipts.items.additionalProperties, false, `${label} takes receipts only`)
   }
@@ -4201,6 +4450,22 @@ test('reply.py\'s error line fails the batch with that error, not a seal mismatc
   assert.equal(logs.some(l => /does not match its seal/.test(l)), false)
   assert.ok(logs.some(l => l.includes(`resolve#1 incomplete — reply.py: ${RATE}`)), logs.join('\n'))
   assert.equal(result.history[0].fixNotePosts.detail, `reply.py: ${RATE}`)
+})
+
+test('a pending review of the posting account stops the launch with a blocker naming it, never retried each cycle (#321)', async () => {
+  const PENDING = 'pending review 5661141307 of hathach on PR #3888 blocks replies: GitHub refuses a review reply while its author holds a pending review; a human submits or deletes it'
+  const line = { error: PENDING, pendingReview: { id: 5661141307, login: 'hathach' } }
+  const reviews = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
+  const { result, labels, logs } = await run({ reviews, replyError: (label) => label.startsWith('replies#') && line, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(result.reason, 'pending-review')
+  assert.deepEqual([result.review, result.login, result.detail], [5661141307, 'hathach', PENDING])
+  assert.equal(result.cycles, 1, 'the next cycle would meet the same refusal')
+  assert.deepEqual(labels.filter(l => /^(replies|resolve|defer)#/.test(l)), ['replies#1'], 'no reply batch is sent after it')
+  assert.ok(logs.some(l => l.includes('holds pending review 5661141307 on PR #3888') && l.includes("the human's to submit or delete")), logs.join('\n'))
+  const other = await run({ reviews, replyError: (label) => label.startsWith('replies#') && RATE.replace('rate limit', 'oops'), args: { autoPush: true, maxCycles: 1 } })
+  assert.notEqual(other.result.reason, 'pending-review', 'only reply.py\'s pending-review line stops so')
+  const textOnly = await run({ reviews, replyError: (label) => label.startsWith('replies#') && PENDING, args: { autoPush: true, maxCycles: 1 } })
+  assert.notEqual(textOnly.result.reason, 'pending-review', 'the pendingReview member stops it, never the error text')
 })
 
 test('reply.py\'s error line refuses a settlement with that error (#115)', async () => {
@@ -5710,7 +5975,7 @@ test('a resumed launch refuses a checkout that is another PR, even at the expect
   const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
   const second = await run({
     args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state },
-    preflight: { prRepo: 'someone/tinyusb', prUrl: 'https://github.com/someone/tinyusb/pull/3888', pushUrls: ['git@github.com:someone/tinyusb.git'] },
+    preflight: { prRepo: 'someone/tinyusb', pushUrls: ['git@github.com:someone/tinyusb.git'] },
     reviews: owing,
   })
   assert.equal(second.result.reason, 'state-mismatch')
@@ -5838,7 +6103,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE} --tip ${TIP}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
-  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888 --pr 3888\``), push.prompt)
+  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888 --pr 3888 --repo 'hathach/tinyusb'\``), push.prompt)
 })
 
 test('a lost adoption push receipt gets one fresh agent, which reads the push back', async () => {
@@ -5944,20 +6209,17 @@ test('a chain the audit script cannot read back is refused with its error', asyn
   assert.deepEqual(labels, ['preflight', 'adopt:audit'])
 })
 
-test('adoptHead argument errors throw before any agent runs', async () => {
-  const malformed = adoptionState()
-  const equal = adoptionState()
-  const unpinned = adoptionState({ pin: null })
-  for (const [name, args] of [
-    ['no state', { adoptHead: ADOPT }],
-    ['malformed SHA', adoptionArgs(malformed, { adoptHead: 'not-a-full-sha' })],
-    ['candidate equals expected head', adoptionArgs(equal, { adoptHead: HEAD })],
-    ['state has no pin', adoptionArgs(unpinned)],
-  ]) {
-    const trace = []
-    await assert.rejects(run({ args, trace }), /adoptHead|adopt head/i, name)
-    assert.deepEqual(trace, [], `${name}: argument validation precedes preflight`)
-  }
+test('a malformed adoptHead throws before any agent runs', async () => {
+  const trace = []
+  await assert.rejects(run({ args: adoptionArgs(adoptionState(), { adoptHead: 'not-a-full-sha' }), trace }), /adoptHead must be a full 40-hex commit SHA/)
+  assert.deepEqual(trace, [], 'argument validation precedes preflight')
+})
+
+test("an adoptHead equal to the state's expectedHead stops at preflight, naming the state's head", async () => {
+  const { result, labels } = await run({ args: adoptionArgs(adoptionState(), { adoptHead: HEAD }) })
+  assert.equal(result.reason, 'adopt-audit-failed')
+  assert.equal(result.detail, `adoptHead ${HEAD.slice(0, 7)} is the state's expectedHead: launch without it`)
+  assert.deepEqual(labels, ['preflight'])
 })
 
 // #45: the user's word that the PR history was rewritten re-pins the state to the published head.
@@ -6008,8 +6270,7 @@ test('adoption keeps ordinary preflight refusals ahead of its own checks', async
     ['dirty-start', adoptionState(), { head: ADOPT, prHead: FOREIGN, dirty: [' M src/a.c'] }],
     ['wrong-branch', adoptionState(), { head: ADOPT, prHead: FOREIGN, branch: 'main', upstreamBranch: 'main' }],
     ['state-mismatch', adoptionState(), {
-      head: ADOPT, prHead: FOREIGN, prRepo: 'someone/tinyusb',
-      prUrl: 'https://github.com/someone/tinyusb/pull/3888', pushUrls: ['git@github.com:someone/tinyusb.git'],
+      head: ADOPT, prHead: FOREIGN, prRepo: 'someone/tinyusb', pushUrls: ['git@github.com:someone/tinyusb.git'],
     }],
     ['wrong-remote', adoptionState({ pin: { ...STATE_PIN, pushUrls: [badPush] } }), {
       head: ADOPT, prHead: FOREIGN, pushUrls: [badPush], badPushUrl: badPush,
@@ -6052,6 +6313,46 @@ test('adoption refuses a local head other than the candidate and a remote head o
   assert.equal(remote.result.head, FOREIGN)
   assert.deepEqual(remote.result.expected, [HEAD, ADOPT])
   assert.deepEqual(remote.labels, ['preflight', 'adopt:audit'], 'only the audit can say which commits the chain holds')
+})
+
+// #260: a first launch adopts local commits on the live PR head; the wrong-head stop's own state continues the same way.
+test('a launch without a pinned state adopts a local chain whose base is the live PR head', async () => {
+  const first = await run({ args: { maxCycles: 4 }, preflight: { head: ADOPT, prHead: HEAD } })
+  assert.equal(first.result.reason, 'wrong-head')
+  assert.equal(first.result.state.pin, null)
+  for (const [name, args] of [['stateless', { maxCycles: 4 }], ["the wrong-head stop's state", { maxCycles: 4, state: first.result.state }]]) {
+    const { result, labels, calls } = await run({ args: { ...args, adoptHead: ADOPT, autoPush: true }, preflight: { head: ADOPT, prHead: HEAD } })
+    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], name)
+    assert.ok(calls.find(c => c.label === 'adopt:audit').prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} `), name)
+    assert.deepEqual(result.history[0].adoption.commits, [ADOPT], name)
+    assert.equal(result.history[0].adoption.publication, 'pushed', name)
+    assert.equal(result.state.expectedHead, ADOPT, name)
+  }
+  const dry = await run({ args: { adoptHead: ADOPT, autoPush: false }, preflight: { head: ADOPT, prHead: HEAD } })
+  assert.equal(dry.result.reason, 'adopt-needs-push', 'publishing still needs autoPush')
+})
+
+test('a launch without a pinned state refuses a diverged chain, a moved PR head and a candidate that is the PR head', async () => {
+  // commits.py refuses a chain whose first link does not sit on FROM: a local chain off the PR head, or a PR head pushed since.
+  for (const [name, prHead, refusal] of [
+    ['diverged', HEAD, `1111111 sits on ${FOREIGN.slice(0, 7)}, not ${HEAD.slice(0, 7)}`],
+    ['moved PR head', FOREIGN, `1111111 sits on ${HEAD.slice(0, 7)}, not ${FOREIGN.slice(0, 7)}`],
+  ]) {
+    const { result, labels } = await run({
+      args: { adoptHead: ADOPT, autoPush: true }, preflight: { head: ADOPT, prHead },
+      adoptAudit: chainAudit([ADOPT], undefined, { from: prHead, refusal }),
+    })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.equal(result.detail, refusal, name)
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'], `${name}: nothing pushed`)
+    assert.equal(result.state.expectedHead, '', `${name}: no head fabricated`)
+  }
+  const same = await run({ args: { adoptHead: HEAD, autoPush: true } })
+  assert.equal(same.result.reason, 'adopt-audit-failed')
+  assert.match(same.result.detail, /is the PR head: launch without it/)
+  assert.deepEqual(same.labels, ['preflight'])
+  const local = await run({ args: { adoptHead: ADOPT, autoPush: true } })
+  assert.equal(local.result.reason, 'adopt-head-mismatch', 'the checkout must be at the candidate')
 })
 
 test('a PR head pushed outside the workflow inside the audited chain is adopted up to the candidate', async () => {
@@ -6523,8 +6824,10 @@ test('a commit that landed but was not pushed is a pending candidate in the stat
   assert.equal(blocked.result.state.expectedHead, HEAD)
   const rejected = await run({ ...publishing, push: null })
   assert.equal(rejected.result.state.pending.stage, 'push-failed')
-  const unknown = await run({ ...publishing, audit: null, garble: (l, a) => l.startsWith('commit#') ? null : a })
+  const unknown = await run({ ...publishing, audit: null, commitReceipt: null, garble: (l, a) => l.startsWith('commit#') ? null : a })
   assert.deepEqual(unknown.result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'push-unknown' })
+  const landed = await run({ ...publishing, audit: null, garble: (l, a) => l.startsWith('commit#') ? null : a })
+  assert.deepEqual(landed.result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'audit-unknown' }, 'the receipt says the commit landed')
   const recovered = await run({ ...publishing, garble: (l, a) => l.startsWith('commit#') ? null : a })
   assert.equal(recovered.result.state.pending, null, 'the read-back found the commit, which was audited and pushed')
   assert.equal(recovered.result.state.expectedHead, shaFor(1))
@@ -6970,7 +7273,7 @@ test('coderabbitTrigger ticks the Trigger review box on a manual-review skip, th
   assert.equal(result.cycles, 2)
   assert.deepEqual(triggers(labels), ['crtrigger#1'])
   const call = calls.find(c => c.label === 'crtrigger#1')
-  assert.ok(call.prompt.includes(`coderabbit_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
+  assert.ok(call.prompt.includes(`coderabbit_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD}\``), call.prompt)
   assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
   assert.ok(logs.includes('cycle 1: crtrigger#1: ticked (comment 5)'), logs.join('\n'))
   assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit review triggered (${MANUAL}, 10m to cap)`)
@@ -7029,8 +7332,28 @@ test('a CodeRabbit queued after its trigger waits out the cap from the trigger, 
   assert.equal(headLine(late.logs)[2], 'cycle 3 summary — CI green, reviews: coderabbit queued, wait expired after 10m: head unreviewed (review requested)')
 })
 
+test('a manual-review skip read from a check run and its summary is ticked like the status one (#324)', async () => {
+  let n = 0
+  const viaRun = 'Review skipped: manual review required (check run; comment 5 holds an unticked Trigger review box)'
+  const { result, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, reviewsPerCycle: () => quiet([++n === 1 ? skippedCr(viaRun) : bot('coderabbit')]) })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual(triggers(labels), ['crtrigger#1'])
+})
+
+test('a skip that reads otherwise once its box is ticked is still waited on from the tick', async () => {
+  let n = 0
+  const other = 'check run skipped: Review skipped'
+  const { result, labels, logs } = await run({ args: { coderabbitTrigger: true, maxCycles: 4 },
+    reviewsPerCycle: () => quiet([++n === 1 ? skippedCr() : n === 2 ? skippedCr(other) : bot('coderabbit')]) })
+  assert.equal(result.pass, true, result.reason)
+  assert.equal(result.cycles, 3)
+  assert.deepEqual([triggers(labels), requests(labels)], [['crtrigger#1'], []])
+  assert.ok(headLine(logs)[1].includes(`coderabbit review triggered (${other},`), headLine(logs)[1])
+})
+
 test('no trigger without coderabbitTrigger or for another skip, and the switch needs autoPush and coderabbit auto-running', async () => {
-  for (const [args, reason, want] of [[{}, MANUAL, undefined], [{ coderabbitTrigger: true }, 'Review skipped: draft pull request', 'coderabbit-unreviewed']]) {
+  for (const [args, reason, want] of [[{}, MANUAL, undefined], [{ coderabbitTrigger: true }, 'Review skipped: draft pull request', 'coderabbit-unreviewed'],
+    [{ coderabbitTrigger: true }, 'check run skipped: Review skipped', 'coderabbit-unreviewed']]) {
     const { result, labels } = await run({ args, reviews: quiet([skippedCr(reason)]) })
     assert.equal(result.reason, want, 'a review the switch asked for is required, whatever the skip')
     assert.deepEqual(triggers(labels), [])
@@ -7053,7 +7376,7 @@ test('a rate-limited CodeRabbit is asked once after its reset, then waited for',
   assert.equal(result.pass, true, result.reason)
   assert.equal(result.cycles, 3)
   assert.deepEqual(requests(labels), ['crrequest#2'])
-  assert.ok(calls.find(c => c.label === 'crrequest#2').prompt.includes(`coderabbit_trigger.py --pr 3888 --head ${HEAD} --request\``))
+  assert.ok(calls.find(c => c.label === 'crrequest#2').prompt.includes(`coderabbit_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --request\``))
   assert.equal(napMs[0], 21 * 60000, 'one nap to a minute past the reset')
   assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit settled (limited: Review rate limited; asking again after ${at(20)})`)
   assert.ok(logs.includes('cycle 2: crrequest#2: requested (comment 99)'), logs.join('\n'))
@@ -7133,6 +7456,37 @@ test('a fresh limit after the request, or a request that failed, stops CodeRabbi
   }
 })
 
+test('a request that failed before its POST is asked once more; one that may have posted, or a second such failure, is final (#276)', async () => {
+  const unposted = { outcome: 'failed', detail: 'gh api repos/{owner}/{repo}/pulls/263: gh: HTTP 503', retryAt: null, phase: 'read' }
+  let n = 0
+  const once = await run({
+    args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 21,
+    crRequest: (label) => label === 'crrequest#2' ? unposted : { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: at(20) },
+    reviewsPerCycle: () => quiet([++n < 4 ? limitedCr(at(20)) : bot('coderabbit')]),
+  })
+  assert.equal(once.result.pass, true, once.result.reason)
+  assert.deepEqual(requests(once.labels), ['crrequest#2', 'crrequest#3'])
+  assert.ok(once.logs.includes(`cycle 2: crrequest#2: failed (${unposted.detail})`), once.logs.join('\n'))
+  assert.ok(once.logs.includes('cycle 3: crrequest#3: requested (comment 99)'), once.logs.join('\n'))
+  for (const [name, crRequest, want] of [['twice', unposted, ['crrequest#2', 'crrequest#3']], ['posted', { ...unposted, phase: 'post' }, ['crrequest#2']],
+    ['no phase', { ...unposted, phase: undefined }, ['crrequest#2']]]) {
+    const { result, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 21, crRequest, reviews: quiet([limitedCr(at(20))]) })
+    assert.equal(result.reason, 'coderabbit-unreviewed', name)
+    assert.deepEqual(requests(labels), want, name)
+    assert.equal(result.state.reviewClock.request.at, null, name)
+    assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: null }] }, `${name}: a relaunch asks nothing`)
+  }
+  // The retry carries across a resume: a launch out of cycles leaves it to the relaunch, which asks once.
+  const a = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, clockOffset: 21, crRequest: unposted, reviews: quiet([limitedCr(at(20))]) })
+  assert.equal(a.result.state.reviewClock.requestUnposted, true)
+  assert.equal(a.result.state.reviewClock.request, undefined)
+  assert.deepEqual(a.result.coderabbitAsk, { relaunchAsks: 'request', asked: [], retryAt: at(20) })
+  const b = await run({ args: { coderabbitTrigger: true, maxCycles: 3, state: a.result.state }, clockOffset: 22, crRequest: unposted, reviews: quiet([limitedCr(at(20))]) })
+  assert.deepEqual(requests(b.labels), ['crrequest#2'])
+  assert.equal(b.result.state.reviewClock.request.at, null, 'its second unposted failure is final')
+  await assert.rejects(run({ args: { maxCycles: 3, state: seal({ ...a.result.state, reviewClock: { ...a.result.state.reviewClock, requestUnposted: 1 } }) } }), /not a pr-babysit state/)
+})
+
 test('after a request, the same limit or a queued review waits from the request, and notLimited waits for the next harvest', async () => {
   // The limit is its reset time: other evidence around the same reset is the same limit.
   let m = 0
@@ -7167,23 +7521,62 @@ test('a request carries across a resume, and a malformed one is refused', async 
   }
 })
 
-test('a failed or lost trigger stops CodeRabbit unreviewed, logged and not asked again', async () => {
+test('a failed or lost trigger, and then a failed request, stops CodeRabbit unreviewed, logged and not asked again', async () => {
   const cases = [
     [{ outcome: 'failed', detail: '0 CodeRabbit comments hold one Trigger review box, not 1' }, 'failed (0 CodeRabbit comments hold one Trigger review box, not 1)'],
     [{ error: 'gh: HTTP 502', outcome: '', detail: '', at: '' }, 'failed (gh: HTTP 502)'],
     [null, 'failed (no answer)'],
   ]
+  const crRequest = { outcome: 'failed', detail: 'gh api: boom', retryAt: null, phase: 'post' }
   for (const [crTrigger, line] of cases) {
-    const { result, logs, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, crTrigger, reviews: quiet([skippedCr()]) })
+    const { result, logs, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, crTrigger, crRequest, reviews: quiet([skippedCr()]) })
     assert.equal(result.reason, 'coderabbit-unreviewed')
     assert.equal(result.cycles, 1)
     assert.deepEqual(triggers(labels), crTrigger === null ? ['crtrigger#1', 'crtrigger#1.retry'] : ['crtrigger#1'])
+    assert.deepEqual(requests(labels), ['crrequest#1'])
     assert.ok(logs.includes(`cycle 1: crtrigger#1: ${line}`), logs.join('\n'))
+    assert.ok(logs.includes('cycle 1: crrequest#1: failed (gh api: boom)'), logs.join('\n'))
     assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit settled (skipped: ${MANUAL})`)
-    assert.equal(result.state.reviewClock.triggeredAt, null, 'tried and not waiting')
+    assert.deepEqual([result.state.reviewClock.triggeredAt, result.state.reviewClock.request], [null, { at: null, retryAt: null }], 'tried and not waiting')
     assert.equal(result.observation.actions.botAsks, undefined, 'no comment named, no receipt')
-    assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: null }] }, 'a failed tick is not tried again')
+    assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: null }, { ask: 'request', at: null }] }, 'neither is tried again')
   }
+})
+
+test('a failed tick spends no comment: one `@coderabbitai review` asks for the skipped head instead, never a second (#274)', async () => {
+  const noBox = { outcome: 'failed', detail: '0 CodeRabbit comments hold one Trigger review box, not 1' }
+  let n = 0
+  const { result, logs, labels, calls } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 3 }, crTrigger: noBox, reviewsPerCycle: () => quiet([++n === 1 ? skippedCr() : bot('coderabbit')]),
+  })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual([triggers(labels), requests(labels)], [['crtrigger#1'], ['crrequest#1']])
+  const call = calls.find(c => c.label === 'crrequest#1')
+  assert.ok(call.prompt.includes(`coderabbit_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --request\``), call.prompt)
+  assert.ok(call.prompt.includes('that it skipped for a manual review'), call.prompt)
+  assert.ok(logs.includes('cycle 1: crrequest#1: requested (comment 99)'), logs.join('\n'))
+  assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit review triggered (${MANUAL}, 10m to cap)`)
+  assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), triggeredAt: null, request: { at: at(0), retryAt: null } })
+  assert.deepEqual(result.observation.launchActions[0].botAsks, [{ bot: 'coderabbit', kind: 'request', outcome: 'requested', commentId: 99, at: at(0), sha: HEAD }])
+  // Skipped is not reviewed: the cap after the comment stops it unreviewed, asked once.
+  const capped = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5, crTrigger: noBox, reviews: quiet([skippedCr()]) })
+  assert.equal(capped.result.reason, 'coderabbit-unreviewed')
+  assert.deepEqual([triggers(capped.labels), requests(capped.labels)], [['crtrigger#1'], ['crrequest#1']])
+  assert.deepEqual(capped.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: null }, { ask: 'request', at: at(0) }] })
+  // A relaunch on a state whose tick failed before the fallback existed (hathach/agentrc#300) comments once, and the next asks nothing.
+  const a = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true }, reviews: quiet([skippedCr()]) })
+  const { request, ...clock } = { ...a.result.state.reviewClock, triggeredAt: null }
+  const failedTick = seal({ ...a.result.state, reviewClock: clock })
+  const b = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true, state: failedTick }, clockOffset: 12, reviews: quiet([skippedCr()]) })
+  assert.deepEqual([triggers(b.labels), requests(b.labels)], [[], ['crrequest#2']])
+  assert.deepEqual(b.result.state.reviewClock.request, { at: at(12), retryAt: null })
+  const c = await run({ args: { coderabbitTrigger: true, maxCycles: 3, state: b.result.state }, clockOffset: 24, reviews: quiet([skippedCr()]) })
+  assert.deepEqual([triggers(c.labels), requests(c.labels)], [[], []], 'never a second comment on the head')
+  assert.equal(c.result.reason, 'coderabbit-unreviewed')
+  const d = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, crTrigger: noBox, crRequest: { outcome: 'already', detail: 'comment 51', commentId: 51, retryAt: null },
+    reviews: quiet([skippedCr()]) })
+  assert.deepEqual(requests(d.labels), ['crrequest#1'])
+  assert.equal(d.result.state.reviewClock.request.at, at(0), "the script's own check finds the standing comment, and it is waited on")
 })
 
 test('a cycle that asked a bot to review and then met a GitHub rate limit stays charged', async () => {
@@ -7384,6 +7777,18 @@ test('a mis-copied, missing or duplicated chunk is asked for again alone', async
   assert.equal(extra.labels[2], 'preflight')
 })
 
+test('the stateRef bootstrap runs under the interpreter python names, before preflight (#234)', async () => {
+  const { state, stateRef } = await savedForLoad()
+  const named = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef, python: '/opt/My Python/python3' }, load: state })
+  assert.deepEqual(named.labels.slice(0, 2), ['state:load#1', 'preflight'])
+  assert.match(named.calls[0].prompt, /^Run exactly: '\/opt\/My Python\/python3' ~\/\.claude\/skills\/pr-babysit\/scripts\/state_transfer\.py /)
+  assert.deepEqual(interpreters(named.calls), ["'/opt/My Python/python3'"])
+  assert.equal(named.result.state.cyclesUsed, 2)
+  const bare = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state })
+  assert.match(bare.calls[0].prompt, /^Run exactly: python3 ~\//)
+  assert.equal(SCRIPT_RUN.exec(bare.calls.find(c => c.label === 'preflight').prompt)[1], 'python3')
+})
+
 test('a mis-copied chunk is asked again padded, so its text differs, then plain (#147)', async () => {
   const { state, stateRef } = await savedForLoad()
   // The relays keep the source's sum and alter the data, as wf_70c961b3-aea's did, on every unpadded copy of chunk 1.
@@ -7531,7 +7936,7 @@ test('markSonar marks the SonarCloud issue of a refuted code-scanning comment wi
   assert.ok(labels.indexOf('sonar#1') > labels.findIndex(l => l.startsWith('replies#')), labels.join(', '))
   const [item] = payloadOf(calls.find(c => c.label === 'sonar#1').prompt, 'Manifest').items
   assert.deepEqual(item, { commentId: 3, commentDigest: 'd3', how: 'refutation', note: 'Not injectable: a list argv.', digest: fnv1a('Not injectable: a list argv.') })
-  assert.match(calls.find(c => c.label === 'sonar#1').prompt, new RegExp(`--pr 3888 --head ${HEAD} --manifest`))
+  assert.match(calls.find(c => c.label === 'sonar#1').prompt, new RegExp(`--pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --manifest`))
   assert.deepEqual(result.history[0].sonar, [{ commentId: 3, issue: 'K3', outcome: 'marked', detail: 'false positive' }])
   assert.equal('sonarUnmarked' in result, false)
   assert.deepEqual(sonarOf(result.state), [])
@@ -8068,7 +8473,7 @@ test('greptileTrigger waits out a grace with Greptile absent, asks once, then wa
   assert.equal(result.cycles, 5)
   assert.deepEqual(gAsks(labels), ['greptile#3'], 'two minutes after the first observation, once')
   const call = calls.find(c => c.label === 'greptile#3')
-  assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
+  assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD}\``), call.prompt)
   assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
   assert.equal(labels.some(l => l.startsWith('prstate#')), false, 'the script reads the PR open at the head itself, just before it posts')
   assert.deepEqual(harvestFlags(calls.find(c => c.label === 'reviews#1').prompt)[1], ['coderabbit', 'greptile'])

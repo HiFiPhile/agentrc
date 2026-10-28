@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, cap_families, http_get   # noqa: E402
+from doclib import Doc, begin_enumeration, cap_families, http_get, partial_enumeration   # noqa: E402
 
 GRID = "https://www.st.com/bin/st/selectors/cxst/en.cxst-rs-grid.html/{}.all.json"
 BASE = "https://www.st.com"
@@ -71,8 +71,8 @@ def _grid(grid_id: str, refresh: bool = False) -> list:
         if f.exists():
             print(f"  {grid_id}: fetch failed, using cached copy", file=sys.stderr)
             return json.loads(f.read_text(encoding="utf-8")).get("rows", [])
-        print(f"  {grid_id}: fetch failed and nothing cached — ST is likely throttling; "
-              f"wait a few minutes and re-run (progress is cached)", file=sys.stderr)
+        partial_enumeration(f"{grid_id}: fetch failed and nothing cached — ST is likely throttling; "
+                            f"wait a few minutes and re-run (progress is cached)")
         return []
     f.write_bytes(data)
     time.sleep(PACE_SECONDS)
@@ -92,6 +92,7 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
     families: e.g. ['STM32H7'] — None means every grid (slow; ~25 fetches).
     types:    normalized kinds, e.g. ['datasheet', 'errata'].
     """
+    begin_enumeration()
     grids = [g for g, fam in SERIES.items()
              if families is None or fam is None or fam in families]
     if families:   # a named family implies its grid; drop the class-wide one unless asked

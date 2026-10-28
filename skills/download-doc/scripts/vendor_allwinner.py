@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, http_get   # noqa: E402
+from doclib import Doc, begin_enumeration, http_get, partial_enumeration   # noqa: E402
 
 AUTHOR = "Allwinner Technology"
 PAGE = "https://linux-sunxi.org/F1C100s"
@@ -43,11 +43,12 @@ def _kind(name: str) -> str | None:
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
+    begin_enumeration()
     try:
         html = http_get(PAGE, timeout=30, accept="text/html",
                         validate=lambda b: len(b) > 2000).decode("utf-8", "replace")
     except RuntimeError:
-        print("  linux-sunxi wiki unreachable", file=sys.stderr)
+        partial_enumeration("linux-sunxi wiki unreachable")
         return []
     want = {f.upper() for f in families} if families else None
     docs, seen = [], set()

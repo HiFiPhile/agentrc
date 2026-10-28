@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, http_get   # noqa: E402
+from doclib import Doc, begin_enumeration, http_get, partial_enumeration   # noqa: E402
 
 INDEX = "https://www.espressif.com/en/support/documents/technical-documents"
 AUTHOR = "Espressif Systems"
@@ -104,6 +104,7 @@ def _resolve_pdf(url: str) -> str | None:
         page = http_get(url, timeout=30, accept="text/html",
                         validate=lambda b: b"<html" in b.lower()).decode("utf-8", "replace")
     except RuntimeError:
+        partial_enumeration(f"{url}: fetch failed")
         return None
     m = re.search(r'href="([^"]+\.pdf)"', page)
     return urljoin(url, m.group(1)) if m else None
@@ -115,6 +116,7 @@ def enumerate_docs(chips=None, types=None, refresh=False) -> list:
     chips: filenames/titles must mention one of these (default: the USB-OTG parts).
            Pass an empty list to disable chip filtering entirely.
     """
+    begin_enumeration()
     want = OTG_CHIPS if chips is None else {c.lower(): c.upper() for c in chips}
     docs, seen = [], set()
     for row in _ROW.findall(_index_html(refresh)):

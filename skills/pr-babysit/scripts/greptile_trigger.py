@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Ask Greptile to review PR N's head: post exactly `@greptileai` as a top-level comment, once per head.
 
-  greptile_trigger.py --pr N --head SHA
+  greptile_trigger.py --pr N --head SHA [--repo OWNER/NAME]
 
 A repository whose Greptile config reviews only on PR open has a pushed head
-reviewed only on request. Run from the PR checkout. Each head's attempt is
+reviewed only on request. Run from the PR checkout; PR N is --repo's, else the
+checkout's one repository (facts.bind_repo). Each head's attempt is
 recorded under the checkout's git common dir, in
 pr-babysit/greptile/<owner>-<repo>-<N>-<SHA>.json: claimed, with the exact
 `@greptileai` comments already on the PR, before the POST, and given the
@@ -33,7 +34,8 @@ comment's time on those, else the UTC time the script finished. commentId is the
 comment's id on requested and already, and on an uncertain one that was posted
 and did not read back. stdout ends with one JSON line {outcome, detail, at,
 commentId?, seal} (seal: facts.sealed). Exit 2 with
-{"error": ...} when the arguments are wrong or GitHub's answer cannot be read.
+{"error": ...} when the arguments are wrong or GitHub's answer cannot be read, the workflow
+file of a run that might date the head included (harvest.workflow_file), with nothing posted.
 A rerun after a lost line reports `already`.
 Deduplication is this checkout's: with no receipt recorded here, a later
 head event on the same SHA (a reopen after a request made elsewhere or by
@@ -49,7 +51,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from coderabbit_trigger import pull_at  # noqa: E402
-from facts import FULL_SHA, Parser, Unusable, attempt, git, locked, report, utc  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, git, locked, report, utc  # noqa: E402
 from harvest import gh_json, head_event, newest, pages, stamp  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
@@ -125,7 +127,8 @@ def request(pr, head):
             return found(path, record, 'already', pr, f"an attempt claimed this head at {record['claimedAt']} and its comment is not on the PR")
         standing = asks(pr)
         view = {'headRefName': pull['head']['ref'], 'headRepository': {'nameWithOwner': pull['head']['repo']['full_name']}}
-        event_at, evidence = head_event(repo, pr, view, head)
+        # Only a standing request needs the head's time; a workflow file that would date it and cannot be read is an error line.
+        event_at, evidence = head_event(repo, pr, view, head) if standing else (None, '')
         if standing and event_at is None:
             return {'outcome': 'failed', 'detail': f"the head event time is unknown ({evidence}), so comment {standing[-1]['id']} "
                                                    'cannot be placed before or after it: nothing posted'}
@@ -166,9 +169,11 @@ def collect(argv):
     p = Parser(prog='greptile_trigger.py')
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--head', required=True)
+    p.add_argument('--repo')
     a = p.parse_args(argv)
     if not FULL_SHA.match(a.head):
         raise Unusable(f'not a full SHA: {a.head!r}')
+    bind_repo(a.repo)
     try:
         return {'at': utc(time.time()), **request(a.pr, a.head)}
     except (KeyError, TypeError, AttributeError) as e:

@@ -9,13 +9,30 @@ export const meta = {
 if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
+const ARG_NAMES = ['pr', 'repo', 'python', 'reviewers', 'autoRun', 'maxCycles', 'autoPush', 'markSonar', 'coderabbitTrigger', 'greptileTrigger', 'checkoutDir',
+  'protected', 'generated', 'ciWait', 'ciNotes', 'acceptedFailures', 'deferrals', 'replySettlements', 'build', 'yieldAfterCycle', 'yieldOnChange',
+  'lane', 'state', 'stateRef', 'adoptHead', 'adoptProtected', 'adoptReviewedProtected', 'rebasedHead', 'rejudge']
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, greptileTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, adoptReviewedProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error(`args must be { pr: number, ${ARG_NAMES.slice(1).map(k => `${k}?`).join(', ')} }; run from the PR branch checkout or point checkoutDir at it`)
 }
+// An ignored argument would read as one obeyed (#311).
+const unknownArgs = Object.keys(args).filter(k => !ARG_NAMES.includes(k))
+if (unknownArgs.length) throw new Error(`unknown argument(s) ${JSON.stringify(unknownArgs)}: pr-babysit takes only ${ARG_NAMES.join(', ')} (ARGUMENTS.md)`)
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
   throw new Error('args.pr must be a positive integer PR number')
 }
+// OWNER/NAME, as facts.py's REPO reads it.
+const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9-]*\/(?!\.\.?$)[A-Za-z0-9._-]+$/
+if (args.repo != null && (typeof args.repo !== 'string' || !REPO_NAME.test(args.repo))) {
+  throw new Error('repo must be OWNER/NAME, the repository PR pr belongs to (a fork PR\'s base repository)')
+}
+// One interpreter for every script (#234): the caller's, else the one `python3` names, by the absolute path preflight reports; never a search.
+const pythonArg = args.python ?? null
+if (pythonArg !== null && (typeof pythonArg !== 'string' || !pythonArg.trim() || /[\x00-\x1f]/.test(pythonArg))) {
+  throw new Error('python must be the interpreter every script runs under, a path or command name on one line')
+}
+let PY = pythonArg === null ? 'python3' : shq(pythonArg)
 const checkoutDir = args.checkoutDir || '.'
 if (typeof checkoutDir !== 'string') {
   throw new Error('checkoutDir must be a path string')
@@ -249,7 +266,7 @@ if (args.stateRef != null) {
     const groups = missing ? [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
       : [{ asked: null, pad: false }]
     const replies = await parallel(groups.map(({ asked, pad }) => () => agent(
-      `Run exactly: python3 ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}${pad ? ' --pad' : ''}` : ''}\n` +
+      `Run exactly: ${PY} ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}${pad ? ' --pad' : ''}` : ''}\n` +
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `state:load#${++call}`, agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
@@ -297,8 +314,10 @@ if (args.state !== undefined && args.state !== null) {
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
       (st.reviewClock.greptileAt == null || Number.isFinite(Date.parse(st.reviewClock.greptileAt))) &&
-      (st.reviewClock.request === undefined || (st.reviewClock.request && Number.isFinite(Date.parse(st.reviewClock.request.retryAt)) &&
+      (st.reviewClock.request === undefined || (st.reviewClock.request &&
+        (st.reviewClock.request.retryAt === null || Number.isFinite(Date.parse(st.reviewClock.request.retryAt))) &&
         (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
+      (st.reviewClock.requestUnposted === undefined || st.reviewClock.requestUnposted === true) &&
       (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
         Object.values(st.reviewClock.unknown).every(u => u && typeof u.reading === 'string' && Number.isFinite(Date.parse(u.since)))))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
@@ -312,15 +331,19 @@ if (args.state !== undefined && args.state !== null) {
   if (st.build !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(st.build)} → ${JSON.stringify(buildCmd)}`)
   restored = st
 }
+const repoOf = (prUrl) => /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+$/.exec(prUrl || '')?.[1] ?? null
+const stateRepo = restored && restored.pin ? repoOf(restored.pin.prUrl) : null
+if (args.repo != null && stateRepo && args.repo.toLowerCase() !== stateRepo.toLowerCase()) {
+  throw new Error(`repo ${args.repo} is not the state's ${stateRepo}: a state continues only the PR it pinned`)
+}
+// Every gh call names the PR's repository (#311): the caller's, the state's, else the one preflight finds the checkout naming alone.
+let repo = args.repo ?? stateRepo
 const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 16)
 if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
 let cyclesUsed = restored ? restored.cyclesUsed : 0
 const adoptHead = args.adoptHead === undefined || args.adoptHead === null ? null : args.adoptHead
 if (adoptHead !== null) {
   if (typeof adoptHead !== 'string' || !/^[0-9a-f]{40}$/.test(adoptHead)) throw new Error('adoptHead must be a full 40-hex commit SHA')
-  if (!restored) throw new Error('adoptHead continues a previous launch: it needs that launch\'s state')
-  if (!restored.pin) throw new Error('adoptHead needs a state whose preflight pinned the PR head')
-  if (adoptHead === restored.expectedHead) throw new Error('adoptHead equals the state\'s expectedHead: there is nothing to adopt')
 }
 // The user's word that the PR's history was rewritten (#45): the published head replaces the state's, unaudited, since this run publishes none of it.
 const rebasedHead = args.rebasedHead === undefined || args.rebasedHead === null ? null : args.rebasedHead
@@ -365,7 +388,11 @@ const REQUIRED_CHECK = {
   type: 'object', additionalProperties: false, required: ['context', 'app', 'state', 'bucket'],
   properties: { context: { type: 'string' }, app: { type: 'integer' }, state: { type: 'string' }, bucket: { enum: ['pass', 'pending', 'fail', 'missing'] } },
 }
-const INVENTORY = withSeal({
+// collect.py's CONTRACT: the members its lines hold, which these schemas read. A line of another is a collector older or newer
+// than this workflow copy, whose relayed copy can never pass its seal: told apart before the seal (#293).
+const COLLECT_CONTRACT = 1
+const collectorLine = (schema) => withSeal({ ...schema, required: [...schema.required, 'contract'], properties: { ...schema.properties, contract: { type: 'integer' } } })
+const INVENTORY = collectorLine({
   type: 'object', required: ['head', 'baseRef', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'requiredChecks', 'observedAt'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, baseRef: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
@@ -387,7 +414,7 @@ const GATE = {
   },
 }
 // `bases`: each --check's base job as `run:job:conclusion`, null without one.
-const EVIDENCE = withSeal({
+const EVIDENCE = collectorLine({
   type: 'object', required: ['head', 'detail', 'gates', 'bases'],
   properties: {
     rateLimit: RATE_LIMIT,
@@ -398,7 +425,7 @@ const EVIDENCE = withSeal({
     },
   },
 })
-const BASES = withSeal({
+const BASES = collectorLine({
   type: 'object', required: ['head', 'bases'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, bases: EVIDENCE.properties.bases },
 })
@@ -409,7 +436,7 @@ const VERDICT = {
 // collect.py's RECALL_BYTES bounds a recall line; a failed seal costs only its own batch (#9).
 const RECALL_PER_CALL = 5
 // `left`: links collect.py held back for room, with where their pages start.
-const RECALLED = withSeal({
+const RECALLED = collectorLine({
   type: 'object', required: ['head', 'verdicts', 'left'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT },
@@ -419,7 +446,7 @@ const RECALLED = withSeal({
     },
   },
 })
-const REMEMBERED = withSeal({
+const REMEMBERED = collectorLine({
   type: 'object', required: ['head'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' } },
 })
@@ -499,7 +526,7 @@ const REVIEWS = {
         properties: { commentId: { type: 'integer' }, body: { type: 'string' } },
       },
     },
-    // harvest.py's error, verbatim, when it failed twice for any other reason (#205).
+    // harvest.py's error, verbatim, when it failed twice for any other reason (#205); its last stderr line when it printed no JSON line (#240).
     harvestError: { type: 'string' },
     // harvest.py's error line when GitHub refused it for a rate limit, with that error.
     rateLimit: { ...RATE_LIMIT, required: [...RATE_LIMIT.required, 'error'], properties: { ...RATE_LIMIT.properties, error: { type: 'string' } } },
@@ -582,7 +609,7 @@ const TRIGGER = withSeal({
   required: ['outcome', 'detail', 'at'],
   properties: {
     error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
-    retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] },
+    retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, phase: { type: ['string', 'null'] },
   },
 })
 const ADOPT_AUDIT = withSeal({
@@ -607,6 +634,15 @@ const COMMIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['committed', 'detail'],
   properties: { error: { type: 'string' }, committed: { type: 'boolean' }, detail: { type: 'string' } },
+})
+// commits.py's saved commit line, read back when the committer's copy was lost (#266).
+const COMMIT_RECEIPT = withSeal({
+  type: 'object', additionalProperties: false,
+  required: ['request', 'parent', 'scope', 'committed', 'detail', 'sha'],
+  properties: {
+    error: { type: 'string' }, request: { type: 'string' }, parent: { type: 'string' }, scope: { type: 'array', items: { type: 'string' } },
+    committed: { type: 'boolean' }, detail: { type: 'string' }, sha: { type: 'string' },
+  },
 })
 const RECHECK = withSeal({
   type: 'object', additionalProperties: false,
@@ -674,7 +710,7 @@ const SCOPE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/scope_check.py'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
 const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
-const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
   const empty = schema.required.map(k => {
@@ -726,10 +762,19 @@ const noteLimit = (limit, from = '') => {
 }
 // A copy that fails its script's seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
-const relayAgent = async (prompt, { fileTool, ...opts }) => {
+const relayAgent = async (prompt, { fileTool, contract, ...opts }) => {
   const v = await agent(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
+  // Before the seal, which a line of another contract never matches however often it is copied (#293).
+  if (v && !v.error && contract !== undefined && v.contract !== contract) {
+    return { ...v, skew: true, error: `collect.py prints output contract ${v.contract}, and this launch's workflow script reads ${contract}: ` +
+      'the launch runs a workflow copy older or newer than the installed collector. Relaunch from the installed file (Workflow ' +
+      'scriptPath ~/.claude/workflows/pr-babysit.js), in a fresh session after an agentrc update; no retry clears it' }
+  }
   if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
     log(`${opts.label}: the relayed copy does not match its seal`)
+    // Bounded: the copy can carry a whole hook log (#266).
+    const copy = JSON.stringify(v)
+    log(`${opts.label}: the rejected copy: ${copy.length > 600 ? `${copy.slice(0, 600)}… (${copy.length} characters)` : copy}`)
     return null
   }
   if (v && v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
@@ -751,16 +796,19 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 // saved receipt instead, so a reply that run posted is not reported as found there (#53).
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
-  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
-  'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\'. ' +
+  `\`${PY} ${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
+  'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\', and its pendingReview member when it has one. ' +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
 ).then(out => {
   // reply.py names a rate limit only in error text: the line's, or a sealed receipt's when it struck mid-batch.
   const said = !out ? undefined : (out.error ? [out.error] : out.receipts.map(r => r.error)).find(e => e && /rate limit|HTTP 429/i.test(e))
   if (said) noteLimit({ error: `reply.py: ${said}`, observedAt: null, resetAt: null, secondary: /secondary/i.test(said) })
+  if (out && out.error && out.pendingReview && !pendingReview) pendingReview = { review: out.pendingReview.id, login: out.pendingReview.login, detail: out.error }
   return out
 })
+// The posting account's pending review, which GitHub refuses every review reply beside (#321): a human submits or deletes it.
+let pendingReview = null
 function fromBase64 (text) {
   if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
   const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -782,6 +830,7 @@ const RECEIPTS = withSeal({
   required: ['receipts'],
   properties: {
     error: { type: 'string' },
+    pendingReview: { type: 'object', additionalProperties: false, required: ['id', 'login'], properties: { id: { type: 'integer' }, login: { type: 'string' } } },
     receipts: {
       type: 'array',
       items: {
@@ -817,6 +866,8 @@ const noteRerun = (r) => {
   else if (r.sure) ciReruns[i] = r
 }
 const ciVerdicts = new Map()
+// Checks this launch judged, or sent back to be judged, from what the collector reads now (#319).
+const tailsRefreshed = new Set()
 // Saved entries are of the state's expectedHead; one saved before the head was left out names it too.
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e, head: restored.expectedHead })
 const ciChecks = { judged: 0, partial: 0, reused: 0, unchanged: 0 }
@@ -850,7 +901,8 @@ let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
 // When the wait for a silent bot began, per head; kept across launches so a resume does not restart the cap.
 // triggeredAt: absent until this head's one CodeRabbit trigger, then when the script finished, or null when it failed.
-// greptileAt the same for its one `@greptileai` request.
+// greptileAt the same for its one `@greptileai` request. requestUnposted: a CodeRabbit request failed before its POST and was
+// tried once more, the retry it gets.
 let reviewClock = restored ? restored.reviewClock : null
 // Latched by the first launch with greptileTrigger: from then on every head of this run needs Greptile's review, whatever
 // later launches pass; only posting the request stays with the switch.
@@ -1194,7 +1246,7 @@ const botCell = (b, headWaitedMin) => {
   if (b.state === 'reviewed') return `reviewed ${b.sha.slice(0, 7)}`
   if (!waitedOn.includes(b.bot)) return `${b.state} (${b.kind ? `${b.kind}: ` : ''}${b.reason}; not waited on)`
   const waitedMin = b.triggeredMin ?? headWaitedMin
-  if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again after ${b.retryAt})`
+  if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again ${b.retryAt ? `after ${b.retryAt}` : 'next cycle'})`
   if (b.state === 'settled' && b.triggeredMin !== undefined) {
     return b.done ? `settled (${b.kind}: ${b.reason}; no review ${waitedMin}m after its trigger)`
       : `review triggered (${b.reason}, ${Math.max(0, REVIEW_CAP_MIN - waitedMin)}m to cap)`
@@ -1258,6 +1310,8 @@ const buildCheck = async (tag, owned) => {
         "command = the shell command, run from the checkout's top level, that builds what these paths affect, with `<BUILD>` where the contract takes a fresh build directory; " +
         'setup = the shell lines the contract says must run first in the same shell (sourcing a toolchain\'s environment script, say), else null; ' +
         'requires = the executables command runs that setup or the system must put on PATH, each a bare name; ' +
+        // #309: a wrapper building one board per family needed Espressif's export.sh and idf.py, and a missing idf.py failed the batch.
+        'when command builds several targets or board families, a wrapper script\'s included, setup and requires hold every one\'s: each family\'s own setup the contract names (such as `. "$IDF_PATH/export.sh"` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build; ' +
         'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
         { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
       ).catch(quiet(`build:resolve#${tag}`))
@@ -1268,7 +1322,7 @@ const buildCheck = async (tag, owned) => {
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
   const r = await relayRun(
-    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
+    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${PY} ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
     `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}\` ` +
     relayed(BUILD_RUN),
     { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
@@ -1340,7 +1394,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   const plain = candidates.filter(f => !refusal.has(f))
   if (plain.length > 0) {
     const v = await relayRun(
-      `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}\` ` +
+      `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${PY} ${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}\` ` +
       relayed(SCOPE_CHECK),
       { label: 'scope:check', phase: 'Fix', model: 'haiku', effort: 'low', schema: SCOPE_CHECK },
     )
@@ -1549,7 +1603,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   }
   // Identity is an exact SHA, never a count.
   const now = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: RECHECK },
   )
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
@@ -1577,7 +1631,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   // A required hook may regenerate files outside the scope: run the hooks first and admit only what appeared after they reported changes, the checked files unchanged; the committer never picks a path.
   const quoted = checked.map(shq).join(' ')
   const hooks = await relayRun(
-    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
+    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`${PY} ${HOOKS_SCRIPT} ${quoted}\` ` +
     // A repository's hooks may run its whole test suite: hooks.py stops them before this limit (#140).
     `in the foreground with a Bash timeout of 600000 ms, the tool's maximum, ` +
     relayed(HOOKS),
@@ -1635,24 +1689,32 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   }
 
   // Commit and push are separate turns so the commit is audited before it leaves.
+  const commitLabel = `commit#${cycle}-${what}`
+  const receiptFile = shq(`${pinned.receipts.trim()}/${commitLabel}.json`)
   const made = await relayRun(
     `${IN_CHECKOUT}On branch ${pinned.branch}, write a commit message with your file tool to a new temporary file outside the checkout, a name without quotes: an imperative subject summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, ` +
     'in the style `git log -5 --format=%s` shows, and a body only for a why the diff cannot show; ' +
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
-    `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
+    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit --receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
     'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
-    { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
+    { label: commitLabel, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
   )
-  // A dead committer or relay error leaves no receipt: the read-back settles it, else committed stays null.
-  const lost = made ? made.error : 'commit agent died'
-  if (!lost && !made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
+  // A lost or error copy is recovered from the script's own receipt, never by a second commit; with none, the HEAD read-back settles it, else committed stays null.
+  let lost = made ? made.error : 'commit agent died'
+  const receipt = lost ? await readCommitReceipt(commitLabel, receiptFile, scope) : null
+  if (receipt) {
+    log(`${commitLabel}: recovered from the commit script's receipt: ${receipt.committed ? `committed ${receipt.sha.slice(0, 7)}` : 'no commit'} — ${receipt.detail}`)
+    lost = null
+  }
+  const said = receipt || made
+  if (!lost && !said.committed) return { pass: false, committed: false, detail: said.detail || 'no commit was created', sha: '' }
 
   const seen = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
     relayed(AUDIT),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   )
@@ -1677,6 +1739,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     return !got || want.blob !== got.blob || want.mode !== got.mode
   })
   const why = seen.error ? `the commit could not be read back: ${seen.error}`
+    : receipt && sha !== receipt.sha ? `HEAD is ${sha.slice(0, 7)}, but the commit script's receipt names ${receipt.sha.slice(0, 7)}`
     : seen.parent !== expectedHead || seen.scope.join('\0') !== scope.join('\0') ? `the audit read ${seen.scope.join(', ')} on ${seen.parent.slice(0, 7)}, not this commit`
     : !FULL_SHA.test(sha) ? `commit reported no full SHA: ${JSON.stringify(seen.sha)}`
     : seen.refusal || (unbound.length ? `commit content differs from what the hooks left: ${unbound.join(', ')}` : null)
@@ -1696,11 +1759,25 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
 }
 
+// Read-only, so a lost copy gets the usual fresh agent; a receipt bound to another request, parent or scope is none.
+const readCommitReceipt = async (label, file, scope) => {
+  const r = await relayOnce(
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} receipt ${file} --request ${shq(label)} --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
+    relayed(COMMIT_RECEIPT),
+    { label: `receipt:${label}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT_RECEIPT },
+  )
+  const why = !r ? 'the read-back agent died' : r.error ? r.error
+    : r.request !== label || r.parent !== expectedHead || r.scope.join('\0') !== scope.join('\0') ? `it is for ${r.request} on ${r.parent.slice(0, 7)}, not this commit`
+    : r.committed && !FULL_SHA.test(r.sha) ? `it names no full SHA: ${JSON.stringify(r.sha)}` : null
+  if (why) log(`${label}: no commit receipt read back: ${why}`)
+  return why ? null : r
+}
+
 // Push one audited SHA, never the branch. Landed only when every pinned URL (and the PR, for an adoption) reads it back; failed only when every URL answered without it; else unknown. null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
   const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
-    `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
-    `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')} --open-pr ${args.pr}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
+    `\`${PY} ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
+    `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')} --open-pr ${args.pr}${prToo ? ` --pr ${args.pr}` : ''} --repo ${shq(repo)}\` ` +
     relayed(PUSH)
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
   // A retry finds a push that landed; it cannot prove one did not.
@@ -1731,7 +1808,7 @@ const pushExact = async (sha, label, prToo = false) => {
 
 const PR_STATE = withSeal({ type: 'object', additionalProperties: false, required: ['state'], properties: { error: { type: 'string' }, state: { type: 'string' } } })
 const readPrState = async (tag) => {
-  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --state ${args.pr}\` ` + relayed(PR_STATE),
+  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --state ${args.pr} --repo ${shq(repo)}\` ` + relayed(PR_STATE),
     { label: `prstate#${tag}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PR_STATE })
   if (!r || r.error || !['OPEN', 'MERGED', 'CLOSED'].includes(r.state)) log(`prstate#${tag}: PR #${args.pr} state unread — ${!r ? 'the relay died' : r.error || JSON.stringify(r.state)}`)
   return r && !r.error ? r.state : null
@@ -1832,6 +1909,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   }
   // Every draft went to the caller: the handoffs name them, and no batch was sent.
   if (replies.length === 0) return null
+  if (pendingReview) return { pass: false, detail: `not sent: pending review ${pendingReview.review} of ${pendingReview.login}`, receipts: [], replied: [] }
   const out = await runReplyScript(label, 'manifest', `Publish these replies on PR #${args.pr}`,
     'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ',
     `Manifest: ${JSON.stringify({ replies })}`)
@@ -1892,7 +1970,7 @@ const settleSonar = async (cycle, entry, ended) => {
   const receipt = `${pinned.receipts.trim()}/sonar-${cycle}-${fnv1a(JSON.stringify({ head: expectedHead, items }))}.json`
   const r = await relayOnce(
     `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
-    `\`python3 ${SONAR_SCRIPT} --pr ${args.pr} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}\` ` + relayed(SONAR) +
+    `\`${PY} ${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}\` ` + relayed(SONAR) +
     ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`,
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
   if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }
@@ -1910,9 +1988,15 @@ const settleSonar = async (cycle, entry, ended) => {
 const MANUAL_SKIP = /^review skipped: manual review required/i
 const manualSkip = (cr) => cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
 // The ask CodeRabbit's state leaves a coderabbitTrigger launch on the head of `clock`, one of each per head (#243): a tick of a
-// manual skip's box, or a request after a rate limit with a known reset, whenever that reset comes; null when neither is left.
-const coderabbitAskable = (cr, clock) => manualSkip(cr) && clock.triggeredAt === undefined ? 'tick'
-  : cr.state === 'settled' && cr.kind === 'limited' && cr.retryAt !== null && !clock.request ? 'request' : null
+// manual skip's box, or a request after a rate limit with a known reset, whenever that reset comes, or after a failed tick, which
+// spends no comment (#274); null when neither is left.
+const coderabbitAskable = (cr, clock) => {
+  if (manualSkip(cr)) {
+    if (clock.triggeredAt === undefined) return 'tick'
+    return !clock.request && clock.triggeredAt === null ? 'request' : null
+  }
+  return !clock.request && cr.state === 'settled' && cr.kind === 'limited' && cr.retryAt !== null ? 'request' : null
+}
 const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitRequired || !cr) return
@@ -1926,16 +2010,18 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
   if (cr.state === 'settled' && cr.kind === 'limited') return requestCodeRabbit(cycle, r, cr, ended)
-  // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone.
+  if (manual) await requestCodeRabbit(cycle, r, cr, ended)
+  // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip after
+  // the ask is waited on too: the skip asked about may read otherwise once its box is ticked.
   const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
-  if (!asks.length || !(manual || cr.state === 'queued' || cr.state === 'absent')) return
+  if (!asks.length || !(cr.state === 'settled' && cr.kind === 'skipped' || cr.state === 'queued' || cr.state === 'absent')) return
   waitAfter(cr, asks.reduce((a, b) => Date.parse(a) >= Date.parse(b) ? a : b), r.observedAt)
 }
 // One trigger script's run through a relay: its line, and the outcome, `failed` for a line it cannot read.
 const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
   const label = `${kind}#${cycle}`
   const t = await relayOnce(
-    `${IN_CHECKOUT}${task}: run \`python3 ${script} --pr ${args.pr} --head ${expectedHead}${flag}\` ` +
+    `${IN_CHECKOUT}${task}: run \`${PY} ${script} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead}${flag}\` ` +
     relayed(TRIGGER) + ' Change nothing on GitHub yourself.',
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: TRIGGER })
   const known = !!t && !t.error && outcomes.includes(t.outcome)
@@ -1978,7 +2064,8 @@ const waitAfter = (cr, askedAt, observedAt) => {
   cr.triggeredMin = Math.floor((Date.parse(observedAt) - Date.parse(askedAt)) / 60000)
   cr.done = cr.triggeredMin >= REVIEW_CAP_MIN
 }
-// A rate limit leaves no box to tick: once its reset passes, one `@coderabbitai review` per head asks again.
+// A rate limit leaves no box to tick: once its reset passes, one `@coderabbitai review` per head asks again. So does a manual
+// skip whose tick failed, at once.
 const RETRY_WAIT_MAX_MS = 60 * 60000
 const retryLater = (cr, cycle, ms) => {
   if (ms > RETRY_WAIT_MAX_MS || cycle >= maxCycles) return
@@ -1994,11 +2081,17 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
     return
   }
   if (!coderabbitTrigger || coderabbitAskable(cr, reviewClock) !== 'request') return
-  const dueMs = Date.parse(cr.retryAt) - Date.parse(r.observedAt)
+  const dueMs = cr.retryAt === null ? 0 : Date.parse(cr.retryAt) - Date.parse(r.observedAt)
   if (dueMs > 0) return retryLater(cr, cycle, dueMs)
   if (await ended('crrequest')) return
-  const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} after its rate limit`, ' --request',
+  const why = cr.kind === 'limited' ? 'after its rate limit' : 'that it skipped for a manual review'
+  const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`, ' --request',
     ['requested', 'already', 'notDue', 'notLimited', 'failed'])
+  // A failure before the POST posted nothing (#276): one more try, behind the script's own `already` check. One that may have posted is final.
+  if (outcome === 'failed' && t && t.phase === 'read' && !reviewClock.requestUnposted) {
+    reviewClock.requestUnposted = true
+    return retryLater(cr, cycle, 0)
+  }
   const atOk = !!t && Number.isFinite(Date.parse(t.at))
   const reset = t && Number.isFinite(Date.parse(t.retryAt)) ? t.retryAt : null
   if (outcome === 'notDue' && reset && atOk) return retryLater(cr, cycle, Math.max(0, Date.parse(reset) - Date.parse(t.at)))
@@ -2079,26 +2172,26 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
 
 // collect.py waits and lists without a model; the judge reads only the failing checks' evidence. Waits stay short while the review lane may still push.
 const ciLaneRun = async (cycle, lanes, entry) => {
-  const repo = ((pin && pin.prUrl) || '').match(/github\.com\/([^/]+\/[^/]+)\/pull\//)?.[1]
-  if (!repo) {
-    log(`cycle ${cycle}: CI not collected — no PR repository in ${JSON.stringify(pin && pin.prUrl)}`)
-    return null
-  }
   // The head the last collector call queried, its retry too: a review-lane push moves expectedHead while one runs.
   let queried = expectedHead
   const collect = (label, command, schema, payload) => {
     const head = queried = expectedHead
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file, a name without quotes, and ' : ''}` +
-      `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
+      `run exactly \`${PY} ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
       'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
       (payload ? `\n${JSON.stringify(payload)}` : '')
-    const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema }
+    const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema, contract: COLLECT_CONTRACT }
+    // A skew stops the cycle (runLanes); to every reader here its line is an error.
+    const skewed = (got) => {
+      if (got && got.skew) entry.collectorSkew = got.error
+      return got
+    }
     return relayRun(prompt(command), opts).then(got => {
       // A retry after a rate limit would only call GitHub again.
-      if (got || githubLimit) return got
+      if (got || githubLimit) return skewed(got)
       shortened = shortened || /--wait-seconds [1-9]/.test(command)
-      return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts)
+      return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts).then(skewed)
     })
   }
   // A slice retried without its wait leaves the budget short of a whole wait.
@@ -2231,6 +2324,12 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     }
   }
   await parallel(groupsOf(unread, RECALL_PER_CALL).map((batch, k) => () => recallBatch(batch, k)))
+  // A CircleCI verdict judged incomplete may predate the whole-log collector (#319): collected and judged again once per
+  // launch, so a resumed launch reads the whole log; still incomplete after that, it stands as judged.
+  const tails = failing.filter(c => reusable(c) && c.attempt.startsWith('circleci:') && !tailsRefreshed.has(c.link) &&
+    ciVerdicts.get(c.link).failures.some(f => !f.complete))
+  for (const c of tails) { tailsRefreshed.add(c.link); ciVerdicts.delete(c.link) }
+  if (tails.length) log(`cycle ${cycle}: CI verdicts judged on an incomplete log collected and judged again for ${tails.map(c => c.name).join(', ')}`)
   // A stored check is judged again only for its unclassified failures, when its stored list is complete and distinct.
   const storedOf = (c) => ciVerdicts.get(c.link).failures
   const unplaced = (c) => storedOf(c).filter(f => f.verdict === 'unclassified')
@@ -2293,8 +2392,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   // The judge may re-run checks: the PR must read OPEN, and no review push may have landed during that read.
   if (await prGate(lanes, `${cycle}-judge`) || superseded()) return report
   const judged = await agent(
-    `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} at head ${report.headSha} per your procedure. ` +
-    `The collector's evidence for them is in ${ev.detail}. The checks, each needing exactly one entry in your reply: ` +
+    `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} of ${repo} at head ${report.headSha} per your procedure. ` +
+    `The collector's evidence for them is in ${ev.detail}. Run any ci-rerun script under ${PY}. The checks, each needing exactly one entry in your reply: ` +
     JSON.stringify(judging.map(c => ({
       link: c.link, check: c.name, workflow: c.workflow, bucket: c.bucket,
       ...(partial.includes(c) ? {
@@ -2357,6 +2456,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     const base = ev.bases.find(b => b.link === v.link)?.base ?? null
     const placedWith = v.failures.some(f => f.verdict === 'unclassified') ? { placedWith: placedKey(base) } : {}
     ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v, ...placedWith })
+    tailsRefreshed.add(v.link)
   }
   // After a push these verdicts are never recalled; a lost one fails its digest and is judged again.
   if (fresh.length && !lanes.reviewPublishing) {
@@ -2383,6 +2483,11 @@ const runCycle = async (cycle, entry) => {
     log(`cycle ${cycle}: GitHub refused a call for a ${secondary ? 'secondary ' : ''}rate limit (${error}) — stopping; relaunch ${resetAt ? `after ${resetAt}` : 'once it clears'}`)
     return stop(cycle, 'github-rate-limited', { rateLimit: githubLimit })
   }
+  // Every later reply batch meets the same refusal until a human submits or deletes the review.
+  if (pendingReview) {
+    log(`cycle ${cycle}: ${pendingReview.login} holds pending review ${pendingReview.review} on PR #${args.pr}, so GitHub refuses its replies — stopping; it is the human's to submit or delete`)
+    return stop(cycle, 'pending-review', { ...pendingReview })
+  }
   return verdict
 }
 
@@ -2399,7 +2504,7 @@ const runLanes = async (cycle, entry, lanes) => {
     const owedLastCycle = outstanding().map(commentId => ({ commentId, findingIds: owedIds(commentId) }))
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure. ${IN_CHECKOUT}` +
-      `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
+      `Harvest with exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
       `A drafted reply is posted only when each point has at most ${REPLY_WORDS} words and no line is over ${REPLY_LINE_CHARS} characters. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
@@ -2829,6 +2934,11 @@ const runLanes = async (cycle, entry, lanes) => {
       return null
     }
     const c = await ciPromise
+    if (entry.collectorSkew) {
+      log(`cycle ${cycle}: ${entry.collectorSkew}`)
+      entry.error = `collector skew: ${entry.collectorSkew}`
+      return stop(cycle, 'collector-skew', { detail: entry.collectorSkew })
+    }
     if (!c) {
       const now = entry.ciCollectFailed, prev = before('ciCollectFailed')
       if (now && prev && now.head === prev.head && now.error === prev.error) {
@@ -3011,10 +3121,11 @@ const runLanes = async (cycle, entry, lanes) => {
 // Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['branch', 'prBranch', 'prHead', 'prBase', 'prBaseBranch', 'prBaseTip', 'prRepo', 'prUrl', 'prState', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
+  required: ['python', 'missing', 'repo', 'branch', 'prBranch', 'prHead', 'prBase', 'prBaseBranch', 'prBaseTip', 'prRepo', 'prUrl', 'prState', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
   properties: {
     error: { type: 'string' },
-    branch: { type: 'string' }, prBranch: { type: 'string' },
+    python: { type: 'string' }, missing: { type: 'array', items: { type: 'string' } },
+    repo: { type: 'string' }, branch: { type: 'string' }, prBranch: { type: 'string' },
     prHead: { type: 'string' }, prBase: { type: 'string' }, prBaseBranch: { type: 'string' }, prBaseTip: { type: 'string' },
     prRepo: { type: 'string' }, prUrl: { type: 'string' }, prState: { type: 'string' },
     remote: { type: 'string' }, upstreamBranch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
@@ -3023,12 +3134,16 @@ const PIN = withSeal({
     pr: { type: 'integer' }, badPushUrl: { type: 'string' }, receipts: { type: 'string' },
   },
 })
+// The modules the enabled lanes import beyond the standard library: harvest.py dates a head for the bots waited on from workflow files.
+const MODULES = reviewLane && reviewers.length && waitedOn.length ? ['yaml'] : []
+const PACKAGE = { yaml: 'PyYAML' }
 if (cyclesUsed >= maxCycles) {
   log(`state: ${cyclesUsed} of ${maxCycles} cycles already used — nothing left to run`)
   return finish(stop(cyclesUsed, 'budget-exhausted'))
 }
 const pinned = await relayOnce(
-  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}\` ` +
+  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}` +
+  `${MODULES.map(m => ` --module ${m}`).join('')}${repo ? ` --repo ${shq(repo)}` : ''}\` ` +
   relayed(PIN),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 )
@@ -3042,10 +3157,29 @@ if (pinned.pr !== args.pr) {
   log(`preflight: the pin is of PR #${pinned.pr}, not #${args.pr}`)
   return finish(stop(cyclesUsed, 'preflight-failed', { detail: `the pin is of PR #${pinned.pr}` }))
 }
+// The repository every later call names must be the one asked for and the one the PR read lives in.
+const pinnedRepo = pinned.repo.trim()
+const notRepo = !REPO_NAME.test(pinnedRepo) ? `the pin names no repository OWNER/NAME (${JSON.stringify(pinned.repo)})`
+  : repo && pinnedRepo.toLowerCase() !== repo.toLowerCase() ? `the pin is of ${pinnedRepo}, not ${repo}`
+  : (repoOf(pinned.prUrl) || '').toLowerCase() !== pinnedRepo.toLowerCase() || !pinned.prUrl.endsWith(`/pull/${args.pr}`)
+    ? `${pinnedRepo} read PR #${args.pr} as ${pinned.prUrl}` : null
+if (notRepo) {
+  log(`preflight: ${notRepo}`)
+  return finish(stop(cyclesUsed, 'preflight-failed', { detail: notRepo }))
+}
+repo = pinnedRepo
 if (pinned.prState !== 'OPEN') {
   log(`preflight: PR #${args.pr} is ${pinned.prState.toLowerCase()} — nothing to babysit`)
   return finish(prEnded(cyclesUsed, pinned.prState.toLowerCase()))
 }
+const unusable = !pinned.python.trim() ? 'preflight names no interpreter'
+  : pinned.missing.length ? `${pinned.python} cannot import ${pinned.missing.map(m => { const p = PACKAGE[m.split(':')[0]]; return p ? `${m} (${p})` : m }).join('; ')}, which this launch's lanes need: ` +
+    'install it for that interpreter, or launch with python naming one that has it' : null
+if (unusable) {
+  log(`preflight: ${unusable}`)
+  return finish(stop(cyclesUsed, 'python-unusable', { detail: unusable }))
+}
+if (pythonArg === null) PY = shq(pinned.python)
 const dirty = withoutIdeDrift(pinned.dirty)
 if (dirty.length !== pinned.dirty.length) log(`preflight: ignoring ${pinned.dirty.length - dirty.length} dirty .idea/ path(s) (IDE metadata)`)
 if (dirty.length) {
@@ -3085,18 +3219,24 @@ if (pinned.badPushUrl) {
   return finish(stop(cyclesUsed, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected }))
 }
 // Adoption replaces the head checks: checkout at adoptHead, PR at the state's head or a chain commit, the chain audited commit by commit.
+// Without a pinned state (a first launch, or one that stopped before its pin) the chain starts at the live PR head (#260).
 let adoption = null
 if (adoptHead !== null) {
-  const X = restored.expectedHead
   const prHead = pinned.prHead.trim()
+  const X = restored && restored.pin ? restored.expectedHead : prHead
   const base = pinned.prBase.trim()
   const tip = pinned.prBaseTip.trim()
   if (pinned.head.trim() !== adoptHead) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
     return finish(stop(cyclesUsed, 'adopt-head-mismatch', { head: pinned.head.trim(), expected: adoptHead }))
   }
+  if (adoptHead === X) {
+    const what = restored && restored.pin ? 'the state\'s expectedHead' : 'the PR head'
+    log(`preflight: adoption refused — ${adoptHead.slice(0, 7)} is ${what}: there is nothing to adopt`)
+    return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: `adoptHead ${adoptHead.slice(0, 7)} is ${what}: launch without it` }))
+  }
   // An unpublished candidate is decided by a retry of the same adoption or, while the PR heads the state's head, a chain from it; never one this run's audit refused.
-  const p = restored.pending
+  const p = restored && restored.pending
   const retry = !!p && p.lane === 'adopt' && p.sha === adoptHead
   if (p && !retry && (prHead !== X || p.stage === 'audit-blocked')) {
     log(`preflight: the state holds an unpublished candidate (${p.stage}); resolve it before adopting`)
@@ -3105,7 +3245,7 @@ if (adoptHead !== null) {
   if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
   if (tip !== base) log(`preflight: ${pinned.prBaseBranch} is at ${tip.slice(0, 7)}, not the base ${base.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`)
   const audit = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}\` ` +
     relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   )

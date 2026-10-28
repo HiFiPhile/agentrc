@@ -6,7 +6,7 @@
 --auto-run names the bots settled from their artifacts, only coderabbit and greptile. Copilot is read
 from its newest submitted review on the head; any other reviewer is `harvested`, its state not read.
 
-Run from the PR checkout; --repo names the PR's repository instead of the checkout's. It settles first and harvests second: the bots'
+Run from the PR checkout; --repo names the PR's repository, else the checkout's one repository does (facts.bind_repo). It settles first and harvests second: the bots'
 artifacts are read, then the three comment endpoints, then the head again; a
 head that moved restarts the read once on the new head, and one that moves
 again is an error. The settle rules are this file's, and its tests', and read
@@ -15,7 +15,8 @@ evidence it cannot order, or a read that failed makes that bot `unknown`,
 never `absent`.
 
 stdout ends with one JSON line: headSha, observedAt, headEventAt (null when no
-run or timeline event dates the head, or no bot auto-runs), headEventEvidence (saying so when, without
+run or timeline event dates the head, when the workflow file of a run that might date it could not be read twice, or
+when no bot auto-runs), headEventEvidence (naming that unread file, or saying so when, without
 PyYAML, no pull_request run on the head could be read to date it), bots (one record per
 --reviewers name: bot, state, kind, sha, evidence, reason, retryAt: when a rate-limited
 bot's notice says its next review is available, an hour after a CodeRabbit notice
@@ -43,6 +44,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,7 +55,7 @@ except ImportError:
     yaml = None
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, RateLimited, Unusable, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, RateLimited, Unusable, bind_repo, report, run  # noqa: E402
 
 # reply.py checks a comment against the same digest, so both skills share one definition.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
@@ -70,11 +72,16 @@ CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
 CR_RATE_STATUS = 'review rate limited'
+# A repository CodeRabbit reviews only on request: a box in its summary comment, ticked once asked, or these words beside it (#324).
+CR_TRIGGER_BOX = re.compile(r'^(?P<pre>(?:> )?- \[)(?P<mark>[ xX])(?P<post>\][^\n]*Trigger (?:a manual )?review[^\n]*)$', re.M)
+CR_MANUAL_ONLY = 'does not receive automatic reviews'
 CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
 COUNTDOWN_TERM = re.compile(r'(\d+) (hour|minute|second)s?')
 # CodeRabbit's included reviews come back within the hour: the reset a notice without a countdown is given.
 ESTIMATED_RESET = timedelta(hours=1)
-COPILOT_QUOTA = 'Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.'
+# The quota notice's known wordings (#308); any other "unable to review" body stays unknown.
+COPILOT_QUOTA = ('Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.',
+                 'Copilot was unable to review this pull request because the user who requested the review has insufficient remaining quota.')
 COPILOT_NO_FILES = "Copilot wasn't able to review any files in this pull request."
 COPILOT_OVERVIEW = ('<!-- ccr-overview', '## Pull request overview')
 REVIEW_SUBMITTED = ('COMMENTED', 'APPROVED', 'CHANGES_REQUESTED')
@@ -85,6 +92,11 @@ GREPTILE_STATUS = '<!-- greptile-status -->'
 GREPTILE_REVIEW_WAIT = timedelta(minutes=10)
 FAILED_RUN = ('failure', 'cancelled', 'timed_out', 'action_required')
 RUN_PROGRESS = {'queued': ('queued', 'check run queued'), 'in_progress': ('working', 'check run in progress')}
+WORKFLOW_RETRY_S = 2
+
+
+class Unreadable(Unusable):
+    """A workflow file a run on the head names could not be read, so whether that run dates the head is not known."""
 
 
 def gh_json(*argv):
@@ -189,13 +201,13 @@ def coderabbit(head, statuses, checks, issue, event_at):
         limited, why = newest_reading(fresh, 'created_at', retry_at)
         return limited_record('rate-limited after the head event', limited or fresh[0], why, ev, None)
     if s and run_ and s_at == run_at:
-        a, b = coderabbit_status(s, ev, head), coderabbit_run(run_, ev, head)
+        a, b = coderabbit_status(s, ev, head), coderabbit_run(run_, ev, head, stickies)
         if (a['state'], a['kind']) != (b['state'], b['kind']):
             return record('coderabbit', 'unknown', 'its status and check run disagree at one timestamp', ev)
     if s and (run_ is None or s_at >= run_at):
         return coderabbit_status(s, ev, head)
     if run_:
-        return coderabbit_run(run_, ev, head)
+        return coderabbit_run(run_, ev, head, stickies)
     return record('coderabbit', 'absent', 'no status and no check run on the head')
 
 
@@ -231,14 +243,31 @@ def coderabbit_status(s, ev, head):
     return record('coderabbit', 'unknown', f'status state {state!r} is not one this reads', ev)
 
 
-def coderabbit_run(run_, ev, head):
+def coderabbit_run(run_, ev, head, stickies):
     if run_['status'] in RUN_PROGRESS:
         return record('coderabbit', *RUN_PROGRESS[run_['status']], ev, head)
     if run_['status'] == 'completed' and run_.get('conclusion') == 'success':
         return record('coderabbit', 'reviewed', 'check run completed', ev, head)
     if run_['status'] == 'completed' and run_.get('conclusion') in ('failure', 'cancelled', 'timed_out'):
         return record('coderabbit', 'settled', f"check run {run_['conclusion']}", ev, head, 'failed')
+    title = ((run_.get('output') or {}).get('title') or '').strip()
+    if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped' and title.lower().startswith('review skipped'):
+        # A check run gives no skip reason: the summary comment tells a manual-review skip, read as its status says it, from any other.
+        why = manual_only(stickies)
+        return record('coderabbit', 'settled', f'Review skipped: manual review required (check run; {why})' if why else f'check run skipped: {title}',
+                      ev, head, 'skipped')
     return record('coderabbit', 'unknown', f"check run {run_['status']}/{run_.get('conclusion')} is not one this reads", ev)
+
+
+def manual_only(stickies):
+    """Which CodeRabbit comment says it reviews the repository only on request, None when none does."""
+    for c in stickies:
+        body = c.get('body') or ''
+        if CR_TRIGGER_BOX.search(body):
+            return f"comment {c['id']} holds a Trigger review box"
+        if CR_MANUAL_ONLY in body:
+            return f"comment {c['id']} says the repository gets no automatic reviews"
+    return None
 
 
 def greptile(head, checks, issue, reviews, event_at, now=None):
@@ -330,7 +359,7 @@ def greptile_paused(head, reviews, harvested):
 def copilot_reading(body):
     """(state, kind, reason) for a Copilot review body."""
     body = (body or '').strip()
-    if body == COPILOT_QUOTA:
+    if body in COPILOT_QUOTA:
         return 'settled', 'limited', 'the requesting user reached the Copilot quota'
     if body.startswith(COPILOT_NO_FILES):
         return 'settled', 'skipped', 'no file in the PR is one Copilot reviews'
@@ -381,15 +410,14 @@ def dates_head(repo, run_, branch, head_repo):
 
 @functools.cache
 def pr_types(repo, path, sha):
-    """The pull_request activity types a workflow revision runs on, or None when they cannot be read, PyYAML missing too."""
+    """The pull_request activity types a workflow revision runs on, or None when its file does not parse into them, PyYAML
+    missing too; a file that does not read raises Unreadable."""
     if yaml is None:
         return None
+    meta = workflow_file(repo, path, sha)
     try:
-        meta = gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
         doc = yaml.safe_load(base64.b64decode(meta['content']).decode())
-    except RateLimited:
-        raise
-    except (Unusable, KeyError, ValueError, yaml.YAMLError):
+    except (KeyError, ValueError, yaml.YAMLError):
         return None
     on = doc.get('on', doc.get(True)) if isinstance(doc, dict) else None  # YAML 1.1 reads a bare `on` as True
     if isinstance(on, str):
@@ -403,6 +431,20 @@ def pr_types(repo, path, sha):
     if types is None:
         return {'opened', 'synchronize', 'reopened'}
     return set([types] if isinstance(types, str) else types)
+
+
+def workflow_file(repo, path, sha):
+    """The contents API's answer for a workflow revision, read twice; Unreadable after that, never taken for a workflow
+    without pull_request (#242)."""
+    for left in (1, 0):
+        try:
+            return gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
+        except RateLimited:
+            raise
+        except Unusable as e:
+            if not left:
+                raise Unreadable(f'workflow {path} at {sha[:9]} could not be read ({e})')
+            time.sleep(WORKFLOW_RETRY_S)
 
 
 def entry(kind, c, src, body, created, updated, path=None, line=None, commit=None, reply_to=None):
@@ -455,7 +497,10 @@ def observe(repo, n, reviewers, auto):
     head = view['headRefOid']
     if not FULL_SHA.match(head or ''):
         raise Unusable(f'gh pr view {n}: no head SHA')
-    event_at, event_why = head_event(repo, n, view, head) if auto else (None, 'no reviewer auto-runs, so no head event is read')
+    try:
+        event_at, event_why = head_event(repo, n, view, head) if auto else (None, 'no reviewer auto-runs, so no head event is read')
+    except Unreadable as e:
+        event_at, event_why = None, f'{e}, so whether its run dates the head is not known'
     statuses = pages(f'repos/{repo}/commits/{head}/statuses') if 'coderabbit' in auto else []
     checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if auto else []
     issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else None
@@ -492,8 +537,8 @@ def collect(argv):
     unknown = [r for r in reviewers if r not in KNOWN] + [r for r in auto if r not in SETTLED]
     if unknown or not set(auto) <= set(reviewers):
         raise Unusable(f'reviewers are {", ".join(KNOWN)}, and --auto-run a subset of them among {", ".join(SETTLED)}: {unknown or auto}')
+    repo = bind_repo(a.repo)
     try:
-        repo = a.repo or gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
         for _ in range(2):
             seen = observe(repo, a.pr, reviewers, auto)
             again = gh_json('pr', 'view', str(a.pr), '-R', repo, '--json', 'headRefOid')['headRefOid']

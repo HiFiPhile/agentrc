@@ -213,7 +213,7 @@ class LaunchResultTest(unittest.TestCase):
                              ('adopt-base-missing', 'retry the same adoption with the same stateRef and adoptHead'),
                              ('rebase-refused', 'the re-pin was refused'),
                              ('stale-head', "only on the user's word"),
-                             ('wrong-head', 'check out the PR head'),
+                             ('wrong-head', 'relaunch with adoptHead naming HEAD and the same stateRef, if any'),
                              ('deferral-refused', 'it needs a new decision'),
                              ('pr-conflicting', 'relaunch with adoptHead naming that merge'),
                              ('stale-workflow', 'relaunch from a fresh session'),
@@ -288,7 +288,9 @@ class LaunchResultTest(unittest.TestCase):
                 ({'relaunchAsks': None, 'asked': []}, "nothing in CodeRabbit's state is ours to ask, so a relaunch will not ask"),
                 ({'relaunchAsks': 'tick', 'asked': []}, 'a relaunch with coderabbitTrigger ticks it once'),
                 ({'relaunchAsks': 'request', 'asked': [], 'retryAt': '2026-10-23T02:07:00Z'},
-                 'rate-limited until 2026-10-23T02:07:00Z and this run never asked on the head: a relaunch with coderabbitTrigger after that')):
+                 'rate-limited until 2026-10-23T02:07:00Z and this run never asked on the head: a relaunch with coderabbitTrigger after that'),
+                ({'relaunchAsks': 'request', 'asked': [{'ask': 'tick', 'at': None}], 'retryAt': None},
+                 'no tick asked for its review: a relaunch with coderabbitTrigger comments `@coderabbitai review` once')):
             with self.subTest(ask):
                 blockers = self.run_it(stopped(ask))[1]['blockers']
                 self.assertEqual(len(blockers), 1, blockers)
