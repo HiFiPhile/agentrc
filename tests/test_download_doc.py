@@ -27,7 +27,7 @@ import vendor_renesas  # noqa: E402
 import vendor_st  # noqa: E402
 import vendor_ti  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, tmpdir  # noqa: E402
 
 
 def doc(doc_id, aliases=()):
@@ -668,6 +668,22 @@ class PageOneText(unittest.TestCase):
 
     def test_retitle_reads_the_number_off_such_a_page(self):
         self.assertEqual(retitle.from_pdf(self.pdf), ('ES0182', 'both', None))
+
+
+class ReindexPath(unittest.TestCase):
+    """The reindex command sync.py prints names read-doc's locate.py through an install link."""
+
+    def test_the_reindex_path_follows_an_installed_link_to_read_doc(self):
+        skills = Path(__file__).resolve().parents[1] / 'skills'
+        link = tmpdir(self) / 'download-doc'
+        try:
+            link.symlink_to(skills / 'download-doc', target_is_directory=True)
+        except OSError as e:
+            self.skipTest(f'no symlink: {e}')
+        with unittest.mock.patch.object(sys, 'path', list(sys.path)):
+            linked = runpy.run_path(str(link / 'scripts' / 'sync.py'))
+        self.assertEqual(linked['LOCATE'], skills / 'read-doc' / 'scripts' / 'locate.py')
+        self.assertTrue(linked['LOCATE'].is_file())
 
 
 @unittest.skipUnless(shutil.which('pdftotext'), 'identity checks read the PDF with pdftotext')

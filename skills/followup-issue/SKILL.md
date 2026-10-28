@@ -15,8 +15,8 @@ python3 "$P" comment --repo <o/r> --allow-repo <o/r> --issue <N> --body-file <f>
 ```
 
 `--title-file <f>`, a file holding the title line, stands in for `--title`. Captain, whose guard admits no quoting,
-runs these steps with the recipes in `../captain/SKILL.md` from this skill's directory: one-word searches, a title file
-and a body file.
+runs these steps with the recipes in `../captain/SKILL.md` from this skill's directory, its symlink resolved first:
+one-word searches, a title file and a body file.
 
 ## Judgment
 
