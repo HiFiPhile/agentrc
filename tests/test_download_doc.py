@@ -5,6 +5,7 @@ import io
 import json
 import os
 import runpy
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -902,7 +903,7 @@ class AddOne(unittest.TestCase):
             'comments': f'\n\nDocument ID: PS1234\nRevision: 1.4\nSource: {self.URL}'}])
         self.assertIn('IMPORTED #1 nordic:PS1234', out)
         locate = Path(__file__).resolve().parents[1] / 'skills' / 'read-doc' / 'scripts' / 'locate.py'
-        self.assertIn(f'python3 "{locate}" build --all', out)
+        self.assertIn(f'python3 {shlex.quote(str(locate))} build --all', out)
 
     def test_an_identifier_already_filed_is_refused_before_any_download(self):
         self.library = FakeCalibre({'id': 7, 'title': 'PS1234 old', 'authors': 'Nordic Semiconductor',
